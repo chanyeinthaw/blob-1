@@ -12,3 +12,4 @@ regex = "1"
 rig-core = { workspace = true, features = ["reqwest"] }
 serde_json.workspace = true
 storage.workspace = true
+tokio.workspace = true

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 llm.workspace = true
+async-trait.workspace = true
 clap.workspace = true
 environment-local.workspace = true
 harness.workspace = true

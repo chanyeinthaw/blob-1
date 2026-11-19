@@ -37,6 +37,46 @@ pub enum LlmError {
     Request(String),
     #[error("context overflow: {0}")]
     ContextOverflow(String),
+    #[error("rate limited: {message}")]
+    RateLimited {
+        message: String,
+        retry_after: Option<std::time::Duration>,
+    },
+    #[error("quota exhausted: {0}")]
+    QuotaExhausted(String),
+}
+
+pub struct Fallback<A, B> {
+    primary: A,
+    secondary: B,
+    switched: std::sync::atomic::AtomicBool,
+}
+
+impl<A, B> Fallback<A, B> {
+    pub fn new(primary: A, secondary: B) -> Self {
+        Self {
+            primary,
+            secondary,
+            switched: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<A: Llm + Sync, B: Llm + Sync> Llm for Fallback<A, B> {
+    async fn complete(
+        &self,
+        request: CompletionRequest<'_>,
+    ) -> Result<CompletionResponse, LlmError> {
+        use std::sync::atomic::Ordering;
+        if !self.switched.load(Ordering::Acquire) {
+            match self.primary.complete(request.clone()).await {
+                Err(LlmError::QuotaExhausted(_)) => self.switched.store(true, Ordering::Release),
+                result => return result,
+            }
+        }
+        self.secondary.complete(request).await
+    }
 }
 
 #[async_trait::async_trait]

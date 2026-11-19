@@ -9,15 +9,21 @@ use rig_core::{
     providers::openai::{OpenAI, OpenAIConfig},
     DynModel,
 };
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, SystemTime};
 use storage::{DiscoveredModel, Message, Model, Provider, ProviderApi, ReasoningLevel};
+use tokio::sync::Mutex;
+use tokio::time::Instant;
 
+#[derive(Clone)]
 pub struct RigLlm {
     model: DynModel<Completion>,
     reasoning: Option<ReasoningSetting>,
     api: ProviderApi,
+    hold: Arc<Mutex<Option<Instant>>>,
 }
 
+#[derive(Clone)]
 enum ReasoningSetting {
     Typed(completion::Reasoning),
     Raw(String),
@@ -29,6 +35,7 @@ impl RigLlm {
             model: model.into(),
             reasoning: None,
             api: ProviderApi::OpenAiResponses,
+            hold: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -39,11 +46,12 @@ impl RigLlm {
         let response = self.model.call(request).await.map_err(|error| {
             let status = error
                 .provider_response_status()
-                .is_some_and(|status| status.as_u16() == 413);
-            classify_error(error.to_string(), status)
+                .map(|status| status.as_u16());
+            let retry_after = error.report().retry_after(SystemTime::now());
+            classify_error(error.to_string(), status, retry_after)
         })?;
         match response.error {
-            Some(error) => Err(classify_error(error, false)),
+            Some(error) => Err(classify_error(error, None, None)),
             None => Ok(response),
         }
     }
@@ -159,7 +167,38 @@ impl Llm for RigLlm {
             }),
             None => request,
         };
-        let response = self.send(request).await?;
+        let mut attempt = 0;
+        let response = loop {
+            loop {
+                let until = *self.hold.lock().await;
+                match until {
+                    Some(until) if until > Instant::now() => tokio::time::sleep_until(until).await,
+                    _ => break,
+                }
+            }
+            attempt += 1;
+            match self.send(request.clone()).await {
+                Err(LlmError::RateLimited {
+                    message,
+                    retry_after,
+                }) => {
+                    let delay = retry_after
+                        .unwrap_or_else(|| Duration::from_secs((1_u64 << (attempt - 1)).min(60)))
+                        .min(Duration::from_secs(300));
+                    let mut hold = self.hold.lock().await;
+                    let until = Instant::now() + delay;
+                    *hold = Some(hold.map_or(until, |previous| previous.max(until)));
+                    drop(hold);
+                    if attempt >= 8 {
+                        return Err(LlmError::RateLimited {
+                            message,
+                            retry_after,
+                        });
+                    }
+                }
+                result => break result?,
+            }
+        };
         let usage = Usage {
             input: response.usage.input_tokens.unwrap_or_default(),
             output: response.usage.output_tokens.unwrap_or_default(),
@@ -285,8 +324,48 @@ static NON_OVERFLOW: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
-fn classify_error(text: String, status_413: bool) -> LlmError {
-    if !NON_OVERFLOW.is_match(&text) && (status_413 || OVERFLOW.is_match(&text)) {
+fn classify_error(text: String, status: Option<u16>, retry_after: Option<Duration>) -> LlmError {
+    let lower = text.to_lowercase();
+    if status == Some(402)
+        || [
+            "insufficient_quota",
+            "exceeded your current quota",
+            "credit balance",
+        ]
+        .iter()
+        .any(|term| lower.contains(term))
+    {
+        LlmError::QuotaExhausted(text)
+    } else if status == Some(429)
+        || [
+            "rate limit",
+            "too many requests",
+            "throttl",
+            "quota exceeded for requests",
+        ]
+        .iter()
+        .any(|term| lower.contains(term))
+    {
+        static RETRY: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(?i)(?:try again|retry)(?:\s+after|\s+in)\s+(\d+(?:\.\d+)?)\s*(milliseconds?|msecs?|ms|seconds?|secs?|s)\b").unwrap()
+        });
+        let retry_after = retry_after.or_else(|| {
+            RETRY.captures(&text).and_then(|m| {
+                let amount = m[1].parse::<f64>().ok()?;
+                let unit = m[2].to_ascii_lowercase();
+                let seconds = if unit.starts_with('m') {
+                    amount / 1000.0
+                } else {
+                    amount
+                };
+                Duration::try_from_secs_f64(seconds).ok()
+            })
+        });
+        LlmError::RateLimited {
+            message: text,
+            retry_after,
+        }
+    } else if status == Some(413) || (!NON_OVERFLOW.is_match(&text) && OVERFLOW.is_match(&text)) {
         LlmError::ContextOverflow(text)
     } else {
         LlmError::Request(text)

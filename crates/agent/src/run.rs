@@ -9,6 +9,24 @@ use tokio::signal::unix::{signal, SignalKind};
 
 use crate::{api_key, Result};
 
+enum Model {
+    Main(llm_rig::RigLlm),
+    Fallback(llm::Fallback<llm_rig::RigLlm, llm_rig::RigLlm>),
+}
+
+#[async_trait::async_trait]
+impl llm::Llm for Model {
+    async fn complete(
+        &self,
+        request: llm::CompletionRequest<'_>,
+    ) -> std::result::Result<llm::CompletionResponse, llm::LlmError> {
+        match self {
+            Self::Main(model) => model.complete(request).await,
+            Self::Fallback(model) => model.complete(request).await,
+        }
+    }
+}
+
 pub async fn run(
     store: Arc<SqliteStorage>,
     mount_dir: &Path,
@@ -43,7 +61,10 @@ pub async fn run(
         reasoning.unwrap_or(settings.reasoning),
     );
 
-    let mut summarizer = if let Some(model) = settings.compaction_model.clone() {
+    let llm_main = llm;
+    let mut summarizer = if let Some(selected) = settings.compaction_model.clone() {
+        let is_main = selected == model;
+        let model = selected;
         let provider = store
             .providers()?
             .into_iter()
@@ -67,7 +88,14 @@ pub async fn run(
                 .compaction_reasoning
                 .unwrap_or(reasoning.unwrap_or(settings.reasoning)),
         );
-        Some((llm, stored.effective_context()))
+        Some((
+            if is_main {
+                Model::Main(llm)
+            } else {
+                Model::Fallback(llm::Fallback::new(llm, llm_main.clone()))
+            },
+            stored.effective_context(),
+        ))
     } else {
         None
     };
@@ -76,14 +104,14 @@ pub async fn run(
         Some(if let Some((llm, _)) = summarizer.take() {
             llm
         } else {
-            llm_rig::connect(
+            Model::Main(llm_rig::connect(
                 &provider,
                 &api_key(&provider)?,
                 &stored_model,
                 settings
                     .compaction_reasoning
                     .unwrap_or(reasoning.unwrap_or(settings.reasoning)),
-            )
+            ))
         })
     } else {
         None
@@ -102,7 +130,7 @@ pub async fn run(
         let memory =
             memory::Memory::open(store.clone(), compactor, memory::MemoryConfig::default())?;
         let harness = ChatHarness::new(
-            llm,
+            Model::Main(llm_main),
             environment,
             store,
             memory,
@@ -120,7 +148,7 @@ pub async fn run(
         return Ok(());
     }
     let harness = SessionHarness::new(
-        llm,
+        Model::Main(llm_main),
         environment,
         store,
         EnvironmentPaths { workspace, skills },
