@@ -1,0 +1,11 @@
+[package]
+name = "harness"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+executor.workspace = true
+storage.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/harness",
+  "crates/storage",
+  "crates/executor",
+  "crates/executor-local",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+async-trait = "0.1"
+executor = { path = "crates/executor" }
+storage = { path = "crates/storage" }
+thiserror = "1"
+tokio = { version = "1", features = ["process", "fs", "io-util", "rt", "time", "sync", "macros"] }
