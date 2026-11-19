@@ -329,6 +329,8 @@ pub struct ModelRef {
 pub struct Settings {
     pub default_model: Option<ModelRef>,
     pub reasoning: ReasoningLevel,
+    pub compaction_model: Option<ModelRef>,
+    pub compaction_reasoning: Option<ReasoningLevel>,
 }
 
 pub trait ConfigStore: Send + Sync {

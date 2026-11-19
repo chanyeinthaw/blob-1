@@ -166,16 +166,19 @@ impl ConfigStore for SqliteStorage {
     }
 
     fn settings(&self) -> Result<Settings, StoreError> {
-        let (provider, model, reasoning) = self
+        let (provider, model, reasoning, compaction_provider, compaction_model, compaction_reasoning) = self
             .lock()
             .query_row(
-                "SELECT default_provider, default_model, reasoning FROM settings WHERE id = 1",
+                "SELECT default_provider, default_model, reasoning, compaction_provider, compaction_model, compaction_reasoning FROM settings WHERE id = 1",
                 [],
                 |row| {
                     Ok((
                         row.get::<_, Option<String>>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         reasoning_from_column(row, 2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?.map(|level| level.parse().map_err(|error| rusqlite::Error::FromSqlConversionFailure(5, Type::Text, Box::new(error)))).transpose()?,
                     ))
                 },
             )
@@ -186,6 +189,13 @@ impl ConfigStore for SqliteStorage {
                 model,
             }),
             reasoning,
+            compaction_model: compaction_provider
+                .zip(compaction_model)
+                .map(|(provider, model)| ModelRef {
+                    provider: ProviderId(provider),
+                    model,
+                }),
+            compaction_reasoning,
         })
     }
 
@@ -194,12 +204,16 @@ impl ConfigStore for SqliteStorage {
             .default_model
             .map(|model| (model.provider.0, model.model))
             .unzip();
+        let (compaction_provider, compaction_model) = settings
+            .compaction_model
+            .map(|model| (model.provider.0, model.model))
+            .unzip();
         self.lock()
             .execute(
                 "UPDATE settings
-                 SET default_provider = ?1, default_model = ?2, reasoning = ?3
+                 SET default_provider = ?1, default_model = ?2, reasoning = ?3, compaction_provider = ?4, compaction_model = ?5, compaction_reasoning = ?6
                  WHERE id = 1",
-                params![provider, model, settings.reasoning.as_str()],
+                params![provider, model, settings.reasoning.as_str(), compaction_provider, compaction_model, settings.compaction_reasoning.map(ReasoningLevel::as_str)],
             )
             .map_err(backend)?;
         Ok(())

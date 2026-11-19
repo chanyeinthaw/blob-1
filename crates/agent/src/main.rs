@@ -81,9 +81,22 @@ enum ModelsCommand {
 
 #[derive(Subcommand)]
 enum ModelCommand {
-    Set { model: String },
-    Map { model: String, pairs: Vec<String> },
-    Context { model: String, tokens: String },
+    Set {
+        model: String,
+    },
+    Compaction {
+        model: String,
+        #[arg(long)]
+        reasoning: Option<ReasoningLevel>,
+    },
+    Map {
+        model: String,
+        pairs: Vec<String>,
+    },
+    Context {
+        model: String,
+        tokens: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -193,6 +206,7 @@ async fn models(store: &SqliteStorage, command: ModelsCommand) -> Result<()> {
             let settings = store.settings()?;
             println!("reasoning: {}", settings.reasoning.as_str());
             let default = settings.default_model;
+            let compaction = settings.compaction_model;
             for provider in store.providers()? {
                 for model in store.models(&provider.id)? {
                     let marker = match &default {
@@ -202,6 +216,21 @@ async fn models(store: &SqliteStorage, command: ModelsCommand) -> Result<()> {
                             "*"
                         }
                         _ => " ",
+                    };
+                    let compaction_marker = if compaction.as_ref().is_some_and(|selected| {
+                        selected.provider == model.provider && selected.model == model.id
+                    }) {
+                        "c"
+                    } else {
+                        " "
+                    };
+                    let override_level = if compaction_marker == "c" {
+                        settings
+                            .compaction_reasoning
+                            .map(|level| format!("\tcompaction reasoning: {}", level.as_str()))
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
                     };
                     let context = match (model.effective_context(), model.context_window) {
                         (Some(limit), Some(window)) if limit < window => {
@@ -223,7 +252,10 @@ async fn models(store: &SqliteStorage, command: ModelsCommand) -> Result<()> {
                     } else {
                         format!("\t{map}")
                     };
-                    println!("{marker} {}/{}{context}{map}", provider.id.0, model.id);
+                    println!(
+                        "{marker}{compaction_marker} {}/{}{context}{map}{override_level}",
+                        provider.id.0, model.id
+                    );
                 }
             }
         }
@@ -256,6 +288,21 @@ fn model_command(store: &SqliteStorage, command: ModelCommand) -> Result<()> {
                 provider: model.provider,
                 model: model.id,
             });
+            store.save_settings(settings)?;
+        }
+        ModelCommand::Compaction { model, reasoning } => {
+            let mut settings = store.settings()?;
+            if model == "-" {
+                settings.compaction_model = None;
+                settings.compaction_reasoning = None;
+            } else {
+                let model = known_model(store, &model)?;
+                settings.compaction_model = Some(ModelRef {
+                    provider: model.provider,
+                    model: model.id,
+                });
+                settings.compaction_reasoning = reasoning;
+            }
             store.save_settings(settings)?;
         }
         ModelCommand::Map { model, pairs } => {

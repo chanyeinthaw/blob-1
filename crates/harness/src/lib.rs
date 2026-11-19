@@ -59,6 +59,7 @@ pub trait Llm {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionConfig {
     pub context_window: Option<u32>,
+    pub summarizer_window: Option<u32>,
     pub reserve_tokens: u32,
     pub keep_recent_tokens: u32,
 }
@@ -67,6 +68,7 @@ impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             context_window: None,
+            summarizer_window: None,
             reserve_tokens: 16384,
             keep_recent_tokens: 20000,
         }
@@ -100,6 +102,7 @@ pub struct EnvironmentPaths {
 
 pub struct Harness<L, E, S> {
     llm: L,
+    summarizer: Option<L>,
     environment: E,
     store: S,
     paths: EnvironmentPaths,
@@ -116,12 +119,18 @@ where
     pub fn new(llm: L, environment: E, store: S, paths: EnvironmentPaths) -> Self {
         Self {
             llm,
+            summarizer: None,
             environment,
             store,
             paths,
             config: HarnessConfig::default(),
             steering: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn with_summarizer(mut self, llm: L) -> Self {
+        self.summarizer = Some(llm);
+        self
     }
 
     pub fn with_config(mut self, config: HarnessConfig) -> Self {
@@ -264,7 +273,15 @@ where
         } else {
             keep
         };
-        let Some(messages) = compaction::compact(&self.llm, &session.messages, keep).await? else {
+        let Some(messages) = compaction::compact(
+            self.summarizer.as_ref().unwrap_or(&self.llm),
+            &session.messages,
+            keep,
+            config.summarizer_window,
+            config.reserve_tokens,
+        )
+        .await?
+        else {
             return Ok(false);
         };
         if overflow

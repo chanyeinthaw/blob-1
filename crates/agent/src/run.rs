@@ -42,6 +42,35 @@ pub async fn run(
         reasoning.unwrap_or(settings.reasoning),
     );
 
+    let summarizer = if let Some(model) = settings.compaction_model {
+        let provider = store
+            .providers()?
+            .into_iter()
+            .find(|provider| provider.id == model.provider)
+            .ok_or_else(|| format!("unknown provider: {}", model.provider.0))?;
+        let stored = store
+            .models(&model.provider)?
+            .into_iter()
+            .find(|candidate| candidate.id == model.model)
+            .ok_or_else(|| {
+                format!(
+                    "unknown model {}/{}; run `agent models refresh` first",
+                    model.provider.0, model.model
+                )
+            })?;
+        let llm = llm_rig::connect(
+            &provider,
+            &api_key(&provider)?,
+            &stored,
+            settings
+                .compaction_reasoning
+                .unwrap_or(reasoning.unwrap_or(settings.reasoning)),
+        );
+        Some((llm, stored.effective_context()))
+    } else {
+        None
+    };
+
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
     let workspace = mount_dir.join("workspace");
@@ -61,9 +90,15 @@ pub async fn run(
     .with_config(HarnessConfig {
         compaction: CompactionConfig {
             context_window: stored_model.effective_context(),
+            summarizer_window: summarizer.as_ref().and_then(|(_, window)| *window),
             ..CompactionConfig::default()
         },
     });
+    let harness = if let Some((llm, _)) = summarizer {
+        harness.with_summarizer(llm)
+    } else {
+        harness
+    };
     let session = SessionId::new(session);
     let answer: Result<String> = tokio::select! {
         answer = harness.run(&session, prompt) => answer.map_err(Into::into),

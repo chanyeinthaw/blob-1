@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use environment::ToolInput;
 use storage::Message;
 
-use crate::{CompletionRequest, HarnessError, Llm, Usage};
+use crate::{CompletionRequest, HarnessError, Llm, LlmError, Usage};
 
 const SYSTEM: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
 const INITIAL: &str = r#"The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
@@ -112,26 +112,101 @@ pub(crate) fn context_tokens(
     }
 }
 
-fn render(messages: &[Message]) -> String {
-    let mut parts = Vec::new();
-    let mut calls = Vec::new();
-    for message in messages {
-        if let Message::ToolCall {
-            name, arguments, ..
-        } = message
-        {
-            calls.push(format!("{name}({arguments})"));
-            continue;
+fn fit_prompt(
+    messages: &[Message],
+    parts: &[Option<String>],
+    prefix: &str,
+    suffix: &str,
+    window: Option<u32>,
+    reserve: u32,
+    start: &mut usize,
+) -> Result<String, HarnessError> {
+    let budget = window.map(|window| u64::from(window.saturating_sub(reserve)));
+    let fixed = format!("{prefix}{suffix}");
+    let fits = |length: u64| {
+        budget.is_none_or(|budget| estimate_text(SYSTEM) + length.div_ceil(4) <= budget)
+    };
+    if !fits(fixed.encode_utf16().count() as u64) {
+        return Err(HarnessError::Compaction(
+            "Summarization instructions and previous summary exceed the summarizer context window"
+                .into(),
+        ));
+    }
+    let marker = "[Earlier messages omitted]\n\n";
+    let fixed_len = fixed.encode_utf16().count() as u64;
+    let mut length = 0;
+    let mut next_call = false;
+    let mut selected = messages.len();
+    for i in (*start..messages.len()).rev() {
+        let is_call = matches!(messages[i], Message::ToolCall { .. });
+        if let Some(part) = &parts[i] {
+            length += part.encode_utf16().count() as u64;
+            if is_call && next_call {
+                length += 2;
+            } else {
+                if length > part.encode_utf16().count() as u64 {
+                    length += 2;
+                }
+                if is_call {
+                    length += "[Assistant tool calls]: ".len() as u64;
+                }
+            }
         }
-        if !calls.is_empty() {
-            parts.push(format!("[Assistant tool calls]: {}", calls.join("; ")));
-            calls.clear();
+        next_call = is_call;
+        let marker_len = if i > 0 { marker.len() as u64 } else { 0 };
+        if fits(fixed_len + marker_len + length) {
+            selected = i;
         }
-        match message {
-            Message::User(text) if text.is_empty() => {}
-            Message::User(text) => parts.push(format!("[User]: {text}")),
-            Message::Assistant(text) => parts.push(format!("[Assistant]: {text}")),
-            Message::Summary { text, .. } => parts.push(format!("[Summary]: {text}")),
+    }
+    *start = selected;
+    if selected == messages.len() {
+        return Ok(if selected > 0 && fits(fixed_len + marker.len() as u64) {
+            format!("{prefix}{marker}{suffix}")
+        } else {
+            fixed
+        });
+    }
+    let mut rendered = String::new();
+    let mut in_calls = false;
+    for i in selected..messages.len() {
+        let is_call = matches!(messages[i], Message::ToolCall { .. });
+        if let Some(part) = &parts[i] {
+            if is_call && in_calls {
+                rendered.push_str("; ");
+            } else {
+                if !rendered.is_empty() {
+                    rendered.push_str("\n\n");
+                }
+                if is_call {
+                    rendered.push_str("[Assistant tool calls]: ");
+                }
+            }
+            rendered.push_str(part);
+        }
+        in_calls = is_call;
+    }
+    let marker = if selected > 0 { marker } else { "" };
+    Ok(format!("{prefix}{marker}{rendered}{suffix}"))
+}
+
+async fn summarize<L: Llm>(
+    llm: &L,
+    messages: &[Message],
+    prefix: &str,
+    suffix: &str,
+    window: Option<u32>,
+    reserve: u32,
+) -> Result<String, HarnessError> {
+    let parts: Vec<_> = messages
+        .iter()
+        .map(|message| match message {
+            Message::User(text) if text.is_empty() => None,
+            Message::User(text) => Some(format!("[User]: {text}")),
+            Message::Assistant(text) => Some(format!("[Assistant]: {text}")),
+            Message::Summary { text, .. } => Some(format!("[Summary]: {text}")),
+            Message::ToolCall {
+                name, arguments, ..
+            } => Some(format!("{name}({arguments})")),
             Message::ToolResult { content, .. } => {
                 let count = content.chars().count();
                 let prefix: String = content.chars().take(2000).collect();
@@ -140,25 +215,33 @@ fn render(messages: &[Message]) -> String {
                 } else {
                     String::new()
                 };
-                parts.push(format!("[Tool result]: {prefix}{suffix}"));
+                Some(format!("[Tool result]: {prefix}{suffix}"))
             }
-            Message::ToolCall { .. } => unreachable!(),
-        }
-    }
-    if !calls.is_empty() {
-        parts.push(format!("[Assistant tool calls]: {}", calls.join("; ")));
-    }
-    parts.join("\n\n")
-}
-
-async fn summarize<L: Llm>(llm: &L, prompt: String) -> Result<String, HarnessError> {
-    let response = llm
-        .complete(CompletionRequest {
-            system: SYSTEM,
-            messages: &[Message::User(prompt)],
-            tools: &[],
         })
-        .await?;
+        .collect();
+    let mut start = 0;
+    let response = loop {
+        let prompt = fit_prompt(
+            messages, &parts, prefix, suffix, window, reserve, &mut start,
+        )?;
+        match llm
+            .complete(CompletionRequest {
+                system: SYSTEM,
+                messages: &[Message::User(prompt)],
+                tools: &[],
+            })
+            .await
+        {
+            Err(error @ LlmError::ContextOverflow(_)) => {
+                let remaining = messages.len() - start;
+                if remaining <= 1 {
+                    return Err(error.into());
+                }
+                start += remaining.div_ceil(2);
+            }
+            result => break result?,
+        }
+    };
     if !response.tool_calls.is_empty() {
         return Err(HarnessError::Compaction(
             "Summarization attempted to call a tool".into(),
@@ -176,6 +259,8 @@ pub(crate) async fn compact<L: Llm>(
     llm: &L,
     messages: &[Message],
     keep: u32,
+    window: Option<u32>,
+    reserve: u32,
 ) -> Result<Option<Vec<Message>>, HarnessError> {
     let previous = match messages.first() {
         Some(Message::Summary {
@@ -256,21 +341,25 @@ pub(crate) async fn compact<L: Llm>(
             .map_or("No prior history.", |(text, _, _)| text)
             .to_owned()
     } else {
-        let mut prompt = format!("<conversation>\n{}\n</conversation>\n\n", render(history));
-        if let Some((text, _, _)) = previous {
-            prompt.push_str(&format!(
+        let suffix = format!(
+            "\n</conversation>\n\n{}{}",
+            previous.map_or_else(String::new, |(text, _, _)| format!(
                 "<previous-summary>\n{text}\n</previous-summary>\n\n"
-            ));
-        }
-        prompt.push_str(if previous.is_some() { UPDATE } else { INITIAL });
-        summarize(llm, prompt).await?
+            )),
+            if previous.is_some() { UPDATE } else { INITIAL }
+        );
+        summarize(llm, history, "<conversation>\n", &suffix, window, reserve).await?
     };
     if !prefix.is_empty() {
-        let prompt = format!(
-            "# Conversation\n{}\n\n# Instructions\n{TURN_PREFIX}",
-            render(prefix)
-        );
-        let prefix_summary = summarize(llm, prompt).await?;
+        let prefix_summary = summarize(
+            llm,
+            prefix,
+            "# Conversation\n",
+            &format!("\n\n# Instructions\n{TURN_PREFIX}"),
+            window,
+            reserve,
+        )
+        .await?;
         text.push_str(&format!(
             "\n\n---\n\n**Turn Context (split turn):**\n\n{prefix_summary}"
         ));

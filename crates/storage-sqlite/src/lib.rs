@@ -100,7 +100,11 @@ CREATE TABLE IF NOT EXISTS settings (
     default_provider TEXT,
     default_model TEXT,
     reasoning TEXT NOT NULL DEFAULT 'medium' CHECK (reasoning IN ('off', 'low', 'medium', 'high', 'xhigh', 'max')),
-    FOREIGN KEY (default_provider, default_model) REFERENCES models (provider, id) ON DELETE SET NULL
+    compaction_provider TEXT,
+    compaction_model TEXT,
+    compaction_reasoning TEXT CHECK (compaction_reasoning IN ('off', 'low', 'medium', 'high', 'xhigh', 'max')),
+    FOREIGN KEY (default_provider, default_model) REFERENCES models (provider, id) ON DELETE SET NULL,
+    FOREIGN KEY (compaction_provider, compaction_model) REFERENCES models (provider, id) ON DELETE SET NULL
 ) STRICT;
 
 INSERT OR IGNORE INTO settings (id) VALUES (1);
