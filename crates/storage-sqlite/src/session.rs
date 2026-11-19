@@ -1,7 +1,14 @@
 use rusqlite::{params, types::Type, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use storage::{Message, Session, SessionId, SessionStore, StoreError};
 
 use crate::{backend, SqliteStorage};
+
+#[derive(Serialize, Deserialize)]
+struct SummaryDetails {
+    read_files: Vec<String>,
+    modified_files: Vec<String>,
+}
 
 impl SqliteStorage {
     fn load_session(&self, id: &SessionId) -> rusqlite::Result<Option<Session>> {
@@ -16,7 +23,7 @@ impl SqliteStorage {
         }
 
         let mut statement = connection.prepare(
-            "SELECT role, content, tool_call_id, tool_name FROM messages
+            "SELECT role, content, tool_call_id, tool_name, details FROM messages
              WHERE session_id = ?1 ORDER BY position",
         )?;
         let messages = statement
@@ -24,7 +31,22 @@ impl SqliteStorage {
                 let role: String = row.get(0)?;
                 let content: String = row.get(1)?;
                 Ok(match role.as_str() {
-                    "system" => Message::System(content),
+                    "summary" => {
+                        let json: String = row.get(4)?;
+                        let details: SummaryDetails =
+                            serde_json::from_str(&json).map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    4,
+                                    Type::Text,
+                                    Box::new(error),
+                                )
+                            })?;
+                        Message::Summary {
+                            text: content,
+                            read_files: details.read_files,
+                            modified_files: details.modified_files,
+                        }
+                    }
                     "user" => Message::User(content),
                     "assistant" => Message::Assistant(content),
                     "tool_call" => Message::ToolCall {
@@ -67,21 +89,34 @@ impl SqliteStorage {
         )?;
         {
             let mut insert = transaction.prepare(
-                "INSERT INTO messages (session_id, position, role, content, tool_call_id, tool_name)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO messages (session_id, position, role, content, tool_call_id, tool_name, details)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for (position, message) in session.messages.iter().enumerate() {
-                let (role, content, tool_call_id, tool_name) = match message {
-                    Message::System(content) => ("system", content, None, None),
-                    Message::User(content) => ("user", content, None, None),
-                    Message::Assistant(content) => ("assistant", content, None, None),
+                let (role, content, tool_call_id, tool_name, details) = match message {
+                    Message::Summary {
+                        text,
+                        read_files,
+                        modified_files,
+                    } => {
+                        let details = serde_json::to_string(&SummaryDetails {
+                            read_files: read_files.clone(),
+                            modified_files: modified_files.clone(),
+                        })
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
+                        ("summary", text, None, None, Some(details))
+                    }
+                    Message::User(content) => ("user", content, None, None, None),
+                    Message::Assistant(content) => ("assistant", content, None, None, None),
                     Message::ToolCall {
                         id,
                         name,
                         arguments,
-                    } => ("tool_call", arguments, Some(id), Some(name)),
+                    } => ("tool_call", arguments, Some(id), Some(name), None),
                     Message::ToolResult { id, name, content } => {
-                        ("tool_result", content, Some(id), Some(name))
+                        ("tool_result", content, Some(id), Some(name), None)
                     }
                 };
                 insert.execute(params![
@@ -90,7 +125,8 @@ impl SqliteStorage {
                     role,
                     content,
                     tool_call_id,
-                    tool_name
+                    tool_name,
+                    details
                 ])?;
             }
         }

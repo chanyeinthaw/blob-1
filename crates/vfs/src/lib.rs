@@ -12,24 +12,31 @@ use fuser::{
     ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request, TimeOrNow,
     WriteFlags,
 };
-use storage::{Node, NodeId, NodeKind, WorkspaceError, WorkspaceStore};
+use storage::{Node, NodeId, NodeKind, Tree, WorkspaceError, WorkspaceStore};
 
 const TTL: Duration = Duration::from_secs(1);
 
 pub fn mount<S: WorkspaceStore + 'static>(
     store: S,
+    tree: Tree,
     mountpoint: impl AsRef<Path>,
+    read_only: bool,
 ) -> io::Result<BackgroundSession> {
     let mountpoint = mountpoint.as_ref();
     let owner = std::fs::metadata(mountpoint)?;
+    let root = store.root(tree).map_err(io::Error::other)?;
     let mut config = Config::default();
     config.mount_options = vec![
         MountOption::FSName("workspace".into()),
         MountOption::DefaultPermissions,
     ];
+    if read_only {
+        config.mount_options.push(MountOption::RO);
+    }
     fuser::spawn_mount(
         Workspace {
             store,
+            root,
             uid: owner.uid(),
             gid: owner.gid(),
             references: Mutex::new(HashMap::new()),
@@ -41,6 +48,7 @@ pub fn mount<S: WorkspaceStore + 'static>(
 
 struct Workspace<S> {
     store: S,
+    root: NodeId,
     uid: u32,
     gid: u32,
     references: Mutex<HashMap<u64, u64>>,
@@ -53,7 +61,7 @@ impl<S: WorkspaceStore> Workspace<S> {
             (NodeKind::Directory, linked) => (FileType::Directory, 2 * u32::from(linked)),
         };
         FileAttr {
-            ino: INodeNo(node.id.0),
+            ino: self.ino(node.id),
             size: node.size,
             blocks: node.size.div_ceil(512),
             atime: node.modified,
@@ -71,6 +79,22 @@ impl<S: WorkspaceStore> Workspace<S> {
         }
     }
 
+    fn id(&self, ino: INodeNo) -> NodeId {
+        if ino == INodeNo::ROOT {
+            self.root
+        } else {
+            NodeId(ino.0)
+        }
+    }
+
+    fn ino(&self, id: NodeId) -> INodeNo {
+        if id == self.root {
+            INodeNo::ROOT
+        } else {
+            INodeNo(id.0)
+        }
+    }
+
     fn reference(&self, node: &Node) -> FileAttr {
         *self
             .references
@@ -84,7 +108,7 @@ impl<S: WorkspaceStore> Workspace<S> {
 
 impl<S: WorkspaceStore + 'static> Filesystem for Workspace<S> {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        match utf8(name).and_then(|name| self.store.lookup(id(parent), name).map_err(errno)) {
+        match utf8(name).and_then(|name| self.store.lookup(self.id(parent), name).map_err(errno)) {
             Ok(node) => reply.entry(&TTL, &self.reference(&node), Generation(0)),
             Err(error) => reply.error(error),
         }
@@ -96,25 +120,25 @@ impl<S: WorkspaceStore + 'static> Filesystem for Workspace<S> {
                 .references
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            match references.get_mut(&ino.0) {
+            match references.get_mut(&self.id(ino).0) {
                 Some(count) if *count > nlookup => {
                     *count -= nlookup;
                     false
                 }
                 Some(_) => {
-                    references.remove(&ino.0);
+                    references.remove(&self.id(ino).0);
                     true
                 }
                 None => false,
             }
         };
         if released {
-            let _ = self.store.forget(id(ino));
+            let _ = self.store.forget(self.id(ino));
         }
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        match self.store.node(id(ino)) {
+        match self.store.node(self.id(ino)) {
             Ok(node) => reply.attr(&TTL, &self.attr(&node)),
             Err(error) => reply.error(errno(error)),
         }
@@ -139,7 +163,7 @@ impl<S: WorkspaceStore + 'static> Filesystem for Workspace<S> {
         reply: ReplyAttr,
     ) {
         let updated = (|| {
-            let mut node = self.store.node(id(ino))?;
+            let mut node = self.store.node(self.id(ino))?;
             if let Some(mode) = mode {
                 node = self.store.set_mode(node.id, mode)?;
             }
@@ -172,7 +196,7 @@ impl<S: WorkspaceStore + 'static> Filesystem for Workspace<S> {
     ) {
         let created = utf8(name).and_then(|name| {
             self.store
-                .create(id(parent), name, NodeKind::Directory, mode & !umask)
+                .create(self.id(parent), name, NodeKind::Directory, mode & !umask)
                 .map_err(errno)
         });
         match created {
@@ -186,7 +210,7 @@ impl<S: WorkspaceStore + 'static> Filesystem for Workspace<S> {
             reply,
             utf8(name).and_then(|name| {
                 self.store
-                    .remove(id(parent), name, NodeKind::File)
+                    .remove(self.id(parent), name, NodeKind::File)
                     .map_err(errno)
             }),
         );
@@ -197,7 +221,7 @@ impl<S: WorkspaceStore + 'static> Filesystem for Workspace<S> {
             reply,
             utf8(name).and_then(|name| {
                 self.store
-                    .remove(id(parent), name, NodeKind::Directory)
+                    .remove(self.id(parent), name, NodeKind::Directory)
                     .map_err(errno)
             }),
         );
@@ -223,7 +247,7 @@ impl<S: WorkspaceStore + 'static> Filesystem for Workspace<S> {
         let renamed = utf8(name).and_then(|name| {
             let newname = utf8(newname)?;
             self.store
-                .rename(id(parent), name, id(newparent), newname, replace)
+                .rename(self.id(parent), name, self.id(newparent), newname, replace)
                 .map_err(errno)
         });
         empty(reply, renamed);
@@ -240,7 +264,7 @@ impl<S: WorkspaceStore + 'static> Filesystem for Workspace<S> {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        match self.store.read(id(ino), offset, size) {
+        match self.store.read(self.id(ino), offset, size) {
             Ok(data) => reply.data(&data),
             Err(error) => reply.error(errno(error)),
         }
@@ -258,7 +282,7 @@ impl<S: WorkspaceStore + 'static> Filesystem for Workspace<S> {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        match self.store.write(id(ino), offset, data) {
+        match self.store.write(self.id(ino), offset, data) {
             Ok(_) => reply.written(data.len() as u32),
             Err(error) => reply.error(errno(error)),
         }
@@ -311,7 +335,7 @@ impl<S: WorkspaceStore + 'static> Filesystem for Workspace<S> {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let children = match self.store.children(id(ino)) {
+        let children = match self.store.children(self.id(ino)) {
             Ok(children) => children,
             Err(error) => return reply.error(errno(error)),
         };
@@ -325,7 +349,7 @@ impl<S: WorkspaceStore + 'static> Filesystem for Workspace<S> {
                 NodeKind::File => FileType::RegularFile,
                 NodeKind::Directory => FileType::Directory,
             };
-            (INodeNo(entry.node.id.0), kind, entry.name)
+            (self.ino(entry.node.id), kind, entry.name)
         }));
         for (index, (ino, kind, name)) in entries.enumerate().skip(offset as usize) {
             if reply.add(ino, index as u64 + 1, kind, name) {
@@ -347,7 +371,7 @@ impl<S: WorkspaceStore + 'static> Filesystem for Workspace<S> {
     ) {
         let created = utf8(name).and_then(|name| {
             self.store
-                .create(id(parent), name, NodeKind::File, mode & !umask)
+                .create(self.id(parent), name, NodeKind::File, mode & !umask)
                 .map_err(errno)
         });
         match created {
@@ -361,10 +385,6 @@ impl<S: WorkspaceStore + 'static> Filesystem for Workspace<S> {
             Err(error) => reply.error(error),
         }
     }
-}
-
-fn id(ino: INodeNo) -> NodeId {
-    NodeId(ino.0)
 }
 
 fn utf8(name: &OsStr) -> Result<&str, Errno> {

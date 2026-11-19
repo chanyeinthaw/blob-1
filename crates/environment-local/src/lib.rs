@@ -14,14 +14,49 @@ const TAIL_TRIM_AT: usize = 4 * MAX_BYTES;
 const MAX_TIMEOUT_SECS: f64 = 2_147_483.647;
 const EXIT_STDIO_GRACE: Duration = Duration::from_millis(100);
 
+struct ProcessGroup(Option<u32>);
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", "--", &format!("-{pid}")])
+                .status();
+        }
+    }
+}
+
 pub struct LocalEnvironment {
     root: PathBuf,
+    readable: Vec<PathBuf>,
 }
 
 impl LocalEnvironment {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, ToolError> {
         let root = root.into().canonicalize().map_err(io_error)?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            readable: Vec::new(),
+        })
+    }
+
+    pub fn with_readable(mut self, root: impl Into<PathBuf>) -> Result<Self, ToolError> {
+        self.readable
+            .push(root.into().canonicalize().map_err(io_error)?);
+        Ok(self)
+    }
+
+    fn resolve_readable(&self, path: &Path) -> Result<PathBuf, ToolError> {
+        let resolved = self
+            .root
+            .join(path)
+            .canonicalize()
+            .map_err(|_| ToolError::NotFound(path.display().to_string()))?;
+        if self.readable.iter().any(|root| resolved.starts_with(root)) {
+            return Ok(resolved);
+        }
+        self.ensure_inside_root(&resolved)?;
+        Ok(resolved)
     }
 
     fn resolve_existing(&self, path: &Path) -> Result<PathBuf, ToolError> {
@@ -75,7 +110,7 @@ impl LocalEnvironment {
         offset: Option<usize>,
         limit: Option<usize>,
     ) -> Result<String, ToolError> {
-        let resolved = self.resolve_existing(path)?;
+        let resolved = self.resolve_readable(path)?;
         let content = tokio::fs::read_to_string(resolved)
             .await
             .map_err(io_error)?;
@@ -202,6 +237,7 @@ impl LocalEnvironment {
             .spawn()
             .map_err(io_error)?;
         let pid = child.id();
+        let mut process_group = ProcessGroup(pid);
 
         let (sender, mut chunks) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         std::thread::spawn(move || {
@@ -259,6 +295,7 @@ impl LocalEnvironment {
             }
         }
 
+        process_group.0 = None;
         let body = output.render();
         let exit_code = status.map_or(1, |status| {
             status

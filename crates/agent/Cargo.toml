@@ -1,0 +1,15 @@
+[package]
+name = "agent"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+environment-local.workspace = true
+harness.workspace = true
+llm-rig.workspace = true
+storage.workspace = true
+storage-sqlite.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+vfs.workspace = true

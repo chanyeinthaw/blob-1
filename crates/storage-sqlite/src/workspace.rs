@@ -1,7 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, OptionalExtension, Row, Transaction};
-use storage::{DirEntry, Node, NodeId, NodeKind, WorkspaceError, WorkspaceStore};
+use storage::{DirEntry, Node, NodeId, NodeKind, Tree, WorkspaceError, WorkspaceStore};
 
 use crate::{backend, SqliteStorage};
 
@@ -9,7 +9,8 @@ const CHUNK_SIZE: u64 = 64 * 1024;
 const MAX_FILE_SIZE: u64 = i64::MAX as u64;
 
 const NODE_COLUMNS: &str = "n.id, n.kind, n.mode, n.size, n.modified_ns,
-    n.id = 1 OR EXISTS (SELECT 1 FROM workspace_entries linked WHERE linked.node = n.id)";
+    EXISTS (SELECT 1 FROM workspace_roots root WHERE root.node = n.id)
+    OR EXISTS (SELECT 1 FROM workspace_entries linked WHERE linked.node = n.id)";
 
 enum Failure {
     Workspace(WorkspaceError),
@@ -51,6 +52,20 @@ impl SqliteStorage {
 }
 
 impl WorkspaceStore for SqliteStorage {
+    fn root(&self, tree: Tree) -> Result<NodeId, WorkspaceError> {
+        let name = match tree {
+            Tree::Workspace => "workspace",
+            Tree::Skills => "skills",
+        };
+        self.in_transaction(|tx| {
+            Ok(NodeId(tx.query_row(
+                "SELECT node FROM workspace_roots WHERE tree = ?1",
+                [name],
+                |row| row.get::<_, i64>(0),
+            )? as u64))
+        })
+    }
+
     fn node(&self, id: NodeId) -> Result<Node, WorkspaceError> {
         self.in_transaction(|tx| node(tx, id))
     }

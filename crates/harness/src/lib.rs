@@ -1,18 +1,36 @@
-use environment::{Environment, ToolCall, ToolInput, ToolSpec};
+use std::path::PathBuf;
 use std::{collections::HashMap, sync::Mutex};
 
-use storage::{Message, Session, SessionId, SessionStore, StoreError};
+use environment::{Environment, ToolCall, ToolInput, ToolSpec};
+use storage::{
+    Message, Session, SessionId, SessionStore, StoreError, WorkspaceError, WorkspaceStore,
+};
+
+mod compaction;
+pub mod prompt;
+pub mod skills;
 
 #[derive(Debug, Clone)]
 pub struct CompletionRequest<'a> {
+    pub system: &'a str,
     pub messages: &'a [Message],
     pub tools: &'a [ToolSpec],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Usage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub total: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionResponse {
     pub text: String,
     pub tool_calls: Vec<ToolCallRequest>,
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +44,8 @@ pub struct ToolCallRequest {
 pub enum LlmError {
     #[error("LLM request failed: {0}")]
     Request(String),
+    #[error("context overflow: {0}")]
+    ContextOverflow(String),
 }
 
 #[async_trait::async_trait]
@@ -34,20 +54,28 @@ pub trait Llm {
         &self,
         request: CompletionRequest<'_>,
     ) -> Result<CompletionResponse, LlmError>;
-    async fn summarize(&self, messages: &[Message]) -> Result<String, LlmError>;
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct HarnessConfig {
-    pub max_history_messages: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionConfig {
+    pub context_window: Option<u32>,
+    pub reserve_tokens: u32,
+    pub keep_recent_tokens: u32,
 }
 
-impl Default for HarnessConfig {
+impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
-            max_history_messages: 100,
+            context_window: None,
+            reserve_tokens: 16384,
+            keep_recent_tokens: 20000,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HarnessConfig {
+    pub compaction: CompactionConfig,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -56,12 +84,25 @@ pub enum HarnessError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Llm(#[from] LlmError),
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceError),
+    #[error("{0}")]
+    Compaction(String),
+    #[error("invalid skill: {0}")]
+    Skill(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentPaths {
+    pub workspace: PathBuf,
+    pub skills: PathBuf,
 }
 
 pub struct Harness<L, E, S> {
     llm: L,
     environment: E,
     store: S,
+    paths: EnvironmentPaths,
     config: HarnessConfig,
     steering: Mutex<HashMap<SessionId, Vec<String>>>,
 }
@@ -70,13 +111,14 @@ impl<L, E, S> Harness<L, E, S>
 where
     L: Llm,
     E: Environment,
-    S: SessionStore,
+    S: SessionStore + WorkspaceStore,
 {
-    pub fn new(llm: L, environment: E, store: S) -> Self {
+    pub fn new(llm: L, environment: E, store: S, paths: EnvironmentPaths) -> Self {
         Self {
             llm,
             environment,
             store,
+            paths,
             config: HarnessConfig::default(),
             steering: Mutex::new(HashMap::new()),
         }
@@ -93,24 +135,51 @@ where
             None => Session::new(id.clone()),
         };
 
+        let skills = skills::catalog(&self.store, &self.paths.skills)?;
+        let system = prompt::build(&self.paths.workspace, &skills);
+
         session.push(Message::User(user_message));
         self.store.save(session.clone())?;
 
+        let mut usage = None;
+        let mut overflow_retried = false;
+        let mut retrying = false;
         loop {
             self.apply_steering(&mut session, id);
 
-            if session.messages.len() > self.config.max_history_messages {
-                self.compact(&mut session).await?;
-            }
-
-            let response = self
-                .llm
-                .complete(CompletionRequest {
-                    messages: &session.messages,
-                    tools: environment::CATALOG,
+            if !retrying
+                && self.config.compaction.context_window.is_some_and(|window| {
+                    compaction::context_tokens(&system, &session.messages, usage)
+                        > u64::from(window.saturating_sub(self.config.compaction.reserve_tokens))
                 })
-                .await?;
+                && self.compact(&mut session, false).await?
+            {
+                usage = None;
+            }
+            retrying = false;
 
+            let response = match self.llm.complete(CompletionRequest {
+                system: &system,
+                messages: &session.messages,
+                tools: environment::CATALOG,
+            }).await {
+                Ok(response) => response,
+                Err(LlmError::ContextOverflow(_)) if !overflow_retried => {
+                    if self.compact(&mut session, true).await? {
+                        overflow_retried = true;
+                        retrying = true;
+                        usage = None;
+                        continue;
+                    }
+                    return Err(HarnessError::Compaction(
+                        "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.".into(),
+                    ));
+                }
+                Err(LlmError::ContextOverflow(_)) => return Err(HarnessError::Compaction(
+                    "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.".into(),
+                )),
+                Err(error) => return Err(error.into()),
+            };
             if !response.text.is_empty() {
                 session.push(Message::Assistant(response.text.clone()));
             }
@@ -125,6 +194,9 @@ where
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
                 });
+            }
+            if let Some(value) = response.usage {
+                usage = Some((value, session.messages.len()));
             }
             for call in response.tool_calls {
                 let executed = match ToolInput::parse(&call.name, &call.arguments) {
@@ -175,32 +247,34 @@ where
         }
     }
 
-    async fn compact(&self, session: &mut Session) -> Result<(), HarnessError> {
-        let is_user = |message: &Message| matches!(message, Message::User(_));
-        let Some(last_user) = session.messages.iter().rposition(is_user) else {
-            return Ok(());
+    async fn compact(&self, session: &mut Session, overflow: bool) -> Result<bool, HarnessError> {
+        let config = self.config.compaction;
+        let keep = config
+            .context_window
+            .map_or(config.keep_recent_tokens, |window| {
+                config
+                    .keep_recent_tokens
+                    .min(window.saturating_sub(config.reserve_tokens) / 2)
+                    .max(1)
+            });
+        let keep = if overflow {
+            u64::from(keep)
+                .min(compaction::context_tokens("", &session.messages, None) / 2)
+                .max(1) as u32
+        } else {
+            keep
         };
-        let budget_split = session
-            .messages
-            .len()
-            .saturating_sub(self.config.max_history_messages);
-        let split = session.messages[budget_split..]
-            .iter()
-            .position(is_user)
-            .map_or(last_user, |offset| budget_split + offset);
-
-        if session.messages[..split]
-            .iter()
-            .all(|message| matches!(message, Message::System(_)))
+        let Some(messages) = compaction::compact(&self.llm, &session.messages, keep).await? else {
+            return Ok(false);
+        };
+        if overflow
+            && compaction::context_tokens("", &messages, None)
+                >= compaction::context_tokens("", &session.messages, None)
         {
-            return Ok(());
+            return Ok(false);
         }
-
-        let summary = self.llm.summarize(&session.messages[..split]).await?;
-        let mut compacted = Vec::with_capacity(self.config.max_history_messages + 1);
-        compacted.push(Message::System(summary));
-        compacted.extend(session.messages[split..].to_vec());
-        session.messages = compacted;
-        Ok(())
+        session.messages = messages;
+        self.store.save(session.clone())?;
+        Ok(true)
     }
 }

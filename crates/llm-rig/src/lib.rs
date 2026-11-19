@@ -1,21 +1,34 @@
 use environment::ToolSpec;
-use harness::{CompletionRequest, CompletionResponse, Llm, LlmError, ToolCallRequest};
+use harness::{CompletionRequest, CompletionResponse, Llm, LlmError, ToolCallRequest, Usage};
+use regex::Regex;
 use rig_core::{
+    catalog::Catalog,
     completion::{self, AssistantContent, ToolDefinition},
     message::{CallId, ToolCall, ToolFunction, ToolName, ToolResultContent, UserContent},
     operation::Completion,
+    providers::openai::{OpenAI, OpenAIConfig},
     DynModel,
 };
-use storage::Message;
+use std::sync::LazyLock;
+use storage::{DiscoveredModel, Message, Model, Provider, ProviderApi, ReasoningLevel};
 
 pub struct RigLlm {
     model: DynModel<Completion>,
+    reasoning: Option<ReasoningSetting>,
+    api: ProviderApi,
+}
+
+enum ReasoningSetting {
+    Typed(completion::Reasoning),
+    Raw(String),
 }
 
 impl RigLlm {
     pub fn new(model: impl Into<DynModel<Completion>>) -> Self {
         Self {
             model: model.into(),
+            reasoning: None,
+            api: ProviderApi::OpenAiResponses,
         }
     }
 
@@ -23,12 +36,112 @@ impl RigLlm {
         &self,
         request: completion::CompletionRequest,
     ) -> Result<completion::CompletionResponse, LlmError> {
-        let response = self.model.call(request).await.map_err(request_error)?;
+        let response = self.model.call(request).await.map_err(|error| {
+            let status = error
+                .provider_response_status()
+                .is_some_and(|status| status.as_u16() == 413);
+            classify_error(error.to_string(), status)
+        })?;
         match response.error {
-            Some(error) => Err(LlmError::Request(error)),
+            Some(error) => Err(classify_error(error, false)),
             None => Ok(response),
         }
     }
+}
+
+pub fn connect(provider: &Provider, api_key: &str, model: &Model, level: ReasoningLevel) -> RigLlm {
+    let client = client(provider, api_key);
+    let mut llm = match provider.api {
+        ProviderApi::OpenAiResponses => RigLlm::new(client.responses(&model.id)),
+        ProviderApi::OpenAiCompletions => RigLlm::new(client.chat(&model.id)),
+    };
+    llm.reasoning = resolve_reasoning(&llm.model, model, level);
+    llm.api = provider.api;
+    llm
+}
+
+fn resolve_reasoning(
+    rig: &DynModel<Completion>,
+    model: &Model,
+    requested: ReasoningLevel,
+) -> Option<ReasoningSetting> {
+    let spec = rig.spec();
+    let levels = spec.and_then(|s| s.reasoning.levels());
+    let off = spec.and_then(|s| s.reasoning.can_disable()).unwrap_or(true);
+    let supported = |level: ReasoningLevel| {
+        model.reasoning_map.get(&level).map_or_else(
+            || {
+                if level == ReasoningLevel::Off {
+                    off
+                } else {
+                    levels.is_none_or(|levels| {
+                        levels
+                            .iter()
+                            .any(|effort| effort.as_str() == level.as_str())
+                    })
+                }
+            },
+            Option::is_some,
+        )
+    };
+    let chosen = ReasoningLevel::ALL
+        .into_iter()
+        .filter(|level| *level >= requested)
+        .find(|level| supported(*level))
+        .or_else(|| {
+            ReasoningLevel::ALL
+                .into_iter()
+                .rev()
+                .filter(|level| *level < requested)
+                .find(|level| supported(*level))
+        })?;
+    let mapped = model.reasoning_map.get(&chosen).and_then(Option::as_deref);
+    if let Some(value) = mapped {
+        return Some(ReasoningSetting::Raw(value.to_owned()));
+    }
+    let effort = match chosen {
+        ReasoningLevel::Off => {
+            return off.then_some(ReasoningSetting::Typed(completion::Reasoning::Off))
+        }
+        ReasoningLevel::Low => completion::Effort::Low,
+        ReasoningLevel::Medium => completion::Effort::Medium,
+        ReasoningLevel::High => completion::Effort::High,
+        ReasoningLevel::XHigh => completion::Effort::XHigh,
+        ReasoningLevel::Max => completion::Effort::Max,
+    };
+    Some(ReasoningSetting::Typed(effort.into()))
+}
+
+pub async fn discover(
+    provider: &Provider,
+    api_key: &str,
+) -> Result<Vec<DiscoveredModel>, LlmError> {
+    let listed = client(provider, api_key)
+        .list_models()
+        .await
+        .map_err(request_error)?;
+    let mut models: Vec<DiscoveredModel> = listed
+        .data
+        .into_iter()
+        .map(|info| DiscoveredModel {
+            context_window: info.context_length.or_else(|| context_window(&info.id)),
+            id: info.id,
+        })
+        .collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(models)
+}
+
+fn client(provider: &Provider, api_key: &str) -> OpenAI {
+    OpenAIConfig::new(api_key)
+        .with_base_url(&provider.base_url)
+        .client()
+}
+
+fn context_window(model: &str) -> Option<u32> {
+    Catalog::builtin()
+        .iter()
+        .find_map(|spec| (spec.id == model).then_some(spec.context_window).flatten())
 }
 
 #[async_trait::async_trait]
@@ -37,7 +150,26 @@ impl Llm for RigLlm {
         &self,
         request: CompletionRequest<'_>,
     ) -> Result<CompletionResponse, LlmError> {
-        let response = self.send(to_rig_request(request)?).await?;
+        let mut request = to_rig_request(request)?;
+        request = match &self.reasoning {
+            Some(ReasoningSetting::Typed(reasoning)) => request.reasoning(*reasoning),
+            Some(ReasoningSetting::Raw(value)) => request.additional_params(match self.api {
+                ProviderApi::OpenAiResponses => serde_json::json!({"reasoning": {"effort": value}}),
+                ProviderApi::OpenAiCompletions => serde_json::json!({"reasoning_effort": value}),
+            }),
+            None => request,
+        };
+        let response = self.send(request).await?;
+        let usage = Usage {
+            input: response.usage.input_tokens.unwrap_or_default(),
+            output: response.usage.output_tokens.unwrap_or_default(),
+            cache_read: response.usage.cached_input_tokens.unwrap_or_default(),
+            cache_write: response
+                .usage
+                .cache_creation_input_tokens
+                .unwrap_or_default(),
+            total: response.usage.total_tokens.unwrap_or_default(),
+        };
         Ok(CompletionResponse {
             text: response.text(),
             tool_calls: response
@@ -48,32 +180,27 @@ impl Llm for RigLlm {
                     arguments: call.function.raw_arguments(),
                 })
                 .collect(),
+            usage: (usage != Usage::default()).then_some(usage),
         })
-    }
-
-    async fn summarize(&self, messages: &[Message]) -> Result<String, LlmError> {
-        let transcript = messages.iter().map(render).collect::<Vec<_>>().join("\n\n");
-        let prompt = format!(
-            "Summarize the conversation below so it can be continued from the summary alone. Keep the user's goals, decisions made, important facts and file paths, and any unfinished work.\n\n{transcript}"
-        );
-        let response = self
-            .send(completion::CompletionRequest::new(
-                completion::Message::user(prompt),
-            ))
-            .await?;
-        Ok(response.text())
     }
 }
 
 fn to_rig_request(
     request: CompletionRequest<'_>,
 ) -> Result<completion::CompletionRequest, LlmError> {
-    let mut system = Vec::new();
     let mut history: Vec<completion::Message> = Vec::new();
 
     for message in request.messages {
         match message {
-            Message::System(text) => system.push(text.as_str()),
+            Message::Summary {
+                text,
+                read_files,
+                modified_files,
+            } => history.push(completion::Message::user(summary_text(
+                text,
+                read_files,
+                modified_files,
+            ))),
             Message::User(text) => history.push(completion::Message::user(text)),
             Message::Assistant(text) => history.push(completion::Message::assistant(text)),
             Message::ToolCall {
@@ -114,9 +241,9 @@ fn to_rig_request(
         .map(tool_definition)
         .collect::<Result<Vec<_>, _>>()?;
     let rig_request = completion::CompletionRequest::from(history).tools(tools);
-    Ok(match system.is_empty() {
+    Ok(match request.system.is_empty() {
         true => rig_request,
-        false => rig_request.preamble(system.join("\n\n")),
+        false => rig_request.preamble(request.system),
     })
 }
 
@@ -137,16 +264,47 @@ fn request_error(error: impl std::fmt::Display) -> LlmError {
     LlmError::Request(error.to_string())
 }
 
-fn render(message: &Message) -> String {
-    match message {
-        Message::System(text) => format!("System: {text}"),
-        Message::User(text) => format!("User: {text}"),
-        Message::Assistant(text) => format!("Assistant: {text}"),
-        Message::ToolCall {
-            name, arguments, ..
-        } => format!("Assistant called tool {name} with {arguments}"),
-        Message::ToolResult { name, content, .. } => {
-            format!("Tool {name} returned: {content}")
-        }
+static OVERFLOW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+    r"(?i)(?:prompt (?:is )?too long|prompt exceeds max length|request_too_large|",
+    r"input is too long for requested model|exceeds the context window|",
+    r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))|",
+    r"context window exceeded|input token count.*exceeds the maximum|maximum prompt length is \d+|",
+    r"reduce the length of the messages|maximum context length is \d+ tokens|",
+    r"exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?|",
+    r"input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)|",
+    r"exceeds the limit of \d+|exceeds the available context size|greater than the context length|",
+    r"context window exceeds limit|exceeded model token limit|too large for model with \d+ maximum context length|",
+    r"prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?|",
+    r"model_context_window_exceeded|prompt too long; exceeded (?:max )?context length|",
+    r"range of input length should be|context[_ ]length[_ ]exceeded|too many tokens|token limit exceeded)"
+)).unwrap()
+});
+static NON_OVERFLOW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:Throttling error|Service unavailable):|rate limit|too many requests")
+        .unwrap()
+});
+
+fn classify_error(text: String, status_413: bool) -> LlmError {
+    if !NON_OVERFLOW.is_match(&text) && (status_413 || OVERFLOW.is_match(&text)) {
+        LlmError::ContextOverflow(text)
+    } else {
+        LlmError::Request(text)
+    }
+}
+
+fn summary_text(text: &str, read_files: &[String], modified_files: &[String]) -> String {
+    format!(
+        "The conversation history before this point was compacted into the following summary:\n\n<summary>\n{text}{}{}\n</summary>",
+        file_list("read-files", read_files),
+        file_list("modified-files", modified_files),
+    )
+}
+
+fn file_list(tag: &str, files: &[String]) -> String {
+    if files.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n<{tag}>\n{}\n</{tag}>", files.join("\n"))
     }
 }
