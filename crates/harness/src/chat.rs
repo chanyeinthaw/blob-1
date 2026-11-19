@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use environment::{Environment, ToolCall, ToolInput, ToolSpec};
 use memory::{Kind, Memory};
 use serde::Deserialize;
-use storage::{MemoryStore, Message, SessionStore, WorkspaceStore};
+use storage::{MemoryStore, Message, ReasoningLevel, SessionStore, WorkspaceStore};
 use tokio::sync::Notify;
 
 use crate::{
@@ -47,9 +47,20 @@ Messages the user sends while you work reach you between tool calls. Subagents r
 const EXTRA: &[ToolSpec] = &[
     ToolSpec { name: "zoom", description: "Open the line id+n of the view into the two lines of n/2 under it; n = 1 gives the message whole. With an agent's name as id, give that agent's chat as stored, with older parts summarized if compacted. A long text comes in pages from character at, saying where to go on.", input_schema: r#"{"type":"object","properties":{"id":{"oneOf":[{"type":"integer"},{"type":"string"}]},"n":{"type":"integer"},"at":{"type":"integer"}},"required":["id"]}"# },
     ToolSpec { name: "date", description: "The date and time of message id.", input_schema: r#"{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}"# },
-    ToolSpec { name: "spawn", description: "Start one background agent per task. Each sees the chat view and its task, works with read, write, edit and bash, and reports back as a message starting [Name]. Never wait or poll for it.", input_schema: r#"{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"string"}}},"required":["tasks"]}"# },
+    ToolSpec { name: "models", description: "List the configured providers and models you can give to spawn: provider, model id, context window, supported reasoning levels. Use search to filter.", input_schema: r#"{"type":"object","properties":{"search":{"type":"string"}}}"# },
+    ToolSpec { name: "spawn", description: "Start one background agent per task. Optionally specify provider, model and reasoning per task; call models to see available choices. Give provider and model together. Never wait or poll for it.", input_schema: r#"{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{"task":{"type":"string"},"provider":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string","enum":["off","low","medium","high","xhigh","max"]}},"required":["task"]}}},"required":["tasks"]}"# },
     ToolSpec { name: "tell", description: "Send a message to an agent by name: delivered between its tool calls if it is working, or restarts it from its chat.", input_schema: r#"{"type":"object","properties":{"name":{"type":"string"},"text":{"type":"string"}},"required":["name","text"]}"# },
 ];
+
+pub trait Models: Send + Sync + 'static {
+    type Llm: Llm + Send + Sync + 'static;
+    fn list(&self, search: Option<&str>) -> Result<String, HarnessError>;
+    fn connect(
+        &self,
+        choice: Option<(&str, &str)>,
+        reasoning: Option<ReasoningLevel>,
+    ) -> Result<(Self::Llm, Option<u32>), HarnessError>;
+}
 
 #[derive(Clone)]
 pub(crate) struct Shared<T>(pub Arc<T>);
@@ -79,22 +90,28 @@ pub(crate) struct State {
     pub next: u64,
     pub tasks: Vec<tokio::task::AbortHandle>,
 }
-pub(crate) struct Inner<L, E, S, M> {
+type AgentSessions<L, E, S> =
+    Mutex<std::collections::HashMap<String, Arc<SessionHarness<Shared<L>, Shared<E>, S>>>>;
+
+pub(crate) struct Inner<L, E, S, M, F: Models> {
     pub llm: Shared<L>,
     pub environment: Shared<E>,
     pub store: S,
     pub memory: Memory<S, M>,
     pub paths: EnvironmentPaths,
-    pub session: SessionHarness<Shared<L>, Shared<E>, S>,
+    pub models: F,
+    pub summarizer: Option<Shared<F::Llm>>,
+    pub summarizer_window: Option<u32>,
+    pub sessions: AgentSessions<F::Llm, E, S>,
     pub state: Mutex<State>,
     pub notify: Notify,
 }
-pub struct ChatHarness<L, E, S, M> {
-    pub(crate) inner: Arc<Inner<L, E, S, M>>,
+pub struct ChatHarness<L, E, S, M, F: Models> {
+    pub(crate) inner: Arc<Inner<L, E, S, M, F>>,
     turn: tokio::sync::Mutex<()>,
 }
 
-impl<L, E, S, M> Drop for ChatHarness<L, E, S, M> {
+impl<L, E, S, M, F: Models> Drop for ChatHarness<L, E, S, M, F> {
     fn drop(&mut self) {
         let state = self.inner.state.lock().expect("chat state mutex poisoned");
         for task in &state.tasks {
@@ -126,7 +143,18 @@ struct Date {
 }
 #[derive(Deserialize)]
 struct Spawn {
-    tasks: Vec<String>,
+    tasks: Vec<SpawnTask>,
+}
+#[derive(Deserialize)]
+pub(crate) struct SpawnTask {
+    pub task: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub reasoning: Option<String>,
+}
+#[derive(Deserialize)]
+struct ModelsArgs {
+    search: Option<String>,
 }
 #[derive(Deserialize)]
 struct Tell {
@@ -134,7 +162,7 @@ struct Tell {
     text: String,
 }
 
-impl<L, E, S, M> ChatHarness<L, E, S, M>
+impl<L, E, S, M, F: Models> ChatHarness<L, E, S, M, F>
 where
     L: Llm + Send + Sync + 'static,
     E: Environment + 'static,
@@ -147,15 +175,15 @@ where
         store: S,
         memory: Memory<S, M>,
         paths: EnvironmentPaths,
+        models: F,
+        summarizer: Option<(F::Llm, Option<u32>)>,
     ) -> Self {
         let llm = Shared(Arc::new(llm));
         let environment = Shared(Arc::new(environment));
-        let session = SessionHarness::new(
-            Shared(Arc::clone(&llm.0)),
-            Shared(Arc::clone(&environment.0)),
-            store.clone(),
-            paths.clone(),
-        );
+        let (summarizer, summarizer_window) = match summarizer {
+            Some((llm, window)) => (Some(Shared(Arc::new(llm))), window),
+            None => (None, None),
+        };
         Self {
             inner: Arc::new(Inner {
                 llm,
@@ -163,7 +191,10 @@ where
                 store,
                 memory,
                 paths,
-                session,
+                models,
+                summarizer,
+                summarizer_window,
+                sessions: Mutex::new(Default::default()),
                 state: Mutex::new(State {
                     running: Default::default(),
                     reports: Default::default(),
@@ -338,6 +369,10 @@ where
             "date" => {
                 let args: Date = serde_json::from_str(&call.arguments)?;
                 self.inner.memory.date(args.id)?
+            }
+            "models" => {
+                let args: ModelsArgs = serde_json::from_str(&call.arguments)?;
+                self.inner.models.list(args.search.as_deref())?
             }
             "spawn" => {
                 let args: Spawn = serde_json::from_str(&call.arguments)?;

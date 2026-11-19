@@ -68,30 +68,50 @@ pub fn connect(provider: &Provider, api_key: &str, model: &Model, level: Reasoni
     llm
 }
 
+pub fn reasoning_levels(provider: &Provider, model: &Model) -> Option<Vec<ReasoningLevel>> {
+    let client = client(provider, "unused");
+    let rig = match provider.api {
+        ProviderApi::OpenAiResponses => RigLlm::new(client.responses(&model.id)),
+        ProviderApi::OpenAiCompletions => RigLlm::new(client.chat(&model.id)),
+    };
+    rig.model.spec()?;
+    Some(supported_levels(&rig.model, model))
+}
+
+fn supported_levels(rig: &DynModel<Completion>, model: &Model) -> Vec<ReasoningLevel> {
+    let spec = rig.spec();
+    let levels = spec.and_then(|s| s.reasoning.levels());
+    let off = spec.and_then(|s| s.reasoning.can_disable()).unwrap_or(true);
+    ReasoningLevel::ALL
+        .into_iter()
+        .filter(|level| {
+            model.reasoning_map.get(level).map_or_else(
+                || {
+                    if *level == ReasoningLevel::Off {
+                        off
+                    } else {
+                        levels.is_none_or(|levels| {
+                            levels
+                                .iter()
+                                .any(|effort| effort.as_str() == level.as_str())
+                        })
+                    }
+                },
+                Option::is_some,
+            )
+        })
+        .collect()
+}
+
 fn resolve_reasoning(
     rig: &DynModel<Completion>,
     model: &Model,
     requested: ReasoningLevel,
 ) -> Option<ReasoningSetting> {
     let spec = rig.spec();
-    let levels = spec.and_then(|s| s.reasoning.levels());
     let off = spec.and_then(|s| s.reasoning.can_disable()).unwrap_or(true);
-    let supported = |level: ReasoningLevel| {
-        model.reasoning_map.get(&level).map_or_else(
-            || {
-                if level == ReasoningLevel::Off {
-                    off
-                } else {
-                    levels.is_none_or(|levels| {
-                        levels
-                            .iter()
-                            .any(|effort| effort.as_str() == level.as_str())
-                    })
-                }
-            },
-            Option::is_some,
-        )
-    };
+    let levels = supported_levels(rig, model);
+    let supported = |level: ReasoningLevel| levels.contains(&level);
     let chosen = ReasoningLevel::ALL
         .into_iter()
         .filter(|level| *level >= requested)
