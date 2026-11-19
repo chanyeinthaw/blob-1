@@ -41,6 +41,9 @@ enum Command {
         #[command(subcommand)]
         command: SkillCommand,
     },
+    Chat {
+        message: String,
+    },
     Run {
         prompt: String,
         #[arg(long, default_value = "default")]
@@ -139,7 +142,28 @@ async fn main() -> Result<()> {
             prompt,
             session,
             reasoning,
-        } => run::run(store, &data_dir.join("mnt"), prompt, session, reasoning).await,
+        } => {
+            run::run(
+                store,
+                &data_dir.join("mnt"),
+                prompt,
+                session,
+                reasoning,
+                false,
+            )
+            .await
+        }
+        Command::Chat { message } => {
+            run::run(
+                store,
+                &data_dir.join("mnt"),
+                message,
+                String::new(),
+                None,
+                true,
+            )
+            .await
+        }
     }
 }
 

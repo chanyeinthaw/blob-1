@@ -5,9 +5,9 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+llm.workspace = true
 async-trait.workspace = true
 environment.workspace = true
-harness.workspace = true
 regex = "1"
 rig-core = { workspace = true, features = ["reqwest"] }
 serde_json.workspace = true

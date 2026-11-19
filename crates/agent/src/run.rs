@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use environment_local::LocalEnvironment;
-use harness::{CompactionConfig, EnvironmentPaths, Harness, HarnessConfig};
+use harness::{ChatHarness, CompactionConfig, EnvironmentPaths, HarnessConfig, SessionHarness};
 use storage::{ConfigStore, ReasoningLevel, SessionId, Tree};
 use storage_sqlite::SqliteStorage;
 use tokio::signal::unix::{signal, SignalKind};
@@ -15,6 +15,7 @@ pub async fn run(
     prompt: String,
     session: String,
     reasoning: Option<ReasoningLevel>,
+    chat: bool,
 ) -> Result<()> {
     let settings = store.settings()?;
     let model = settings
@@ -42,7 +43,7 @@ pub async fn run(
         reasoning.unwrap_or(settings.reasoning),
     );
 
-    let summarizer = if let Some(model) = settings.compaction_model {
+    let mut summarizer = if let Some(model) = settings.compaction_model.clone() {
         let provider = store
             .providers()?
             .into_iter()
@@ -71,6 +72,22 @@ pub async fn run(
         None
     };
 
+    let compactor = if chat {
+        Some(if let Some((llm, _)) = summarizer.take() {
+            llm
+        } else {
+            llm_rig::connect(
+                &provider,
+                &api_key(&provider)?,
+                &stored_model,
+                settings
+                    .compaction_reasoning
+                    .unwrap_or(reasoning.unwrap_or(settings.reasoning)),
+            )
+        })
+    } else {
+        None
+    };
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
     let workspace = mount_dir.join("workspace");
@@ -81,7 +98,28 @@ pub async fn run(
     let skills_mount = vfs::mount(store.clone(), Tree::Skills, &skills, true)?;
 
     let environment = LocalEnvironment::new(&workspace)?.with_readable(&skills)?;
-    let harness = Harness::new(
+    if let Some(compactor) = compactor {
+        let memory =
+            memory::Memory::open(store.clone(), compactor, memory::MemoryConfig::default())?;
+        let harness = ChatHarness::new(
+            llm,
+            environment,
+            store,
+            memory,
+            EnvironmentPaths { workspace, skills },
+        );
+        let answer: Result<String> = tokio::select! {
+            answer = harness.run(&prompt) => answer.map_err(Into::into),
+            _ = interrupt.recv() => Err("interrupted".into()),
+            _ = terminate.recv() => Err("terminated".into()),
+        };
+        drop(harness);
+        skills_mount.umount_and_join()?;
+        workspace_mount.umount_and_join()?;
+        println!("{}", answer?);
+        return Ok(());
+    }
+    let harness = SessionHarness::new(
         llm,
         environment,
         store,

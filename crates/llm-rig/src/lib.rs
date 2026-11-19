@@ -1,5 +1,5 @@
 use environment::ToolSpec;
-use harness::{CompletionRequest, CompletionResponse, Llm, LlmError, ToolCallRequest, Usage};
+use llm::{CompletionRequest, CompletionResponse, Llm, LlmError, ToolCallRequest, Usage};
 use regex::Regex;
 use rig_core::{
     catalog::Catalog,

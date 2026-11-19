@@ -358,3 +358,104 @@ pub trait ConfigStore: Send + Sync {
     fn settings(&self) -> Result<Settings, StoreError>;
     fn save_settings(&self, settings: Settings) -> Result<(), StoreError>;
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemoryKind {
+    User,
+    Assistant,
+    Tool,
+    Echo,
+    Work,
+}
+
+impl MemoryKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+            Self::Echo => "echo",
+            Self::Work => "work",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryMessage {
+    pub i: u64,
+    pub kind: MemoryKind,
+    pub text: String,
+    pub size: u64,
+    pub date: String,
+    pub more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryNode {
+    pub l: u32,
+    pub i: u64,
+    pub text: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewName {
+    Chat,
+    Seen,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryView {
+    pub parts: Vec<(u32, u64)>,
+    pub batch: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewChange {
+    pub view: ViewName,
+    pub removed: Vec<(u32, u64)>,
+    pub added: Vec<(u32, u64)>,
+    pub batch: Option<bool>,
+}
+
+pub trait MemoryStore: Send + Sync {
+    fn append_messages(
+        &self,
+        rows: &[MemoryMessage],
+        changes: &[ViewChange],
+    ) -> Result<(), StoreError>;
+    fn message(&self, i: u64) -> Result<Option<MemoryMessage>, StoreError>;
+    fn message_count(&self) -> Result<u64, StoreError>;
+    fn node(&self, l: u32, i: u64) -> Result<Option<MemoryNode>, StoreError>;
+    fn built_nodes(&self) -> Result<Vec<(u32, u64)>, StoreError>;
+    fn put_node(&self, node: MemoryNode, changes: &[ViewChange]) -> Result<(), StoreError>;
+    fn view(&self, name: ViewName) -> Result<Option<MemoryView>, StoreError>;
+}
+
+impl<T: MemoryStore + ?Sized> MemoryStore for std::sync::Arc<T> {
+    fn append_messages(
+        &self,
+        rows: &[MemoryMessage],
+        changes: &[ViewChange],
+    ) -> Result<(), StoreError> {
+        (**self).append_messages(rows, changes)
+    }
+    fn message(&self, i: u64) -> Result<Option<MemoryMessage>, StoreError> {
+        (**self).message(i)
+    }
+    fn message_count(&self) -> Result<u64, StoreError> {
+        (**self).message_count()
+    }
+    fn node(&self, l: u32, i: u64) -> Result<Option<MemoryNode>, StoreError> {
+        (**self).node(l, i)
+    }
+    fn built_nodes(&self) -> Result<Vec<(u32, u64)>, StoreError> {
+        (**self).built_nodes()
+    }
+    fn put_node(&self, node: MemoryNode, changes: &[ViewChange]) -> Result<(), StoreError> {
+        (**self).put_node(node, changes)
+    }
+    fn view(&self, name: ViewName) -> Result<Option<MemoryView>, StoreError> {
+        (**self).view(name)
+    }
+}
