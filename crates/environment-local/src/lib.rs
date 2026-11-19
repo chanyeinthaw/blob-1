@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use executor::{Replacement, ToolCall, ToolError, ToolExecutor, ToolInput, ToolResult};
+use environment::{Environment, Replacement, ToolCall, ToolError, ToolInput, ToolResult};
 use tokio::time::{sleep_until, Instant};
 
 const MAX_LINES: usize = 2000;
@@ -14,11 +14,11 @@ const TAIL_TRIM_AT: usize = 4 * MAX_BYTES;
 const MAX_TIMEOUT_SECS: f64 = 2_147_483.647;
 const EXIT_STDIO_GRACE: Duration = Duration::from_millis(100);
 
-pub struct LocalExecutor {
+pub struct LocalEnvironment {
     root: PathBuf,
 }
 
-impl LocalExecutor {
+impl LocalEnvironment {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, ToolError> {
         let root = root.into().canonicalize().map_err(io_error)?;
         Ok(Self { root })
@@ -562,7 +562,7 @@ fn io_error(error: std::io::Error) -> ToolError {
 }
 
 #[async_trait::async_trait]
-impl ToolExecutor for LocalExecutor {
+impl Environment for LocalEnvironment {
     async fn execute(&self, call: ToolCall) -> Result<ToolResult, ToolError> {
         let content = match &call.input {
             ToolInput::Read {

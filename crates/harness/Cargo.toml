@@ -6,6 +6,6 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-executor.workspace = true
+environment.workspace = true
 storage.workspace = true
 thiserror.workspace = true

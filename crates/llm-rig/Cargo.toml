@@ -1,0 +1,13 @@
+[package]
+name = "llm-rig"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+environment.workspace = true
+harness.workspace = true
+rig-core.workspace = true
+serde_json.workspace = true
+storage.workspace = true

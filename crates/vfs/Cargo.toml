@@ -1,0 +1,9 @@
+[package]
+name = "vfs"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+fuser.workspace = true
+storage.workspace = true

@@ -1,9 +1,9 @@
 [package]
-name = "executor"
+name = "storage-sqlite"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [dependencies]
-async-trait.workspace = true
-thiserror.workspace = true
+rusqlite.workspace = true
+storage.workspace = true

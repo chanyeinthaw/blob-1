@@ -2,9 +2,12 @@
 resolver = "2"
 members = [
   "crates/harness",
+  "crates/llm-rig",
   "crates/storage",
-  "crates/executor",
-  "crates/executor-local",
+  "crates/storage-sqlite",
+  "crates/vfs",
+  "crates/environment",
+  "crates/environment-local",
 ]
 
 [workspace.package]
@@ -14,7 +17,13 @@ license = "MIT"
 
 [workspace.dependencies]
 async-trait = "0.1"
-executor = { path = "crates/executor" }
+environment = { path = "crates/environment" }
+rusqlite = { version = "0.43", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+harness = { path = "crates/harness" }
+rig-core = "0.46"
+fuser = "0.18"
 storage = { path = "crates/storage" }
 thiserror = "1"
 tokio = { version = "1", features = ["process", "fs", "io-util", "rt", "time", "sync", "macros"] }

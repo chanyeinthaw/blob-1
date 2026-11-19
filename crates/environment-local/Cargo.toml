@@ -1,0 +1,10 @@
+[package]
+name = "environment-local"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+environment.workspace = true
+tokio.workspace = true

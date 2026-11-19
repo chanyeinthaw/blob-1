@@ -1,6 +1,15 @@
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, PartialEq)]
+use serde::Deserialize;
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(
+    tag = "name",
+    content = "arguments",
+    rename_all = "lowercase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum ToolInput {
     Read {
         path: PathBuf,
@@ -22,6 +31,15 @@ pub enum ToolInput {
 }
 
 impl ToolInput {
+    pub fn parse(name: &str, arguments: &str) -> Result<Self, ToolError> {
+        let invalid = |error: serde_json::Error| {
+            ToolError::Invalid(format!("Invalid arguments for tool \"{name}\": {error}"))
+        };
+        let arguments: serde_json::Value = serde_json::from_str(arguments).map_err(invalid)?;
+        serde_json::from_value(serde_json::json!({ "name": name, "arguments": arguments }))
+            .map_err(invalid)
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Self::Read { .. } => "read",
@@ -32,7 +50,8 @@ impl ToolInput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Replacement {
     pub old_text: String,
     pub new_text: String,
@@ -61,7 +80,7 @@ pub const CATALOG: &[ToolSpec] = &[
     ToolSpec {
         name: "read",
         description: "Read the contents of a file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
-        input_schema: r#"{"type":"object","required":["path"],"properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"number","description":"Line number to start reading from (1-indexed)"},"limit":{"type":"number","description":"Maximum number of lines to read"}}}"#,
+        input_schema: r#"{"type":"object","required":["path"],"properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"integer","minimum":1,"description":"Line number to start reading from (1-indexed)"},"limit":{"type":"integer","minimum":0,"description":"Maximum number of lines to read"}}}"#,
     },
     ToolSpec {
         name: "write",
@@ -93,6 +112,6 @@ pub enum ToolError {
 }
 
 #[async_trait::async_trait]
-pub trait ToolExecutor: Send + Sync {
+pub trait Environment: Send + Sync {
     async fn execute(&self, call: ToolCall) -> Result<ToolResult, ToolError>;
 }
