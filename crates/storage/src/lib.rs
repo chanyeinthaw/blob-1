@@ -391,12 +391,21 @@ impl ReportStatus {
     }
 }
 
-fn attribute(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
+pub fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
-        .replace('"', "&quot;")
+}
+
+pub fn attribute(value: &str) -> String {
+    escape(value).replace('"', "&quot;")
+}
+
+pub fn render_input(meta: Option<&Meta>, i: u64, body: &str) -> String {
+    match meta {
+        Some(meta) => meta.render(i, body),
+        None => format!("<message>\n{}\n</message>", escape(body)),
+    }
 }
 
 fn for_attribute(value: &Option<String>) -> String {
@@ -406,14 +415,15 @@ fn for_attribute(value: &Option<String>) -> String {
 }
 
 impl Meta {
-    pub fn tag(&self, i: u64) -> String {
+    pub fn render(&self, i: u64, body: &str) -> String {
+        let body = escape(body);
         match self {
             Self::Report { task, status, for_message } => format!(
-                "<report task=\"{}\" status=\"{}\"{}/>",
+                "<report task=\"{}\" status=\"{}\"{}>\n{body}\n</report>",
                 attribute(task), status.as_str(), for_attribute(for_message)
             ),
             Self::Reminder { task, running, last_activity, for_message } => format!(
-                "<reminder task=\"{}\" running=\"{}\" last_activity=\"{}\"{}/>",
+                "<reminder task=\"{}\" running=\"{}\" last_activity=\"{}\"{}>\n{body}\n</reminder>",
                 attribute(task), attribute(running), attribute(last_activity), for_attribute(for_message)
             ),
             Self::Message {
@@ -424,7 +434,7 @@ impl Meta {
                 earlier,
                 ..
             } => format!(
-                "<message interface=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}/>",
+                "<message interface=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}>\n{body}\n</message>",
                 attribute(interface),
                 attribute(&author.id),
                 attribute(&author.name),

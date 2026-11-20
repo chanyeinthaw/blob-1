@@ -84,20 +84,59 @@ struct LookupArgs {
 fn token(value: &str, prefix: char) -> Result<u64, Error> {
     Ok(value.strip_prefix(prefix).ok_or("invalid token")?.parse()?)
 }
-fn render(messages: Vec<Fetched>) -> String {
+fn element(m: &Fetched) -> String {
+    format!(
+        "<message author=\"{}\" author_name=\"{}\" message=\"{}\" date=\"{}\">\n{}\n</message>",
+        storage::attribute(&m.author.id),
+        storage::attribute(&m.author.name),
+        storage::attribute(&m.message),
+        storage::attribute(&m.date),
+        storage::escape(&m.text)
+    )
+}
+fn fit<'a>(messages: impl Iterator<Item = &'a Fetched>) -> Vec<(&'a Fetched, String)> {
+    let mut kept = Vec::new();
+    let mut size = 0;
+    for m in messages {
+        let line = element(m);
+        size += line.chars().count() + 1;
+        if size + 100 > memory::TOOL_OUTPUT_LIMIT {
+            break;
+        }
+        kept.push((m, line));
+    }
+    kept
+}
+fn render_history(messages: Vec<Fetched>) -> String {
     if messages.is_empty() {
         return "no messages".into();
     }
-    messages
-        .into_iter()
-        .map(|m| {
-            format!(
-                "{} {} ({}) [{}]: {}",
-                m.date, m.author.name, m.author.id, m.message, m.text
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut kept = fit(messages.iter().rev());
+    kept.reverse();
+    let lines: Vec<_> = kept.iter().map(|(_, line)| line.as_str()).collect();
+    match (messages.len() - kept.len(), kept.first()) {
+        (0, _) => lines.join("\n"),
+        (older, None) => format!(
+            "[{older} messages not shown: the newest is too large to show; page with before=\"{}\"]",
+            messages.last().expect("non-empty").message
+        ),
+        (older, Some((oldest, _))) => format!(
+            "[{older} older messages not shown; page with before=\"{}\"]\n{}",
+            oldest.message,
+            lines.join("\n")
+        ),
+    }
+}
+fn render_search(messages: Vec<Fetched>) -> String {
+    if messages.is_empty() {
+        return "no messages".into();
+    }
+    let kept = fit(messages.iter());
+    let lines: Vec<_> = kept.iter().map(|(_, line)| line.as_str()).collect();
+    match messages.len() - kept.len() {
+        0 => lines.join("\n"),
+        more => format!("{}\n[{more} more matches not shown]", lines.join("\n")),
+    }
 }
 impl Interfaces {
     pub fn new<S: InterfaceStore + MemoryStore + 'static>(
@@ -330,7 +369,7 @@ impl Interfaces {
             "history" => {
                 let to = args.to.as_deref().ok_or("to is required")?;
                 let (name, place) = self.place(to, args.channel)?;
-                Ok(render(
+                Ok(render_history(
                     self.find(&name)?
                         .history(&place, args.before.as_deref(), limit)
                         .await?,
@@ -339,7 +378,7 @@ impl Interfaces {
             "search" => {
                 let (name, scope) = self.scope(&args)?;
                 let query = args.query.as_deref().ok_or("query is required")?;
-                Ok(render(
+                Ok(render_search(
                     self.find(&name)?.search(&scope, query, limit).await?,
                 ))
             }
@@ -354,7 +393,7 @@ impl Interfaces {
                 }
                 Ok(people
                     .into_iter()
-                    .map(|p| format!("{} ({})", p.name, p.id))
+                    .map(|p| format!("{} ({})", storage::escape(&p.name), storage::escape(&p.id)))
                     .collect::<Vec<_>>()
                     .join("\n"))
             }

@@ -293,7 +293,13 @@ where
                         lookup
                             .lookup(&call.name, &call.arguments)
                             .await
-                            .map(|content| memory::clip_tool_output(&content))
+                            .map(|content| {
+                                if call.name == "participants" {
+                                    memory::clip_tool_output(&content)
+                                } else {
+                                    content
+                                }
+                            })
                             .map_err(|e| e.to_string())
                     } else {
                         match ToolInput::parse(&call.name, &call.arguments) {

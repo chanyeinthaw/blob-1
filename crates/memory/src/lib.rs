@@ -145,7 +145,7 @@ fn render(
         .filter_map(|&p| {
             nodes
                 .get(&p)
-                .map(|text| format!("{}|{}", reference(p), flat(text)))
+                .map(|text| format!("{}|{}", reference(p), storage::escape(&flat(text))))
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -443,12 +443,14 @@ impl<S: MemoryStore + 'static, L: llm::Llm + Send + Sync + 'static> Memory<S, L>
             let text: String = m.text.chars().skip(at).take(30_000).collect();
             let next = at.saturating_add(text.chars().count());
             let more = m.text.chars().nth(next).is_some();
+            let text = match m.kind {
+                Kind::Work if m.meta.is_none() => storage::escape(&text),
+                Kind::User | Kind::Work => storage::render_input(m.meta.as_ref(), id, &text),
+                _ => text,
+            };
             return Ok(format!(
-                "{id}+1|{}: {}{text}{}{}",
+                "{id}+1|{}: {text}{}{}",
                 m.kind.as_str(),
-                m.meta
-                    .as_ref()
-                    .map_or_else(String::new, |meta| format!("{}\n", meta.tag(id))),
                 if more {
                     format!("\n[more from at={next}]")
                 } else {
@@ -470,10 +472,10 @@ impl<S: MemoryStore + 'static, L: llm::Llm + Send + Sync + 'static> Memory<S, L>
                 format!(
                     "{}|{}",
                     reference(p),
-                    state
-                        .nodes
-                        .get(&p)
-                        .map_or_else(|| "(not summarized yet: zoom it)".to_owned(), |s| flat(s))
+                    state.nodes.get(&p).map_or_else(
+                        || "(not summarized yet: zoom it)".to_owned(),
+                        |s| storage::escape(&flat(s))
+                    )
                 )
             })
             .collect::<Vec<_>>()
@@ -606,13 +608,20 @@ impl<S: MemoryStore + 'static, L: llm::Llm + Send + Sync + 'static> Memory<S, L>
         let limit = self.inner.config.node_bytes;
         let ruler = "-".repeat(limit);
         let words = limit * 70 / 512;
+        let escaped_source = storage::escape(&source);
         let task = if p.0 == 0 {
-            format!("Compaction: compress message {} into one line of at most {limit} bytes\n(about {words} words), the length of this ruler:\n{ruler}\n<input>\n{source}\n</input>", p.1)
+            format!(
+                "Compaction: compress message {} into one line of at most {limit} bytes\n(about {words} words), the length of this ruler:\n{ruler}\n<input>\n{escaped_source}\n</input>",
+                p.1
+            )
         } else {
             let (id, n) = span(p);
             let a = reference((p.0 - 1, p.1 * 2));
             let b = reference((p.0 - 1, p.1 * 2 + 1));
-            format!("Compaction: merge lines {a} and {b}, adjacent, into one line of at most\n{limit} bytes (about {words} words), the length of this ruler:\n{ruler}\n<chat> may hold their messages, {id} to {}, in more detail: take details\nof them from there too.\n<input>\n{source}\n</input>", id + n - 1)
+            format!(
+                "Compaction: merge lines {a} and {b}, adjacent, into one line of at most\n{limit} bytes (about {words} words), the length of this ruler:\n{ruler}\n<chat> may hold their messages, {id} to {}, in more detail: take details\nof them from there too.\n<input>\n{escaped_source}\n</input>",
+                id + n - 1
+            )
         };
         let base = format!("{view}\n\n{task}");
         let mut prompt = base.clone();
@@ -635,7 +644,11 @@ impl<S: MemoryStore + 'static, L: llm::Llm + Send + Sync + 'static> Memory<S, L>
             if !answer.is_empty() && answer.len() <= self.inner.config.node_bytes {
                 break;
             }
-            prompt = format!("{base}\n\nToo long: your last line for this <input> was {} bytes,\nover the {limit}-byte limit. Write the whole line again, cutting just\nenough of the least valuable items to fit before this cut:\n{}| ← LIMIT", answer.len(), clip_bytes(answer, limit));
+            prompt = format!(
+                "{base}\n\nToo long: your last line for this <input> was {} bytes,\nover the {limit}-byte limit. Write the whole line again, cutting just\nenough of the least valuable items to fit before this cut:\n{}| ← LIMIT",
+                answer.len(),
+                storage::escape(clip_bytes(answer, limit))
+            );
         }
         let answer = shortest.unwrap_or_else(|| flat(&source));
         Ok(clip_bytes(&answer, self.inner.config.node_bytes).to_owned())
@@ -687,9 +700,10 @@ fn enqueue_parent(state: &mut State, p: Part) {
         state.ready.insert(key(parent));
     }
 }
+pub const TOOL_OUTPUT_LIMIT: usize = 30_000;
 pub fn clip_tool_output(text: &str) -> String {
     let count = text.chars().count();
-    if count <= 30_000 {
+    if count <= TOOL_OUTPUT_LIMIT {
         return text.to_owned();
     }
     let head: String = text.chars().take(15_000).collect();
