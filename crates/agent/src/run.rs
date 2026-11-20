@@ -402,7 +402,7 @@ fn admit(
     let to = store.destination("discord", &dest)?;
     let (place, message) = (inbound.place.clone(), inbound.message.clone());
     tokio::spawn(async move {
-        if let Err(error) = discord.acknowledge(&place, &message).await {
+        if let Err(error) = discord.react(&place, &message, interface::Mark::Seen).await {
             eprintln!("{error}");
         }
     });

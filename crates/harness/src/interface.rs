@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use environment::ToolSpec;
-use interface::{Fetched, Interface, Outbound, Place, Scope, Target};
+use interface::{Fetched, Interface, Mark, Outbound, Place, Scope, Target};
 use serde::Deserialize;
 use storage::{InterfaceStore, MemoryStore, Meta};
 
@@ -40,6 +40,15 @@ pub struct Interfaces {
     interfaces: Vec<Arc<dyn Interface>>,
     store: Arc<dyn Store>,
     live: Arc<LiveState>,
+    marks: tokio::sync::mpsc::UnboundedSender<MarkJob>,
+}
+
+struct MarkJob {
+    interface: Arc<dyn Interface>,
+    place: Place,
+    message: String,
+    add: Vec<Mark>,
+    remove: Vec<Mark>,
 }
 
 #[derive(Default)]
@@ -99,6 +108,72 @@ impl Interfaces {
             interfaces,
             store: Arc::new(store),
             live: Arc::default(),
+            marks: {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<MarkJob>();
+                tokio::spawn(async move {
+                    while let Some(job) = rx.recv().await {
+                        for mark in job.remove {
+                            if let Err(error) =
+                                job.interface.unreact(&job.place, &job.message, mark).await
+                            {
+                                eprintln!("{error}");
+                            }
+                        }
+                        for mark in job.add {
+                            if let Err(error) =
+                                job.interface.react(&job.place, &job.message, mark).await
+                            {
+                                eprintln!("{error}");
+                            }
+                        }
+                    }
+                });
+                tx
+            },
+        }
+    }
+    pub fn mark(&self, reply: &str, add: &[Mark], remove: &[Mark]) {
+        let resolved = (|| -> Result<_, Error> {
+            let row = self
+                .store
+                .message(token(reply, 'm')?)?
+                .ok_or("unknown message")?;
+            let Some(Meta::Message {
+                interface,
+                place,
+                message,
+                ..
+            }) = row.meta
+            else {
+                return Err("message has no interface metadata".into());
+            };
+            let interface = self
+                .interfaces
+                .iter()
+                .find(|i| i.name() == interface)
+                .ok_or("unknown interface")?
+                .clone();
+            Ok((interface, place, message))
+        })();
+        let (interface, place, message) = match resolved {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("{reply}: {error}");
+                return;
+            }
+        };
+        if self
+            .marks
+            .send(MarkJob {
+                interface,
+                place,
+                message,
+                add: add.to_vec(),
+                remove: remove.to_vec(),
+            })
+            .is_err()
+        {
+            eprintln!("mark worker stopped");
         }
     }
     pub fn live(&self, interface: &str, to: u64, place: Place) -> tokio::task::Id {

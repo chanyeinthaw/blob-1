@@ -72,10 +72,20 @@ pub trait Lookup: Send + Sync {
     ) -> Result<Vec<Person>, InterfaceError>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    Seen,
+    Working,
+    Done,
+    Failed,
+}
+
 #[async_trait::async_trait]
 pub trait Interface: Lookup {
     async fn listen(&self, inbound: mpsc::Sender<Inbound>) -> Result<(), InterfaceError>;
-    async fn acknowledge(&self, place: &Place, message: &str) -> Result<(), InterfaceError>;
+    async fn react(&self, place: &Place, message: &str, mark: Mark) -> Result<(), InterfaceError>;
+    async fn unreact(&self, place: &Place, message: &str, mark: Mark)
+        -> Result<(), InterfaceError>;
     async fn typing(&self, place: &Place) -> Result<(), InterfaceError>;
     async fn send(&self, outbound: Outbound) -> Result<(), InterfaceError>;
 }

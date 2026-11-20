@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use environment::Environment;
+use interface::Mark;
 use memory::{Meta, ReportStatus};
 use storage::{MemoryStore, Message, SessionId, SessionStore, TaskChoice};
 
@@ -163,6 +164,15 @@ where
         {
             session.take_steering(&SessionId::new(format!("task:{name}")));
         }
+        if let (Some(interfaces), Some(message)) = (&inner.interfaces, &for_message) {
+            if !state
+                .agents
+                .values()
+                .any(|agent| agent.is_running() && agent.for_message.as_ref() == Some(message))
+            {
+                interfaces.mark(message, &[Mark::Failed], &[Mark::Working]);
+            }
+        }
         state.reports.push_back(Report {
             meta: Meta::Report {
                 task: name.to_owned(),
@@ -194,15 +204,18 @@ where
 {
     let mut prepared = Vec::new();
     for task in tasks {
-        if let Some(value) = &task.for_message {
-            let digits = value.strip_prefix('m').ok_or("invalid for token")?;
-            if digits.is_empty()
-                || !digits.bytes().all(|b| b.is_ascii_digit())
-                || digits.parse::<u64>().is_err()
-            {
-                return Err("invalid for token".into());
-            }
-        }
+        let for_message = task
+            .for_message
+            .as_deref()
+            .map(|value| {
+                value
+                    .strip_prefix('m')
+                    .filter(|digits| digits.bytes().all(|b| b.is_ascii_digit()))
+                    .and_then(|digits| digits.parse::<u64>().ok())
+                    .map(|row| format!("m{row}"))
+                    .ok_or("invalid for token")
+            })
+            .transpose()?;
         let choice = match (&task.provider, &task.model) {
             (Some(provider), Some(model)) => Some((provider.as_str(), model.as_str())),
             (None, None) => None,
@@ -212,7 +225,7 @@ where
         let (llm, window, selection) = inner.models.connect(choice, reasoning)?;
         prepared.push((
             task.task,
-            task.for_message,
+            for_message,
             llm,
             window,
             selection.provider,
@@ -436,7 +449,11 @@ fn launch<L, E, S, M, F: Models>(
 {
     let inner = Arc::clone(inner);
     let mut state = inner.state.lock().expect("chat state mutex poisoned");
-    let run_id = state.agents.get(&name).expect("agent tracked").run_id;
+    let agent = state.agents.get(&name).expect("agent tracked");
+    let run_id = agent.run_id;
+    if let (Some(interfaces), Some(message)) = (&inner.interfaces, &agent.for_message) {
+        interfaces.mark(message, &[Mark::Working], &[Mark::Done, Mark::Failed]);
+    }
     let watch_inner = Arc::downgrade(&inner);
     let watch_name = name.clone();
     let watch = tokio::spawn(async move {
@@ -487,102 +504,123 @@ fn launch<L, E, S, M, F: Models>(
     let crash_name = name.clone();
     let crash_name_for_handle = name.clone();
     let crash_session = Arc::clone(&session);
-    let work = tokio::spawn(async move {
-        let inner = task_inner;
-        let id = SessionId::new(format!("task:{name}"));
-        let mut text = text;
-        loop {
-            let (result, status) = match session.run_pending(&id, text).await {
-                Ok(result) => (result, ReportStatus::Done),
-                Err(error) => (format!("error: {error}"), ReportStatus::Failed),
-            };
-            let mut state = inner.state.lock().expect("chat state mutex poisoned");
-            if !state
-                .agents
-                .get(&name)
-                .is_some_and(|agent| agent.run_id == run_id && agent.is_running())
-            {
-                return;
-            }
-            let mut pending = session.take_steering(&id).into_iter();
-            if let Some(next) = pending.next() {
-                for message in pending {
-                    session.steer(&id, message).expect("steering failed");
+    let work =
+        tokio::spawn(async move {
+            let inner = task_inner;
+            let id = SessionId::new(format!("task:{name}"));
+            let mut text = text;
+            loop {
+                let (result, status) = match session.run_pending(&id, text).await {
+                    Ok(result) => (result, ReportStatus::Done),
+                    Err(error) => (format!("error: {error}"), ReportStatus::Failed),
+                };
+                let mut state = inner.state.lock().expect("chat state mutex poisoned");
+                if !state
+                    .agents
+                    .get(&name)
+                    .is_some_and(|agent| agent.run_id == run_id && agent.is_running())
+                {
+                    return;
                 }
-                text = Some(next);
-                continue;
+                let mut pending = session.take_steering(&id).into_iter();
+                if let Some(next) = pending.next() {
+                    for message in pending {
+                        session.steer(&id, message).expect("steering failed");
+                    }
+                    text = Some(next);
+                    continue;
+                }
+                let agent = state.agents.get_mut(&name).expect("agent tracked");
+                agent.status = Status::Idle {
+                    finished: Instant::now(),
+                    delivered: false,
+                };
+                if let Some(watch) = agent.watch.take() {
+                    watch.abort();
+                }
+                let for_message = agent.for_message.clone();
+                if let (Some(interfaces), Some(message)) = (&inner.interfaces, &for_message) {
+                    if !state.agents.values().any(|agent| {
+                        agent.is_running() && agent.for_message.as_ref() == Some(message)
+                    }) {
+                        let mark = if matches!(status, ReportStatus::Done) {
+                            Mark::Done
+                        } else {
+                            Mark::Failed
+                        };
+                        interfaces.mark(message, &[mark], &[Mark::Working]);
+                    }
+                }
+                state.reports.push_back(Report {
+                    meta: Meta::Report {
+                        task: name.clone(),
+                        status,
+                        for_message,
+                    },
+                    text: result,
+                    name: name.clone(),
+                    run_id,
+                });
+                break;
             }
-            let agent = state.agents.get_mut(&name).expect("agent tracked");
-            agent.status = Status::Idle {
-                finished: Instant::now(),
-                delivered: false,
-            };
-            if let Some(watch) = agent.watch.take() {
-                watch.abort();
-            }
-            let for_message = agent.for_message.clone();
-            state.reports.push_back(Report {
-                meta: Meta::Report {
-                    task: name.clone(),
-                    status,
-                    for_message,
-                },
-                text: result,
-                name: name.clone(),
-                run_id,
-            });
-            break;
-        }
-        inner.notify.notify_one();
-    });
+            inner.notify.notify_one();
+        });
     let work_abort = work.abort_handle();
-    let task = tokio::spawn(async move {
-        if let Err(error) = work.await {
-            if error.is_cancelled() {
-                return;
+    let task =
+        tokio::spawn(async move {
+            if let Err(error) = work.await {
+                if error.is_cancelled() {
+                    return;
+                }
+                let panic = error.into_panic();
+                let message = panic
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("unknown panic");
+                let mut state = crash_inner.state.lock().expect("chat state mutex poisoned");
+                if !state
+                    .agents
+                    .get(&crash_name)
+                    .is_some_and(|agent| agent.run_id == run_id && agent.is_running())
+                {
+                    return;
+                }
+                let dropped = crash_session
+                    .take_steering(&SessionId::new(format!("task:{crash_name}")))
+                    .len();
+                let suffix = if dropped > 0 {
+                    format!(" (dropped {dropped} pending messages)")
+                } else {
+                    String::new()
+                };
+                let agent = state.agents.get_mut(&crash_name).expect("agent tracked");
+                agent.status = Status::Crashed(message.to_owned());
+                if let Some(watch) = agent.watch.take() {
+                    watch.abort();
+                }
+                let for_message = agent.for_message.clone();
+                if let (Some(interfaces), Some(message)) = (&crash_inner.interfaces, &for_message) {
+                    if !state.agents.values().any(|agent| {
+                        agent.is_running() && agent.for_message.as_ref() == Some(message)
+                    }) {
+                        interfaces.mark(message, &[Mark::Failed], &[Mark::Working]);
+                    }
+                }
+                state.reports.push_back(Report {
+                    meta: Meta::Report {
+                        task: crash_name.clone(),
+                        status: ReportStatus::Crashed,
+                        for_message,
+                    },
+                    text: format!("error: task crashed: {message}{suffix}"),
+                    name: crash_name.clone(),
+                    run_id,
+                });
+                drop(state);
+                crash_inner.notify.notify_one();
             }
-            let panic = error.into_panic();
-            let message = panic
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("unknown panic");
-            let mut state = crash_inner.state.lock().expect("chat state mutex poisoned");
-            if !state
-                .agents
-                .get(&crash_name)
-                .is_some_and(|agent| agent.run_id == run_id && agent.is_running())
-            {
-                return;
-            }
-            let dropped = crash_session
-                .take_steering(&SessionId::new(format!("task:{crash_name}")))
-                .len();
-            let suffix = if dropped > 0 {
-                format!(" (dropped {dropped} pending messages)")
-            } else {
-                String::new()
-            };
-            let agent = state.agents.get_mut(&crash_name).expect("agent tracked");
-            agent.status = Status::Crashed(message.to_owned());
-            if let Some(watch) = agent.watch.take() {
-                watch.abort();
-            }
-            let for_message = agent.for_message.clone();
-            state.reports.push_back(Report {
-                meta: Meta::Report {
-                    task: crash_name.clone(),
-                    status: ReportStatus::Crashed,
-                    for_message,
-                },
-                text: format!("error: task crashed: {message}{suffix}"),
-                name: crash_name.clone(),
-                run_id,
-            });
-            drop(state);
-            crash_inner.notify.notify_one();
-        }
-    });
+        });
     state.tasks.retain(|task| !task.is_finished());
     if let Some(agent) = state.agents.get_mut(&crash_name_for_handle) {
         agent.work = Some(work_abort.clone());

@@ -2,7 +2,7 @@ mod gateway;
 mod render;
 
 use interface::{
-    Fetched, Inbound, Interface, InterfaceError, Lookup, Outbound, Person, Place, Scope,
+    Fetched, Inbound, Interface, InterfaceError, Lookup, Mark, Outbound, Person, Place, Scope,
 };
 use std::collections::HashSet;
 use tokio::sync::mpsc;
@@ -28,6 +28,17 @@ fn id<T>(value: &str) -> Result<Id<T>, InterfaceError> {
 
 fn channel(place: &Place) -> Result<Id<ChannelMarker>, InterfaceError> {
     id(place.thread.as_deref().unwrap_or(&place.channel))
+}
+
+fn reaction(mark: Mark) -> twilight_http::request::channel::reaction::RequestReactionType<'static> {
+    twilight_http::request::channel::reaction::RequestReactionType::Unicode {
+        name: match mark {
+            Mark::Seen => "👀",
+            Mark::Working => "⏳",
+            Mark::Done => "✅",
+            Mark::Failed => "⚠️",
+        },
+    }
 }
 
 fn person(user: &User) -> Person {
@@ -197,15 +208,21 @@ impl Interface for Discord {
     async fn listen(&self, inbound: mpsc::Sender<Inbound>) -> Result<(), InterfaceError> {
         gateway::listen(self, inbound).await
     }
-    async fn acknowledge(&self, place: &Place, message: &str) -> Result<(), InterfaceError> {
+    async fn react(&self, place: &Place, message: &str, mark: Mark) -> Result<(), InterfaceError> {
         self.http
-            .create_reaction(
-                channel(place)?,
-                id(message)?,
-                &twilight_http::request::channel::reaction::RequestReactionType::Unicode {
-                    name: "👀",
-                },
-            )
+            .create_reaction(channel(place)?, id(message)?, &reaction(mark))
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
+    async fn unreact(
+        &self,
+        place: &Place,
+        message: &str,
+        mark: Mark,
+    ) -> Result<(), InterfaceError> {
+        self.http
+            .delete_current_user_reaction(channel(place)?, id(message)?, &reaction(mark))
             .await
             .map_err(backend)?;
         Ok(())
