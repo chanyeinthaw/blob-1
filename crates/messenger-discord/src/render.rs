@@ -91,7 +91,8 @@ pub async fn send(discord: &Discord, outbound: Outbound) -> Result<(), Messenger
         mentions.retain(|m| m != &author);
         mentions.insert(0, author);
     }
-    let replied_user = reference.is_some() && ping;
+    let reference = reference.filter(|_| ping);
+    let replied_user = reference.is_some();
     let users: Vec<Id<UserMarker>> = mentions.iter().map(|m| id(m)).collect::<Result<_, _>>()?;
     let allowed = AllowedMentions {
         parse: vec![],

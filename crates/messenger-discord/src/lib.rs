@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use tokio::sync::mpsc;
 use twilight_http::Client;
 use twilight_model::{
-    channel::Message,
+    channel::{message::MessageType, Message},
     id::{
         marker::{ChannelMarker, UserMarker},
         Id,
@@ -108,9 +108,10 @@ impl Discord {
             })
             .await?;
         let latest = self
-            .messages(place, None, 1)
+            .messages(place, None, 10)
             .await?
-            .first()
+            .iter()
+            .find(|message| matches!(message.kind, MessageType::Regular | MessageType::Reply))
             .map(|message| message.author.id);
         Ok((latest, user, latest != Some(user)))
     }

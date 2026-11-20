@@ -9,11 +9,11 @@ use storage::{MemoryStore, MessengerStore, Meta};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
-const SEND_LIMIT: usize = 400;
+const SEND_LIMIT: usize = 300;
 
 pub const SEND: ToolSpec = ToolSpec {
     name: "send",
-    description: "Send a message to people on a messenger. Give exactly one of reply (an m-token from a <message> tag: answers that message in its thread, starting one if needed) or to (a d-token: posts plainly in that conversation). At most 400 characters; split longer text into several sends. mention: user ids to mention; the system adds the mentions.",
+    description: "Send a message to people on a messenger. Give exactly one of reply (an m-token from a <message> tag: answers that message in its thread, starting one if needed) or to (a d-token: posts plainly in that conversation). At most 300 characters; split longer text into several sends. mention: user ids to mention; the system adds the mentions.",
     input_schema: r#"{"type":"object","properties":{"text":{"type":"string"},"reply":{"type":"string","description":"m-token of the message to reply to"},"to":{"type":"string","description":"d-token of the conversation"},"mention":{"type":"array","items":{"type":"string"},"description":"User ids to mention"}},"required":["text"]}"#,
 };
 pub const LOOKUP: &[ToolSpec] = &[
