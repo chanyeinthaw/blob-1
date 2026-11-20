@@ -1,0 +1,13 @@
+services:
+  agent:
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      CPA1_KEY: ${CPA1_KEY:?}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:?}
+    volumes:
+      - agent-data:/data
+
+volumes:
+  agent-data:
