@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 pub use storage::MemoryKind as Kind;
 use storage::{MemoryMessage, MemoryNode, MemoryStore, MemoryView, ViewChange, ViewName};
+pub use storage::{Meta, ReportStatus};
 
 type Part = (u32, u64);
 type Ready = (u64, Reverse<u32>, u64);
@@ -123,7 +124,10 @@ fn clip_bytes(text: &str, limit: usize) -> &str {
     &text[..end]
 }
 fn show(m: &MemoryMessage) -> String {
-    format!("{}: {}", m.kind.as_str(), m.text)
+    match &m.meta {
+        Some(meta) => format!("{} ({}): {}", m.kind.as_str(), meta.source(), m.text),
+        None => format!("{}: {}", m.kind.as_str(), m.text),
+    }
 }
 fn render(
     view: &MemoryView,
@@ -303,7 +307,12 @@ impl<S: MemoryStore + 'static, L: llm::Llm + Send + Sync + 'static> Memory<S, L>
     fn lock(&self) -> MutexGuard<'_, State> {
         self.inner.state.lock().unwrap_or_else(|e| e.into_inner())
     }
-    pub fn append(&self, kind: Kind, text: &str) -> Result<Vec<u64>, MemoryError> {
+    pub fn append(
+        &self,
+        kind: Kind,
+        text: &str,
+        meta: Option<&Meta>,
+    ) -> Result<Vec<u64>, MemoryError> {
         let mut state = self.lock();
         let mut rest = text;
         let mut rows = Vec::new();
@@ -321,9 +330,11 @@ impl<S: MemoryStore + 'static, L: llm::Llm + Send + Sync + 'static> Memory<S, L>
             rest = &rest[end..];
             let more = !rest.is_empty();
             let id = state.count + rows.len() as u64;
+            let meta = if rows.is_empty() { meta.cloned() } else { None };
             rows.push(MemoryMessage {
                 i: id,
                 kind,
+                meta,
                 text: page.to_owned(),
                 size: (kind.as_str().len() + 2 + page.len()) as u64,
                 date: utc_date()?,
@@ -433,8 +444,11 @@ impl<S: MemoryStore + 'static, L: llm::Llm + Send + Sync + 'static> Memory<S, L>
             let next = at.saturating_add(text.chars().count());
             let more = m.text.chars().nth(next).is_some();
             return Ok(format!(
-                "{id}+1|{}: {text}{}{}",
+                "{id}+1|{}: {}{text}{}{}",
                 m.kind.as_str(),
+                m.meta
+                    .as_ref()
+                    .map_or_else(String::new, |meta| format!("{}\n", meta.tag())),
                 if more {
                     format!("\n[more from at={next}]")
                 } else {

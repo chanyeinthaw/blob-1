@@ -47,7 +47,13 @@ impl MemoryStore for SqliteStorage {
             if sql_integer(row.i)? != next {
                 return Err(StoreError::Backend("memory message id mismatch".into()));
             }
-            tx.execute("INSERT INTO memory_messages (i, kind, text, size, date, more) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![next, row.kind.as_str(), row.text, sql_integer(row.size)?, row.date, row.more]).map_err(backend)?;
+            let meta = row
+                .meta
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| StoreError::Backend(Box::new(error)))?;
+            tx.execute("INSERT INTO memory_messages (i, kind, text, size, date, more, meta) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![next, row.kind.as_str(), row.text, sql_integer(row.size)?, row.date, row.more, meta]).map_err(backend)?;
         }
         save_views(&tx, changes)?;
         tx.commit().map_err(backend)
@@ -56,7 +62,7 @@ impl MemoryStore for SqliteStorage {
     fn message(&self, i: u64) -> Result<Option<MemoryMessage>, StoreError> {
         self.lock()
             .query_row(
-                "SELECT i, kind, text, size, date, more FROM memory_messages WHERE i = ?1",
+                "SELECT i, kind, text, size, date, more, meta FROM memory_messages WHERE i = ?1",
                 [sql_integer(i)?],
                 |row| {
                     let kind: String = row.get(1)?;
@@ -77,6 +83,18 @@ impl MemoryStore for SqliteStorage {
                     Ok(MemoryMessage {
                         i: unsigned(row, 0)?,
                         kind,
+                        meta: row
+                            .get::<_, Option<String>>(6)?
+                            .map(|value| {
+                                serde_json::from_str(&value).map_err(|error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        6,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(error),
+                                    )
+                                })
+                            })
+                            .transpose()?,
                         text: row.get(2)?,
                         size: unsigned(row, 3)?,
                         date: row.get(4)?,

@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use environment::Environment;
+use memory::{Meta, ReportStatus};
 use storage::{MemoryStore, Message, SessionId, SessionStore, TaskChoice};
 
 use crate::{
@@ -13,6 +14,7 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Clone)]
 pub(crate) struct Report {
+    pub(crate) meta: Meta,
     pub(crate) text: String,
     name: String,
     run_id: u64,
@@ -152,7 +154,11 @@ where
             session.take_steering(&SessionId::new(format!("task:{name}")));
         }
         state.reports.push_back(Report {
-            text: format!("[{name}]\nstopped: {reason}\n\nChat: zoom(\"{name}\")"),
+            meta: Meta::Report {
+                task: name.to_owned(),
+                status: ReportStatus::Stopped,
+            },
+            text: format!("stopped: {reason}"),
             name: name.to_owned(),
             run_id,
         });
@@ -417,10 +423,10 @@ fn launch<L, E, S, M, F: Models>(
         let id = SessionId::new(format!("task:{name}"));
         let mut text = text;
         loop {
-            let result = session
-                .run_pending(&id, text)
-                .await
-                .unwrap_or_else(|error| format!("error: {error}"));
+            let (result, status) = match session.run_pending(&id, text).await {
+                Ok(result) => (result, ReportStatus::Done),
+                Err(error) => (format!("error: {error}"), ReportStatus::Failed),
+            };
             let mut state = inner.state.lock().expect("chat state mutex poisoned");
             if !state
                 .agents
@@ -437,13 +443,16 @@ fn launch<L, E, S, M, F: Models>(
                 text = Some(next);
                 continue;
             }
-            let report = format!("[{name}]\n{result}\n\nChat: zoom(\"{name}\")");
             state.agents.get_mut(&name).expect("agent tracked").status = Status::Idle {
                 finished: Instant::now(),
                 delivered: false,
             };
             state.reports.push_back(Report {
-                text: report,
+                meta: Meta::Report {
+                    task: name.clone(),
+                    status,
+                },
+                text: result,
                 name: name.clone(),
                 run_id,
             });
@@ -485,7 +494,11 @@ fn launch<L, E, S, M, F: Models>(
                 .expect("agent tracked")
                 .status = Status::Crashed(message.to_owned());
             state.reports.push_back(Report {
-                text: format!("[{crash_name}]\nerror: task crashed: {message}{suffix}\n\nChat: zoom(\"{crash_name}\")"),
+                meta: Meta::Report {
+                    task: crash_name.clone(),
+                    status: ReportStatus::Crashed,
+                },
+                text: format!("error: task crashed: {message}{suffix}"),
                 name: crash_name.clone(),
                 run_id,
             });

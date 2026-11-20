@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionId(pub String);
 
@@ -328,10 +330,58 @@ impl MemoryKind {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Meta {
+    Report { task: String, status: ReportStatus },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportStatus {
+    Done,
+    Failed,
+    Stopped,
+    Crashed,
+}
+
+impl ReportStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+            Self::Crashed => "crashed",
+        }
+    }
+}
+
+impl Meta {
+    pub fn tag(&self) -> String {
+        match self {
+            Self::Report { task, status } => {
+                let task = task
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+                    .replace('"', "&quot;");
+                format!("<report task=\"{task}\" status=\"{}\"/>", status.as_str())
+            }
+        }
+    }
+
+    pub fn source(&self) -> String {
+        match self {
+            Self::Report { task, status } => format!("task {task}, {}", status.as_str()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryMessage {
     pub i: u64,
     pub kind: MemoryKind,
+    pub meta: Option<Meta>,
     pub text: String,
     pub size: u64,
     pub date: String,

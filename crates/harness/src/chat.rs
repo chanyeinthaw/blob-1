@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use environment::{Environment, ToolCall, ToolInput, ToolSpec};
+use environment::{Environment, ToolCall, ToolSpec};
 use memory::{Kind, Memory};
 use serde::Deserialize;
 use storage::{MemoryStore, Message, ReasoningLevel, SessionStore};
@@ -24,7 +24,7 @@ Each message has a kind:
 - assistant: Agent's replies
 - tool: Agent's tool calls
 - echo: tool results
-- work: a task's report, starting "[id]"
+- work: a task's report, arriving as `<report task="id" status="done|failed|stopped|crashed"/>` followed by its body
 - note: memories from before this chat
 
 The summaries form a binary tree: each message is compressed into a line (a short message is its own line), then adjacent lines are merged in pairs, again and again. So recent lines cover one message each, and older lines cover more. A message not summarized yet shows as "(not summarized yet: zoom it)". A text too long for one message is split over several in a row.
@@ -34,15 +34,16 @@ Tools:
 - zoom(id, 1) gives message id whole
 - zoom("id") gives a task's chat as stored, with older parts summarized if compacted
 - date(id) gives the date and time of message id
-- read, write, edit and bash work in the working directory
 
 # Turns
 
-Do the user's tasks yourself, with your tools. Start tasks only when the user asks for them.
+Coordinate and talk to the user. Delegate anything touching files, commands, the web or the machine via spawn. Tasks have read, write, edit and bash in the working directory, read-only zoom and date on your memory, and can load skills. Name a skill in the task when it fits.
+
+System-originated messages may start with a self-closing XML tag containing metadata. The user's own words have no tag.
 
 The view is your memory, and its latest word on a thing is the truth. Whenever you need any information, first find its latest mention in the view and zoom until you have it whole, before any other source, and before you act, guess or ask. Never grep or search memories manually; zoom is your only allowed mechanism to navigate the tree. Summaries keep little of tool output, so say in your reply what you learned that will matter later.
 
-Messages the user sends while you work reach you between tool calls. Use tasks to check on tasks when the user asks or before deciding what to do next; never call it in a loop or to wait. Use stop to stop a running task. Tasks run in the background; each one's report reaches you as a message starting "[id]", between your tool calls or as a new turn. Never wait for one (no sleep, no polling): go on, or end your turn and tell the user what is running."#;
+Messages the user sends while you work reach you between tool calls. Use tasks to check on tasks when the user asks or before deciding what to do next; never call it in a loop or to wait. Use stop to stop a running task. Tasks run in the background; each report reaches you between tool calls or as a new turn. Never wait for one (no sleep, no polling): go on, or end your turn and tell the user what is running."#;
 
 pub(crate) const EXTRA: &[ToolSpec] = &[
     ToolSpec { name: "zoom", description: "Open the line id+n of the view into the two lines of n/2 under it; n = 1 gives the message whole. With a task id, give that task's chat as stored, with older parts summarized if compacted. A long text comes in pages from character at, saying where to go on.", input_schema: r#"{"type":"object","properties":{"id":{"oneOf":[{"type":"integer"},{"type":"string"}]},"n":{"type":"integer"},"at":{"type":"integer"}},"required":["id"]}"# },
@@ -249,8 +250,8 @@ where
         let _guard = self.turn.lock().await;
         self.inner.memory.settle(self.inner.memory.count()?).await?;
         let view = self.inner.memory.view()?;
-        self.inner.memory.append(Kind::User, text)?;
-        let mut answers = vec![self.turn(text, false, view).await?];
+        self.inner.memory.append(Kind::User, text, None)?;
+        let mut answers = vec![self.turn(text, view).await?];
         loop {
             let notified = self.inner.notify.notified();
             let (report, steering, running) = {
@@ -271,15 +272,20 @@ where
             for text in steering {
                 self.inner.memory.settle(self.inner.memory.count()?).await?;
                 let view = self.inner.memory.view()?;
-                self.inner.memory.append(Kind::User, &text)?;
-                answers.push(self.turn(&text, false, view).await?);
+                self.inner.memory.append(Kind::User, &text, None)?;
+                answers.push(self.turn(&text, view).await?);
             }
             if let Some(report) = report {
                 self.inner.memory.settle(self.inner.memory.count()?).await?;
                 let view = self.inner.memory.view()?;
-                self.inner.memory.append(Kind::Work, &report.text)?;
+                self.inner
+                    .memory
+                    .append(Kind::Work, &report.text, Some(&report.meta))?;
                 tasks::delivered(&self.inner);
-                answers.push(self.turn(&report.text, true, view).await?);
+                answers.push(
+                    self.turn(&format!("{}\n{}", report.meta.tag(), report.text), view)
+                        .await?,
+                );
             } else if had_steering {
                 continue;
             } else if running {
@@ -291,31 +297,21 @@ where
         Ok(answers.join("\n\n"))
     }
 
-    async fn turn(&self, text: &str, report: bool, view: String) -> Result<String, HarnessError> {
+    async fn turn(&self, text: &str, view: String) -> Result<String, HarnessError> {
         let skills = self.inner.environment.skill_catalog().await?;
         let system = format!(
             "{CHAT_PROMPT}\n\n{}",
-            prompt::build(&self.inner.paths.workspace, &skills)
+            prompt::build_chat(&self.inner.paths.workspace, &skills)
         );
-        let mut messages = vec![
-            Message::User(view),
-            Message::User(format!(
-                "Turn: {}\n\n{text}",
-                if report {
-                    "a task's report:"
-                } else {
-                    "the user's new message:"
-                }
-            )),
-        ];
-        let tools: Vec<_> = environment::CATALOG.iter().chain(EXTRA).copied().collect();
+        let mut messages = vec![Message::User(view), Message::User(text.to_owned())];
+        let tools = EXTRA;
         loop {
             let steering = {
                 let mut state = self.inner.state.lock().expect("chat state mutex poisoned");
                 std::mem::take(&mut state.steering)
             };
             for text in steering {
-                self.inner.memory.append(Kind::User, &text)?;
+                self.inner.memory.append(Kind::User, &text, None)?;
                 messages.push(Message::User(text));
             }
             loop {
@@ -329,9 +325,15 @@ where
                     .cloned();
                 let Some(report) = report else { break };
                 self.inner.memory.settle(self.inner.memory.count()?).await?;
-                self.inner.memory.append(Kind::Work, &report.text)?;
+                self.inner
+                    .memory
+                    .append(Kind::Work, &report.text, Some(&report.meta))?;
                 tasks::delivered(&self.inner);
-                messages.push(Message::User(report.text));
+                messages.push(Message::User(format!(
+                    "{}\n{}",
+                    report.meta.tag(),
+                    report.text
+                )));
             }
             let response = self
                 .inner
@@ -339,11 +341,13 @@ where
                 .complete(CompletionRequest {
                     system: &system,
                     messages: &messages,
-                    tools: &tools,
+                    tools,
                 })
                 .await?;
             if !response.text.is_empty() {
-                self.inner.memory.append(Kind::Assistant, &response.text)?;
+                self.inner
+                    .memory
+                    .append(Kind::Assistant, &response.text, None)?;
                 messages.push(Message::Assistant(response.text.clone()));
             }
             if response.tool_calls.is_empty() {
@@ -357,9 +361,11 @@ where
                 });
             }
             for call in response.tool_calls {
-                self.inner
-                    .memory
-                    .append(Kind::Tool, &format!("{} {}", call.name, call.arguments))?;
+                self.inner.memory.append(
+                    Kind::Tool,
+                    &format!("{} {}", call.name, call.arguments),
+                    None,
+                )?;
                 let content = match self.execute(&call).await {
                     Ok(content) => content,
                     Err(error) => format!("error: {error}"),
@@ -369,7 +375,7 @@ where
                 } else {
                     memory::clip_tool_output(&content)
                 };
-                self.inner.memory.append(Kind::Echo, &content)?;
+                self.inner.memory.append(Kind::Echo, &content, None)?;
                 messages.push(Message::ToolResult {
                     id: call.id,
                     name: call.name,
@@ -409,17 +415,7 @@ where
                 let args: Tell = serde_json::from_str(&call.arguments)?;
                 tasks::tell(&self.inner, &args.task, args.text)?
             }
-            _ => {
-                let input = ToolInput::parse(&call.name, &call.arguments)?;
-                self.inner
-                    .environment
-                    .execute(ToolCall {
-                        id: call.id.clone(),
-                        input,
-                    })
-                    .await?
-                    .content
-            }
+            _ => return Err(format!("unknown tool: {}", call.name).into()),
         })
     }
 }
