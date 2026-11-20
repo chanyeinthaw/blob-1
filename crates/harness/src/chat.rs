@@ -150,6 +150,7 @@ pub(crate) struct Inner<L, E, S, M, F: Models> {
     pub state: Mutex<State>,
     pub notify: Notify,
     pub interfaces: Option<crate::Interfaces>,
+    pub pulses: Mutex<Vec<(u64, tokio::task::Id)>>,
 }
 pub struct ChatHarness<L, E, S, M, F: Models> {
     pub(crate) inner: Arc<Inner<L, E, S, M, F>>,
@@ -255,6 +256,7 @@ where
                 }),
                 notify: Notify::new(),
                 interfaces: None,
+                pulses: Mutex::new(Vec::new()),
             }),
             turn: tokio::sync::Mutex::new(()),
         }
@@ -350,6 +352,7 @@ where
                     .memory
                     .append(Kind::Work, &report.text, Some(&report.meta))?;
                 tasks::delivered(&self.inner);
+                self.live_for(&report.meta);
                 answers.push(
                     self.turn(&format!("{}\n{}", report.meta.tag(0), report.text), view)
                         .await?,
@@ -369,7 +372,45 @@ where
             .join("\n\n"))
     }
 
+    fn live_for(&self, meta: &Meta) {
+        let (
+            Some(interfaces),
+            Meta::Report {
+                for_message: Some(reply),
+                ..
+            }
+            | Meta::Reminder {
+                for_message: Some(reply),
+                ..
+            },
+        ) = (&self.inner.interfaces, meta)
+        else {
+            return;
+        };
+        match interfaces.live_for(reply) {
+            Ok(Some(pulse)) => self
+                .inner
+                .pulses
+                .lock()
+                .expect("pulses mutex poisoned")
+                .push(pulse),
+            Ok(None) => {}
+            Err(error) => eprintln!("{error}"),
+        }
+    }
+
     async fn turn(&self, text: &str, view: String) -> Result<String, HarnessError> {
+        let result = self.turn_loop(text, view).await;
+        let pulses = std::mem::take(&mut *self.inner.pulses.lock().expect("pulses mutex poisoned"));
+        if let Some(interfaces) = &self.inner.interfaces {
+            for (to, pulse) in pulses {
+                interfaces.settle(to, pulse);
+            }
+        }
+        result
+    }
+
+    async fn turn_loop(&self, text: &str, view: String) -> Result<String, HarnessError> {
         let skills = self.inner.environment.skill_catalog().await?;
         let system = format!(
             "{CHAT_PROMPT}\n\n{}{}",
@@ -420,6 +461,7 @@ where
                     .memory
                     .append(Kind::Work, &report.text, Some(&report.meta))?;
                 tasks::delivered(&self.inner);
+                self.live_for(&report.meta);
                 messages.push(Message::User(format!(
                     "{}\n{}",
                     report.meta.tag(0),

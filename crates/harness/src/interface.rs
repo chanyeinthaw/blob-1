@@ -101,7 +101,7 @@ impl Interfaces {
             live: Arc::default(),
         }
     }
-    pub fn live(&self, interface: &str, to: u64, place: Place) {
+    pub fn live(&self, interface: &str, to: u64, place: Place) -> tokio::task::Id {
         let interface = self
             .interfaces
             .iter()
@@ -130,6 +130,29 @@ impl Interfaces {
             .insert(to, pulse.abort_handle())
         {
             old.abort();
+        }
+        pulse.id()
+    }
+    pub fn live_for(&self, reply: &str) -> Result<Option<(u64, tokio::task::Id)>, Error> {
+        let row = self
+            .store
+            .message(token(reply, 'm')?)?
+            .ok_or("unknown message")?;
+        if let Some(Meta::Message {
+            interface,
+            place,
+            to,
+            ..
+        }) = row.meta
+        {
+            return Ok(Some((to, self.live(&interface, to, place))));
+        }
+        Ok(None)
+    }
+    pub fn settle(&self, to: u64, pulse: tokio::task::Id) {
+        let mut live = self.live.0.lock().expect("live mutex poisoned");
+        if live.get(&to).is_some_and(|handle| handle.id() == pulse) {
+            live.remove(&to).expect("checked").abort();
         }
     }
     pub fn quiet(&self) {
