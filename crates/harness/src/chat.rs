@@ -42,13 +42,15 @@ Do the user's tasks yourself, with your tools, following the user's instructions
 
 The view is your memory, and its latest word on a thing is the truth. Whenever you need any information, first find its latest mention in the view and zoom until you have it whole, before any other source, and before you act, guess or ask. Never grep or search memories manually; zoom is your only allowed mechanism to navigate the tree. Summaries keep little of tool output, so say in your reply what you learned that will matter later.
 
-Messages the user sends while you work reach you between tool calls. Subagents run in the background; each one's report reaches you as a message starting "[Name]", between your tool calls or as a new turn. Never wait for one (no sleep, no polling): go on, or end your turn and tell the user what is running."#;
+Messages the user sends while you work reach you between tool calls. Use agents to check on agents when the user asks or before deciding what to do next; never call it in a loop or to wait. Use stop to stop a running agent. Subagents run in the background; each one's report reaches you as a message starting "[Name]", between your tool calls or as a new turn. Never wait for one (no sleep, no polling): go on, or end your turn and tell the user what is running."#;
 
 const EXTRA: &[ToolSpec] = &[
     ToolSpec { name: "zoom", description: "Open the line id+n of the view into the two lines of n/2 under it; n = 1 gives the message whole. With an agent's name as id, give that agent's chat as stored, with older parts summarized if compacted. A long text comes in pages from character at, saying where to go on.", input_schema: r#"{"type":"object","properties":{"id":{"oneOf":[{"type":"integer"},{"type":"string"}]},"n":{"type":"integer"},"at":{"type":"integer"}},"required":["id"]}"# },
     ToolSpec { name: "date", description: "The date and time of message id.", input_schema: r#"{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}"# },
     ToolSpec { name: "models", description: "List the configured providers and models you can give to spawn: provider, model id, context window, supported reasoning levels. Use search to filter.", input_schema: r#"{"type":"object","properties":{"search":{"type":"string"}}}"# },
     ToolSpec { name: "spawn", description: "Start one background agent per task. Optionally specify provider, model and reasoning per task; call models to see available choices. Give provider and model together. Never wait or poll for it.", input_schema: r#"{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{"task":{"type":"string"},"provider":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string","enum":["off","low","medium","high","xhigh","max"]}},"required":["task"]}}},"required":["tasks"]}"# },
+    ToolSpec { name: "agents", description: "List agents with their status, model, how long they have been running, and what each is doing now.", input_schema: r#"{"type":"object","properties":{}}"# },
+    ToolSpec { name: "stop", description: "Stop a running agent: cancels its work and kills its running commands. Its report says it was stopped.", input_schema: r#"{"type":"object","properties":{"name":{"type":"string"},"reason":{"type":"string"}},"required":["name"]}"# },
     ToolSpec { name: "tell", description: "Send a message to an agent by name: delivered between its tool calls if it is working, or restarts it from its chat.", input_schema: r#"{"type":"object","properties":{"name":{"type":"string"},"text":{"type":"string"}},"required":["name","text"]}"# },
 ];
 
@@ -59,7 +61,14 @@ pub trait Models: Send + Sync + 'static {
         &self,
         choice: Option<(&str, &str)>,
         reasoning: Option<ReasoningLevel>,
-    ) -> Result<(Self::Llm, Option<u32>), HarnessError>;
+    ) -> Result<(Self::Llm, Option<u32>, ModelSelection), HarnessError>;
+}
+
+#[derive(Clone)]
+pub struct ModelSelection {
+    pub provider: String,
+    pub model: String,
+    pub reasoning: ReasoningLevel,
 }
 
 #[derive(Clone)]
@@ -84,8 +93,8 @@ impl<T: Environment> Environment for Shared<T> {
 }
 
 pub(crate) struct State {
-    pub running: std::collections::HashSet<String>,
-    pub reports: std::collections::VecDeque<String>,
+    pub agents: std::collections::HashMap<String, agents::Agent>,
+    pub reports: std::collections::VecDeque<agents::Report>,
     pub steering: Vec<String>,
     pub next: u64,
     pub tasks: Vec<tokio::task::AbortHandle>,
@@ -157,6 +166,11 @@ struct ModelsArgs {
     search: Option<String>,
 }
 #[derive(Deserialize)]
+struct Stop {
+    name: String,
+    reason: Option<String>,
+}
+#[derive(Deserialize)]
 struct Tell {
     name: String,
     text: String,
@@ -196,7 +210,7 @@ where
                 summarizer_window,
                 sessions: Mutex::new(Default::default()),
                 state: Mutex::new(State {
-                    running: Default::default(),
+                    agents: Default::default(),
                     reports: Default::default(),
                     steering: Vec::new(),
                     next: 1,
@@ -234,7 +248,11 @@ where
                 } else {
                     None
                 };
-                (report, steering, !state.running.is_empty())
+                (
+                    report,
+                    steering,
+                    state.agents.values().any(agents::Agent::is_running),
+                )
             };
             let had_steering = !steering.is_empty();
             for text in steering {
@@ -246,14 +264,9 @@ where
             if let Some(report) = report {
                 self.inner.memory.settle(self.inner.memory.count()?).await?;
                 let view = self.inner.memory.view()?;
-                self.inner.memory.append(Kind::Work, &report)?;
-                self.inner
-                    .state
-                    .lock()
-                    .expect("chat state mutex poisoned")
-                    .reports
-                    .pop_front();
-                answers.push(self.turn(&report, true, view).await?);
+                self.inner.memory.append(Kind::Work, &report.text)?;
+                agents::delivered(&self.inner);
+                answers.push(self.turn(&report.text, true, view).await?);
             } else if had_steering {
                 continue;
             } else if running {
@@ -303,14 +316,9 @@ where
                     .cloned();
                 let Some(report) = report else { break };
                 self.inner.memory.settle(self.inner.memory.count()?).await?;
-                self.inner.memory.append(Kind::Work, &report)?;
-                self.inner
-                    .state
-                    .lock()
-                    .expect("chat state mutex poisoned")
-                    .reports
-                    .pop_front();
-                messages.push(Message::User(report));
+                self.inner.memory.append(Kind::Work, &report.text)?;
+                agents::delivered(&self.inner);
+                messages.push(Message::User(report.text));
             }
             let response = self
                 .inner
@@ -377,6 +385,11 @@ where
             "spawn" => {
                 let args: Spawn = serde_json::from_str(&call.arguments)?;
                 agents::spawn(&self.inner, args.tasks).await?.join(", ")
+            }
+            "agents" => agents::list(&self.inner)?,
+            "stop" => {
+                let args: Stop = serde_json::from_str(&call.arguments)?;
+                agents::stop(&self.inner, &args.name, args.reason).await?
             }
             "tell" => {
                 let args: Tell = serde_json::from_str(&call.arguments)?;

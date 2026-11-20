@@ -196,6 +196,7 @@ async fn summarize<L: Llm>(
     suffix: &str,
     window: Option<u32>,
     reserve: u32,
+    on_model: &(dyn Fn() + Sync),
 ) -> Result<String, HarnessError> {
     let parts: Vec<_> = messages
         .iter()
@@ -224,6 +225,7 @@ async fn summarize<L: Llm>(
         let prompt = fit_prompt(
             messages, &parts, prefix, suffix, window, reserve, &mut start,
         )?;
+        on_model();
         match llm
             .complete(CompletionRequest {
                 system: SYSTEM,
@@ -261,6 +263,7 @@ pub(crate) async fn compact<L: Llm>(
     keep: u32,
     window: Option<u32>,
     reserve: u32,
+    on_model: &(dyn Fn() + Sync),
 ) -> Result<Option<Vec<Message>>, HarnessError> {
     let previous = match messages.first() {
         Some(Message::Summary {
@@ -348,7 +351,16 @@ pub(crate) async fn compact<L: Llm>(
             )),
             if previous.is_some() { UPDATE } else { INITIAL }
         );
-        summarize(llm, history, "<conversation>\n", &suffix, window, reserve).await?
+        summarize(
+            llm,
+            history,
+            "<conversation>\n",
+            &suffix,
+            window,
+            reserve,
+            on_model,
+        )
+        .await?
     };
     if !prefix.is_empty() {
         let prefix_summary = summarize(
@@ -358,6 +370,7 @@ pub(crate) async fn compact<L: Llm>(
             &format!("\n\n# Instructions\n{TURN_PREFIX}"),
             window,
             reserve,
+            on_model,
         )
         .await?;
         text.push_str(&format!(

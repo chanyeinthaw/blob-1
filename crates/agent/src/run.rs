@@ -91,7 +91,8 @@ impl harness::Models for ModelFactory {
         &self,
         choice: Option<(&str, &str)>,
         reasoning: Option<ReasoningLevel>,
-    ) -> std::result::Result<(Model, Option<u32>), harness::HarnessError> {
+    ) -> std::result::Result<(Model, Option<u32>, harness::ModelSelection), harness::HarnessError>
+    {
         let settings = self.store.settings()?;
         let default = settings
             .default_model
@@ -127,6 +128,11 @@ impl harness::Models for ModelFactory {
                 reasoning.unwrap_or(self.default_reasoning),
             )),
             model.effective_context(),
+            harness::ModelSelection {
+                provider: provider_id.to_owned(),
+                model: model_id.to_owned(),
+                reasoning: reasoning.unwrap_or(self.default_reasoning),
+            },
         ))
     }
 }

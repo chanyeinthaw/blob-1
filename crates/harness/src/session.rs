@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::{collections::HashMap, sync::Mutex};
 
 use environment::{Environment, ToolCall, ToolInput};
@@ -55,8 +56,16 @@ pub struct EnvironmentPaths {
     pub skills: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub enum Step {
+    Model,
+    Tool { name: String },
+    Idle,
+}
+
 pub struct SessionHarness<L, E, S> {
     llm: L,
+    observer: Option<Arc<dyn Fn(Step) + Send + Sync>>,
     summarizer: Option<L>,
     environment: E,
     store: S,
@@ -74,12 +83,24 @@ where
     pub fn new(llm: L, environment: E, store: S, paths: EnvironmentPaths) -> Self {
         Self {
             llm,
+            observer: None,
             summarizer: None,
             environment,
             store,
             paths,
             config: HarnessConfig::default(),
             steering: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn with_observer(mut self, observer: Arc<dyn Fn(Step) + Send + Sync>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    fn observe(&self, step: Step) {
+        if let Some(observer) = &self.observer {
+            observer(step);
         }
     }
 
@@ -94,6 +115,24 @@ where
     }
 
     pub async fn run(&self, id: &SessionId, user_message: String) -> Result<String, HarnessError> {
+        self.run_pending(id, Some(user_message)).await
+    }
+
+    pub(crate) async fn run_pending(
+        &self,
+        id: &SessionId,
+        user_message: Option<String>,
+    ) -> Result<String, HarnessError> {
+        let result = self.run_inner(id, user_message).await;
+        self.observe(Step::Idle);
+        result
+    }
+
+    async fn run_inner(
+        &self,
+        id: &SessionId,
+        user_message: Option<String>,
+    ) -> Result<String, HarnessError> {
         let mut session = match self.store.load(id)? {
             Some(session) => session,
             None => Session::new(id.clone()),
@@ -102,8 +141,10 @@ where
         let skills = skills::catalog(&self.store, &self.paths.skills)?;
         let system = prompt::build(&self.paths.workspace, &skills);
 
-        session.push(Message::User(user_message));
-        self.store.save(session.clone())?;
+        if let Some(user_message) = user_message {
+            session.push(Message::User(user_message));
+            self.store.save(session.clone())?;
+        }
 
         let mut usage = None;
         let mut overflow_retried = false;
@@ -122,6 +163,7 @@ where
             }
             retrying = false;
 
+            self.observe(Step::Model);
             let response = match self.llm.complete(CompletionRequest {
                 system: &system,
                 messages: &session.messages,
@@ -167,6 +209,9 @@ where
                 usage = Some((value, session.messages.len()));
             }
             for call in response.tool_calls {
+                self.observe(Step::Tool {
+                    name: call.name.clone(),
+                });
                 let executed = match ToolInput::parse(&call.name, &call.arguments) {
                     Ok(input) => {
                         self.environment
@@ -178,6 +223,7 @@ where
                     }
                     Err(error) => Err(error),
                 };
+                self.observe(Step::Idle);
                 let content = match executed {
                     Ok(result) => result.content,
                     Err(error) => format!("error: {error}"),
@@ -242,12 +288,18 @@ where
         } else {
             keep
         };
+        let observer = &self.observer;
         let Some(messages) = compaction::compact(
             self.summarizer.as_ref().unwrap_or(&self.llm),
             &session.messages,
             keep,
             config.summarizer_window,
             config.reserve_tokens,
+            &|| {
+                if let Some(observer) = observer {
+                    observer(Step::Model);
+                }
+            },
         )
         .await?
         else {

@@ -58,6 +58,7 @@ pub enum StoreError {
 pub trait SessionStore: Send + Sync {
     fn load(&self, id: &SessionId) -> Result<Option<Session>, StoreError>;
     fn save(&self, session: Session) -> Result<(), StoreError>;
+    fn session_ids(&self, prefix: &str) -> Result<Vec<SessionId>, StoreError>;
 }
 
 impl<T: SessionStore + ?Sized> SessionStore for std::sync::Arc<T> {
@@ -67,6 +68,10 @@ impl<T: SessionStore + ?Sized> SessionStore for std::sync::Arc<T> {
 
     fn save(&self, session: Session) -> Result<(), StoreError> {
         (**self).save(session)
+    }
+
+    fn session_ids(&self, prefix: &str) -> Result<Vec<SessionId>, StoreError> {
+        (**self).session_ids(prefix)
     }
 }
 

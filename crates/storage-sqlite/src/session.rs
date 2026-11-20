@@ -143,4 +143,33 @@ impl SessionStore for SqliteStorage {
     fn save(&self, session: Session) -> Result<(), StoreError> {
         self.save_session(&session).map_err(backend)
     }
+
+    fn session_ids(&self, prefix: &str) -> Result<Vec<SessionId>, StoreError> {
+        let mut upper = prefix.to_owned();
+        let successor = loop {
+            match upper.pop() {
+                Some(ch) => {
+                    if let Some(next) = (ch as u32 + 1..=0x10ffff).find_map(char::from_u32) {
+                        upper.push(next);
+                        break Some(upper);
+                    }
+                }
+                None => break None,
+            }
+        };
+        let connection = self.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT id FROM sessions WHERE id >= ?1 AND (?2 IS NULL OR id < ?2) ORDER BY id",
+            )
+            .map_err(backend)?;
+        let ids = statement
+            .query_map(params![prefix, successor], |row| {
+                row.get::<_, String>(0).map(SessionId)
+            })
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?;
+        Ok(ids)
+    }
 }
