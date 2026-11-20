@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use environment::{Environment, ToolCall, ToolSpec};
 use memory::{Kind, Memory};
 use serde::Deserialize;
-use storage::{MemoryStore, Message, ReasoningLevel, SessionStore};
+use storage::{MemoryStore, Message, Meta, ReasoningLevel, SessionStore};
 use tokio::sync::Notify;
 
 use crate::{
@@ -39,11 +39,11 @@ Tools:
 
 Coordinate and talk to the user. Delegate anything touching files, commands, the web or the machine via spawn. Tasks have read, write, edit and bash in the working directory, read-only zoom and date on your memory, and can load skills. Name a skill in the task when it fits.
 
-System-originated messages may start with a self-closing XML tag containing metadata. The user's own words have no tag.
-
 The view is your memory, and its latest word on a thing is the truth. Whenever you need any information, first find its latest mention in the view and zoom until you have it whole, before any other source, and before you act, guess or ask. Never grep or search memories manually; zoom is your only allowed mechanism to navigate the tree. Summaries keep little of tool output, so say in your reply what you learned that will matter later.
 
 Messages the user sends while you work reach you between tool calls. Use tasks to check on tasks when the user asks or before deciding what to do next; never call it in a loop or to wait. Use stop to stop a running task. Tasks run in the background; each report reaches you between tool calls or as a new turn. Never wait for one (no sleep, no polling): go on, or end your turn and tell the user what is running."#;
+
+const INTERFACE_PROMPT: &str = r#"People on interfaces only see what you send. Interface messages have a <message .../> tag with interface, reply and to tokens, author id and name, where, and earlier messages in the thread. Use history to read earlier messages. Send with reply to answer in a thread, creating one if needed; send with to to post plainly in that conversation. You may send any number of messages per turn. Several people and conversations can be active, so pick the right token. Talk like a human teammate. Keep each send under 250 characters; split longer messages. Mention people by user id with mention; find ids with participants. Use history or search when context is missing. Delegate long work to tasks and briefly tell the person you are on it. If no further words are needed, end with exactly NO_UPDATES."#;
 
 pub(crate) const EXTRA: &[ToolSpec] = &[
     ToolSpec { name: "zoom", description: "Open the line id+n of the view into the two lines of n/2 under it; n = 1 gives the message whole. With a task id, give that task's chat as stored, with older parts summarized if compacted. A long text comes in pages from character at, saying where to go on.", input_schema: r#"{"type":"object","properties":{"id":{"oneOf":[{"type":"integer"},{"type":"string"}]},"n":{"type":"integer"},"at":{"type":"integer"}},"required":["id"]}"# },
@@ -111,7 +111,7 @@ impl<T: Environment> Environment for Shared<T> {
 pub(crate) struct State {
     pub agents: std::collections::HashMap<String, tasks::Task>,
     pub reports: std::collections::VecDeque<tasks::Report>,
-    pub steering: Vec<String>,
+    pub steering: Vec<(String, Option<Meta>)>,
     pub tasks: Vec<tokio::task::AbortHandle>,
 }
 type TaskSessions<L, E, S> =
@@ -129,6 +129,7 @@ pub(crate) struct Inner<L, E, S, M, F: Models> {
     pub sessions: TaskSessions<F::Llm, E, S>,
     pub state: Mutex<State>,
     pub notify: Notify,
+    pub interfaces: Option<crate::Interfaces>,
 }
 pub struct ChatHarness<L, E, S, M, F: Models> {
     pub(crate) inner: Arc<Inner<L, E, S, M, F>>,
@@ -231,33 +232,72 @@ where
                     tasks: Vec::new(),
                 }),
                 notify: Notify::new(),
+                interfaces: None,
             }),
             turn: tokio::sync::Mutex::new(()),
         }
     }
 
+    pub fn with_interfaces(mut self, interfaces: crate::Interfaces) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("unshared chat")
+            .interfaces = Some(interfaces);
+        self
+    }
+
     pub fn steer(&self, text: String) {
+        self.steer_message(text, None);
+    }
+
+    pub fn steer_message(&self, text: String, meta: Option<Meta>) {
         self.inner
             .state
             .lock()
             .expect("chat state mutex poisoned")
             .steering
-            .push(text);
+            .push((text, meta));
         self.inner.notify.notify_one();
     }
 
+    pub fn take_steering(&self) -> Vec<(String, Option<Meta>)> {
+        std::mem::take(
+            &mut self
+                .inner
+                .state
+                .lock()
+                .expect("chat state mutex poisoned")
+                .steering,
+        )
+    }
+
+    fn append_user(&self, text: &str, meta: Option<&Meta>) -> Result<String, HarnessError> {
+        let ids = self.inner.memory.append(Kind::User, text, meta)?;
+        Ok(match meta {
+            Some(meta) => format!("{}\n{}", meta.tag(ids[0]), text),
+            None => text.to_owned(),
+        })
+    }
+
     pub async fn run(&self, text: &str) -> Result<String, HarnessError> {
+        self.run_message(text.to_owned(), None).await
+    }
+
+    pub async fn run_message(
+        &self,
+        text: String,
+        meta: Option<Meta>,
+    ) -> Result<String, HarnessError> {
         let _guard = self.turn.lock().await;
         self.inner.memory.settle(self.inner.memory.count()?).await?;
         let view = self.inner.memory.view()?;
-        self.inner.memory.append(Kind::User, text, None)?;
-        let mut answers = vec![self.turn(text, view).await?];
+        let text = self.append_user(&text, meta.as_ref())?;
+        let mut answers = vec![self.turn(&text, view).await?];
         loop {
             let notified = self.inner.notify.notified();
             let (report, steering, running) = {
-                let mut state = self.inner.state.lock().expect("chat state mutex poisoned");
-                let steering = std::mem::take(&mut state.steering);
-                let report = if steering.is_empty() {
+                let state = self.inner.state.lock().expect("chat state mutex poisoned");
+                let steering = state.steering.first().cloned();
+                let report = if steering.is_none() {
                     state.reports.front().cloned()
                 } else {
                     None
@@ -268,11 +308,17 @@ where
                     state.agents.values().any(tasks::Task::is_running),
                 )
             };
-            let had_steering = !steering.is_empty();
-            for text in steering {
+            let had_steering = steering.is_some();
+            if let Some((text, meta)) = steering {
                 self.inner.memory.settle(self.inner.memory.count()?).await?;
                 let view = self.inner.memory.view()?;
-                self.inner.memory.append(Kind::User, &text, None)?;
+                let text = self.append_user(&text, meta.as_ref())?;
+                self.inner
+                    .state
+                    .lock()
+                    .expect("chat state mutex poisoned")
+                    .steering
+                    .remove(0);
                 answers.push(self.turn(&text, view).await?);
             }
             if let Some(report) = report {
@@ -283,7 +329,7 @@ where
                     .append(Kind::Work, &report.text, Some(&report.meta))?;
                 tasks::delivered(&self.inner);
                 answers.push(
-                    self.turn(&format!("{}\n{}", report.meta.tag(), report.text), view)
+                    self.turn(&format!("{}\n{}", report.meta.tag(0), report.text), view)
                         .await?,
                 );
             } else if had_steering {
@@ -294,25 +340,48 @@ where
                 break;
             }
         }
-        Ok(answers.join("\n\n"))
+        Ok(answers
+            .into_iter()
+            .filter(|answer| !answer.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"))
     }
 
     async fn turn(&self, text: &str, view: String) -> Result<String, HarnessError> {
         let skills = self.inner.environment.skill_catalog().await?;
         let system = format!(
-            "{CHAT_PROMPT}\n\n{}",
+            "{CHAT_PROMPT}\n\n{}{}",
+            if self.inner.interfaces.is_some() {
+                format!("{INTERFACE_PROMPT}\n\n")
+            } else {
+                String::new()
+            },
             prompt::build_chat(&self.inner.paths.workspace, &skills)
         );
         let mut messages = vec![Message::User(view), Message::User(text.to_owned())];
-        let tools = EXTRA;
+        let mut tools = EXTRA.to_vec();
+        if self.inner.interfaces.is_some() {
+            tools.push(crate::interface::SEND);
+            tools.extend_from_slice(crate::interface::LOOKUP);
+        }
         loop {
-            let steering = {
-                let mut state = self.inner.state.lock().expect("chat state mutex poisoned");
-                std::mem::take(&mut state.steering)
-            };
-            for text in steering {
-                self.inner.memory.append(Kind::User, &text, None)?;
-                messages.push(Message::User(text));
+            loop {
+                let next = self
+                    .inner
+                    .state
+                    .lock()
+                    .expect("chat state mutex poisoned")
+                    .steering
+                    .first()
+                    .cloned();
+                let Some((text, meta)) = next else { break };
+                messages.push(Message::User(self.append_user(&text, meta.as_ref())?));
+                self.inner
+                    .state
+                    .lock()
+                    .expect("chat state mutex poisoned")
+                    .steering
+                    .remove(0);
             }
             loop {
                 let report = self
@@ -331,7 +400,7 @@ where
                 tasks::delivered(&self.inner);
                 messages.push(Message::User(format!(
                     "{}\n{}",
-                    report.meta.tag(),
+                    report.meta.tag(0),
                     report.text
                 )));
             }
@@ -341,9 +410,15 @@ where
                 .complete(CompletionRequest {
                     system: &system,
                     messages: &messages,
-                    tools,
+                    tools: &tools,
                 })
                 .await?;
+            if self.inner.interfaces.is_some()
+                && response.tool_calls.is_empty()
+                && response.text.trim() == "NO_UPDATES"
+            {
+                return Ok(String::new());
+            }
             if !response.text.is_empty() {
                 self.inner
                     .memory
@@ -414,6 +489,22 @@ where
             "tell" => {
                 let args: Tell = serde_json::from_str(&call.arguments)?;
                 tasks::tell(&self.inner, &args.task, args.text)?
+            }
+            "send" => {
+                self.inner
+                    .interfaces
+                    .as_ref()
+                    .ok_or("interfaces not configured")?
+                    .send(&call.arguments)
+                    .await?
+            }
+            "history" | "search" | "participants" => {
+                self.inner
+                    .interfaces
+                    .as_ref()
+                    .ok_or("interfaces not configured")?
+                    .lookup(&call.name, &call.arguments)
+                    .await?
             }
             _ => return Err(format!("unknown tool: {}", call.name).into()),
         })

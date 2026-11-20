@@ -153,15 +153,23 @@ impl llm::Llm for Model {
     }
 }
 
-pub async fn run(
-    store: Arc<SqliteStorage>,
+type Chat = ChatHarness<Model, LocalEnvironment, Arc<SqliteStorage>, Model, ModelFactory>;
+
+struct Setup {
+    llm: llm_rig::RigLlm,
+    environment: LocalEnvironment,
+    context_window: Option<u32>,
+    summarizer: Option<(Model, Option<u32>)>,
+    compactor: Model,
+    reasoning: ReasoningLevel,
+}
+
+async fn setup(
+    store: &Arc<SqliteStorage>,
     workspace: &Path,
     skills_dir: Option<&Path>,
-    prompt: String,
-    session: String,
     reasoning: Option<ReasoningLevel>,
-    chat: bool,
-) -> Result<()> {
+) -> Result<Setup> {
     let settings = store.settings()?;
     let model = settings
         .default_model
@@ -181,15 +189,16 @@ pub async fn run(
                 model.provider.0, model.model
             )
         })?;
+    let key = api_key(&provider)?;
     let llm = llm_rig::connect(
         &provider,
-        &api_key(&provider)?,
+        &key,
         &stored_model,
         reasoning.unwrap_or(settings.reasoning),
     );
 
     let llm_main = llm;
-    let mut summarizer = if let Some(selected) = settings.compaction_model.clone() {
+    let summarizer = if let Some(selected) = settings.compaction_model.clone() {
         let is_main = selected == model;
         let model = selected;
         let provider = store
@@ -234,25 +243,6 @@ pub async fn run(
         None
     };
 
-    let task_summarizer = summarizer.clone();
-    let compactor = if chat {
-        Some(if let Some((llm, _)) = summarizer.take() {
-            llm
-        } else {
-            Model::Main(llm_rig::connect(
-                &provider,
-                &api_key(&provider)?,
-                &stored_model,
-                settings
-                    .compaction_reasoning
-                    .unwrap_or(reasoning.unwrap_or(settings.reasoning)),
-            ))
-        })
-    } else {
-        None
-    };
-    let mut interrupt = signal(SignalKind::interrupt())?;
-    let mut terminate = signal(SignalKind::terminate())?;
     let workspace = workspace.to_path_buf();
     let environment = LocalEnvironment::new(&workspace, skills_dir.map(Path::to_path_buf))?;
     let manifest = environment.managed_skills().await?;
@@ -284,39 +274,91 @@ pub async fn run(
     for name in environment.apply_skills(put, remove).await? {
         eprintln!("skill {name} skipped: a user-owned skill with this name exists");
     }
-    if let Some(compactor) = compactor {
-        let memory =
-            memory::Memory::open(store.clone(), compactor, memory::MemoryConfig::default())?;
-        let harness = ChatHarness::new(
-            Model::Main(llm_main),
-            environment,
-            store.clone(),
-            memory,
-            EnvironmentPaths { workspace },
-            ModelFactory {
-                store,
-                default_reasoning: reasoning.unwrap_or(settings.reasoning),
-            },
-            task_summarizer,
-        );
+    let compactor = summarizer
+        .as_ref()
+        .map(|(model, _)| model.clone())
+        .unwrap_or_else(|| {
+            Model::Main(llm_rig::connect(
+                &provider,
+                &key,
+                &stored_model,
+                settings
+                    .compaction_reasoning
+                    .unwrap_or(reasoning.unwrap_or(settings.reasoning)),
+            ))
+        });
+    Ok(Setup {
+        llm: llm_main,
+        environment,
+        context_window: stored_model.effective_context(),
+        summarizer,
+        compactor,
+        reasoning: reasoning.unwrap_or(settings.reasoning),
+    })
+}
+
+async fn chat_harness(
+    store: Arc<SqliteStorage>,
+    workspace: &Path,
+    skills_dir: Option<&Path>,
+    reasoning: Option<ReasoningLevel>,
+) -> Result<Chat> {
+    let setup = setup(&store, workspace, skills_dir, reasoning).await?;
+    let memory = memory::Memory::open(
+        store.clone(),
+        setup.compactor,
+        memory::MemoryConfig::default(),
+    )?;
+    Ok(ChatHarness::new(
+        Model::Main(setup.llm),
+        setup.environment,
+        store.clone(),
+        memory,
+        EnvironmentPaths {
+            workspace: workspace.to_path_buf(),
+        },
+        ModelFactory {
+            store,
+            default_reasoning: setup.reasoning,
+        },
+        setup.summarizer,
+    ))
+}
+
+pub async fn run(
+    store: Arc<SqliteStorage>,
+    workspace: &Path,
+    skills_dir: Option<&Path>,
+    prompt: String,
+    session: String,
+    reasoning: Option<ReasoningLevel>,
+    chat: bool,
+) -> Result<()> {
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    if chat {
+        let harness = chat_harness(store, workspace, skills_dir, reasoning).await?;
         let answer: Result<String> = tokio::select! {
             answer = harness.run(&prompt) => answer.map_err(Into::into),
             _ = interrupt.recv() => Err("interrupted".into()),
             _ = terminate.recv() => Err("terminated".into()),
         };
-        drop(harness);
         println!("{}", answer?);
         return Ok(());
     }
+    let setup = setup(&store, workspace, skills_dir, reasoning).await?;
+    let summarizer = setup.summarizer;
     let harness = SessionHarness::new(
-        Model::Main(llm_main),
-        environment,
+        Model::Main(setup.llm),
+        setup.environment,
         store,
-        EnvironmentPaths { workspace },
+        EnvironmentPaths {
+            workspace: workspace.to_path_buf(),
+        },
     )
     .with_config(HarnessConfig {
         compaction: CompactionConfig {
-            context_window: stored_model.effective_context(),
+            context_window: setup.context_window,
             summarizer_window: summarizer.as_ref().and_then(|(_, window)| *window),
             ..CompactionConfig::default()
         },
@@ -336,4 +378,94 @@ pub async fn run(
     drop(harness);
     println!("{}", answer?);
     Ok(())
+}
+
+fn admit(
+    store: &Arc<SqliteStorage>,
+    inbound: interface::Inbound,
+) -> Result<Option<(String, storage::Meta)>> {
+    use storage::InterfaceStore;
+    if !store.allowed_users("discord")?.contains(&inbound.author.id) {
+        return Ok(None);
+    }
+    let dest = if inbound.place.thread.is_some() || inbound.place.dm {
+        inbound.place.clone()
+    } else {
+        storage::Place {
+            channel: inbound.place.channel.clone(),
+            thread: Some(inbound.message.clone()),
+            dm: false,
+        }
+    };
+    let to = store.destination("discord", &dest)?;
+    Ok(Some((
+        inbound.text,
+        storage::Meta::Message {
+            interface: "discord".into(),
+            place: inbound.place,
+            message: inbound.message,
+            author: inbound.author,
+            to,
+            location: inbound.location,
+            earlier: inbound.earlier,
+        },
+    )))
+}
+
+pub async fn serve(
+    store: Arc<SqliteStorage>,
+    workspace: &Path,
+    skills_dir: Option<&Path>,
+    token: String,
+) -> Result<()> {
+    let harness = chat_harness(store.clone(), workspace, skills_dir, None).await?;
+    let discord: Arc<dyn interface::Interface> = Arc::new(interface_discord::Discord::new(token));
+    let harness = harness.with_interfaces(harness::Interfaces::new(
+        vec![discord.clone()],
+        store.clone(),
+    ));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+    let listener = tokio::spawn(async move { discord.listen(tx).await });
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut pending = std::collections::VecDeque::<(String, storage::Meta)>::new();
+    loop {
+        let (text, meta) = if let Some(next) = pending.pop_front() {
+            next
+        } else {
+            let inbound = tokio::select! {
+                value = rx.recv() => match value {
+                    Some(value) => value,
+                    None => return match listener.await? { Err(error) => Err(error.into()), Ok(()) => Err("discord listener stopped".into()) },
+                },
+                _ = interrupt.recv() => { listener.abort(); return Ok(()); },
+                _ = terminate.recv() => { listener.abort(); return Ok(()); },
+            };
+            let Some(next) = admit(&store, inbound)? else {
+                continue;
+            };
+            next
+        };
+        let run = harness.run_message(text, Some(meta));
+        tokio::pin!(run);
+        while let Some((text, meta)) = pending.pop_front() {
+            harness.steer_message(text, Some(meta));
+        }
+        loop {
+            tokio::select! {
+                result = &mut run => { if let Err(error) = result { eprintln!("{error}"); } break; },
+                value = rx.recv() => match value {
+                    Some(inbound) => if let Some((text, meta)) = admit(&store, inbound)? { harness.steer_message(text, Some(meta)); },
+                    None => return match listener.await? { Err(error) => Err(error.into()), Ok(()) => Err("discord listener stopped".into()) },
+                },
+                _ = interrupt.recv() => { listener.abort(); return Ok(()); },
+                _ = terminate.recv() => { listener.abort(); return Ok(()); },
+            }
+        }
+        for (text, meta) in harness.take_steering().into_iter().rev() {
+            if let Some(meta) = meta {
+                pending.push_front((text, meta));
+            }
+        }
+    }
 }

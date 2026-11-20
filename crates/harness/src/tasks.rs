@@ -387,6 +387,9 @@ where
             ..CompactionConfig::default()
         },
     });
+    if let Some(interfaces) = &inner.interfaces {
+        session = session.with_lookup_tools(interfaces.clone());
+    }
     if let Some(summarizer) = &inner.summarizer {
         session = session.with_summarizer(Shared(Arc::clone(&summarizer.0)));
     }

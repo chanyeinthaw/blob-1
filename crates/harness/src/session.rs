@@ -76,6 +76,7 @@ pub trait MemoryTools: Send + Sync {
 pub struct SessionHarness<L, E, S> {
     llm: L,
     memory_tools: Option<Arc<dyn MemoryTools>>,
+    lookup_tools: Option<crate::Interfaces>,
     observer: Option<Arc<dyn Fn(Step) + Send + Sync>>,
     summarizer: Option<L>,
     environment: E,
@@ -95,6 +96,7 @@ where
         Self {
             llm,
             memory_tools: None,
+            lookup_tools: None,
             observer: None,
             summarizer: None,
             environment,
@@ -107,6 +109,11 @@ where
 
     pub fn with_memory_tools(mut self, tools: Arc<dyn MemoryTools>) -> Self {
         self.memory_tools = Some(tools);
+        self
+    }
+
+    pub fn with_lookup_tools(mut self, tools: crate::Interfaces) -> Self {
+        self.lookup_tools = Some(tools);
         self
     }
 
@@ -165,6 +172,10 @@ where
         let mut tools = environment::CATALOG.to_vec();
         if self.memory_tools.is_some() {
             tools.extend_from_slice(&crate::chat::EXTRA[..2]);
+        }
+
+        if self.lookup_tools.is_some() {
+            tools.extend_from_slice(crate::interface::LOOKUP);
         }
 
         if let Some(user_message) = user_message {
@@ -267,28 +278,37 @@ where
                             ),
                             _ => None,
                         });
-                let executed = if let Some(result) = memory_result {
-                    result.map(|content| {
-                        if call.name == "zoom" {
-                            content
-                        } else {
-                            memory::clip_tool_output(&content)
-                        }
-                    })
-                } else {
-                    match ToolInput::parse(&call.name, &call.arguments) {
-                        Ok(input) => self
-                            .environment
-                            .execute(ToolCall {
-                                id: call.id.clone(),
-                                input,
-                            })
+                let executed =
+                    if let Some(result) = memory_result {
+                        result.map(|content| {
+                            if call.name == "zoom" {
+                                content
+                            } else {
+                                memory::clip_tool_output(&content)
+                            }
+                        })
+                    } else if let Some(lookup) = self.lookup_tools.as_ref().filter(|_| {
+                        matches!(call.name.as_str(), "history" | "search" | "participants")
+                    }) {
+                        lookup
+                            .lookup(&call.name, &call.arguments)
                             .await
-                            .map(|result| result.content)
-                            .map_err(|e| e.to_string()),
-                        Err(error) => Err(error.to_string()),
-                    }
-                };
+                            .map(|content| memory::clip_tool_output(&content))
+                            .map_err(|e| e.to_string())
+                    } else {
+                        match ToolInput::parse(&call.name, &call.arguments) {
+                            Ok(input) => self
+                                .environment
+                                .execute(ToolCall {
+                                    id: call.id.clone(),
+                                    input,
+                                })
+                                .await
+                                .map(|result| result.content)
+                                .map_err(|e| e.to_string()),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    };
                 self.observe(Step::Idle);
                 let content = match executed {
                     Ok(result) => result,

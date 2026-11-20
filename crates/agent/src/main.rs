@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use storage::{
-    ConfigStore, ModelRef, Provider, ProviderApi, ProviderId, ReasoningLevel, SkillStore,
+    ConfigStore, InterfaceStore, ModelRef, Provider, ProviderApi, ProviderId, ReasoningLevel,
+    SkillStore,
 };
 use storage_sqlite::SqliteStorage;
 
@@ -27,6 +28,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Serve,
+    Interface {
+        #[command(subcommand)]
+        command: InterfaceCommand,
+    },
     Provider {
         #[command(subcommand)]
         command: ProviderCommand,
@@ -57,6 +63,13 @@ enum Command {
         #[arg(long)]
         reasoning: Option<ReasoningLevel>,
     },
+}
+
+#[derive(Subcommand)]
+enum InterfaceCommand {
+    Allow { interface: String, user_id: String },
+    Disallow { interface: String, user_id: String },
+    List { interface: String },
 }
 
 #[derive(Subcommand)]
@@ -134,9 +147,27 @@ async fn main() -> Result<()> {
         Some(dir) if !dir.is_absolute() => Some(std::env::current_dir()?.join(dir)),
         dir => dir,
     };
-    let store = Arc::new(SqliteStorage::open(data_dir.join("agent.db"))?);
+    let path = data_dir.join("agent.db");
+    let store = Arc::new(if matches!(cli.command, Command::Interface { .. }) {
+        SqliteStorage::open_shared(path)?
+    } else {
+        SqliteStorage::open(path)?
+    });
 
     match cli.command {
+        Command::Interface { command } => interface(&store, command),
+        Command::Serve => {
+            let token =
+                std::env::var("DISCORD_BOT_TOKEN").map_err(|_| "DISCORD_BOT_TOKEN is not set")?;
+            std::fs::create_dir_all(&workspace)?;
+            run::serve(
+                store,
+                &workspace.canonicalize()?,
+                skills_dir.as_deref(),
+                token,
+            )
+            .await
+        }
         Command::Provider { command } => provider(&store, command),
         Command::Models { command } => models(&store, command).await,
         Command::Model { command } => model_command(&store, command),
@@ -389,6 +420,21 @@ fn skill(store: &SqliteStorage, command: SkillCommand) -> Result<()> {
             }
         }
         SkillCommand::Remove { name } => import::remove(store, &name)?,
+    }
+    Ok(())
+}
+
+fn interface(store: &SqliteStorage, command: InterfaceCommand) -> Result<()> {
+    match command {
+        InterfaceCommand::Allow { interface, user_id } => store.allow_user(&interface, &user_id)?,
+        InterfaceCommand::Disallow { interface, user_id } => {
+            store.disallow_user(&interface, &user_id)?;
+        }
+        InterfaceCommand::List { interface } => {
+            for user in store.allowed_users(&interface)? {
+                println!("{user}");
+            }
+        }
     }
     Ok(())
 }

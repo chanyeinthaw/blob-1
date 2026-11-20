@@ -330,10 +330,36 @@ impl MemoryKind {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Place {
+    pub channel: String,
+    pub thread: Option<String>,
+    pub dm: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Person {
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Meta {
-    Report { task: String, status: ReportStatus },
+    Report {
+        task: String,
+        status: ReportStatus,
+    },
+    Message {
+        interface: String,
+        place: Place,
+        message: String,
+        author: Person,
+        to: u64,
+        #[serde(rename = "where")]
+        location: String,
+        earlier: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -356,23 +382,49 @@ impl ReportStatus {
     }
 }
 
+fn attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 impl Meta {
-    pub fn tag(&self) -> String {
+    pub fn tag(&self, i: u64) -> String {
         match self {
-            Self::Report { task, status } => {
-                let task = task
-                    .replace('&', "&amp;")
-                    .replace('<', "&lt;")
-                    .replace('>', "&gt;")
-                    .replace('"', "&quot;");
-                format!("<report task=\"{task}\" status=\"{}\"/>", status.as_str())
-            }
+            Self::Report { task, status } => format!(
+                "<report task=\"{}\" status=\"{}\"/>",
+                attribute(task),
+                status.as_str()
+            ),
+            Self::Message {
+                interface,
+                author,
+                to,
+                location,
+                earlier,
+                ..
+            } => format!(
+                "<message interface=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}/>",
+                attribute(interface),
+                attribute(&author.id),
+                attribute(&author.name),
+                attribute(location),
+                earlier.map_or_else(String::new, |n| format!(" earlier=\"{n}\""))
+            ),
         }
     }
 
     pub fn source(&self) -> String {
         match self {
             Self::Report { task, status } => format!("task {task}, {}", status.as_str()),
+            Self::Message {
+                interface,
+                author,
+                location,
+                ..
+            } => format!("{interface} @{} in {location}", author.name),
         }
     }
 }
@@ -455,5 +507,31 @@ impl<T: MemoryStore + ?Sized> MemoryStore for std::sync::Arc<T> {
     }
     fn view(&self, name: ViewName) -> Result<Option<MemoryView>, StoreError> {
         (**self).view(name)
+    }
+}
+
+pub trait InterfaceStore: Send + Sync {
+    fn destination(&self, interface: &str, place: &Place) -> Result<u64, StoreError>;
+    fn place(&self, id: u64) -> Result<Option<(String, Place)>, StoreError>;
+    fn allowed_users(&self, interface: &str) -> Result<Vec<String>, StoreError>;
+    fn allow_user(&self, interface: &str, user: &str) -> Result<(), StoreError>;
+    fn disallow_user(&self, interface: &str, user: &str) -> Result<bool, StoreError>;
+}
+
+impl<T: InterfaceStore + ?Sized> InterfaceStore for std::sync::Arc<T> {
+    fn destination(&self, interface: &str, place: &Place) -> Result<u64, StoreError> {
+        (**self).destination(interface, place)
+    }
+    fn place(&self, id: u64) -> Result<Option<(String, Place)>, StoreError> {
+        (**self).place(id)
+    }
+    fn allowed_users(&self, interface: &str) -> Result<Vec<String>, StoreError> {
+        (**self).allowed_users(interface)
+    }
+    fn allow_user(&self, interface: &str, user: &str) -> Result<(), StoreError> {
+        (**self).allow_user(interface, user)
+    }
+    fn disallow_user(&self, interface: &str, user: &str) -> Result<bool, StoreError> {
+        (**self).disallow_user(interface, user)
     }
 }

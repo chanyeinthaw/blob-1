@@ -448,7 +448,7 @@ impl<S: MemoryStore + 'static, L: llm::Llm + Send + Sync + 'static> Memory<S, L>
                 m.kind.as_str(),
                 m.meta
                     .as_ref()
-                    .map_or_else(String::new, |meta| format!("{}\n", meta.tag())),
+                    .map_or_else(String::new, |meta| format!("{}\n", meta.tag(id))),
                 if more {
                     format!("\n[more from at={next}]")
                 } else {

@@ -10,6 +10,8 @@ members = [
   "crates/storage-sqlite",
   "crates/environment",
   "crates/environment-local",
+  "crates/interface",
+  "crates/interface-discord",
 ]
 
 [workspace.package]
@@ -25,6 +27,8 @@ rusqlite = { version = "0.43", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 harness = { path = "crates/harness" }
+interface = { path = "crates/interface" }
+interface-discord = { path = "crates/interface-discord" }
 environment-local = { path = "crates/environment-local" }
 llm = { path = "crates/llm" }
 memory = { path = "crates/memory" }
@@ -33,4 +37,7 @@ storage-sqlite = { path = "crates/storage-sqlite" }
 rig-core = "0.46"
 storage = { path = "crates/storage" }
 thiserror = "1"
+twilight-gateway = "0.18"
+twilight-http = "0.18"
+twilight-model = "0.18"
 tokio = { version = "1", features = ["process", "fs", "io-util", "rt", "time", "sync", "macros"] }

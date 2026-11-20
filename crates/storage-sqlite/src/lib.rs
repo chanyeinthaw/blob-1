@@ -6,6 +6,7 @@ use rusqlite::Connection;
 use storage::StoreError;
 
 mod config;
+mod interface;
 mod memory;
 mod session;
 mod skill;
@@ -41,6 +42,9 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE TABLE IF NOT EXISTS skills (name TEXT PRIMARY KEY, description TEXT NOT NULL, hash TEXT NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS skill_files (skill TEXT NOT NULL REFERENCES skills (name) ON DELETE CASCADE, path TEXT NOT NULL, mode INTEGER NOT NULL, content BLOB NOT NULL, PRIMARY KEY (skill, path)) STRICT;
+
+CREATE TABLE IF NOT EXISTS destinations (id INTEGER PRIMARY KEY, interface TEXT NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, dm INTEGER NOT NULL CHECK (dm IN (0,1)), UNIQUE (interface, channel, thread)) STRICT;
+CREATE TABLE IF NOT EXISTS allowed_users (interface TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (interface, user_id)) STRICT;
 
 CREATE TABLE IF NOT EXISTS providers (
     id TEXT PRIMARY KEY,
@@ -83,7 +87,7 @@ INSERT OR IGNORE INTO settings (id) VALUES (1);
 
 pub struct SqliteStorage {
     connection: Mutex<Connection>,
-    _owner: File,
+    _owner: Option<File>,
 }
 
 impl SqliteStorage {
@@ -104,7 +108,18 @@ impl SqliteStorage {
             }
             Err(TryLockError::Error(error)) => return Err(StoreError::Backend(Box::new(error))),
         }
+        Self::connect(path, Some(owner))
+    }
+
+    pub fn open_shared(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::connect(path.as_ref(), None)
+    }
+
+    fn connect(path: &Path, owner: Option<File>) -> Result<Self, StoreError> {
         let connection = Connection::open(path).map_err(backend)?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(backend)?;
         connection
             .pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))
             .map_err(backend)?;
