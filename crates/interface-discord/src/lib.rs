@@ -2,7 +2,8 @@ mod gateway;
 mod render;
 
 use interface::{
-    Fetched, Inbound, Interface, InterfaceError, Lookup, Mark, Outbound, Person, Place, Scope,
+    Attachment, Fetched, Inbound, Interface, InterfaceError, Lookup, Mark, Outbound, Person, Place,
+    Scope,
 };
 use std::collections::HashSet;
 use tokio::sync::mpsc;
@@ -51,12 +52,25 @@ fn person(user: &User) -> Person {
     }
 }
 
+fn attachments(files: &[twilight_model::channel::Attachment]) -> Vec<Attachment> {
+    files
+        .iter()
+        .map(|file| Attachment {
+            name: file.filename.clone(),
+            content_type: file.content_type.clone(),
+            size: file.size,
+            url: file.url.clone(),
+        })
+        .collect()
+}
+
 fn fetched(message: Message) -> Fetched {
     Fetched {
         message: message.id.to_string(),
         author: person(&message.author),
         text: message.content,
         date: message.timestamp.iso_8601().to_string(),
+        attachments: attachments(&message.attachments),
     }
 }
 

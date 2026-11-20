@@ -418,6 +418,7 @@ fn admit(
             location: inbound.location,
             earlier: inbound.earlier,
             quote: inbound.quote,
+            attachments: inbound.attachments,
         },
     )))
 }

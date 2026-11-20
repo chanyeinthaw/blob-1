@@ -1,4 +1,4 @@
-use crate::{backend, person, Discord};
+use crate::{attachments, backend, person, Discord};
 use interface::{Inbound, InterfaceError, Place, Quote};
 use tokio::sync::mpsc;
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, ShardState, StreamExt};
@@ -10,6 +10,7 @@ async fn quote(discord: &Discord, message: &Message) -> Option<Quote> {
             message: quoted.id.to_string(),
             author: person(&quoted.author),
             text: quoted.content.clone(),
+            attachments: attachments(&quoted.attachments),
         });
     }
     let reference = message.reference.as_ref()?;
@@ -22,6 +23,7 @@ async fn quote(discord: &Discord, message: &Message) -> Option<Quote> {
         Ok(quoted) => Some(Quote {
             message: quoted.id.to_string(),
             author: person(&quoted.author),
+            attachments: attachments(&quoted.attachments),
             text: quoted.content,
         }),
         Err(error) => {
@@ -146,6 +148,7 @@ pub async fn listen(discord: &Discord, tx: mpsc::Sender<Inbound>) -> Result<(), 
                     author: person(&message.author),
                     text,
                     quote: quote(discord, &message).await,
+                    attachments: attachments(&message.attachments),
                     location,
                     earlier,
                 };

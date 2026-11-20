@@ -344,14 +344,25 @@ pub struct Person {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub name: String,
+    pub content_type: Option<String>,
+    pub size: u64,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quote {
     pub message: String,
     pub author: Person,
     pub text: String,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum Meta {
     Report {
         task: String,
@@ -377,6 +388,8 @@ pub enum Meta {
         earlier: Option<u32>,
         #[serde(default)]
         quote: Option<Quote>,
+        #[serde(default)]
+        attachments: Vec<Attachment>,
     },
 }
 
@@ -408,6 +421,27 @@ pub fn escape(text: &str) -> String {
 
 pub fn attribute(value: &str) -> String {
     escape(value).replace('"', "&quot;")
+}
+
+pub fn render_attachments(attachments: &[Attachment]) -> String {
+    attachments
+        .iter()
+        .map(|attachment| {
+            let content_type = attachment
+                .content_type
+                .as_ref()
+                .map_or_else(String::new, |value| {
+                    format!(" type=\"{}\"", attribute(value))
+                });
+            format!(
+                "<attachment name=\"{}\"{} size=\"{}\" url=\"{}\"/>\n",
+                attribute(&attachment.name),
+                content_type,
+                attachment.size,
+                attribute(&attachment.url)
+            )
+        })
+        .collect()
 }
 
 pub fn render_input(meta: Option<&Meta>, i: u64, body: &str) -> String {
@@ -442,18 +476,20 @@ impl Meta {
                 location,
                 earlier,
                 quote,
+                attachments,
                 ..
             } => format!(
-                "<message interface=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}>\n{}{body}\n</message>",
+                "<message interface=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}>\n{}{}{body}\n</message>",
                 attribute(interface),
                 attribute(&author.id),
                 attribute(&author.name),
                 attribute(location),
                 earlier.map_or_else(String::new, |n| format!(" earlier=\"{n}\"")),
                 quote.as_ref().map_or_else(String::new, |quote| format!(
-                    "<quote author=\"{}\" author_name=\"{}\" message=\"{}\">\n{}\n</quote>\n",
-                    attribute(&quote.author.id), attribute(&quote.author.name), attribute(&quote.message), escape(&quote.text)
-                ))
+                    "<quote author=\"{}\" author_name=\"{}\" message=\"{}\">\n{}{}\n</quote>\n",
+                    attribute(&quote.author.id), attribute(&quote.author.name), attribute(&quote.message), render_attachments(&quote.attachments), escape(&quote.text)
+                )),
+                render_attachments(attachments)
             ),
         }
     }

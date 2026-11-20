@@ -1,4 +1,4 @@
-pub use storage::{Person, Place, Quote};
+pub use storage::{Attachment, Person, Place, Quote};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
@@ -8,6 +8,7 @@ pub struct Inbound {
     pub author: Person,
     pub text: String,
     pub quote: Option<Quote>,
+    pub attachments: Vec<Attachment>,
     pub location: String,
     pub earlier: Option<u32>,
 }
@@ -41,6 +42,7 @@ pub struct Fetched {
     pub author: Person,
     pub text: String,
     pub date: String,
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Debug, thiserror::Error)]

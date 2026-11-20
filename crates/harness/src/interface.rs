@@ -93,11 +93,12 @@ fn token(value: &str, prefix: char) -> Result<u64, Error> {
 }
 fn element(m: &Fetched) -> String {
     format!(
-        "<message author=\"{}\" author_name=\"{}\" message=\"{}\" date=\"{}\">\n{}\n</message>",
+        "<message author=\"{}\" author_name=\"{}\" message=\"{}\" date=\"{}\">\n{}{}\n</message>",
         storage::attribute(&m.author.id),
         storage::attribute(&m.author.name),
         storage::attribute(&m.message),
         storage::attribute(&m.date),
+        storage::render_attachments(&m.attachments),
         storage::escape(&m.text)
     )
 }
