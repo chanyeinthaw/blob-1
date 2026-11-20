@@ -7,7 +7,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends bash ca-certificates curl git ripgrep \
+    && apt-get install -y --no-install-recommends bash ca-certificates curl file git ripgrep \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/agent /usr/local/bin/agent
 ENV XDG_DATA_HOME=/data
