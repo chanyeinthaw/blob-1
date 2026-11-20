@@ -34,6 +34,20 @@ pub enum Message {
 pub struct Session {
     pub id: SessionId,
     pub messages: Vec<Message>,
+    pub usage: Option<SessionUsage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionUsage {
+    pub tokens: u64,
+    pub boundary: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentChoice {
+    pub provider: String,
+    pub model: String,
+    pub reasoning: String,
 }
 
 impl Session {
@@ -41,6 +55,7 @@ impl Session {
         Self {
             id,
             messages: Vec::new(),
+            usage: None,
         }
     }
 
@@ -59,6 +74,8 @@ pub trait SessionStore: Send + Sync {
     fn load(&self, id: &SessionId) -> Result<Option<Session>, StoreError>;
     fn save(&self, session: Session) -> Result<(), StoreError>;
     fn session_ids(&self, prefix: &str) -> Result<Vec<SessionId>, StoreError>;
+    fn save_agent_choice(&self, name: &str, choice: &AgentChoice) -> Result<(), StoreError>;
+    fn agent_choice(&self, name: &str) -> Result<Option<AgentChoice>, StoreError>;
 }
 
 impl<T: SessionStore + ?Sized> SessionStore for std::sync::Arc<T> {
@@ -72,6 +89,14 @@ impl<T: SessionStore + ?Sized> SessionStore for std::sync::Arc<T> {
 
     fn session_ids(&self, prefix: &str) -> Result<Vec<SessionId>, StoreError> {
         (**self).session_ids(prefix)
+    }
+
+    fn save_agent_choice(&self, name: &str, choice: &AgentChoice) -> Result<(), StoreError> {
+        (**self).save_agent_choice(name, choice)
+    }
+
+    fn agent_choice(&self, name: &str) -> Result<Option<AgentChoice>, StoreError> {
+        (**self).agent_choice(name)
     }
 }
 

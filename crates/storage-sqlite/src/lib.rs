@@ -19,8 +19,12 @@ CREATE TABLE IF NOT EXISTS memory_views (name TEXT PRIMARY KEY CHECK (name IN ('
 CREATE TABLE IF NOT EXISTS memory_view_parts (view TEXT NOT NULL CHECK (view IN ('chat','seen')), start INTEGER NOT NULL, l INTEGER NOT NULL, i INTEGER NOT NULL, PRIMARY KEY (view, start)) STRICT, WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY
+    id TEXT PRIMARY KEY,
+    usage_tokens INTEGER,
+    usage_boundary INTEGER
 ) STRICT;
+
+CREATE TABLE IF NOT EXISTS agent_choices (name TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, reasoning TEXT NOT NULL) STRICT;
 
 CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL REFERENCES sessions (id),

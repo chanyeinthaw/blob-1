@@ -1,6 +1,6 @@
 use rusqlite::{params, types::Type, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use storage::{Message, Session, SessionId, SessionStore, StoreError};
+use storage::{AgentChoice, Message, Session, SessionId, SessionStore, SessionUsage, StoreError};
 
 use crate::{backend, SqliteStorage};
 
@@ -14,13 +14,38 @@ impl SqliteStorage {
     fn load_session(&self, id: &SessionId) -> rusqlite::Result<Option<Session>> {
         let connection = self.lock();
 
-        let exists = connection
-            .query_row("SELECT 1 FROM sessions WHERE id = ?1", [&id.0], |_| Ok(()))
-            .optional()?
-            .is_some();
-        if !exists {
-            return Ok(None);
-        }
+        let usage = connection
+            .query_row(
+                "SELECT usage_tokens, usage_boundary FROM sessions WHERE id = ?1",
+                [&id.0],
+                |row| {
+                    let tokens: Option<i64> = row.get(0)?;
+                    let boundary: Option<i64> = row.get(1)?;
+                    tokens
+                        .zip(boundary)
+                        .map(|(tokens, boundary)| {
+                            Ok(SessionUsage {
+                                tokens: u64::try_from(tokens).map_err(|e| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        0,
+                                        Type::Integer,
+                                        Box::new(e),
+                                    )
+                                })?,
+                                boundary: usize::try_from(boundary).map_err(|e| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        1,
+                                        Type::Integer,
+                                        Box::new(e),
+                                    )
+                                })?,
+                            })
+                        })
+                        .transpose()
+                },
+            )
+            .optional()?;
+        let Some(usage) = usage else { return Ok(None) };
 
         let mut statement = connection.prepare(
             "SELECT role, content, tool_call_id, tool_name, details FROM messages
@@ -73,15 +98,26 @@ impl SqliteStorage {
         Ok(Some(Session {
             id: id.clone(),
             messages,
+            usage,
         }))
     }
 
     fn save_session(&self, session: &Session) -> rusqlite::Result<()> {
         let mut connection = self.lock();
         let transaction = connection.transaction()?;
+        let tokens = session
+            .usage
+            .map(|u| i64::try_from(u.tokens))
+            .transpose()
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let boundary = session
+            .usage
+            .map(|u| i64::try_from(u.boundary))
+            .transpose()
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         transaction.execute(
-            "INSERT OR IGNORE INTO sessions (id) VALUES (?1)",
-            [&session.id.0],
+            "INSERT INTO sessions (id, usage_tokens, usage_boundary) VALUES (?1, ?2, ?3) ON CONFLICT(id) DO UPDATE SET usage_tokens = excluded.usage_tokens, usage_boundary = excluded.usage_boundary",
+            params![session.id.0, tokens, boundary],
         )?;
         transaction.execute(
             "DELETE FROM messages WHERE session_id = ?1",
@@ -136,6 +172,28 @@ impl SqliteStorage {
 }
 
 impl SessionStore for SqliteStorage {
+    fn save_agent_choice(&self, name: &str, choice: &AgentChoice) -> Result<(), StoreError> {
+        self.lock().execute("INSERT INTO agent_choices (name, provider, model, reasoning) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(name) DO UPDATE SET provider=excluded.provider, model=excluded.model, reasoning=excluded.reasoning", params![name, choice.provider, choice.model, choice.reasoning]).map_err(backend)?;
+        Ok(())
+    }
+
+    fn agent_choice(&self, name: &str) -> Result<Option<AgentChoice>, StoreError> {
+        self.lock()
+            .query_row(
+                "SELECT provider, model, reasoning FROM agent_choices WHERE name = ?1",
+                [name],
+                |row| {
+                    Ok(AgentChoice {
+                        provider: row.get(0)?,
+                        model: row.get(1)?,
+                        reasoning: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(backend)
+    }
+
     fn load(&self, id: &SessionId) -> Result<Option<Session>, StoreError> {
         self.load_session(id).map_err(backend)
     }

@@ -99,11 +99,7 @@ impl harness::Models for ModelFactory {
             .default_model
             .ok_or_else(|| harness::HarnessError::Compaction("no default model".into()))?;
         let (provider_id, model_id) = choice.unwrap_or((&default.provider.0, &default.model));
-        let unknown = || {
-            harness::HarnessError::Compaction(format!(
-                "Unknown model {provider_id} {model_id}; call models to see what is available."
-            ))
-        };
+        let unknown = || harness::HarnessError::UnknownModel(format!("{provider_id} {model_id}"));
         let provider = self
             .store
             .providers()?

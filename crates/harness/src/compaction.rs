@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 
 use environment::ToolInput;
-use storage::Message;
+use storage::{Message, SessionUsage};
 
-use crate::{CompletionRequest, HarnessError, Llm, LlmError, Usage};
+use crate::{CompletionRequest, HarnessError, Llm, LlmError};
 
 const SYSTEM: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
 const INITIAL: &str = r#"The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
@@ -97,17 +97,10 @@ fn estimate(message: &Message) -> u64 {
 pub(crate) fn context_tokens(
     system: &str,
     messages: &[Message],
-    usage: Option<(Usage, usize)>,
+    usage: Option<SessionUsage>,
 ) -> u64 {
     match usage {
-        Some((usage, index)) => {
-            let total = if usage.total > 0 {
-                usage.total
-            } else {
-                usage.input + usage.output + usage.cache_read + usage.cache_write
-            };
-            total + messages[index..].iter().map(estimate).sum::<u64>()
-        }
+        Some(usage) => usage.tokens + messages[usage.boundary..].iter().map(estimate).sum::<u64>(),
         None => estimate_text(system) + messages.iter().map(estimate).sum::<u64>(),
     }
 }

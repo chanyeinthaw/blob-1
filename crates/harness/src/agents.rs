@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use environment::Environment;
-use storage::{MemoryStore, Message, Session, SessionId, SessionStore};
+use storage::{AgentChoice, MemoryStore, Message, Session, SessionId, SessionStore};
 
 use crate::{
     chat::{Inner, Models, Shared, SpawnTask},
@@ -81,7 +81,16 @@ where
     for id in stored {
         let name = id.0.strip_prefix("agent:").expect("matching prefix");
         if !state.agents.contains_key(name) {
-            lines.push(format!("{name}  idle  (from an earlier run)"));
+            let choice = inner.store.agent_choice(name)?;
+            let suffix = choice
+                .map(|c| {
+                    format!(
+                        "  provider={} model={} reasoning={}",
+                        c.provider, c.model, c.reasoning
+                    )
+                })
+                .unwrap_or_default();
+            lines.push(format!("{name}  idle  (from an earlier run){suffix}"));
         }
     }
     Ok(if lines.is_empty() {
@@ -213,6 +222,14 @@ where
         let text = format!("{view}\n\nYour task:\n\n{task}");
         let mut initial = Session::new(SessionId::new(format!("agent:{name}")));
         initial.push(Message::User(text));
+        inner.store.save_agent_choice(
+            &name,
+            &AgentChoice {
+                provider: provider.clone(),
+                model: model.clone(),
+                reasoning: reasoning.clone(),
+            },
+        )?;
         inner.store.save(initial)?;
         let now = Instant::now();
         inner
@@ -252,7 +269,7 @@ pub(crate) fn tell<L, E, S, M, F: Models>(
     inner: &Arc<Inner<L, E, S, M, F>>,
     name: &str,
     text: String,
-) -> Result<(), Error>
+) -> Result<String, Error>
 where
     L: Llm + Send + Sync + 'static,
     E: Environment + 'static,
@@ -260,6 +277,7 @@ where
     M: Llm + Send + Sync + 'static,
 {
     let id = SessionId::new(format!("agent:{name}"));
+    let mut fallback = false;
     let mut state = inner.state.lock().expect("chat state mutex poisoned");
     let session = inner
         .sessions
@@ -274,7 +292,21 @@ where
     } else if inner.store.load(&id)?.is_some() {
         let mut selection = None;
         if session.is_none() {
-            let (llm, window, resolved) = inner.models.connect(None, None)?;
+            let choice = inner.store.agent_choice(name)?;
+            let result = match &choice {
+                Some(choice) => inner.models.connect(
+                    Some((&choice.provider, &choice.model)),
+                    Some(choice.reasoning.parse()?),
+                ),
+                None => inner.models.connect(None, None),
+            };
+            let (llm, window, resolved) = match result {
+                Err(HarnessError::UnknownModel(_)) if choice.is_some() => {
+                    fallback = true;
+                    inner.models.connect(None, None)?
+                }
+                other => other?,
+            };
             selection = Some(resolved);
             inner
                 .sessions
@@ -315,7 +347,11 @@ where
     } else {
         return Err(format!("unknown agent: {name}").into());
     }
-    Ok(())
+    Ok(if fallback {
+        format!("Sent to {name}; stored model was unavailable, using the default model.")
+    } else {
+        format!("Sent to {name}")
+    })
 }
 
 fn build_session<L, E, S, M, F: Models>(

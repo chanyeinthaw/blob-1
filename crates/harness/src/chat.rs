@@ -405,8 +405,7 @@ where
             }
             "tell" => {
                 let args: Tell = serde_json::from_str(&call.arguments)?;
-                agents::tell(&self.inner, &args.name, args.text)?;
-                format!("Sent to {}", args.name)
+                agents::tell(&self.inner, &args.name, args.text)?
             }
             _ => {
                 let input = ToolInput::parse(&call.name, &call.arguments)?;

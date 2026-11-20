@@ -4,9 +4,17 @@ use std::{collections::HashMap, sync::Mutex};
 
 use environment::{Environment, ToolCall, ToolInput};
 pub use llm::{CompletionRequest, CompletionResponse, Llm, LlmError, ToolCallRequest, Usage};
-use storage::{Message, Session, SessionId, SessionStore, StoreError};
+use storage::{Message, Session, SessionId, SessionStore, SessionUsage, StoreError};
 
 use crate::{compaction, prompt};
+
+fn usage_tokens(usage: Usage) -> u64 {
+    if usage.total > 0 {
+        usage.total
+    } else {
+        usage.input + usage.output + usage.cache_read + usage.cache_write
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionConfig {
@@ -44,6 +52,8 @@ pub enum HarnessError {
     Environment(#[from] environment::ToolError),
     #[error("{0}")]
     Compaction(String),
+    #[error("Unknown model {0}; call models to see what is available.")]
+    UnknownModel(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,7 +172,6 @@ where
             self.store.save(session.clone())?;
         }
 
-        let mut usage = None;
         let mut overflow_retried = false;
         let mut retrying = false;
         loop {
@@ -170,12 +179,11 @@ where
 
             if !retrying
                 && self.config.compaction.context_window.is_some_and(|window| {
-                    compaction::context_tokens(&system, &session.messages, usage)
+                    compaction::context_tokens(&system, &session.messages, session.usage)
                         > u64::from(window.saturating_sub(self.config.compaction.reserve_tokens))
                 })
-                && self.compact(&mut session, false).await?
             {
-                usage = None;
+                self.compact(&mut session, false).await?;
             }
             retrying = false;
 
@@ -190,7 +198,6 @@ where
                     if self.compact(&mut session, true).await? {
                         overflow_retried = true;
                         retrying = true;
-                        usage = None;
                         continue;
                     }
                     return Err(HarnessError::Compaction(
@@ -206,6 +213,12 @@ where
                 session.push(Message::Assistant(response.text.clone()));
             }
             if response.tool_calls.is_empty() {
+                if let Some(value) = response.usage {
+                    session.usage = Some(SessionUsage {
+                        tokens: usage_tokens(value),
+                        boundary: session.messages.len(),
+                    });
+                }
                 if self.apply_steering(&mut session, id) {
                     self.store.save(session.clone())?;
                     continue;
@@ -222,7 +235,10 @@ where
                 });
             }
             if let Some(value) = response.usage {
-                usage = Some((value, session.messages.len()));
+                session.usage = Some(SessionUsage {
+                    tokens: usage_tokens(value),
+                    boundary: session.messages.len(),
+                });
             }
             for call in response.tool_calls {
                 self.observe(Step::Tool {
@@ -355,6 +371,7 @@ where
             return Ok(false);
         }
         session.messages = messages;
+        session.usage = None;
         self.store.save(session.clone())?;
         Ok(true)
     }
