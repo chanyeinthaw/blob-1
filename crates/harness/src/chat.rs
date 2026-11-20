@@ -38,13 +38,13 @@ Tools:
 
 # Turns
 
-Do the user's tasks yourself, with your tools, following the user's instructions at the end of this prompt: who they are, how their files are organized and how they want work done. Use subagents only when the user asks for them.
+Do the user's tasks yourself, with your tools. Use subagents only when the user asks for them.
 
 The view is your memory, and its latest word on a thing is the truth. Whenever you need any information, first find its latest mention in the view and zoom until you have it whole, before any other source, and before you act, guess or ask. Never grep or search memories manually; zoom is your only allowed mechanism to navigate the tree. Summaries keep little of tool output, so say in your reply what you learned that will matter later.
 
 Messages the user sends while you work reach you between tool calls. Use agents to check on agents when the user asks or before deciding what to do next; never call it in a loop or to wait. Use stop to stop a running agent. Subagents run in the background; each one's report reaches you as a message starting "[Name]", between your tool calls or as a new turn. Never wait for one (no sleep, no polling): go on, or end your turn and tell the user what is running."#;
 
-const EXTRA: &[ToolSpec] = &[
+pub(crate) const EXTRA: &[ToolSpec] = &[
     ToolSpec { name: "zoom", description: "Open the line id+n of the view into the two lines of n/2 under it; n = 1 gives the message whole. With an agent's name as id, give that agent's chat as stored, with older parts summarized if compacted. A long text comes in pages from character at, saying where to go on.", input_schema: r#"{"type":"object","properties":{"id":{"oneOf":[{"type":"integer"},{"type":"string"}]},"n":{"type":"integer"},"at":{"type":"integer"}},"required":["id"]}"# },
     ToolSpec { name: "date", description: "The date and time of message id.", input_schema: r#"{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}"# },
     ToolSpec { name: "models", description: "List the configured providers and models you can give to spawn: provider, model id, context window, supported reasoning levels. Use search to filter.", input_schema: r#"{"type":"object","properties":{"search":{"type":"string"}}}"# },
@@ -146,24 +146,24 @@ impl<L, E, S, M, F: Models> Drop for ChatHarness<L, E, S, M, F> {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum ZoomId {
+pub enum ZoomId {
     Number(u64),
     Name(String),
 }
 #[derive(Deserialize)]
-struct Zoom {
-    id: ZoomId,
+pub(crate) struct Zoom {
+    pub(crate) id: ZoomId,
     #[serde(default = "one")]
-    n: u64,
+    pub(crate) n: u64,
     #[serde(default)]
-    at: usize,
+    pub(crate) at: usize,
 }
 fn one() -> u64 {
     1
 }
 #[derive(Deserialize)]
-struct Date {
-    id: u64,
+pub(crate) struct Date {
+    pub(crate) id: u64,
 }
 #[derive(Deserialize)]
 struct Spawn {
@@ -384,14 +384,11 @@ where
         Ok(match call.name.as_str() {
             "zoom" => {
                 let args: Zoom = serde_json::from_str(&call.arguments)?;
-                match args.id {
-                    ZoomId::Number(id) => self.inner.memory.zoom(id, args.n, args.at)?,
-                    ZoomId::Name(name) => agents::zoom(&self.inner, &name, args.at)?,
-                }
+                crate::MemoryTools::zoom(self.inner.as_ref(), args.id, args.n, args.at)?
             }
             "date" => {
                 let args: Date = serde_json::from_str(&call.arguments)?;
-                self.inner.memory.date(args.id)?
+                crate::MemoryTools::date(self.inner.as_ref(), args.id)?
             }
             "models" => {
                 let args: ModelsArgs = serde_json::from_str(&call.arguments)?;
@@ -423,5 +420,24 @@ where
                     .content
             }
         })
+    }
+}
+
+impl<L, E, S, M, F> crate::MemoryTools for Inner<L, E, S, M, F>
+where
+    L: Send + Sync + 'static,
+    E: Send + Sync + 'static,
+    S: SessionStore + MemoryStore + Clone + 'static,
+    M: Llm + Send + Sync + 'static,
+    F: Models,
+{
+    fn zoom(&self, id: ZoomId, n: u64, at: usize) -> Result<String, HarnessError> {
+        match id {
+            ZoomId::Number(id) => Ok(self.memory.zoom(id, n, at)?),
+            ZoomId::Name(name) => agents::zoom(self, &name, at),
+        }
+    }
+    fn date(&self, id: u64) -> Result<String, HarnessError> {
+        Ok(self.memory.date(id)?)
     }
 }

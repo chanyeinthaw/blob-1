@@ -210,7 +210,7 @@ where
                 break name;
             }
         };
-        let text = format!("{view}\n\nThe <chat> above is the main chat's memory, as context. Your task:\n\n{task}");
+        let text = format!("{view}\n\nYour task:\n\n{task}");
         let mut initial = Session::new(SessionId::new(format!("agent:{name}")));
         initial.push(Message::User(text));
         inner.store.save(initial)?;
@@ -325,8 +325,8 @@ fn build_session<L, E, S, M, F: Models>(
     name: &str,
 ) -> Arc<SessionHarness<Shared<F::Llm>, Shared<E>, S>>
 where
-    L: Send + Sync + 'static,
-    M: Send + Sync + 'static,
+    L: Llm + Send + Sync + 'static,
+    M: Llm + Send + Sync + 'static,
     E: Environment + 'static,
     S: SessionStore + MemoryStore + Clone + 'static,
 {
@@ -338,6 +338,7 @@ where
         inner.store.clone(),
         inner.paths.clone(),
     )
+    .with_memory_tools(Arc::new(AgentMemory(Arc::downgrade(inner))))
     .with_observer(Arc::new(move |step| {
         if let Some(inner) = weak.upgrade() {
             let mut state = inner.state.lock().expect("chat state mutex poisoned");
@@ -514,4 +515,22 @@ where
         page.push_str(&format!("\n[more from at={}]", at + 30_000));
     }
     Ok(page)
+}
+
+struct AgentMemory<L, E, S, M, F: Models>(std::sync::Weak<Inner<L, E, S, M, F>>);
+
+impl<L, E, S, M, F> crate::MemoryTools for AgentMemory<L, E, S, M, F>
+where
+    L: Send + Sync + 'static,
+    E: Send + Sync + 'static,
+    S: SessionStore + MemoryStore + Clone + 'static,
+    M: Llm + Send + Sync + 'static,
+    F: Models,
+{
+    fn zoom(&self, id: crate::chat::ZoomId, n: u64, at: usize) -> Result<String, HarnessError> {
+        self.0.upgrade().expect("chat is alive").zoom(id, n, at)
+    }
+    fn date(&self, id: u64) -> Result<String, HarnessError> {
+        self.0.upgrade().expect("chat is alive").date(id)
+    }
 }

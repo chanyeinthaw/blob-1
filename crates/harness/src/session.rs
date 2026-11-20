@@ -58,8 +58,14 @@ pub enum Step {
     Idle,
 }
 
+pub trait MemoryTools: Send + Sync {
+    fn zoom(&self, id: crate::chat::ZoomId, n: u64, at: usize) -> Result<String, HarnessError>;
+    fn date(&self, id: u64) -> Result<String, HarnessError>;
+}
+
 pub struct SessionHarness<L, E, S> {
     llm: L,
+    memory_tools: Option<Arc<dyn MemoryTools>>,
     observer: Option<Arc<dyn Fn(Step) + Send + Sync>>,
     summarizer: Option<L>,
     environment: E,
@@ -78,6 +84,7 @@ where
     pub fn new(llm: L, environment: E, store: S, paths: EnvironmentPaths) -> Self {
         Self {
             llm,
+            memory_tools: None,
             observer: None,
             summarizer: None,
             environment,
@@ -86,6 +93,11 @@ where
             config: HarnessConfig::default(),
             steering: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn with_memory_tools(mut self, tools: Arc<dyn MemoryTools>) -> Self {
+        self.memory_tools = Some(tools);
+        self
     }
 
     pub fn with_observer(mut self, observer: Arc<dyn Fn(Step) + Send + Sync>) -> Self {
@@ -135,6 +147,15 @@ where
 
         let skills = self.environment.skill_catalog().await?;
         let system = prompt::build(&self.paths.workspace, &skills);
+        let system = if self.memory_tools.is_some() {
+            format!("{}\n\n{}", prompt::SUB_PROMPT, system)
+        } else {
+            system
+        };
+        let mut tools = environment::CATALOG.to_vec();
+        if self.memory_tools.is_some() {
+            tools.extend_from_slice(&crate::chat::EXTRA[..2]);
+        }
 
         if let Some(user_message) = user_message {
             session.push(Message::User(user_message));
@@ -162,7 +183,7 @@ where
             let response = match self.llm.complete(CompletionRequest {
                 system: &system,
                 messages: &session.messages,
-                tools: environment::CATALOG,
+                tools: &tools,
             }).await {
                 Ok(response) => response,
                 Err(LlmError::ContextOverflow(_)) if !overflow_retried => {
@@ -207,20 +228,47 @@ where
                 self.observe(Step::Tool {
                     name: call.name.clone(),
                 });
-                let executed = match ToolInput::parse(&call.name, &call.arguments) {
-                    Ok(input) => {
-                        self.environment
+                let memory_result =
+                    self.memory_tools
+                        .as_ref()
+                        .and_then(|tools| match call.name.as_str() {
+                            "zoom" => Some(
+                                serde_json::from_str::<crate::chat::Zoom>(&call.arguments)
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|args| {
+                                        tools
+                                            .zoom(args.id, args.n, args.at)
+                                            .map_err(|e| e.to_string())
+                                    }),
+                            ),
+                            "date" => Some(
+                                serde_json::from_str::<crate::chat::Date>(&call.arguments)
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|args| {
+                                        tools.date(args.id).map_err(|e| e.to_string())
+                                    }),
+                            ),
+                            _ => None,
+                        });
+                let executed = if let Some(result) = memory_result {
+                    result.map(|content| memory::clip_tool_output(&content))
+                } else {
+                    match ToolInput::parse(&call.name, &call.arguments) {
+                        Ok(input) => self
+                            .environment
                             .execute(ToolCall {
                                 id: call.id.clone(),
                                 input,
                             })
                             .await
+                            .map(|result| result.content)
+                            .map_err(|e| e.to_string()),
+                        Err(error) => Err(error.to_string()),
                     }
-                    Err(error) => Err(error),
                 };
                 self.observe(Step::Idle);
                 let content = match executed {
-                    Ok(result) => result.content,
+                    Ok(result) => result,
                     Err(error) => format!("error: {error}"),
                 };
                 session.push(Message::ToolResult {
