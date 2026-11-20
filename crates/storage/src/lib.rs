@@ -344,6 +344,13 @@ pub struct Person {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Quote {
+    pub message: String,
+    pub author: Person,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Meta {
     Report {
@@ -368,6 +375,8 @@ pub enum Meta {
         #[serde(rename = "where")]
         location: String,
         earlier: Option<u32>,
+        #[serde(default)]
+        quote: Option<Quote>,
     },
 }
 
@@ -432,14 +441,19 @@ impl Meta {
                 to,
                 location,
                 earlier,
+                quote,
                 ..
             } => format!(
-                "<message interface=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}>\n{body}\n</message>",
+                "<message interface=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}>\n{}{body}\n</message>",
                 attribute(interface),
                 attribute(&author.id),
                 attribute(&author.name),
                 attribute(location),
-                earlier.map_or_else(String::new, |n| format!(" earlier=\"{n}\""))
+                earlier.map_or_else(String::new, |n| format!(" earlier=\"{n}\"")),
+                quote.as_ref().map_or_else(String::new, |quote| format!(
+                    "<quote author=\"{}\" author_name=\"{}\" message=\"{}\">\n{}\n</quote>\n",
+                    attribute(&quote.author.id), attribute(&quote.author.name), attribute(&quote.message), escape(&quote.text)
+                ))
             ),
         }
     }

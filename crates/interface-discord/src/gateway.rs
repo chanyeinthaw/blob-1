@@ -1,8 +1,35 @@
 use crate::{backend, person, Discord};
-use interface::{Inbound, InterfaceError, Place};
+use interface::{Inbound, InterfaceError, Place, Quote};
 use tokio::sync::mpsc;
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, ShardState, StreamExt};
-use twilight_model::channel::ChannelType;
+use twilight_model::channel::{ChannelType, Message};
+
+async fn quote(discord: &Discord, message: &Message) -> Option<Quote> {
+    if let Some(quoted) = &message.referenced_message {
+        return Some(Quote {
+            message: quoted.id.to_string(),
+            author: person(&quoted.author),
+            text: quoted.content.clone(),
+        });
+    }
+    let reference = message.reference.as_ref()?;
+    let (channel, id) = (reference.channel_id?, reference.message_id?);
+    let quoted = match discord.http.message(channel, id).await {
+        Ok(response) => response.model().await.map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    match quoted {
+        Ok(quoted) => Some(Quote {
+            message: quoted.id.to_string(),
+            author: person(&quoted.author),
+            text: quoted.content,
+        }),
+        Err(error) => {
+            eprintln!("discord quote: {error}");
+            None
+        }
+    }
+}
 
 pub async fn listen(discord: &Discord, tx: mpsc::Sender<Inbound>) -> Result<(), InterfaceError> {
     let intents = Intents::GUILDS
@@ -118,6 +145,7 @@ pub async fn listen(discord: &Discord, tx: mpsc::Sender<Inbound>) -> Result<(), 
                     message: message.id.to_string(),
                     author: person(&message.author),
                     text,
+                    quote: quote(discord, &message).await,
                     location,
                     earlier,
                 };

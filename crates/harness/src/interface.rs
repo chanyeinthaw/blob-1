@@ -16,6 +16,11 @@ pub const SEND: ToolSpec = ToolSpec {
 };
 pub const LOOKUP: &[ToolSpec] = &[
     ToolSpec {
+        name: "message",
+        description: "Read one message: by link (a message link someone pasted), or by to (d-token) plus message id (ids appear in history/search results); channel: true means the thread's parent channel.",
+        input_schema: r#"{"type":"object","properties":{"link":{"type":"string"},"to":{"type":"string"},"message":{"type":"string"},"channel":{"type":"boolean"}}}"#,
+    },
+    ToolSpec {
         name: "history",
         description: "Read earlier messages of a conversation (to = d-token), oldest first; channel: true reads the thread's parent channel instead. before: a message id to page further back. limit 1-50, default 20.",
         input_schema: r#"{"type":"object","properties":{"to":{"type":"string","description":"d-token of the conversation"},"channel":{"type":"boolean","description":"Use the parent channel instead of the thread"},"before":{"type":"string","description":"Message id to page before"},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":["to"]}"#,
@@ -72,6 +77,8 @@ struct SendArgs {
 }
 #[derive(Deserialize)]
 struct LookupArgs {
+    link: Option<String>,
+    message: Option<String>,
     to: Option<String>,
     interface: Option<String>,
     query: Option<String>,
@@ -366,6 +373,28 @@ impl Interfaces {
             return Err("limit must be between 1 and 50".into());
         }
         match name {
+            "message" => {
+                let (interface, place, message) = match (&args.link, &args.to, &args.message) {
+                    (Some(link), None, None) => {
+                        let (interface, (place, message)) = self
+                            .interfaces
+                            .iter()
+                            .find_map(|interface| {
+                                interface
+                                    .parse_link(link)
+                                    .map(|parsed| (interface.as_ref(), parsed))
+                            })
+                            .ok_or("not a message link")?;
+                        (interface, place, message)
+                    }
+                    (None, Some(to), Some(message)) => {
+                        let (name, place) = self.place(to, args.channel)?;
+                        (self.find(&name)?, place, message.clone())
+                    }
+                    _ => return Err("exactly one of link or to plus message is required".into()),
+                };
+                Ok(element(&interface.message(&place, &message).await?))
+            }
             "history" => {
                 let to = args.to.as_deref().ok_or("to is required")?;
                 let (name, place) = self.place(to, args.channel)?;

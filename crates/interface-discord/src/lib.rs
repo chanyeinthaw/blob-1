@@ -96,6 +96,58 @@ impl Lookup for Discord {
         "discord"
     }
 
+    async fn message(&self, place: &Place, message: &str) -> Result<Fetched, InterfaceError> {
+        let message = self
+            .http
+            .message(channel(place)?, id(message)?)
+            .await
+            .map_err(backend)?
+            .model()
+            .await
+            .map_err(backend)?;
+        Ok(fetched(message))
+    }
+
+    fn parse_link(&self, link: &str) -> Option<(Place, String)> {
+        let link = link.strip_prefix("https://")?;
+        let link = link.split(['?', '#']).next()?;
+        let (host, path) = link.split_once('/')?;
+        if !matches!(
+            host,
+            "discord.com"
+                | "discordapp.com"
+                | "ptb.discord.com"
+                | "canary.discord.com"
+                | "ptb.discordapp.com"
+                | "canary.discordapp.com"
+        ) {
+            return None;
+        }
+        let mut parts = path.split('/');
+        if parts.next()? != "channels" {
+            return None;
+        }
+        let guild = parts.next()?;
+        let channel = parts.next()?;
+        let message = parts.next()?;
+        let numeric = |value: &str| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+        if !(guild == "@me" || numeric(guild))
+            || !numeric(channel)
+            || !numeric(message)
+            || parts.next().is_some()
+        {
+            return None;
+        }
+        Some((
+            Place {
+                channel: channel.into(),
+                thread: None,
+                dm: guild == "@me",
+            },
+            message.into(),
+        ))
+    }
+
     async fn history(
         &self,
         place: &Place,

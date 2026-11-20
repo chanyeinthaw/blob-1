@@ -288,13 +288,13 @@ where
                             }
                         })
                     } else if let Some(lookup) = self.lookup_tools.as_ref().filter(|_| {
-                        matches!(call.name.as_str(), "history" | "search" | "participants")
+                        matches!(call.name.as_str(), "message" | "history" | "search" | "participants")
                     }) {
                         lookup
                             .lookup(&call.name, &call.arguments)
                             .await
                             .map(|content| {
-                                if call.name == "participants" {
+                                if call.name == "participants" || call.name == "message" {
                                     memory::clip_tool_output(&content)
                                 } else {
                                     content

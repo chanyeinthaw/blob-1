@@ -1,4 +1,4 @@
-pub use storage::{Person, Place};
+pub use storage::{Person, Place, Quote};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
@@ -7,6 +7,7 @@ pub struct Inbound {
     pub message: String,
     pub author: Person,
     pub text: String,
+    pub quote: Option<Quote>,
     pub location: String,
     pub earlier: Option<u32>,
 }
@@ -53,6 +54,8 @@ pub enum InterfaceError {
 #[async_trait::async_trait]
 pub trait Lookup: Send + Sync {
     fn name(&self) -> &'static str;
+    async fn message(&self, place: &Place, id: &str) -> Result<Fetched, InterfaceError>;
+    fn parse_link(&self, link: &str) -> Option<(Place, String)>;
     async fn history(
         &self,
         place: &Place,
