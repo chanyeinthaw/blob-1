@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use environment::{Environment, SkillBundle};
 use environment_local::LocalEnvironment;
-use harness::{ChatHarness, CompactionConfig, EnvironmentPaths, HarnessConfig, SessionHarness};
-use storage::{ConfigStore, ReasoningLevel, SessionId, SkillStore};
+use harness::{ChatHarness, EnvironmentPaths};
+use storage::{ConfigStore, ReasoningLevel, SkillStore};
 use storage_sqlite::SqliteStorage;
 use tokio::signal::unix::{signal, SignalKind};
 
@@ -158,10 +158,8 @@ impl llm::Llm for Model {
 type Chat = ChatHarness<Model, LocalEnvironment, Arc<SqliteStorage>, Model, ModelFactory>;
 
 struct Setup {
-    images: bool,
     llm: llm_rig::RigLlm,
     environment: LocalEnvironment,
-    context_window: Option<u32>,
     summarizer: Option<(Model, Option<u32>)>,
     compactor: Model,
     reasoning: ReasoningLevel,
@@ -171,7 +169,6 @@ async fn setup(
     store: &Arc<SqliteStorage>,
     workspace: &Path,
     skills_dir: Option<&Path>,
-    reasoning: Option<ReasoningLevel>,
 ) -> Result<Setup> {
     let settings = store.settings()?;
     let model = settings
@@ -193,12 +190,7 @@ async fn setup(
             )
         })?;
     let key = api_key(&provider)?;
-    let llm = llm_rig::connect(
-        &provider,
-        &key,
-        &stored_model,
-        reasoning.unwrap_or(settings.reasoning),
-    );
+    let llm = llm_rig::connect(&provider, &key, &stored_model, settings.reasoning);
 
     let llm_main = llm;
     let summarizer = if let Some(selected) = settings.compaction_model.clone() {
@@ -223,9 +215,7 @@ async fn setup(
             &provider,
             &api_key(&provider)?,
             &stored,
-            settings
-                .compaction_reasoning
-                .unwrap_or(reasoning.unwrap_or(settings.reasoning)),
+            settings.compaction_reasoning.unwrap_or(settings.reasoning),
         );
         Some((
             if is_main {
@@ -285,19 +275,15 @@ async fn setup(
                 &provider,
                 &key,
                 &stored_model,
-                settings
-                    .compaction_reasoning
-                    .unwrap_or(reasoning.unwrap_or(settings.reasoning)),
+                settings.compaction_reasoning.unwrap_or(settings.reasoning),
             ))
         });
     Ok(Setup {
-        images: stored_model.images,
         llm: llm_main,
         environment,
-        context_window: stored_model.effective_context(),
         summarizer,
         compactor,
-        reasoning: reasoning.unwrap_or(settings.reasoning),
+        reasoning: settings.reasoning,
     })
 }
 
@@ -305,9 +291,8 @@ async fn chat_harness(
     store: Arc<SqliteStorage>,
     workspace: &Path,
     skills_dir: Option<&Path>,
-    reasoning: Option<ReasoningLevel>,
 ) -> Result<Chat> {
-    let setup = setup(&store, workspace, skills_dir, reasoning).await?;
+    let setup = setup(&store, workspace, skills_dir).await?;
     let memory = memory::Memory::open(
         store.clone(),
         setup.compactor,
@@ -329,82 +314,44 @@ async fn chat_harness(
     ))
 }
 
-pub async fn run(
+pub async fn chat(
     store: Arc<SqliteStorage>,
     workspace: &Path,
     skills_dir: Option<&Path>,
     prompt: String,
-    session: String,
-    reasoning: Option<ReasoningLevel>,
-    chat: bool,
 ) -> Result<()> {
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
-    if chat {
-        let harness = chat_harness(store, workspace, skills_dir, reasoning).await?;
-        let mut failure = None;
+    let harness = chat_harness(store, workspace, skills_dir).await?;
+    let mut failure = None;
+    let answer = tokio::select! {
+        answer = harness.run(&prompt) => answer,
+        _ = interrupt.recv() => return Err("interrupted".into()),
+        _ = terminate.recv() => return Err("terminated".into()),
+    };
+    match answer {
+        Ok(answer) => println!("{answer}"),
+        Err(error) => failure = Some(error),
+    }
+    while harness.tasks_running() || harness.has_work() {
         let answer = tokio::select! {
-            answer = harness.run(&prompt) => answer,
+            answer = async {
+                harness.work().await;
+                harness.resume().await
+            } => answer,
             _ = interrupt.recv() => return Err("interrupted".into()),
             _ = terminate.recv() => return Err("terminated".into()),
         };
         match answer {
-            Ok(answer) => println!("{answer}"),
-            Err(error) => failure = Some(error),
-        }
-        while harness.tasks_running() || harness.has_work() {
-            let answer = tokio::select! {
-                answer = async {
-                    harness.work().await;
-                    harness.resume().await
-                } => answer,
-                _ = interrupt.recv() => return Err("interrupted".into()),
-                _ = terminate.recv() => return Err("terminated".into()),
-            };
-            match answer {
-                Ok(answer) if !answer.is_empty() => println!("{answer}"),
-                Ok(_) => {}
-                Err(error) => {
-                    eprintln!("{error}");
-                    failure.get_or_insert(error);
-                }
+            Ok(answer) if !answer.is_empty() => println!("{answer}"),
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("{error}");
+                failure.get_or_insert(error);
             }
         }
-        return failure.map_or(Ok(()), |error| Err(error.into()));
     }
-    let setup = setup(&store, workspace, skills_dir, reasoning).await?;
-    let summarizer = setup.summarizer;
-    let harness = SessionHarness::new(
-        Model::Main(setup.llm),
-        setup.environment,
-        store,
-        EnvironmentPaths {
-            workspace: workspace.to_path_buf(),
-        },
-    )
-    .with_config(HarnessConfig {
-        images: setup.images,
-        compaction: CompactionConfig {
-            context_window: setup.context_window,
-            summarizer_window: summarizer.as_ref().and_then(|(_, window)| *window),
-            ..CompactionConfig::default()
-        },
-    });
-    let harness = if let Some((llm, _)) = summarizer {
-        harness.with_summarizer(llm)
-    } else {
-        harness
-    };
-    let session = SessionId::new(session);
-    let answer: Result<String> = tokio::select! {
-        answer = harness.run(&session, prompt) => answer.map_err(Into::into),
-        _ = interrupt.recv() => Err("interrupted".into()),
-        _ = terminate.recv() => Err("terminated".into()),
-    };
-
-    drop(harness);
-    println!("{}", answer?);
-    Ok(())
+    failure.map_or(Ok(()), |error| Err(error.into()))
 }
 
 fn admit(
@@ -456,7 +403,7 @@ pub async fn serve(
     skills_dir: Option<&Path>,
     token: String,
 ) -> Result<()> {
-    let harness = chat_harness(store.clone(), workspace, skills_dir, None).await?;
+    let harness = chat_harness(store.clone(), workspace, skills_dir).await?;
     let discord: Arc<dyn messenger::Messenger> = Arc::new(messenger_discord::Discord::new(token));
     let messengers = harness::Messengers::new(vec![discord.clone()], store.clone());
     let harness = harness.with_messengers(messengers.clone());

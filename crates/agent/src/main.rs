@@ -56,13 +56,6 @@ enum Command {
     Chat {
         message: String,
     },
-    Run {
-        prompt: String,
-        #[arg(long, default_value = "default")]
-        session: String,
-        #[arg(long)]
-        reasoning: Option<ReasoningLevel>,
-    },
 }
 
 #[derive(Subcommand)]
@@ -190,37 +183,10 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Skill { command } => skill(&store, command),
-        Command::Run {
-            prompt,
-            session,
-            reasoning,
-        } => {
-            std::fs::create_dir_all(&workspace)?;
-            let workspace = workspace.canonicalize()?;
-            run::run(
-                store,
-                &workspace,
-                skills_dir.as_deref(),
-                prompt,
-                session,
-                reasoning,
-                false,
-            )
-            .await
-        }
         Command::Chat { message } => {
             std::fs::create_dir_all(&workspace)?;
             let workspace = workspace.canonicalize()?;
-            run::run(
-                store,
-                &workspace,
-                skills_dir.as_deref(),
-                message,
-                String::new(),
-                None,
-                true,
-            )
-            .await
+            run::chat(store, &workspace, skills_dir.as_deref(), message).await
         }
     }
 }

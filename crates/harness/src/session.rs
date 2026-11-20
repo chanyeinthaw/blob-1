@@ -139,10 +139,6 @@ where
         self
     }
 
-    pub async fn run(&self, id: &SessionId, user_message: String) -> Result<String, HarnessError> {
-        self.run_pending(id, Some(user_message)).await
-    }
-
     pub(crate) async fn run_pending(
         &self,
         id: &SessionId,
