@@ -293,8 +293,9 @@ where
                 if active.as_ref().map(|(config, tz)| (config, *tz))
                     != config.as_ref().map(|config| (config, tz))
                 {
-                    let after = (now - chrono::Duration::minutes(2))
-                        .max(last_slot.unwrap_or(DateTime::<Utc>::MIN_UTC));
+                    let after =
+                        (now - chrono::Duration::minutes(2) - chrono::Duration::nanoseconds(1))
+                            .max(last_slot.unwrap_or(DateTime::<Utc>::MIN_UTC));
                     next_checkin_at = config
                         .as_ref()
                         .and_then(|config| next_checkin(config, tz, after));
