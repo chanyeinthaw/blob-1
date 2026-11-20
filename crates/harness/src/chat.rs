@@ -3,11 +3,11 @@ use std::sync::{Arc, Mutex};
 use environment::{Environment, ToolCall, ToolInput, ToolSpec};
 use memory::{Kind, Memory};
 use serde::Deserialize;
-use storage::{MemoryStore, Message, ReasoningLevel, SessionStore, WorkspaceStore};
+use storage::{MemoryStore, Message, ReasoningLevel, SessionStore};
 use tokio::sync::Notify;
 
 use crate::{
-    agents, prompt, skills, CompletionRequest, EnvironmentPaths, HarnessError, Llm, SessionHarness,
+    agents, prompt, CompletionRequest, EnvironmentPaths, HarnessError, Llm, SessionHarness,
 };
 
 pub const NAME: &str = "Agent";
@@ -84,6 +84,21 @@ impl<T: Llm + Send + Sync> Llm for Shared<T> {
 }
 #[async_trait::async_trait]
 impl<T: Environment> Environment for Shared<T> {
+    async fn managed_skills(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, (String, bool)>, environment::ToolError> {
+        self.0.managed_skills().await
+    }
+    async fn apply_skills(
+        &self,
+        put: Vec<environment::SkillBundle>,
+        remove: Vec<String>,
+    ) -> Result<Vec<String>, environment::ToolError> {
+        self.0.apply_skills(put, remove).await
+    }
+    async fn skill_catalog(&self) -> Result<Vec<environment::SkillEntry>, environment::ToolError> {
+        self.0.skill_catalog().await
+    }
     async fn execute(
         &self,
         call: ToolCall,
@@ -180,7 +195,7 @@ impl<L, E, S, M, F: Models> ChatHarness<L, E, S, M, F>
 where
     L: Llm + Send + Sync + 'static,
     E: Environment + 'static,
-    S: SessionStore + WorkspaceStore + MemoryStore + Clone + 'static,
+    S: SessionStore + MemoryStore + Clone + 'static,
     M: Llm + Send + Sync + 'static,
 {
     pub fn new(
@@ -279,7 +294,7 @@ where
     }
 
     async fn turn(&self, text: &str, report: bool, view: String) -> Result<String, HarnessError> {
-        let skills = skills::catalog(&self.inner.store, &self.inner.paths.skills)?;
+        let skills = self.inner.environment.skill_catalog().await?;
         let system = format!(
             "{CHAT_PROMPT}\n\n{}",
             prompt::build(&self.inner.paths.workspace, &skills)

@@ -1,9 +1,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use environment::{Environment, SkillBundle};
 use environment_local::LocalEnvironment;
 use harness::{ChatHarness, CompactionConfig, EnvironmentPaths, HarnessConfig, SessionHarness};
-use storage::{ConfigStore, ReasoningLevel, SessionId, Tree};
+use storage::{ConfigStore, ReasoningLevel, SessionId, SkillStore};
 use storage_sqlite::SqliteStorage;
 use tokio::signal::unix::{signal, SignalKind};
 
@@ -158,7 +159,8 @@ impl llm::Llm for Model {
 
 pub async fn run(
     store: Arc<SqliteStorage>,
-    mount_dir: &Path,
+    workspace: &Path,
+    skills_dir: Option<&Path>,
     prompt: String,
     session: String,
     reasoning: Option<ReasoningLevel>,
@@ -255,14 +257,37 @@ pub async fn run(
     };
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
-    let workspace = mount_dir.join("workspace");
-    let skills = mount_dir.join("skills");
-    std::fs::create_dir_all(&workspace)?;
-    std::fs::create_dir_all(&skills)?;
-    let workspace_mount = vfs::mount(store.clone(), Tree::Workspace, &workspace, false)?;
-    let skills_mount = vfs::mount(store.clone(), Tree::Skills, &skills, true)?;
-
-    let environment = LocalEnvironment::new(&workspace)?.with_readable(&skills)?;
+    let workspace = workspace.to_path_buf();
+    let environment = LocalEnvironment::new(&workspace, skills_dir.map(Path::to_path_buf))?;
+    let manifest = environment.managed_skills().await?;
+    let skills = store.skills()?;
+    let mut put = Vec::new();
+    for skill in &skills {
+        if !matches!(manifest.get(&skill.name), Some((hash, true)) if hash == &skill.hash) {
+            let files = store
+                .skill_files(&skill.name)?
+                .into_iter()
+                .map(|file| environment::SkillFile {
+                    path: file.path,
+                    mode: file.mode,
+                    content: file.content,
+                })
+                .collect();
+            put.push(SkillBundle {
+                name: skill.name.clone(),
+                hash: skill.hash.clone(),
+                files,
+            });
+        }
+    }
+    let remove = manifest
+        .keys()
+        .filter(|name| !skills.iter().any(|skill| &skill.name == *name))
+        .cloned()
+        .collect();
+    for name in environment.apply_skills(put, remove).await? {
+        eprintln!("skill {name} skipped: a user-owned skill with this name exists");
+    }
     if let Some(compactor) = compactor {
         let memory =
             memory::Memory::open(store.clone(), compactor, memory::MemoryConfig::default())?;
@@ -271,7 +296,7 @@ pub async fn run(
             environment,
             store.clone(),
             memory,
-            EnvironmentPaths { workspace, skills },
+            EnvironmentPaths { workspace },
             ModelFactory {
                 store,
                 default_reasoning: reasoning.unwrap_or(settings.reasoning),
@@ -284,8 +309,6 @@ pub async fn run(
             _ = terminate.recv() => Err("terminated".into()),
         };
         drop(harness);
-        skills_mount.umount_and_join()?;
-        workspace_mount.umount_and_join()?;
         println!("{}", answer?);
         return Ok(());
     }
@@ -293,7 +316,7 @@ pub async fn run(
         Model::Main(llm_main),
         environment,
         store,
-        EnvironmentPaths { workspace, skills },
+        EnvironmentPaths { workspace },
     )
     .with_config(HarnessConfig {
         compaction: CompactionConfig {
@@ -315,8 +338,6 @@ pub async fn run(
     };
 
     drop(harness);
-    skills_mount.umount_and_join()?;
-    workspace_mount.umount_and_join()?;
     println!("{}", answer?);
     Ok(())
 }

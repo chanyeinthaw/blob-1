@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use storage::{ConfigStore, ModelRef, Provider, ProviderApi, ProviderId, ReasoningLevel};
+use storage::{
+    ConfigStore, ModelRef, Provider, ProviderApi, ProviderId, ReasoningLevel, SkillStore,
+};
 use storage_sqlite::SqliteStorage;
 
 mod import;
@@ -15,6 +17,10 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 struct Cli {
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
+    #[arg(long, global = true)]
+    workspace: Option<PathBuf>,
+    #[arg(long, global = true)]
+    skills_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -123,6 +129,11 @@ async fn main() -> Result<()> {
     };
     std::fs::create_dir_all(&data_dir)?;
     let data_dir = data_dir.canonicalize()?;
+    let workspace = cli.workspace.unwrap_or_else(|| data_dir.join("workspace"));
+    let skills_dir = match cli.skills_dir {
+        Some(dir) if !dir.is_absolute() => Some(std::env::current_dir()?.join(dir)),
+        dir => dir,
+    };
     let store = Arc::new(SqliteStorage::open(data_dir.join("agent.db"))?);
 
     match cli.command {
@@ -143,9 +154,12 @@ async fn main() -> Result<()> {
             session,
             reasoning,
         } => {
+            std::fs::create_dir_all(&workspace)?;
+            let workspace = workspace.canonicalize()?;
             run::run(
                 store,
-                &data_dir.join("mnt"),
+                &workspace,
+                skills_dir.as_deref(),
                 prompt,
                 session,
                 reasoning,
@@ -154,9 +168,12 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Chat { message } => {
+            std::fs::create_dir_all(&workspace)?;
+            let workspace = workspace.canonicalize()?;
             run::run(
                 store,
-                &data_dir.join("mnt"),
+                &workspace,
+                skills_dir.as_deref(),
                 message,
                 String::new(),
                 None,
@@ -367,7 +384,7 @@ fn skill(store: &SqliteStorage, command: SkillCommand) -> Result<()> {
             println!("added {name}");
         }
         SkillCommand::List => {
-            for skill in harness::skills::catalog(store, &PathBuf::new())? {
+            for skill in store.skills()? {
                 println!("{}\t{}", skill.name, skill.description);
             }
         }

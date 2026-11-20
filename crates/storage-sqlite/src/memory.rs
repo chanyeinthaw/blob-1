@@ -71,7 +71,7 @@ impl MemoryStore for SqliteStorage {
                                 1,
                                 rusqlite::types::Type::Text,
                                 format!("invalid memory kind: {kind}").into(),
-                            ))
+                            ));
                         }
                     };
                     Ok(MemoryMessage {

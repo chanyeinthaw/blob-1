@@ -1,6 +1,63 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::Deserialize;
+
+pub fn valid_skill_name(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('.') && !name.contains('/')
+}
+
+pub const SKILL_FILE: &str = "SKILL.md";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frontmatter {
+    pub name: String,
+    pub description: String,
+}
+
+pub fn parse_frontmatter(content: &str) -> Option<Frontmatter> {
+    let body = content
+        .strip_prefix("---")?
+        .trim_start_matches(['\r', '\n']);
+    let header = &body[..body.find("\n---")?];
+    let mut name = None;
+    let mut description = None;
+    for line in header.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim().trim_matches(['"', '\'']).to_owned();
+        match key.trim() {
+            "name" => name = Some(value),
+            "description" => description = Some(value),
+            _ => {}
+        }
+    }
+    Some(Frontmatter {
+        name: name.filter(|name| !name.is_empty())?,
+        description: description.filter(|description| !description.is_empty())?,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillFile {
+    pub path: String,
+    pub mode: u32,
+    pub content: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillBundle {
+    pub name: String,
+    pub hash: String,
+    pub files: Vec<SkillFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillEntry {
+    pub name: String,
+    pub description: String,
+    pub location: PathBuf,
+}
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(
@@ -113,5 +170,12 @@ pub enum ToolError {
 
 #[async_trait::async_trait]
 pub trait Environment: Send + Sync {
+    async fn managed_skills(&self) -> Result<BTreeMap<String, (String, bool)>, ToolError>;
+    async fn apply_skills(
+        &self,
+        put: Vec<SkillBundle>,
+        remove: Vec<String>,
+    ) -> Result<Vec<String>, ToolError>;
+    async fn skill_catalog(&self) -> Result<Vec<SkillEntry>, ToolError>;
     async fn execute(&self, call: ToolCall) -> Result<ToolResult, ToolError>;
 }

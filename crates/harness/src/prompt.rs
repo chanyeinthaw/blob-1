@@ -1,10 +1,10 @@
 use std::path::Path;
 
-use crate::skills::Skill;
+use environment::SkillEntry;
 
 pub const BASE_PROMPT: &str = "";
 
-pub fn build(workspace: &Path, skills: &[Skill]) -> String {
+pub fn build(workspace: &Path, skills: &[SkillEntry]) -> String {
     let mut sections = Vec::new();
     if !BASE_PROMPT.is_empty() {
         sections.push(BASE_PROMPT.to_owned());

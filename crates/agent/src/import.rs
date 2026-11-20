@@ -1,70 +1,88 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use harness::skills::{parse_frontmatter, SKILL_FILE};
-use storage::{NodeId, NodeKind, Tree, WorkspaceError, WorkspaceStore};
+use environment::{parse_frontmatter, valid_skill_name, SKILL_FILE};
+use sha2::{Digest, Sha256};
+use storage::{SkillFile, SkillInfo, SkillStore};
 use storage_sqlite::SqliteStorage;
 
 use crate::Result;
 
 pub fn add(store: &SqliteStorage, dir: &Path) -> Result<String> {
-    let content = std::fs::read_to_string(dir.join(SKILL_FILE))?;
-    let frontmatter = parse_frontmatter(&content)
-        .ok_or_else(|| format!("{SKILL_FILE} needs name and description frontmatter"))?;
+    let mut files = Vec::new();
+    collect(dir, dir, &mut files)?;
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let skill = files
+        .iter()
+        .find(|file| file.path == SKILL_FILE)
+        .ok_or("missing SKILL.md")?;
+    let frontmatter = parse_frontmatter(std::str::from_utf8(&skill.content)?)
+        .ok_or("invalid SKILL.md frontmatter")?;
+    if !valid_skill_name(&frontmatter.name) {
+        return Err("invalid skill name".into());
+    }
+    let mut hash = Sha256::new();
+    for file in &files {
+        hash.update(file.path.as_bytes());
+        hash.update(b"\0");
+        hash.update(file.mode.to_string().as_bytes());
+        hash.update(b"\0");
+        hash.update(file.content.len().to_string().as_bytes());
+        hash.update(b"\0");
+        hash.update(&file.content);
+    }
     let name = frontmatter.name;
-    if name == "." || name == ".." || name.contains('/') {
-        return Err(format!("invalid skill name: {name}").into());
-    }
-    let root = store.root(Tree::Skills)?;
-    if store.lookup(root, &name).is_ok() {
-        return Err(format!("skill {name} already exists; remove it first").into());
-    }
-    let target = store.create(root, &name, NodeKind::Directory, 0o755)?;
-    if let Err(error) = copy(store, dir, target.id) {
-        remove_tree(store, root, &name)?;
-        return Err(error);
-    }
+    store.put_skill(
+        SkillInfo {
+            name: name.clone(),
+            description: frontmatter.description,
+            hash: format!("{:x}", hash.finalize()),
+        },
+        files,
+    )?;
     Ok(name)
 }
 
-pub fn remove(store: &SqliteStorage, name: &str) -> Result<()> {
-    let root = store.root(Tree::Skills)?;
-    remove_tree(store, root, name)
-}
-
-fn copy(store: &SqliteStorage, source: &Path, parent: NodeId) -> Result<()> {
-    for entry in std::fs::read_dir(source)? {
+fn collect(root: &Path, dir: &Path, files: &mut Vec<SkillFile>) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(dir)?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "not a directory or unsupported file type: {}",
+            dir.display()
+        )
+        .into());
+    }
+    for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|name| format!("non UTF-8 file name: {name:?}"))?;
-        let file_type = entry.file_type()?;
-        let mode = entry.metadata()?.permissions().mode();
-        if file_type.is_dir() {
-            let node = store.create(parent, &name, NodeKind::Directory, mode)?;
-            copy(store, &entry.path(), node.id)?;
-        } else if file_type.is_file() {
-            let node = store.create(parent, &name, NodeKind::File, mode)?;
-            store.write(node.id, 0, &std::fs::read(entry.path())?)?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
+            collect(root, &path, files)?;
+        } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(root)?
+                .to_str()
+                .ok_or("skill path is not UTF-8")?
+                .to_owned();
+            files.push(SkillFile {
+                path: relative,
+                mode: metadata.permissions().mode() & 0o777,
+                content: std::fs::read(&path)?,
+            });
         } else {
-            return Err(format!("unsupported file type: {}", entry.path().display()).into());
+            return Err(format!(
+                "unsupported file type (including symlinks): {}",
+                path.display()
+            )
+            .into());
         }
     }
     Ok(())
 }
 
-fn remove_tree(store: &SqliteStorage, parent: NodeId, name: &str) -> Result<()> {
-    let node = store.lookup(parent, name).map_err(|error| match error {
-        WorkspaceError::NotFound => format!("no skill named {name}").into(),
-        error => Box::<dyn std::error::Error + Send + Sync>::from(error),
-    })?;
-    if node.kind == NodeKind::Directory {
-        for child in store.children(node.id)? {
-            remove_tree(store, node.id, &child.name)?;
-        }
+pub fn remove(store: &SqliteStorage, name: &str) -> Result<()> {
+    if !store.remove_skill(name)? {
+        return Err(format!("skill not found: {name}").into());
     }
-    store.remove(parent, name, node.kind)?;
-    store.forget(node.id)?;
     Ok(())
 }

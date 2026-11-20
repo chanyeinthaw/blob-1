@@ -1,10 +1,16 @@
+use std::collections::BTreeMap;
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use environment::{Environment, Replacement, ToolCall, ToolError, ToolInput, ToolResult};
+use environment::{
+    parse_frontmatter, valid_skill_name, Environment, Replacement, SkillBundle, SkillEntry,
+    ToolCall, ToolError, ToolInput, ToolResult, SKILL_FILE,
+};
 use tokio::time::{sleep_until, Instant};
 
 const MAX_LINES: usize = 2000;
@@ -28,31 +34,55 @@ impl Drop for ProcessGroup {
 
 pub struct LocalEnvironment {
     root: PathBuf,
-    readable: Vec<PathBuf>,
+    skills_dir: PathBuf,
 }
 
 impl LocalEnvironment {
-    pub fn new(root: impl Into<PathBuf>) -> Result<Self, ToolError> {
+    pub fn new(root: impl Into<PathBuf>, skills_dir: Option<PathBuf>) -> Result<Self, ToolError> {
         let root = root.into().canonicalize().map_err(io_error)?;
-        Ok(Self {
-            root,
-            readable: Vec::new(),
-        })
+        let skills_dir = match skills_dir {
+            Some(dir) => dir,
+            None => PathBuf::from(
+                std::env::var_os("HOME")
+                    .ok_or_else(|| ToolError::Invalid("HOME is not set".into()))?,
+            )
+            .join(".agents/skills"),
+        };
+        std::fs::create_dir_all(&skills_dir).map_err(io_error)?;
+        let skills_dir = skills_dir.canonicalize().map_err(io_error)?;
+        Ok(Self { root, skills_dir })
     }
 
-    pub fn with_readable(mut self, root: impl Into<PathBuf>) -> Result<Self, ToolError> {
-        self.readable
-            .push(root.into().canonicalize().map_err(io_error)?);
-        Ok(self)
+    async fn read_manifest(&self) -> Result<BTreeMap<String, String>, ToolError> {
+        match tokio::fs::read(self.skills_dir.join(".managed.json")).await {
+            Ok(data) => {
+                serde_json::from_slice(&data).map_err(|e| ToolError::Invalid(e.to_string()))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(e) => Err(io_error(e)),
+        }
+    }
+
+    async fn write_manifest(&self, manifest: &BTreeMap<String, String>) -> Result<(), ToolError> {
+        let temp = temporary_path(&self.skills_dir);
+        let data = serde_json::to_vec(manifest).map_err(|e| ToolError::Invalid(e.to_string()))?;
+        tokio::fs::write(&temp, data).await.map_err(io_error)?;
+        tokio::fs::rename(temp, self.skills_dir.join(".managed.json"))
+            .await
+            .map_err(io_error)
     }
 
     fn resolve_readable(&self, path: &Path) -> Result<PathBuf, ToolError> {
-        let resolved = self
-            .root
-            .join(path)
+        let joined = self.root.join(path);
+        let lexical_skill = joined.is_absolute()
+            && !joined
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            && joined.starts_with(&self.skills_dir);
+        let resolved = joined
             .canonicalize()
             .map_err(|_| ToolError::NotFound(path.display().to_string()))?;
-        if self.readable.iter().any(|root| resolved.starts_with(root)) {
+        if lexical_skill || resolved.starts_with(&self.skills_dir) {
             return Ok(resolved);
         }
         self.ensure_inside_root(&resolved)?;
@@ -214,12 +244,12 @@ impl LocalEnvironment {
             Some(secs) if !(secs.is_finite() && secs > 0.0) => {
                 return Err(ToolError::Invalid(
                     "Invalid timeout: must be a finite number of seconds".into(),
-                ))
+                ));
             }
             Some(secs) if secs > MAX_TIMEOUT_SECS => {
                 return Err(ToolError::Invalid(
                     "Invalid timeout: maximum is 2147483.647 seconds".into(),
-                ))
+                ));
             }
             Some(secs) => Some(Instant::now() + Duration::from_secs_f64(secs)),
         };
@@ -365,17 +395,25 @@ fn apply_edits(content: &str, edits: &[Replacement], path: &str) -> Result<Strin
         let first = hits.next().filter(|_| !needle.is_empty());
         let Some((start, _)) = first else {
             return Err(ToolError::Invalid(if multi {
-                format!("Could not find edits[{index}] in {path}. The oldText must match exactly including all whitespace and newlines.")
+                format!(
+                    "Could not find edits[{index}] in {path}. The oldText must match exactly including all whitespace and newlines."
+                )
             } else {
-                format!("Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines.")
+                format!(
+                    "Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines."
+                )
             }));
         };
         let count = 1 + hits.count();
         if count > 1 {
             return Err(ToolError::Invalid(if multi {
-                format!("Found {count} occurrences of edits[{index}] in {path}. Each oldText must be unique. Please provide more context to make it unique.")
+                format!(
+                    "Found {count} occurrences of edits[{index}] in {path}. Each oldText must be unique. Please provide more context to make it unique."
+                )
             } else {
-                format!("Found {count} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique.")
+                format!(
+                    "Found {count} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique."
+                )
             }));
         }
         matches.push(Match {
@@ -406,7 +444,9 @@ fn apply_edits(content: &str, edits: &[Replacement], path: &str) -> Result<Strin
         return Err(ToolError::Invalid(if multi {
             format!("No changes made to {path}. The replacements produced identical content.")
         } else {
-            format!("No changes made to {path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected.")
+            format!(
+                "No changes made to {path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."
+            )
         }));
     }
     Ok(updated)
@@ -600,6 +640,118 @@ fn io_error(error: std::io::Error) -> ToolError {
 
 #[async_trait::async_trait]
 impl Environment for LocalEnvironment {
+    async fn managed_skills(&self) -> Result<BTreeMap<String, (String, bool)>, ToolError> {
+        Ok(self
+            .read_manifest()
+            .await?
+            .into_iter()
+            .map(|(name, hash)| {
+                let installed = self.skills_dir.join(&name).join(SKILL_FILE).is_file();
+                (name, (hash, installed))
+            })
+            .collect())
+    }
+
+    async fn apply_skills(
+        &self,
+        put: Vec<SkillBundle>,
+        remove: Vec<String>,
+    ) -> Result<Vec<String>, ToolError> {
+        for name in &remove {
+            validate_name(name)?;
+        }
+        let mut manifest = self.read_manifest().await?;
+        tokio::fs::create_dir_all(&self.skills_dir)
+            .await
+            .map_err(io_error)?;
+        let mut skipped = Vec::new();
+        for bundle in put {
+            validate_name(&bundle.name)?;
+            for file in &bundle.files {
+                let path = Path::new(&file.path);
+                if file.path.is_empty()
+                    || path.is_absolute()
+                    || path
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                    || !path
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::Normal(_)))
+                {
+                    return Err(ToolError::Invalid(format!(
+                        "Invalid skill file path: {}",
+                        file.path
+                    )));
+                }
+            }
+            let dest = self.skills_dir.join(&bundle.name);
+            if dest.symlink_metadata().is_ok() && !manifest.contains_key(&bundle.name) {
+                skipped.push(bundle.name);
+                continue;
+            }
+            let temp = temporary_path(&self.skills_dir);
+            tokio::fs::create_dir(&temp).await.map_err(io_error)?;
+            for file in bundle.files {
+                let path = temp.join(file.path);
+                tokio::fs::create_dir_all(path.parent().unwrap())
+                    .await
+                    .map_err(io_error)?;
+                tokio::fs::write(&path, file.content)
+                    .await
+                    .map_err(io_error)?;
+                tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(file.mode))
+                    .await
+                    .map_err(io_error)?;
+            }
+            if dest.symlink_metadata().is_ok() {
+                tokio::fs::remove_dir_all(&dest).await.map_err(io_error)?;
+            }
+            tokio::fs::rename(&temp, dest).await.map_err(io_error)?;
+            manifest.insert(bundle.name, bundle.hash);
+            self.write_manifest(&manifest).await?;
+        }
+        for name in remove {
+            if manifest.remove(&name).is_some() {
+                match tokio::fs::remove_dir_all(self.skills_dir.join(name)).await {
+                    Ok(()) => (),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(e) => return Err(io_error(e)),
+                }
+                self.write_manifest(&manifest).await?;
+            }
+        }
+        Ok(skipped)
+    }
+
+    async fn skill_catalog(&self) -> Result<Vec<SkillEntry>, ToolError> {
+        let mut entries = match tokio::fs::read_dir(&self.skills_dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io_error(e)),
+        };
+        let mut skills = Vec::new();
+        while let Some(entry) = entries.next_entry().await.map_err(io_error)? {
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let path = self.skills_dir.join(entry.file_name()).join(SKILL_FILE);
+            let Ok(content) = tokio::fs::read_to_string(&path).await else {
+                continue;
+            };
+            let Some(frontmatter) = parse_frontmatter(&content) else {
+                continue;
+            };
+            let location = path;
+            skills.push(SkillEntry {
+                name: frontmatter.name,
+                description: frontmatter.description,
+                location,
+            });
+        }
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(skills)
+    }
+
     async fn execute(&self, call: ToolCall) -> Result<ToolResult, ToolError> {
         let content = match &call.input {
             ToolInput::Read {
@@ -617,4 +769,20 @@ impl Environment for LocalEnvironment {
             content,
         })
     }
+}
+
+fn validate_name(name: &str) -> Result<(), ToolError> {
+    if !valid_skill_name(name) {
+        return Err(ToolError::Invalid(format!("Invalid skill name: {name}")));
+    }
+    Ok(())
+}
+
+fn temporary_path(root: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    root.join(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
 }

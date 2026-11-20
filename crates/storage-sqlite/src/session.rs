@@ -64,7 +64,7 @@ impl SqliteStorage {
                             0,
                             Type::Text,
                             format!("unknown message role: {role}").into(),
-                        ))
+                        ));
                     }
                 })
             })?

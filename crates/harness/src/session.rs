@@ -4,11 +4,9 @@ use std::{collections::HashMap, sync::Mutex};
 
 use environment::{Environment, ToolCall, ToolInput};
 pub use llm::{CompletionRequest, CompletionResponse, Llm, LlmError, ToolCallRequest, Usage};
-use storage::{
-    Message, Session, SessionId, SessionStore, StoreError, WorkspaceError, WorkspaceStore,
-};
+use storage::{Message, Session, SessionId, SessionStore, StoreError};
 
-use crate::{compaction, prompt, skills};
+use crate::{compaction, prompt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionConfig {
@@ -43,17 +41,14 @@ pub enum HarnessError {
     #[error(transparent)]
     Memory(#[from] memory::MemoryError),
     #[error(transparent)]
-    Workspace(#[from] WorkspaceError),
+    Environment(#[from] environment::ToolError),
     #[error("{0}")]
     Compaction(String),
-    #[error("invalid skill: {0}")]
-    Skill(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvironmentPaths {
     pub workspace: PathBuf,
-    pub skills: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -78,7 +73,7 @@ impl<L, E, S> SessionHarness<L, E, S>
 where
     L: Llm,
     E: Environment,
-    S: SessionStore + WorkspaceStore,
+    S: SessionStore,
 {
     pub fn new(llm: L, environment: E, store: S, paths: EnvironmentPaths) -> Self {
         Self {
@@ -138,7 +133,7 @@ where
             None => Session::new(id.clone()),
         };
 
-        let skills = skills::catalog(&self.store, &self.paths.skills)?;
+        let skills = self.environment.skill_catalog().await?;
         let system = prompt::build(&self.paths.workspace, &skills);
 
         if let Some(user_message) = user_message {

@@ -75,163 +75,42 @@ impl<T: SessionStore + ?Sized> SessionStore for std::sync::Arc<T> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NodeId(pub u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tree {
-    Workspace,
-    Skills,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeKind {
-    File,
-    Directory,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Node {
-    pub id: NodeId,
-    pub kind: NodeKind,
-    pub mode: u32,
-    pub size: u64,
-    pub modified: std::time::SystemTime,
-    pub linked: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DirEntry {
+pub struct SkillInfo {
     pub name: String,
-    pub node: Node,
+    pub description: String,
+    pub hash: String,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum WorkspaceError {
-    #[error("no such file or directory")]
-    NotFound,
-    #[error("file exists")]
-    AlreadyExists,
-    #[error("not a directory")]
-    NotADirectory,
-    #[error("is a directory")]
-    IsADirectory,
-    #[error("directory not empty")]
-    NotEmpty,
-    #[error("invalid argument")]
-    Invalid,
-    #[error("file too large")]
-    TooLarge,
-    #[error(transparent)]
-    Store(#[from] StoreError),
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillFile {
+    pub path: String,
+    pub mode: u32,
+    pub content: Vec<u8>,
 }
 
-pub trait WorkspaceStore: Send + Sync {
-    fn root(&self, tree: Tree) -> Result<NodeId, WorkspaceError>;
-    fn node(&self, id: NodeId) -> Result<Node, WorkspaceError>;
-    fn lookup(&self, parent: NodeId, name: &str) -> Result<Node, WorkspaceError>;
-    fn children(&self, parent: NodeId) -> Result<Vec<DirEntry>, WorkspaceError>;
-    fn create(
-        &self,
-        parent: NodeId,
-        name: &str,
-        kind: NodeKind,
-        mode: u32,
-    ) -> Result<Node, WorkspaceError>;
-    fn read(&self, id: NodeId, offset: u64, size: u32) -> Result<Vec<u8>, WorkspaceError>;
-    fn write(&self, id: NodeId, offset: u64, data: &[u8]) -> Result<Node, WorkspaceError>;
-    fn truncate(&self, id: NodeId, size: u64) -> Result<Node, WorkspaceError>;
-    fn set_mode(&self, id: NodeId, mode: u32) -> Result<Node, WorkspaceError>;
-    fn set_modified(
-        &self,
-        id: NodeId,
-        modified: std::time::SystemTime,
-    ) -> Result<Node, WorkspaceError>;
-    fn remove(&self, parent: NodeId, name: &str, kind: NodeKind) -> Result<(), WorkspaceError>;
-    fn rename(
-        &self,
-        parent: NodeId,
-        name: &str,
-        new_parent: NodeId,
-        new_name: &str,
-        replace: bool,
-    ) -> Result<(), WorkspaceError>;
-    fn forget(&self, id: NodeId) -> Result<(), WorkspaceError>;
-    fn sync(&self) -> Result<(), WorkspaceError>;
+pub trait SkillStore: Send + Sync {
+    fn skills(&self) -> Result<Vec<SkillInfo>, StoreError>;
+    fn skill_files(&self, name: &str) -> Result<Vec<SkillFile>, StoreError>;
+    fn put_skill(&self, info: SkillInfo, files: Vec<SkillFile>) -> Result<(), StoreError>;
+    fn remove_skill(&self, name: &str) -> Result<bool, StoreError>;
 }
 
-impl<T: WorkspaceStore + ?Sized> WorkspaceStore for std::sync::Arc<T> {
-    fn root(&self, tree: Tree) -> Result<NodeId, WorkspaceError> {
-        (**self).root(tree)
+impl<T: SkillStore + ?Sized> SkillStore for std::sync::Arc<T> {
+    fn skills(&self) -> Result<Vec<SkillInfo>, StoreError> {
+        (**self).skills()
     }
 
-    fn node(&self, id: NodeId) -> Result<Node, WorkspaceError> {
-        (**self).node(id)
+    fn skill_files(&self, name: &str) -> Result<Vec<SkillFile>, StoreError> {
+        (**self).skill_files(name)
     }
 
-    fn lookup(&self, parent: NodeId, name: &str) -> Result<Node, WorkspaceError> {
-        (**self).lookup(parent, name)
+    fn put_skill(&self, info: SkillInfo, files: Vec<SkillFile>) -> Result<(), StoreError> {
+        (**self).put_skill(info, files)
     }
 
-    fn children(&self, parent: NodeId) -> Result<Vec<DirEntry>, WorkspaceError> {
-        (**self).children(parent)
-    }
-
-    fn create(
-        &self,
-        parent: NodeId,
-        name: &str,
-        kind: NodeKind,
-        mode: u32,
-    ) -> Result<Node, WorkspaceError> {
-        (**self).create(parent, name, kind, mode)
-    }
-
-    fn read(&self, id: NodeId, offset: u64, size: u32) -> Result<Vec<u8>, WorkspaceError> {
-        (**self).read(id, offset, size)
-    }
-
-    fn write(&self, id: NodeId, offset: u64, data: &[u8]) -> Result<Node, WorkspaceError> {
-        (**self).write(id, offset, data)
-    }
-
-    fn truncate(&self, id: NodeId, size: u64) -> Result<Node, WorkspaceError> {
-        (**self).truncate(id, size)
-    }
-
-    fn set_mode(&self, id: NodeId, mode: u32) -> Result<Node, WorkspaceError> {
-        (**self).set_mode(id, mode)
-    }
-
-    fn set_modified(
-        &self,
-        id: NodeId,
-        modified: std::time::SystemTime,
-    ) -> Result<Node, WorkspaceError> {
-        (**self).set_modified(id, modified)
-    }
-
-    fn remove(&self, parent: NodeId, name: &str, kind: NodeKind) -> Result<(), WorkspaceError> {
-        (**self).remove(parent, name, kind)
-    }
-
-    fn rename(
-        &self,
-        parent: NodeId,
-        name: &str,
-        new_parent: NodeId,
-        new_name: &str,
-        replace: bool,
-    ) -> Result<(), WorkspaceError> {
-        (**self).rename(parent, name, new_parent, new_name, replace)
-    }
-
-    fn forget(&self, id: NodeId) -> Result<(), WorkspaceError> {
-        (**self).forget(id)
-    }
-
-    fn sync(&self) -> Result<(), WorkspaceError> {
-        (**self).sync()
+    fn remove_skill(&self, name: &str) -> Result<bool, StoreError> {
+        (**self).remove_skill(name)
     }
 }
 

@@ -260,7 +260,7 @@ fn provider_from_row(row: &Row) -> rusqlite::Result<Provider> {
                     1,
                     Type::Text,
                     format!("unknown provider api: {api}").into(),
-                ))
+                ));
             }
         },
         base_url: row.get(2)?,

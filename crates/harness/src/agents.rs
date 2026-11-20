@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use environment::Environment;
-use storage::{MemoryStore, Message, Session, SessionId, SessionStore, WorkspaceStore};
+use storage::{MemoryStore, Message, Session, SessionId, SessionStore};
 
 use crate::{
     chat::{Inner, Models, Shared, SpawnTask},
@@ -110,7 +110,7 @@ pub(crate) async fn stop<L, E, S, M, F: Models>(
     reason: Option<String>,
 ) -> Result<String, HarnessError>
 where
-    S: SessionStore + WorkspaceStore,
+    S: SessionStore,
     E: Environment,
 {
     let supervisor = {
@@ -163,7 +163,7 @@ pub(crate) async fn spawn<L, E, S, M, F: Models>(
 where
     L: Llm + Send + Sync + 'static,
     E: Environment + 'static,
-    S: SessionStore + WorkspaceStore + MemoryStore + Clone + 'static,
+    S: SessionStore + MemoryStore + Clone + 'static,
     M: Llm + Send + Sync + 'static,
 {
     let mut prepared = Vec::new();
@@ -256,7 +256,7 @@ pub(crate) fn tell<L, E, S, M, F: Models>(
 where
     L: Llm + Send + Sync + 'static,
     E: Environment + 'static,
-    S: SessionStore + WorkspaceStore + MemoryStore + Clone + 'static,
+    S: SessionStore + MemoryStore + Clone + 'static,
     M: Llm + Send + Sync + 'static,
 {
     let id = SessionId::new(format!("agent:{name}"));
@@ -328,7 +328,7 @@ where
     L: Send + Sync + 'static,
     M: Send + Sync + 'static,
     E: Environment + 'static,
-    S: SessionStore + WorkspaceStore + MemoryStore + Clone + 'static,
+    S: SessionStore + MemoryStore + Clone + 'static,
 {
     let weak = Arc::downgrade(inner);
     let name = name.to_owned();
@@ -375,7 +375,7 @@ fn launch<L, E, S, M, F: Models>(
 ) where
     L: Llm + Send + Sync + 'static,
     E: Environment + 'static,
-    S: SessionStore + WorkspaceStore + MemoryStore + Clone + 'static,
+    S: SessionStore + MemoryStore + Clone + 'static,
     M: Llm + Send + Sync + 'static,
 {
     let inner = Arc::clone(inner);

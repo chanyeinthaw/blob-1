@@ -2,13 +2,13 @@ use std::fs::{File, TryLockError};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use storage::StoreError;
 
 mod config;
 mod memory;
 mod session;
-mod workspace;
+mod skill;
 
 const SCHEMA: &str = "
 PRAGMA foreign_keys = ON;
@@ -35,47 +35,8 @@ CREATE TABLE IF NOT EXISTS messages (
     CHECK ((role = 'summary') = (details IS NOT NULL))
 ) STRICT;
 
-CREATE TABLE IF NOT EXISTS workspace_nodes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL CHECK (kind IN ('file', 'directory')),
-    mode INTEGER NOT NULL,
-    size INTEGER NOT NULL CHECK (size >= 0),
-    modified_ns INTEGER NOT NULL
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS workspace_entries (
-    parent INTEGER NOT NULL REFERENCES workspace_nodes (id),
-    name TEXT NOT NULL,
-    node INTEGER NOT NULL UNIQUE REFERENCES workspace_nodes (id),
-    PRIMARY KEY (parent, name)
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS workspace_chunks (
-    node INTEGER NOT NULL REFERENCES workspace_nodes (id),
-    idx INTEGER NOT NULL,
-    data BLOB NOT NULL,
-    PRIMARY KEY (node, idx)
-) STRICT, WITHOUT ROWID;
-
-CREATE TABLE IF NOT EXISTS workspace_roots (
-    tree TEXT PRIMARY KEY CHECK (tree IN ('workspace', 'skills')),
-    node INTEGER NOT NULL UNIQUE REFERENCES workspace_nodes (id)
-) STRICT;
-
-INSERT OR IGNORE INTO workspace_nodes (id, kind, mode, size, modified_ns)
-VALUES (1, 'directory', 493, 0, 0);
-
-INSERT OR IGNORE INTO workspace_roots (tree, node) VALUES ('workspace', 1);
-
-DELETE FROM workspace_chunks WHERE node IN (
-    SELECT id FROM workspace_nodes
-    WHERE id NOT IN (SELECT node FROM workspace_roots)
-      AND id NOT IN (SELECT node FROM workspace_entries)
-);
-
-DELETE FROM workspace_nodes
-WHERE id NOT IN (SELECT node FROM workspace_roots)
-  AND id NOT IN (SELECT node FROM workspace_entries);
+CREATE TABLE IF NOT EXISTS skills (name TEXT PRIMARY KEY, description TEXT NOT NULL, hash TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS skill_files (skill TEXT NOT NULL REFERENCES skills (name) ON DELETE CASCADE, path TEXT NOT NULL, mode INTEGER NOT NULL, content BLOB NOT NULL, PRIMARY KEY (skill, path)) STRICT;
 
 CREATE TABLE IF NOT EXISTS providers (
     id TEXT PRIMARY KEY,
@@ -135,11 +96,11 @@ impl SqliteStorage {
             Err(TryLockError::WouldBlock) => {
                 return Err(StoreError::Backend(
                     format!("{} is already open in another process", path.display()).into(),
-                ))
+                ));
             }
             Err(TryLockError::Error(error)) => return Err(StoreError::Backend(Box::new(error))),
         }
-        let mut connection = Connection::open(path).map_err(backend)?;
+        let connection = Connection::open(path).map_err(backend)?;
         connection
             .pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))
             .map_err(backend)?;
@@ -147,32 +108,6 @@ impl SqliteStorage {
             .pragma_update(None, "synchronous", "NORMAL")
             .map_err(backend)?;
         connection.execute_batch(SCHEMA).map_err(backend)?;
-        let transaction = connection.transaction().map_err(backend)?;
-        let has_skills = transaction
-            .query_row(
-                "SELECT 1 FROM workspace_roots WHERE tree = 'skills'",
-                [],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(backend)?
-            .is_some();
-        if !has_skills {
-            transaction
-                .execute(
-                    "INSERT INTO workspace_nodes (kind, mode, size, modified_ns)
-                     VALUES ('directory', 493, 0, 0)",
-                    [],
-                )
-                .map_err(backend)?;
-            transaction
-                .execute(
-                    "INSERT INTO workspace_roots (tree, node) VALUES ('skills', ?1)",
-                    [transaction.last_insert_rowid()],
-                )
-                .map_err(backend)?;
-        }
-        transaction.commit().map_err(backend)?;
         Ok(Self {
             connection: Mutex::new(connection),
             _owner: owner,

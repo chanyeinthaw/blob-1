@@ -14,5 +14,6 @@ llm-rig.workspace = true
 storage.workspace = true
 storage-sqlite.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
-vfs.workspace = true
+environment.workspace = true
+sha2 = "0.10"
 memory.workspace = true
