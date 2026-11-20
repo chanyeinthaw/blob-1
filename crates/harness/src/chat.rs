@@ -345,10 +345,48 @@ where
         self.inner.memory.settle(self.inner.memory.count()?).await?;
         let view = self.inner.memory.view()?;
         let text = self.append_user(&text, meta.as_ref())?;
-        let mut answers = vec![self.turn(&text, view).await?];
+        let answer = self.turn(&text, view).await?;
+        self.resume_loop(vec![answer]).await
+    }
+
+    pub async fn resume(&self) -> Result<String, HarnessError> {
+        let _guard = self.turn.lock().await;
+        self.resume_loop(Vec::new()).await
+    }
+
+    pub fn tasks_running(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .expect("chat state mutex poisoned")
+            .agents
+            .values()
+            .any(tasks::Task::is_running)
+    }
+
+    pub fn has_work(&self) -> bool {
+        !self
+            .inner
+            .state
+            .lock()
+            .expect("chat state mutex poisoned")
+            .reports
+            .is_empty()
+    }
+
+    pub async fn work(&self) {
         loop {
             let notified = self.inner.notify.notified();
-            let (report, steering, running) = {
+            if self.has_work() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn resume_loop(&self, mut answers: Vec<String>) -> Result<String, HarnessError> {
+        loop {
+            let (report, steering) = {
                 let state = self.inner.state.lock().expect("chat state mutex poisoned");
                 let steering = state.steering.first().cloned();
                 let report = if steering.is_none() {
@@ -356,11 +394,7 @@ where
                 } else {
                     None
                 };
-                (
-                    report,
-                    steering,
-                    state.agents.values().any(tasks::Task::is_running),
-                )
+                (report, steering)
             };
             let had_steering = steering.is_some();
             if let Some((text, meta)) = steering {
@@ -387,11 +421,7 @@ where
                     self.turn(&report.meta.render(0, &report.text), view)
                         .await?,
                 );
-            } else if had_steering {
-                continue;
-            } else if running {
-                notified.await;
-            } else {
+            } else if !had_steering {
                 break;
             }
         }
@@ -486,7 +516,6 @@ where
                     .front()
                     .cloned();
                 let Some(report) = report else { break };
-                self.inner.memory.settle(self.inner.memory.count()?).await?;
                 self.inner
                     .memory
                     .append(Kind::Work, &report.text, Some(&report.meta))?;

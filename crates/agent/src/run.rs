@@ -342,13 +342,35 @@ pub async fn run(
     let mut terminate = signal(SignalKind::terminate())?;
     if chat {
         let harness = chat_harness(store, workspace, skills_dir, reasoning).await?;
-        let answer: Result<String> = tokio::select! {
-            answer = harness.run(&prompt) => answer.map_err(Into::into),
-            _ = interrupt.recv() => Err("interrupted".into()),
-            _ = terminate.recv() => Err("terminated".into()),
+        let mut failure = None;
+        let answer = tokio::select! {
+            answer = harness.run(&prompt) => answer,
+            _ = interrupt.recv() => return Err("interrupted".into()),
+            _ = terminate.recv() => return Err("terminated".into()),
         };
-        println!("{}", answer?);
-        return Ok(());
+        match answer {
+            Ok(answer) => println!("{answer}"),
+            Err(error) => failure = Some(error),
+        }
+        while harness.tasks_running() || harness.has_work() {
+            let answer = tokio::select! {
+                answer = async {
+                    harness.work().await;
+                    harness.resume().await
+                } => answer,
+                _ = interrupt.recv() => return Err("interrupted".into()),
+                _ = terminate.recv() => return Err("terminated".into()),
+            };
+            match answer {
+                Ok(answer) if !answer.is_empty() => println!("{answer}"),
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("{error}");
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        return failure.map_or(Ok(()), |error| Err(error.into()));
     }
     let setup = setup(&store, workspace, skills_dir, reasoning).await?;
     let summarizer = setup.summarizer;
@@ -444,31 +466,42 @@ pub async fn serve(
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
     let mut pending = std::collections::VecDeque::<(String, storage::Meta)>::new();
+    let mut backoff = false;
     loop {
-        let (text, meta) = if let Some(next) = pending.pop_front() {
-            next
+        let next = if let Some(next) = pending.pop_front() {
+            Some(next)
         } else {
-            let inbound = tokio::select! {
+            tokio::select! {
                 value = rx.recv() => match value {
-                    Some(value) => value,
+                    Some(inbound) => match admit(&store, discord.clone(), &messengers, inbound)? {
+                        Some(next) => Some(next),
+                        None => continue,
+                    },
                     None => return match listener.await? { Err(error) => Err(error.into()), Ok(()) => Err("discord listener stopped".into()) },
                 },
+                _ = async {
+                    if backoff {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                    harness.work().await
+                } => None,
                 _ = interrupt.recv() => { listener.abort(); return Ok(()); },
                 _ = terminate.recv() => { listener.abort(); return Ok(()); },
-            };
-            let Some(next) = admit(&store, discord.clone(), &messengers, inbound)? else {
-                continue;
-            };
-            next
+            }
         };
-        let run = harness.run_message(text, Some(meta));
+        let run = async {
+            match next {
+                Some((text, meta)) => harness.run_message(text, Some(meta)).await,
+                None => harness.resume().await,
+            }
+        };
         tokio::pin!(run);
         while let Some((text, meta)) = pending.pop_front() {
             harness.steer_message(text, Some(meta));
         }
         loop {
             tokio::select! {
-                result = &mut run => { if let Err(error) = result { eprintln!("{error}"); } break; },
+                result = &mut run => { backoff = result.is_err(); if let Err(error) = result { eprintln!("{error}"); } break; },
                 value = rx.recv() => match value {
                     Some(inbound) => if let Some((text, meta)) = admit(&store, discord.clone(), &messengers, inbound)? { harness.steer_message(text, Some(meta)); },
                     None => return match listener.await? { Err(error) => Err(error.into()), Ok(()) => Err("discord listener stopped".into()) },
