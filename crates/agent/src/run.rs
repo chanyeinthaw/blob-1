@@ -4,7 +4,7 @@ use std::sync::Arc;
 use environment::{Environment, SkillBundle};
 use environment_local::LocalEnvironment;
 use harness::{ChatHarness, EnvironmentPaths};
-use storage::{ConfigStore, ReasoningLevel, SkillStore};
+use storage::{ConfigStore, MessengerStore, ReasoningLevel, SkillStore};
 use storage_sqlite::SqliteStorage;
 use tokio::signal::unix::{signal, SignalKind};
 
@@ -360,7 +360,6 @@ fn admit(
     messengers: &harness::Messengers,
     inbound: messenger::Inbound,
 ) -> Result<Option<(String, storage::Meta)>> {
-    use storage::MessengerStore;
     if !store.allowed_users("discord")?.contains(&inbound.author.id) {
         return Ok(None);
     }
@@ -380,7 +379,7 @@ fn admit(
             eprintln!("{error}");
         }
     });
-    messengers.live("discord", to, inbound.place.clone());
+    messengers.live("discord", to, dest);
     Ok(Some((
         inbound.text,
         storage::Meta::Message {
@@ -464,14 +463,9 @@ pub async fn serve(
             }
         }
         for (_, meta) in &pending {
-            if let storage::Meta::Message {
-                messenger,
-                place,
-                to,
-                ..
-            } = meta
-            {
-                messengers.live(messenger, *to, place.clone());
+            if let storage::Meta::Message { messenger, to, .. } = meta {
+                let (_, destination) = store.place(*to)?.ok_or("unknown destination")?;
+                messengers.live(messenger, *to, destination);
             }
         }
     }

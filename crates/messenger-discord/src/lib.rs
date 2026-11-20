@@ -10,13 +10,17 @@ use tokio::sync::mpsc;
 use twilight_http::Client;
 use twilight_model::{
     channel::Message,
-    id::{marker::ChannelMarker, Id},
+    id::{
+        marker::{ChannelMarker, UserMarker},
+        Id,
+    },
     user::User,
 };
 
 pub struct Discord {
     token: String,
     http: Client,
+    user: tokio::sync::OnceCell<Id<UserMarker>>,
 }
 
 fn backend(error: impl std::error::Error + Send + Sync + 'static) -> MessengerError {
@@ -80,7 +84,35 @@ impl Discord {
         Self {
             http: Client::new(token.clone()),
             token,
+            user: tokio::sync::OnceCell::new(),
         }
+    }
+
+    pub async fn ping_state(
+        &self,
+        place: &Place,
+    ) -> Result<(Option<Id<UserMarker>>, Id<UserMarker>, bool), MessengerError> {
+        let user = *self
+            .user
+            .get_or_try_init(|| async {
+                Ok::<_, MessengerError>(
+                    self.http
+                        .current_user()
+                        .await
+                        .map_err(backend)?
+                        .model()
+                        .await
+                        .map_err(backend)?
+                        .id,
+                )
+            })
+            .await?;
+        let latest = self
+            .messages(place, None, 1)
+            .await?
+            .first()
+            .map(|message| message.author.id);
+        Ok((latest, user, latest != Some(user)))
     }
 
     async fn messages(
@@ -294,11 +326,17 @@ impl Messenger for Discord {
         Ok(())
     }
     async fn typing(&self, place: &Place) -> Result<(), MessengerError> {
-        self.http
-            .create_typing_trigger(channel(place)?)
-            .await
-            .map_err(backend)?;
-        Ok(())
+        match self.http.create_typing_trigger(channel(place)?).await {
+            Ok(_) => Ok(()),
+            Err(error) if place.thread.is_some() && render::has_code(&error, 10003) => {
+                self.http
+                    .create_typing_trigger(id(&place.channel)?)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
+            }
+            Err(error) => Err(backend(error)),
+        }
     }
     async fn send(&self, outbound: Outbound) -> Result<(), MessengerError> {
         render::send(self, outbound).await

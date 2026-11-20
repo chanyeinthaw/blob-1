@@ -9,9 +9,11 @@ use storage::{MemoryStore, MessengerStore, Meta};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
+const SEND_LIMIT: usize = 400;
+
 pub const SEND: ToolSpec = ToolSpec {
     name: "send",
-    description: "Send a message to people on a messenger. Give exactly one of reply (an m-token from a <message> tag: answers that message in its thread, starting one if needed) or to (a d-token: posts plainly in that conversation). At most 250 characters; split longer text into several sends. mention: user ids to mention; the system adds the mentions.",
+    description: "Send a message to people on a messenger. Give exactly one of reply (an m-token from a <message> tag: answers that message in its thread, starting one if needed) or to (a d-token: posts plainly in that conversation). At most 400 characters; split longer text into several sends. mention: user ids to mention; the system adds the mentions.",
     input_schema: r#"{"type":"object","properties":{"text":{"type":"string"},"reply":{"type":"string","description":"m-token of the message to reply to"},"to":{"type":"string","description":"d-token of the conversation"},"mention":{"type":"array","items":{"type":"string"},"description":"User ids to mention"}},"required":["text"]}"#,
 };
 pub const LOOKUP: &[ToolSpec] = &[
@@ -260,13 +262,8 @@ impl Messengers {
             .store
             .message(token(reply, 'm')?)?
             .ok_or("unknown message")?;
-        if let Some(Meta::Message {
-            messenger,
-            place,
-            to,
-            ..
-        }) = row.meta
-        {
+        if let Some(Meta::Message { messenger, to, .. }) = row.meta {
+            let (_, place) = self.store.place(to)?.ok_or("unknown destination")?;
             return Ok(Some((to, self.live(&messenger, to, place))));
         }
         Ok(None)
@@ -314,8 +311,11 @@ impl Messengers {
         if args.text.is_empty() {
             return Err("text must not be empty".into());
         }
-        if args.text.chars().count() > 250 {
-            return Err("text exceeds 250 characters; shorten or split into several sends".into());
+        if args.text.chars().count() > SEND_LIMIT {
+            return Err(format!(
+                "text exceeds {SEND_LIMIT} characters; shorten or split into several sends"
+            )
+            .into());
         }
         let (name, target, destination) = match (args.reply, args.to) {
             (Some(reply), None) => {

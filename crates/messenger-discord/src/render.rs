@@ -9,7 +9,7 @@ use twilight_model::{
     },
 };
 
-fn has_code(error: &twilight_http::Error, code: u64) -> bool {
+pub(crate) fn has_code(error: &twilight_http::Error, code: u64) -> bool {
     matches!(error.kind(), ErrorType::Response { error: ApiError::General(error), .. } if error.code == code)
 }
 
@@ -51,6 +51,7 @@ async fn thread(
 pub async fn send(discord: &Discord, outbound: Outbound) -> Result<(), MessengerError> {
     let mut mentions = outbound.mention;
     let mut reference = None;
+    let mut reply_author = None;
     let mut retry = None;
     let destination = match outbound.target {
         Target::Reply {
@@ -61,8 +62,7 @@ pub async fn send(discord: &Discord, outbound: Outbound) -> Result<(), Messenger
             let parent = channel(&place)?;
             let message = id(&message)?;
             thread(discord, parent, message).await?;
-            mentions.retain(|m| m != &author);
-            mentions.insert(0, author);
+            reply_author = Some(author);
             Id::new(message.get())
         }
         Target::Reply { place, message, .. } => {
@@ -76,12 +76,28 @@ pub async fn send(discord: &Discord, outbound: Outbound) -> Result<(), Messenger
             channel(&place)?
         }
     };
+    let place = messenger::Place {
+        channel: destination.to_string(),
+        thread: None,
+        dm: false,
+    };
+    let ping = (reply_author.is_some() || reference.is_some())
+        && discord
+            .ping_state(&place)
+            .await
+            .map(|(_, _, ping)| ping)
+            .unwrap_or(true);
+    if let Some(author) = reply_author.filter(|_| ping) {
+        mentions.retain(|m| m != &author);
+        mentions.insert(0, author);
+    }
+    let replied_user = reference.is_some() && ping;
     let users: Vec<Id<UserMarker>> = mentions.iter().map(|m| id(m)).collect::<Result<_, _>>()?;
     let allowed = AllowedMentions {
         parse: vec![],
         roles: vec![],
         users,
-        replied_user: reference.is_some(),
+        replied_user,
     };
     let prefix: String = mentions.iter().map(|m| format!("<@{m}> ")).collect();
     let text = format!("{prefix}{}", outbound.text);
