@@ -307,10 +307,10 @@ async fn chat_harness(
             workspace: workspace.to_path_buf(),
         },
         ModelFactory {
-            store,
+            store: store.clone(),
             default_reasoning: setup.reasoning,
         },
-        setup.summarizer,
+        (setup.summarizer, store),
     ))
 }
 

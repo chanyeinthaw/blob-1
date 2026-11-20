@@ -3,26 +3,26 @@ use std::sync::{Arc, Mutex};
 use environment::{Environment, ToolCall, ToolSpec};
 use memory::{Kind, Memory};
 use serde::Deserialize;
-use storage::{MemoryStore, Message, Meta, ReasoningLevel, SessionStore};
+use storage::{ConfigStore, MemoryStore, Message, Meta, ReasoningLevel, SessionStore};
 use tokio::sync::Notify;
 
 use crate::{
     prompt, tasks, CompletionRequest, EnvironmentPaths, HarnessError, Llm, SessionHarness,
 };
 
-pub const NAME: &str = "Agent";
-pub const CHAT_PROMPT: &str = r#"You are Agent, an AI agent in a single chat that never ends. Each call to you is a turn: the view below is followed by a new message or a task's report.
+pub const DEFAULT_IDENTITY: &str = "You are Blob-1.";
+pub const CHAT_PROMPT: &str = r#"You are an AI agent in a single chat that never ends. Each call to you is a turn: the view below is followed by a new message or a task's report.
 
 # The view
 
-Agent's memory: the whole chat, oldest first, inside <chat> tags, as one-line summaries:
+Your memory: the whole chat, oldest first, inside <chat> tags, as one-line summaries:
 
   id+n|text   the n messages from id on, summarized (newlines as spaces)
 
 Each message has a kind:
 - user: people's words
-- assistant: Agent's replies
-- tool: Agent's tool calls
+- assistant: your replies
+- tool: your tool calls
 - echo: tool results
 - work: a task's report or reminder; a report arrives as `<report task="id" status="done|failed|stopped|crashed">...</report>`
 - note: memories from before this chat
@@ -187,9 +187,12 @@ pub(crate) struct Inner<L, E, S, M, F: Models> {
     pub messengers: Option<crate::Messengers>,
     pub pulses: Mutex<Vec<(u64, tokio::task::Id)>>,
 }
+type ChatConfig<L> = (Option<(L, Option<u32>)>, Arc<dyn ConfigStore>);
+
 pub struct ChatHarness<L, E, S, M, F: Models> {
     pub(crate) inner: Arc<Inner<L, E, S, M, F>>,
     turn: tokio::sync::Mutex<()>,
+    config: Arc<dyn ConfigStore>,
 }
 
 impl<L, E, S, M, F: Models> Drop for ChatHarness<L, E, S, M, F> {
@@ -264,7 +267,7 @@ where
         memory: Memory<S, M>,
         paths: EnvironmentPaths,
         models: F,
-        summarizer: Option<(F::Llm, Option<u32>)>,
+        (summarizer, config): ChatConfig<F::Llm>,
     ) -> Self {
         let llm = Shared(Arc::new(llm));
         let environment = Shared(Arc::new(environment));
@@ -294,6 +297,7 @@ where
                 pulses: Mutex::new(Vec::new()),
             }),
             turn: tokio::sync::Mutex::new(()),
+            config,
         }
     }
 
@@ -475,8 +479,12 @@ where
 
     async fn turn_loop(&self, text: &str, view: String) -> Result<String, HarnessError> {
         let skills = self.inner.environment.skill_catalog().await?;
+        let identity = self
+            .config
+            .identity()?
+            .unwrap_or_else(|| DEFAULT_IDENTITY.to_owned());
         let system = format!(
-            "{CHAT_PROMPT}\n\n{}{}",
+            "# Identity\n\n{identity}\n\nThis identity is current and overrides anything your memory says about who you are.\n\n{CHAT_PROMPT}\n\n{}{}",
             if self.inner.messengers.is_some() {
                 format!("{MESSENGER_PROMPT}\n\n")
             } else {

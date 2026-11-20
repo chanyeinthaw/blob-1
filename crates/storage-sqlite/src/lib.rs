@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS skill_files (skill TEXT NOT NULL REFERENCES skills (n
 CREATE TABLE IF NOT EXISTS destinations (id INTEGER PRIMARY KEY, messenger TEXT NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, dm INTEGER NOT NULL CHECK (dm IN (0,1)), UNIQUE (messenger, channel, thread)) STRICT;
 CREATE TABLE IF NOT EXISTS allowed_users (messenger TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (messenger, user_id)) STRICT;
 
+CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK (id = 1), text TEXT NOT NULL) STRICT;
+
 CREATE TABLE IF NOT EXISTS providers (
     id TEXT PRIMARY KEY,
     api TEXT NOT NULL CHECK (api IN ('openai-responses', 'openai-completions')),

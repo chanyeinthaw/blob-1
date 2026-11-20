@@ -292,6 +292,8 @@ pub struct Settings {
 }
 
 pub trait ConfigStore: Send + Sync {
+    fn identity(&self) -> Result<Option<String>, StoreError>;
+    fn set_identity(&self, text: Option<&str>) -> Result<(), StoreError>;
     fn providers(&self) -> Result<Vec<Provider>, StoreError>;
     fn save_provider(&self, provider: Provider) -> Result<(), StoreError>;
     fn remove_provider(&self, id: &ProviderId) -> Result<(), StoreError>;

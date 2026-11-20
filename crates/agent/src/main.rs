@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -29,6 +30,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Serve,
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommand,
+    },
     Messenger {
         #[command(subcommand)]
         command: MessengerCommand,
@@ -56,6 +61,13 @@ enum Command {
     Chat {
         message: String,
     },
+}
+
+#[derive(Subcommand)]
+enum IdentityCommand {
+    Show,
+    Set { file: PathBuf },
+    Reset,
 }
 
 #[derive(Subcommand)]
@@ -151,13 +163,19 @@ async fn main() -> Result<()> {
         dir => dir,
     };
     let path = data_dir.join("agent.db");
-    let store = Arc::new(if matches!(cli.command, Command::Messenger { .. }) {
-        SqliteStorage::open_shared(path)?
-    } else {
-        SqliteStorage::open(path)?
-    });
+    let store = Arc::new(
+        if matches!(
+            cli.command,
+            Command::Messenger { .. } | Command::Identity { .. }
+        ) {
+            SqliteStorage::open_shared(path)?
+        } else {
+            SqliteStorage::open(path)?
+        },
+    );
 
     match cli.command {
+        Command::Identity { command } => identity(&store, command),
         Command::Messenger { command } => messenger(&store, command),
         Command::Serve => {
             let token =
@@ -189,6 +207,34 @@ async fn main() -> Result<()> {
             run::chat(store, &workspace, skills_dir.as_deref(), message).await
         }
     }
+}
+
+fn identity(store: &SqliteStorage, command: IdentityCommand) -> Result<()> {
+    match command {
+        IdentityCommand::Show => println!(
+            "{}",
+            store
+                .identity()?
+                .as_deref()
+                .unwrap_or(harness::DEFAULT_IDENTITY)
+        ),
+        IdentityCommand::Set { file } => {
+            let text = if file == std::path::Path::new("-") {
+                let mut text = String::new();
+                std::io::stdin().read_to_string(&mut text)?;
+                text
+            } else {
+                std::fs::read_to_string(file)?
+            };
+            let text = text.trim_end();
+            if text.is_empty() {
+                return Err("identity cannot be empty".into());
+            }
+            store.set_identity(Some(text))?;
+        }
+        IdentityCommand::Reset => store.set_identity(None)?,
+    }
+    Ok(())
 }
 
 fn provider(store: &SqliteStorage, command: ProviderCommand) -> Result<()> {

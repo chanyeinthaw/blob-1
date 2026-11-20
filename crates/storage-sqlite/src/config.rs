@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 
-use rusqlite::{params, types::Type, Connection, Row};
+use rusqlite::{params, types::Type, Connection, OptionalExtension, Row};
 use storage::{
     ConfigStore, DiscoveredModel, Model, ModelRef, Provider, ProviderApi, ProviderId,
     ReasoningLevel, Settings, StoreError,
@@ -9,6 +9,23 @@ use storage::{
 use crate::{backend, SqliteStorage};
 
 impl ConfigStore for SqliteStorage {
+    fn identity(&self) -> Result<Option<String>, StoreError> {
+        self.lock()
+            .query_row("SELECT text FROM identity WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(backend)
+    }
+
+    fn set_identity(&self, text: Option<&str>) -> Result<(), StoreError> {
+        let connection = self.lock();
+        match text {
+            Some(text) => connection.execute("INSERT INTO identity (id, text) VALUES (1, ?1) ON CONFLICT (id) DO UPDATE SET text = excluded.text", [text]),
+            None => connection.execute("DELETE FROM identity WHERE id = 1", []),
+        }.map_err(backend)?;
+        Ok(())
+    }
     fn providers(&self) -> Result<Vec<Provider>, StoreError> {
         let connection = self.lock();
         let mut statement = connection
