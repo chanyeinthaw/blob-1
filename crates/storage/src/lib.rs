@@ -12,6 +12,12 @@ impl SessionId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Image {
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     Summary {
         text: String,
@@ -30,6 +36,7 @@ pub enum Message {
         id: String,
         name: String,
         content: String,
+        images: Vec<Image>,
     },
 }
 
@@ -253,6 +260,7 @@ pub struct DiscoveredModel {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Model {
+    pub images: bool,
     pub provider: ProviderId,
     pub id: String,
     pub context_window: Option<u32>,
@@ -288,6 +296,12 @@ pub trait ConfigStore: Send + Sync {
     fn save_provider(&self, provider: Provider) -> Result<(), StoreError>;
     fn remove_provider(&self, id: &ProviderId) -> Result<(), StoreError>;
     fn models(&self, provider: &ProviderId) -> Result<Vec<Model>, StoreError>;
+    fn set_images(
+        &self,
+        provider: &ProviderId,
+        model: &str,
+        images: bool,
+    ) -> Result<(), StoreError>;
     fn replace_models(
         &self,
         provider: &ProviderId,

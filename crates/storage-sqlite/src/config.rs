@@ -52,7 +52,7 @@ impl ConfigStore for SqliteStorage {
         let connection = self.lock();
         let listed = connection
             .prepare(
-                "SELECT id, context_window, context_limit FROM models
+                "SELECT id, context_window, context_limit, EXISTS(SELECT 1 FROM model_images WHERE model_images.provider = models.provider AND model_images.model = models.id) FROM models
                  WHERE provider = ?1 ORDER BY id",
             )
             .map_err(backend)?
@@ -61,15 +61,17 @@ impl ConfigStore for SqliteStorage {
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<u32>>(1)?,
                     row.get::<_, Option<u32>>(2)?,
+                    row.get::<_, bool>(3)?,
                 ))
             })
             .map_err(backend)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(backend)?;
         let mut models = Vec::with_capacity(listed.len());
-        for (id, context_window, context_limit) in listed {
+        for (id, context_window, context_limit, images) in listed {
             let reasoning_map = reasoning_map(&connection, provider, &id)?;
             models.push(Model {
+                images,
                 provider: provider.clone(),
                 id,
                 context_window,
@@ -78,6 +80,43 @@ impl ConfigStore for SqliteStorage {
             });
         }
         Ok(models)
+    }
+
+    fn set_images(
+        &self,
+        provider: &ProviderId,
+        model: &str,
+        images: bool,
+    ) -> Result<(), StoreError> {
+        let connection = self.lock();
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM models WHERE provider = ?1 AND id = ?2)",
+                params![provider.0, model],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        if !exists {
+            return Err(StoreError::Backend(
+                format!("unknown model {}/{model}", provider.0).into(),
+            ));
+        }
+        if images {
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO model_images (provider, model) VALUES (?1, ?2)",
+                    params![provider.0, model],
+                )
+                .map_err(backend)?;
+        } else {
+            connection
+                .execute(
+                    "DELETE FROM model_images WHERE provider = ?1 AND model = ?2",
+                    params![provider.0, model],
+                )
+                .map_err(backend)?;
+        }
+        Ok(())
     }
 
     fn replace_models(

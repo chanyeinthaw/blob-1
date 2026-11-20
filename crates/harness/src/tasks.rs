@@ -231,12 +231,13 @@ where
             selection.provider,
             selection.model,
             selection.reasoning.as_str().to_owned(),
+            selection.images,
         ));
     }
     inner.memory.settle(inner.memory.count()?).await?;
     let view = inner.memory.view()?;
     let mut names = Vec::new();
-    for (task, for_message, llm, window, provider, model, reasoning) in prepared {
+    for (task, for_message, llm, window, provider, model, reasoning, images) in prepared {
         let text = format!("{view}\n\nYour task:\n\n{task}");
         let choice = TaskChoice {
             provider: provider.clone(),
@@ -280,7 +281,7 @@ where
                     run_id: 1,
                 },
             );
-        let session = build_session(inner, llm, window, &name);
+        let session = build_session(inner, llm, window, &name, images);
         inner
             .sessions
             .lock()
@@ -334,12 +335,16 @@ where
                 }
                 other => other?,
             };
+            let images = resolved.images;
             selection = Some(resolved);
             inner
                 .sessions
                 .lock()
                 .expect("sessions mutex poisoned")
-                .insert(name.to_owned(), build_session(inner, llm, window, name));
+                .insert(
+                    name.to_owned(),
+                    build_session(inner, llm, window, name, images),
+                );
         }
         let now = Instant::now();
         let agent = state.agents.entry(name.to_owned()).or_insert_with(|| Task {
@@ -388,6 +393,7 @@ fn build_session<L, E, S, M, F: Models>(
     llm: F::Llm,
     window: Option<u32>,
     name: &str,
+    images: bool,
 ) -> Arc<SessionHarness<Shared<F::Llm>, Shared<E>, S>>
 where
     L: Llm + Send + Sync + 'static,
@@ -418,6 +424,7 @@ where
         }
     }))
     .with_config(HarnessConfig {
+        images,
         compaction: CompactionConfig {
             context_window: window,
             summarizer_window: if inner.summarizer.is_some() {

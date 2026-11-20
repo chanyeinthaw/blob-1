@@ -37,7 +37,7 @@ impl harness::Models for ModelFactory {
                 ),
                 None => "compaction: default".into(),
             },
-            "provider  model  context  reasoning".into(),
+            "provider  model  context  reasoning  input".into(),
         ];
         let search = search.unwrap_or("").to_lowercase();
         for provider in self.store.providers()? {
@@ -77,11 +77,12 @@ impl harness::Models for ModelFactory {
                     }
                 };
                 lines.push(format!(
-                    "{}  {}  {}  {}",
+                    "{}  {}  {}  {}  {}",
                     provider.id.0,
                     model.id,
                     context,
-                    if levels.is_empty() { "-" } else { &levels }
+                    if levels.is_empty() { "-" } else { &levels },
+                    if model.images { "image" } else { "text" }
                 ));
             }
         }
@@ -126,6 +127,7 @@ impl harness::Models for ModelFactory {
             )),
             model.effective_context(),
             harness::ModelSelection {
+                images: model.images,
                 provider: provider_id.to_owned(),
                 model: model_id.to_owned(),
                 reasoning: reasoning.unwrap_or(self.default_reasoning),
@@ -156,6 +158,7 @@ impl llm::Llm for Model {
 type Chat = ChatHarness<Model, LocalEnvironment, Arc<SqliteStorage>, Model, ModelFactory>;
 
 struct Setup {
+    images: bool,
     llm: llm_rig::RigLlm,
     environment: LocalEnvironment,
     context_window: Option<u32>,
@@ -288,6 +291,7 @@ async fn setup(
             ))
         });
     Ok(Setup {
+        images: stored_model.images,
         llm: llm_main,
         environment,
         context_window: stored_model.effective_context(),
@@ -357,6 +361,7 @@ pub async fn run(
         },
     )
     .with_config(HarnessConfig {
+        images: setup.images,
         compaction: CompactionConfig {
             context_window: setup.context_window,
             summarizer_window: summarizer.as_ref().and_then(|(_, window)| *window),

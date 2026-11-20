@@ -103,6 +103,10 @@ enum ModelsCommand {
 
 #[derive(Subcommand)]
 enum ModelCommand {
+    Input {
+        model: String,
+        input: InputKind,
+    },
     Set {
         model: String,
     },
@@ -119,6 +123,12 @@ enum ModelCommand {
         model: String,
         tokens: String,
     },
+}
+
+#[derive(Clone, clap::ValueEnum)]
+enum InputKind {
+    Text,
+    Image,
 }
 
 #[derive(Subcommand)]
@@ -324,8 +334,9 @@ async fn models(store: &SqliteStorage, command: ModelsCommand) -> Result<()> {
                     } else {
                         format!("\t{map}")
                     };
+                    let images = if model.images { "\timage" } else { "" };
                     println!(
-                        "{marker}{compaction_marker} {}/{}{context}{map}{override_level}",
+                        "{marker}{compaction_marker} {}/{}{context}{map}{override_level}{images}",
                         provider.id.0, model.id
                     );
                 }
@@ -353,6 +364,21 @@ fn known_model(store: &SqliteStorage, model: &str) -> Result<storage::Model> {
 
 fn model_command(store: &SqliteStorage, command: ModelCommand) -> Result<()> {
     match command {
+        ModelCommand::Input { model, input } => {
+            let images = matches!(input, InputKind::Image);
+            if model.contains('/') {
+                let model = known_model(store, &model)?;
+                store.set_images(&model.provider, &model.id, images)?;
+            } else {
+                let provider = ProviderId(model);
+                if !store.providers()?.iter().any(|item| item.id == provider) {
+                    return Err(format!("unknown provider: {}", provider.0).into());
+                }
+                for model in store.models(&provider)? {
+                    store.set_images(&provider, &model.id, images)?;
+                }
+            }
+        }
         ModelCommand::Set { model } => {
             let model = known_model(store, &model)?;
             let mut settings = store.settings()?;

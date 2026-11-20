@@ -37,6 +37,7 @@ impl Default for CompactionConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HarnessConfig {
+    pub images: bool,
     pub compaction: CompactionConfig,
 }
 
@@ -199,7 +200,20 @@ where
             retrying = false;
 
             self.observe(Step::Model);
-            let view = session.view();
+            let mut view = session.view();
+            if !self.config.images {
+                for message in &mut view {
+                    if let Message::ToolResult {
+                        content, images, ..
+                    } = message
+                    {
+                        if !images.is_empty() {
+                            images.clear();
+                            content.push_str("\n[image omitted: this model does not accept images; use a model with image input]");
+                        }
+                    }
+                }
+            }
             let response = match self.llm.complete(CompletionRequest {
                 system: &system,
                 messages: &view,
@@ -278,52 +292,70 @@ where
                             ),
                             _ => None,
                         });
-                let executed =
-                    if let Some(result) = memory_result {
-                        result.map(|content| {
-                            if call.name == "zoom" {
-                                content
-                            } else {
+                let mut images = Vec::new();
+                let executed = if let Some(result) = memory_result {
+                    result.map(|content| {
+                        if call.name == "zoom" {
+                            content
+                        } else {
+                            memory::clip_tool_output(&content)
+                        }
+                    })
+                } else if let Some(lookup) = self.lookup_tools.as_ref().filter(|_| {
+                    matches!(
+                        call.name.as_str(),
+                        "message" | "history" | "search" | "participants"
+                    )
+                }) {
+                    lookup
+                        .lookup(&call.name, &call.arguments)
+                        .await
+                        .map(|content| {
+                            if call.name == "participants" || call.name == "message" {
                                 memory::clip_tool_output(&content)
+                            } else {
+                                content
                             }
                         })
-                    } else if let Some(lookup) = self.lookup_tools.as_ref().filter(|_| {
-                        matches!(call.name.as_str(), "message" | "history" | "search" | "participants")
-                    }) {
-                        lookup
-                            .lookup(&call.name, &call.arguments)
-                            .await
-                            .map(|content| {
-                                if call.name == "participants" || call.name == "message" {
-                                    memory::clip_tool_output(&content)
-                                } else {
-                                    content
-                                }
+                        .map_err(|e| e.to_string())
+                } else {
+                    match ToolInput::parse(&call.name, &call.arguments) {
+                        Ok(input) => self
+                            .environment
+                            .execute(ToolCall {
+                                id: call.id.clone(),
+                                input,
                             })
-                            .map_err(|e| e.to_string())
-                    } else {
-                        match ToolInput::parse(&call.name, &call.arguments) {
-                            Ok(input) => self
-                                .environment
-                                .execute(ToolCall {
-                                    id: call.id.clone(),
-                                    input,
-                                })
-                                .await
-                                .map(|result| result.content)
-                                .map_err(|e| e.to_string()),
-                            Err(error) => Err(error.to_string()),
-                        }
-                    };
+                            .await
+                            .map(|result| {
+                                images = result
+                                    .images
+                                    .into_iter()
+                                    .map(|image| storage::Image {
+                                        mime: image.mime,
+                                        data: image.data,
+                                    })
+                                    .collect();
+                                result.content
+                            })
+                            .map_err(|e| e.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    }
+                };
                 self.observe(Step::Idle);
-                let content = match executed {
+                let mut content = match executed {
                     Ok(result) => result,
                     Err(error) => format!("error: {error}"),
                 };
+                if !self.config.images && !images.is_empty() {
+                    images.clear();
+                    content.push_str("\n[image omitted: this model does not accept images; use a model with image input]");
+                }
                 session.push(Message::ToolResult {
                     id: call.id,
                     name: call.name,
                     content,
+                    images,
                 });
             }
             self.store.save(session.clone())?;

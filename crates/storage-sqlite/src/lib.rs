@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS messages (
     CHECK ((role = 'summary') = (details IS NOT NULL))
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS message_images (session_id TEXT NOT NULL, position INTEGER NOT NULL, idx INTEGER NOT NULL, mime TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY (session_id, position, idx), FOREIGN KEY (session_id, position) REFERENCES messages (session_id, position)) STRICT;
 CREATE TABLE IF NOT EXISTS skills (name TEXT PRIMARY KEY, description TEXT NOT NULL, hash TEXT NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS skill_files (skill TEXT NOT NULL REFERENCES skills (name) ON DELETE CASCADE, path TEXT NOT NULL, mode INTEGER NOT NULL, content BLOB NOT NULL, PRIMARY KEY (skill, path)) STRICT;
 
@@ -61,6 +62,7 @@ CREATE TABLE IF NOT EXISTS models (
     PRIMARY KEY (provider, id)
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS model_images (provider TEXT NOT NULL, model TEXT NOT NULL, PRIMARY KEY (provider, model), FOREIGN KEY (provider, model) REFERENCES models (provider, id) ON DELETE CASCADE) STRICT;
 CREATE TABLE IF NOT EXISTS model_reasoning (
     provider TEXT NOT NULL,
     model TEXT NOT NULL,

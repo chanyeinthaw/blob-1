@@ -121,9 +121,16 @@ pub struct ToolCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Image {
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResult {
     pub id: String,
     pub content: String,
+    pub images: Vec<Image>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,7 +143,7 @@ pub struct ToolSpec {
 pub const CATALOG: &[ToolSpec] = &[
     ToolSpec {
         name: "read",
-        description: "Read the contents of a file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
+        description: "Read a text or image file. Text output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large text files. When you need the full file, continue with offset until complete.",
         input_schema: r#"{"type":"object","required":["path"],"properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"integer","minimum":1,"description":"Line number to start reading from (1-indexed)"},"limit":{"type":"integer","minimum":0,"description":"Maximum number of lines to read"}}}"#,
     },
     ToolSpec {

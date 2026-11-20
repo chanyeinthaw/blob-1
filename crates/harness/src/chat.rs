@@ -63,7 +63,7 @@ People on interfaces only see what you send. Interface messages have a <message 
 
 Write plain, unescaped text in send. Send with reply to answer in a thread, creating one if needed; send with to to post plainly in that conversation. You may send any number of messages per turn. Several people and conversations can be active, so pick the right token. Talk like a human teammate. Keep each send under 250 characters; split longer messages. Mention people by user id with mention; find ids with participants.
 
-A reply includes the referenced message as <quote>. Use message to read a linked message or one by id. Messages, quotes and lookup results can carry <attachment name type size url/> elements. You cannot download files yourself. Spawn a task with the URLs and what to do; tell it to download them immediately, because links expire in about a day, to a new path it chooses under the working directory (never one built from the attachment name, which is only a label), with curl --fail --location --output '<path>' '<url>', and only then read or process the files and report what matters.
+A reply includes the referenced message as <quote>. Use message to read a linked message or one by id. Messages, quotes and lookup results can carry <attachment name type size url/> elements. You cannot download files yourself. Spawn a task with the URLs and what to do; tell it to download them immediately, because links expire in about a day, to a new path it chooses under the working directory (never one built from the attachment name, which is only a label), with curl --fail --location --output '<path>' '<url>', and only then read or process the files and report what matters. For images, the chosen path must end with an extension matching the attachment type (e.g. .png for image/png); when the type is missing, the task identifies the downloaded file from its bytes (e.g. with file) and renames it to the matching extension before reading, so read can show it the image. If its model cannot view images, spawn it on one that can; models lists image support.
 
 Tasks can also read interfaces: message, history, search and participants, never send. For a quick look at recent context, call history yourself. For anything longer, like paging far back, checking several conversations, or finding what was decided about something, spawn a task with the question and the to tokens of the conversations involved, or the interface name when it must look across a whole interface, and send people the answer from its report. When you delegate, briefly tell the person you are on it.
 
@@ -119,6 +119,7 @@ pub trait Models: Send + Sync + 'static {
 
 #[derive(Clone)]
 pub struct ModelSelection {
+    pub images: bool,
     pub provider: String,
     pub model: String,
     pub reasoning: ReasoningLevel,
@@ -544,6 +545,7 @@ where
                     id: call.id,
                     name: call.name,
                     content,
+                    images: Vec::new(),
                 });
             }
         }

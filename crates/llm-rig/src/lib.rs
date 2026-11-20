@@ -1,12 +1,16 @@
+use base64::Engine as _;
 use environment::ToolSpec;
 use llm::{CompletionRequest, CompletionResponse, Llm, LlmError, ToolCallRequest, Usage};
 use regex::Regex;
 use rig_core::{
-    catalog::Catalog,
+    catalog::{Catalog, ModelFacts, ModelSpec},
     completion::{self, AssistantContent, ToolDefinition},
     message::{CallId, ToolCall, ToolFunction, ToolName, ToolResultContent, UserContent},
     operation::Completion,
-    providers::openai::{OpenAI, OpenAIConfig},
+    providers::{
+        openai::{OpenAI, OpenAIConfig},
+        registry::ProviderId,
+    },
     DynModel,
 };
 use std::sync::{Arc, LazyLock};
@@ -59,9 +63,30 @@ impl RigLlm {
 
 pub fn connect(provider: &Provider, api_key: &str, model: &Model, level: ReasoningLevel) -> RigLlm {
     let client = client(provider, api_key);
+    let id = match provider.api {
+        ProviderApi::OpenAiResponses => model.id.rsplit('/').next().unwrap_or(&model.id),
+        ProviderApi::OpenAiCompletions => &model.id,
+    };
+    let catalog = Catalog::builtin();
+    let provider_id = ProviderId::catalog("openai").expect("OpenAI is in rig's catalog");
+    let mut spec = catalog
+        .get(provider_id, id)
+        .map(|entry| entry.spec.clone())
+        .unwrap_or_else(|| ModelSpec::new(provider_id, id));
+    spec.id = id.to_owned();
+    spec.input.image = model.images;
+    let facts = ModelFacts::new(spec);
     let mut llm = match provider.api {
-        ProviderApi::OpenAiResponses => RigLlm::new(client.responses(&model.id)),
-        ProviderApi::OpenAiCompletions => RigLlm::new(client.chat(&model.id)),
+        ProviderApi::OpenAiResponses => {
+            let mut rig = client.responses(&model.id);
+            rig.wire = rig.wire.with_facts(facts);
+            RigLlm::new(rig)
+        }
+        ProviderApi::OpenAiCompletions => {
+            let mut rig = client.chat(&model.id);
+            rig.wire = rig.wire.with_facts(facts);
+            RigLlm::new(rig)
+        }
     };
     llm.reasoning = resolve_reasoning(&llm.model, model, level);
     llm.api = provider.api;
@@ -292,11 +317,38 @@ fn to_rig_request(
                     _ => history.push(call.into()),
                 }
             }
-            Message::ToolResult { id, name, content } => {
+            Message::ToolResult {
+                id,
+                name,
+                content,
+                images,
+            } => {
+                let mut parts = vec![ToolResultContent::text(content)];
+                for image in images {
+                    let media_type = match image.mime.as_str() {
+                        "image/png" => rig_core::message::ImageMediaType::PNG,
+                        "image/jpeg" => rig_core::message::ImageMediaType::JPEG,
+                        "image/gif" => rig_core::message::ImageMediaType::GIF,
+                        "image/webp" => rig_core::message::ImageMediaType::WEBP,
+                        other => {
+                            return Err(LlmError::Request(format!(
+                                "unsupported image type: {other}"
+                            )))
+                        }
+                    };
+                    parts.push(ToolResultContent::Image(rig_core::message::Image {
+                        data: rig_core::message::DocumentSourceKind::Base64(
+                            base64::engine::general_purpose::STANDARD.encode(&image.data),
+                        ),
+                        media_type: Some(media_type),
+                        detail: None,
+                        native: None,
+                    }));
+                }
                 let result = UserContent::tool_result(
                     CallId::from_wire(id.as_str()),
                     tool_name(name)?,
-                    vec![ToolResultContent::text(content)],
+                    parts,
                 );
                 match history.last_mut() {
                     Some(completion::Message::User { content })

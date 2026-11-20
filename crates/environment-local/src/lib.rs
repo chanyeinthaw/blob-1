@@ -753,6 +753,42 @@ impl Environment for LocalEnvironment {
     }
 
     async fn execute(&self, call: ToolCall) -> Result<ToolResult, ToolError> {
+        if let ToolInput::Read { path, .. } = &call.input {
+            let mime = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_ascii_lowercase());
+            let mime = match mime.as_deref() {
+                Some("png") => Some("image/png"),
+                Some("jpg" | "jpeg") => Some("image/jpeg"),
+                Some("gif") => Some("image/gif"),
+                Some("webp") => Some("image/webp"),
+                _ => None,
+            };
+            if let Some(mime) = mime {
+                let resolved = self.resolve_readable(path)?;
+                if tokio::fs::metadata(&resolved)
+                    .await
+                    .map_err(io_error)?
+                    .len()
+                    > 20 * 1024 * 1024
+                {
+                    return Err(ToolError::Invalid("Image exceeds 20 MiB".into()));
+                }
+                let data = tokio::fs::read(resolved).await.map_err(io_error)?;
+                if data.len() > 20 * 1024 * 1024 {
+                    return Err(ToolError::Invalid("Image exceeds 20 MiB".into()));
+                }
+                return Ok(ToolResult {
+                    id: call.id,
+                    content: format!("Read image file [{mime}]"),
+                    images: vec![environment::Image {
+                        mime: mime.into(),
+                        data,
+                    }],
+                });
+            }
+        }
         let content = match &call.input {
             ToolInput::Read {
                 path,
@@ -767,6 +803,7 @@ impl Environment for LocalEnvironment {
         Ok(ToolResult {
             id: call.id,
             content,
+            images: Vec::new(),
         })
     }
 }

@@ -5,6 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = "0.22"
 llm.workspace = true
 async-trait.workspace = true
 environment.workspace = true

@@ -85,6 +85,7 @@ impl SqliteStorage {
                         id: row.get(2)?,
                         name: row.get(3)?,
                         content,
+                        images: Vec::new(),
                     },
                     _ => {
                         return Err(rusqlite::Error::FromSqlConversionFailure(
@@ -97,6 +98,24 @@ impl SqliteStorage {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
+        let mut messages = messages;
+        let mut images = connection.prepare("SELECT position, mime, data FROM message_images WHERE session_id = ?1 ORDER BY position, idx")?;
+        let rows = images.query_map([&id.0], |row| {
+            Ok((
+                row.get::<_, u32>(0)? as usize,
+                storage::Image {
+                    mime: row.get(1)?,
+                    data: row.get(2)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (position, image) = row?;
+            match messages.get_mut(position) {
+                Some(Message::ToolResult { images, .. }) => images.push(image),
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            }
+        }
         Ok(Some(Session {
             id: id.clone(),
             messages,
@@ -162,9 +181,9 @@ impl SqliteStorage {
                         name,
                         arguments,
                     } => ("tool_call", arguments, Some(id), Some(name), None),
-                    Message::ToolResult { id, name, content } => {
-                        ("tool_result", content, Some(id), Some(name), None)
-                    }
+                    Message::ToolResult {
+                        id, name, content, ..
+                    } => ("tool_result", content, Some(id), Some(name), None),
                 };
                 insert.execute(params![
                     session.id.0,
@@ -175,6 +194,11 @@ impl SqliteStorage {
                     tool_name,
                     details
                 ])?;
+                if let Message::ToolResult { images, .. } = message {
+                    for (idx, image) in images.iter().enumerate() {
+                        transaction.execute("INSERT INTO message_images (session_id, position, idx, mime, data) VALUES (?1, ?2, ?3, ?4, ?5)", params![session.id.0, position as i64, idx as i64, image.mime, image.data])?;
+                    }
+                }
             }
         }
         transaction.commit()?;
