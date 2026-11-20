@@ -11,11 +11,11 @@ dependencies = [
  "environment",
  "environment-local",
  "harness",
- "interface",
- "interface-discord",
  "llm",
  "llm-rig",
  "memory",
+ "messenger",
+ "messenger-discord",
  "sha2",
  "storage",
  "storage-sqlite",
@@ -718,9 +718,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "environment",
- "interface",
  "llm",
  "memory",
+ "messenger",
  "nanoid",
  "serde",
  "serde_json",
@@ -984,29 +984,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "interface"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "storage",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
-name = "interface-discord"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "interface",
- "rustls",
- "tokio",
- "twilight-gateway",
- "twilight-http",
- "twilight-model",
-]
-
-[[package]]
 name = "ipnet"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1169,6 +1146,29 @@ dependencies = [
  "storage",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "messenger"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "storage",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "messenger-discord"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "messenger",
+ "rustls",
+ "tokio",
+ "twilight-gateway",
+ "twilight-http",
+ "twilight-model",
 ]
 
 [[package]]

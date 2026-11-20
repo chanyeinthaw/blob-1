@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use environment::Environment;
-use interface::Mark;
 use memory::{Meta, ReportStatus};
+use messenger::Mark;
 use storage::{MemoryStore, Message, SessionId, SessionStore, TaskChoice};
 
 use crate::{
@@ -164,13 +164,13 @@ where
         {
             session.take_steering(&SessionId::new(format!("task:{name}")));
         }
-        if let (Some(interfaces), Some(message)) = (&inner.interfaces, &for_message) {
+        if let (Some(messengers), Some(message)) = (&inner.messengers, &for_message) {
             if !state
                 .agents
                 .values()
                 .any(|agent| agent.is_running() && agent.for_message.as_ref() == Some(message))
             {
-                interfaces.mark(message, &[Mark::Failed], &[Mark::Working]);
+                messengers.mark(message, &[Mark::Failed], &[Mark::Working]);
             }
         }
         state.reports.push_back(Report {
@@ -435,8 +435,8 @@ where
             ..CompactionConfig::default()
         },
     });
-    if let Some(interfaces) = &inner.interfaces {
-        session = session.with_lookup_tools(interfaces.clone());
+    if let Some(messengers) = &inner.messengers {
+        session = session.with_lookup_tools(messengers.clone());
     }
     if let Some(summarizer) = &inner.summarizer {
         session = session.with_summarizer(Shared(Arc::clone(&summarizer.0)));
@@ -458,8 +458,8 @@ fn launch<L, E, S, M, F: Models>(
     let mut state = inner.state.lock().expect("chat state mutex poisoned");
     let agent = state.agents.get(&name).expect("agent tracked");
     let run_id = agent.run_id;
-    if let (Some(interfaces), Some(message)) = (&inner.interfaces, &agent.for_message) {
-        interfaces.mark(message, &[Mark::Working], &[Mark::Done, Mark::Failed]);
+    if let (Some(messengers), Some(message)) = (&inner.messengers, &agent.for_message) {
+        messengers.mark(message, &[Mark::Working], &[Mark::Done, Mark::Failed]);
     }
     let watch_inner = Arc::downgrade(&inner);
     let watch_name = name.clone();
@@ -546,7 +546,7 @@ fn launch<L, E, S, M, F: Models>(
                     watch.abort();
                 }
                 let for_message = agent.for_message.clone();
-                if let (Some(interfaces), Some(message)) = (&inner.interfaces, &for_message) {
+                if let (Some(messengers), Some(message)) = (&inner.messengers, &for_message) {
                     if !state.agents.values().any(|agent| {
                         agent.is_running() && agent.for_message.as_ref() == Some(message)
                     }) {
@@ -555,7 +555,7 @@ fn launch<L, E, S, M, F: Models>(
                         } else {
                             Mark::Failed
                         };
-                        interfaces.mark(message, &[mark], &[Mark::Working]);
+                        messengers.mark(message, &[mark], &[Mark::Working]);
                     }
                 }
                 state.reports.push_back(Report {
@@ -607,11 +607,11 @@ fn launch<L, E, S, M, F: Models>(
                     watch.abort();
                 }
                 let for_message = agent.for_message.clone();
-                if let (Some(interfaces), Some(message)) = (&crash_inner.interfaces, &for_message) {
+                if let (Some(messengers), Some(message)) = (&crash_inner.messengers, &for_message) {
                     if !state.agents.values().any(|agent| {
                         agent.is_running() && agent.for_message.as_ref() == Some(message)
                     }) {
-                        interfaces.mark(message, &[Mark::Failed], &[Mark::Working]);
+                        messengers.mark(message, &[Mark::Failed], &[Mark::Working]);
                     }
                 }
                 state.reports.push_back(Report {

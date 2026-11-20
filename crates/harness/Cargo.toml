@@ -11,7 +11,7 @@ environment.workspace = true
 storage.workspace = true
 thiserror.workspace = true
 memory.workspace = true
-interface = { path = "../interface" }
+messenger = { path = "../messenger" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

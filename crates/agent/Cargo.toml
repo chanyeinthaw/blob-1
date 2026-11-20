@@ -17,5 +17,5 @@ tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 environment.workspace = true
 sha2 = "0.10"
 memory.workspace = true
-interface = { path = "../interface" }
-interface-discord = { path = "../interface-discord" }
+messenger = { path = "../messenger" }
+messenger-discord = { path = "../messenger-discord" }

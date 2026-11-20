@@ -1,5 +1,5 @@
 [package]
-name = "interface"
+name = "messenger"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

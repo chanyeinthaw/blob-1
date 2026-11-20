@@ -1,6 +1,6 @@
 pub mod chat;
-pub mod interface;
-pub use interface::Interfaces;
+pub mod messenger;
+pub use messenger::Messengers;
 mod compaction;
 pub mod prompt;
 pub mod session;

@@ -10,8 +10,8 @@ members = [
   "crates/storage-sqlite",
   "crates/environment",
   "crates/environment-local",
-  "crates/interface",
-  "crates/interface-discord",
+  "crates/messenger",
+  "crates/messenger-discord",
 ]
 
 [workspace.package]
@@ -27,8 +27,8 @@ rusqlite = { version = "0.43", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 harness = { path = "crates/harness" }
-interface = { path = "crates/interface" }
-interface-discord = { path = "crates/interface-discord" }
+messenger = { path = "crates/messenger" }
+messenger-discord = { path = "crates/messenger-discord" }
 environment-local = { path = "crates/environment-local" }
 llm = { path = "crates/llm" }
 memory = { path = "crates/memory" }

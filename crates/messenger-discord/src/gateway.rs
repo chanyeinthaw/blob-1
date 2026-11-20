@@ -1,5 +1,5 @@
 use crate::{attachments, backend, person, Discord};
-use interface::{Inbound, InterfaceError, Place, Quote};
+use messenger::{Inbound, MessengerError, Place, Quote};
 use tokio::sync::mpsc;
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, ShardState, StreamExt};
 use twilight_model::channel::{ChannelType, Message};
@@ -33,7 +33,7 @@ async fn quote(discord: &Discord, message: &Message) -> Option<Quote> {
     }
 }
 
-pub async fn listen(discord: &Discord, tx: mpsc::Sender<Inbound>) -> Result<(), InterfaceError> {
+pub async fn listen(discord: &Discord, tx: mpsc::Sender<Inbound>) -> Result<(), MessengerError> {
     let intents = Intents::GUILDS
         | Intents::GUILD_MESSAGES
         | Intents::DIRECT_MESSAGES
@@ -70,7 +70,7 @@ pub async fn listen(discord: &Discord, tx: mpsc::Sender<Inbound>) -> Result<(), 
                     .replace(&format!("<@!{bot}>"), "")
                     .trim()
                     .to_owned();
-                let location_result: Result<_, InterfaceError> = async {
+                let location_result: Result<_, MessengerError> = async {
                     Ok(if dm {
                         (
                             Place {

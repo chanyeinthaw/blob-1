@@ -1,8 +1,8 @@
 mod gateway;
 mod render;
 
-use interface::{
-    Attachment, Fetched, Inbound, Interface, InterfaceError, Lookup, Mark, Outbound, Person, Place,
+use messenger::{
+    Attachment, Fetched, Inbound, Lookup, Mark, Messenger, MessengerError, Outbound, Person, Place,
     Scope,
 };
 use std::collections::HashSet;
@@ -19,15 +19,15 @@ pub struct Discord {
     http: Client,
 }
 
-fn backend(error: impl std::error::Error + Send + Sync + 'static) -> InterfaceError {
-    InterfaceError::Backend(Box::new(error))
+fn backend(error: impl std::error::Error + Send + Sync + 'static) -> MessengerError {
+    MessengerError::Backend(Box::new(error))
 }
 
-fn id<T>(value: &str) -> Result<Id<T>, InterfaceError> {
+fn id<T>(value: &str) -> Result<Id<T>, MessengerError> {
     value.parse().map_err(backend)
 }
 
-fn channel(place: &Place) -> Result<Id<ChannelMarker>, InterfaceError> {
+fn channel(place: &Place) -> Result<Id<ChannelMarker>, MessengerError> {
     id(place.thread.as_deref().unwrap_or(&place.channel))
 }
 
@@ -88,7 +88,7 @@ impl Discord {
         place: &Place,
         before: Option<&str>,
         limit: u32,
-    ) -> Result<Vec<Message>, InterfaceError> {
+    ) -> Result<Vec<Message>, MessengerError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -110,7 +110,7 @@ impl Lookup for Discord {
         "discord"
     }
 
-    async fn message(&self, place: &Place, message: &str) -> Result<Fetched, InterfaceError> {
+    async fn message(&self, place: &Place, message: &str) -> Result<Fetched, MessengerError> {
         let message = self
             .http
             .message(channel(place)?, id(message)?)
@@ -167,7 +167,7 @@ impl Lookup for Discord {
         place: &Place,
         before: Option<&str>,
         limit: u32,
-    ) -> Result<Vec<Fetched>, InterfaceError> {
+    ) -> Result<Vec<Fetched>, MessengerError> {
         Ok(self
             .messages(place, before, limit)
             .await?
@@ -182,9 +182,9 @@ impl Lookup for Discord {
         scope: &Scope,
         query: &str,
         limit: u32,
-    ) -> Result<Vec<Fetched>, InterfaceError> {
+    ) -> Result<Vec<Fetched>, MessengerError> {
         let Scope::Place(place) = scope else {
-            return Err(InterfaceError::Unsupported(
+            return Err(MessengerError::Unsupported(
                 "search across all of discord".into(),
             ));
         };
@@ -203,7 +203,7 @@ impl Lookup for Discord {
         &self,
         scope: &Scope,
         query: Option<&str>,
-    ) -> Result<Vec<Person>, InterfaceError> {
+    ) -> Result<Vec<Person>, MessengerError> {
         let mut seen = HashSet::new();
         let mut result = Vec::new();
         match scope {
@@ -222,9 +222,9 @@ impl Lookup for Discord {
                     }
                 }
             }
-            Scope::Interface => {
+            Scope::Messenger => {
                 let query = query.ok_or_else(|| {
-                    InterfaceError::Unsupported("listing all members; give a query".into())
+                    MessengerError::Unsupported("listing all members; give a query".into())
                 })?;
                 let mut after = None;
                 loop {
@@ -270,11 +270,11 @@ impl Lookup for Discord {
 }
 
 #[async_trait::async_trait]
-impl Interface for Discord {
-    async fn listen(&self, inbound: mpsc::Sender<Inbound>) -> Result<(), InterfaceError> {
+impl Messenger for Discord {
+    async fn listen(&self, inbound: mpsc::Sender<Inbound>) -> Result<(), MessengerError> {
         gateway::listen(self, inbound).await
     }
-    async fn react(&self, place: &Place, message: &str, mark: Mark) -> Result<(), InterfaceError> {
+    async fn react(&self, place: &Place, message: &str, mark: Mark) -> Result<(), MessengerError> {
         self.http
             .create_reaction(channel(place)?, id(message)?, &reaction(mark))
             .await
@@ -286,21 +286,21 @@ impl Interface for Discord {
         place: &Place,
         message: &str,
         mark: Mark,
-    ) -> Result<(), InterfaceError> {
+    ) -> Result<(), MessengerError> {
         self.http
             .delete_current_user_reaction(channel(place)?, id(message)?, &reaction(mark))
             .await
             .map_err(backend)?;
         Ok(())
     }
-    async fn typing(&self, place: &Place) -> Result<(), InterfaceError> {
+    async fn typing(&self, place: &Place) -> Result<(), MessengerError> {
         self.http
             .create_typing_trigger(channel(place)?)
             .await
             .map_err(backend)?;
         Ok(())
     }
-    async fn send(&self, outbound: Outbound) -> Result<(), InterfaceError> {
+    async fn send(&self, outbound: Outbound) -> Result<(), MessengerError> {
         render::send(self, outbound).await
     }
 }

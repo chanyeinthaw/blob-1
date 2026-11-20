@@ -1,12 +1,12 @@
 [package]
-name = "interface-discord"
+name = "messenger-discord"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-interface.workspace = true
+messenger.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio.workspace = true
 twilight-gateway.workspace = true

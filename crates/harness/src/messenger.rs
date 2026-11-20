@@ -3,15 +3,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use environment::ToolSpec;
-use interface::{Fetched, Interface, Mark, Outbound, Place, Scope, Target};
+use messenger::{Fetched, Mark, Messenger, Outbound, Place, Scope, Target};
 use serde::Deserialize;
-use storage::{InterfaceStore, MemoryStore, Meta};
+use storage::{MemoryStore, MessengerStore, Meta};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
 pub const SEND: ToolSpec = ToolSpec {
     name: "send",
-    description: "Send a message to people on an interface. Give exactly one of reply (an m-token from a <message> tag: answers that message in its thread, starting one if needed) or to (a d-token: posts plainly in that conversation). At most 250 characters; split longer text into several sends. mention: user ids to mention; the system adds the mentions.",
+    description: "Send a message to people on a messenger. Give exactly one of reply (an m-token from a <message> tag: answers that message in its thread, starting one if needed) or to (a d-token: posts plainly in that conversation). At most 250 characters; split longer text into several sends. mention: user ids to mention; the system adds the mentions.",
     input_schema: r#"{"type":"object","properties":{"text":{"type":"string"},"reply":{"type":"string","description":"m-token of the message to reply to"},"to":{"type":"string","description":"d-token of the conversation"},"mention":{"type":"array","items":{"type":"string"},"description":"User ids to mention"}},"required":["text"]}"#,
 };
 pub const LOOKUP: &[ToolSpec] = &[
@@ -27,29 +27,29 @@ pub const LOOKUP: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "search",
-        description: "Search messages containing query, in one conversation (to = d-token, channel: true for its parent channel) or across a whole interface (interface = name, if supported). limit 1-50, default 20.",
-        input_schema: r#"{"type":"object","properties":{"query":{"type":"string"},"to":{"type":"string","description":"d-token of the conversation"},"channel":{"type":"boolean","description":"Use the parent channel instead of the thread"},"interface":{"type":"string","description":"Interface name for an interface-wide lookup"},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":["query"]}"#,
+        description: "Search messages containing query, in one conversation (to = d-token, channel: true for its parent channel) or across a whole messenger (messenger = name, if supported). limit 1-50, default 20.",
+        input_schema: r#"{"type":"object","properties":{"query":{"type":"string"},"to":{"type":"string","description":"d-token of the conversation"},"channel":{"type":"boolean","description":"Use the parent channel instead of the thread"},"messenger":{"type":"string","description":"Messenger name for a messenger-wide lookup"},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":["query"]}"#,
     },
     ToolSpec {
         name: "participants",
-        description: "Find people and their user ids, in one conversation (to, channel) or across a whole interface (interface + query). Use the ids with send's mention.",
-        input_schema: r#"{"type":"object","properties":{"to":{"type":"string","description":"d-token of the conversation"},"channel":{"type":"boolean","description":"Use the parent channel instead of the thread"},"interface":{"type":"string","description":"Interface name for an interface-wide lookup"},"query":{"type":"string"}}}"#,
+        description: "Find people and their user ids, in one conversation (to, channel) or across a whole messenger (messenger + query). Use the ids with send's mention.",
+        input_schema: r#"{"type":"object","properties":{"to":{"type":"string","description":"d-token of the conversation"},"channel":{"type":"boolean","description":"Use the parent channel instead of the thread"},"messenger":{"type":"string","description":"Messenger name for a messenger-wide lookup"},"query":{"type":"string"}}}"#,
     },
 ];
 
-trait Store: InterfaceStore + MemoryStore {}
-impl<T: InterfaceStore + MemoryStore> Store for T {}
+trait Store: MessengerStore + MemoryStore {}
+impl<T: MessengerStore + MemoryStore> Store for T {}
 
 #[derive(Clone)]
-pub struct Interfaces {
-    interfaces: Vec<Arc<dyn Interface>>,
+pub struct Messengers {
+    messengers: Vec<Arc<dyn Messenger>>,
     store: Arc<dyn Store>,
     live: Arc<LiveState>,
     marks: tokio::sync::mpsc::UnboundedSender<MarkJob>,
 }
 
 struct MarkJob {
-    interface: Arc<dyn Interface>,
+    messenger: Arc<dyn Messenger>,
     place: Place,
     message: String,
     add: Vec<Mark>,
@@ -80,7 +80,7 @@ struct LookupArgs {
     link: Option<String>,
     message: Option<String>,
     to: Option<String>,
-    interface: Option<String>,
+    messenger: Option<String>,
     query: Option<String>,
     #[serde(default)]
     channel: bool,
@@ -146,13 +146,13 @@ fn render_search(messages: Vec<Fetched>) -> String {
         more => format!("{}\n[{more} more matches not shown]", lines.join("\n")),
     }
 }
-impl Interfaces {
-    pub fn new<S: InterfaceStore + MemoryStore + 'static>(
-        interfaces: Vec<Arc<dyn Interface>>,
+impl Messengers {
+    pub fn new<S: MessengerStore + MemoryStore + 'static>(
+        messengers: Vec<Arc<dyn Messenger>>,
         store: S,
     ) -> Self {
         Self {
-            interfaces,
+            messengers,
             store: Arc::new(store),
             live: Arc::default(),
             marks: {
@@ -161,14 +161,14 @@ impl Interfaces {
                     while let Some(job) = rx.recv().await {
                         for mark in job.remove {
                             if let Err(error) =
-                                job.interface.unreact(&job.place, &job.message, mark).await
+                                job.messenger.unreact(&job.place, &job.message, mark).await
                             {
                                 eprintln!("{error}");
                             }
                         }
                         for mark in job.add {
                             if let Err(error) =
-                                job.interface.react(&job.place, &job.message, mark).await
+                                job.messenger.react(&job.place, &job.message, mark).await
                             {
                                 eprintln!("{error}");
                             }
@@ -186,23 +186,23 @@ impl Interfaces {
                 .message(token(reply, 'm')?)?
                 .ok_or("unknown message")?;
             let Some(Meta::Message {
-                interface,
+                messenger,
                 place,
                 message,
                 ..
             }) = row.meta
             else {
-                return Err("message has no interface metadata".into());
+                return Err("message has no messenger metadata".into());
             };
-            let interface = self
-                .interfaces
+            let messenger = self
+                .messengers
                 .iter()
-                .find(|i| i.name() == interface)
-                .ok_or("unknown interface")?
+                .find(|i| i.name() == messenger)
+                .ok_or("unknown messenger")?
                 .clone();
-            Ok((interface, place, message))
+            Ok((messenger, place, message))
         })();
-        let (interface, place, message) = match resolved {
+        let (messenger, place, message) = match resolved {
             Ok(value) => value,
             Err(error) => {
                 eprintln!("{reply}: {error}");
@@ -212,7 +212,7 @@ impl Interfaces {
         if self
             .marks
             .send(MarkJob {
-                interface,
+                messenger,
                 place,
                 message,
                 add: add.to_vec(),
@@ -223,12 +223,12 @@ impl Interfaces {
             eprintln!("mark worker stopped");
         }
     }
-    pub fn live(&self, interface: &str, to: u64, place: Place) -> tokio::task::Id {
-        let interface = self
-            .interfaces
+    pub fn live(&self, messenger: &str, to: u64, place: Place) -> tokio::task::Id {
+        let messenger = self
+            .messengers
             .iter()
-            .find(|i| i.name() == interface)
-            .expect("unknown interface")
+            .find(|i| i.name() == messenger)
+            .expect("unknown messenger")
             .clone();
         let pulse = tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
@@ -239,7 +239,7 @@ impl Interfaces {
                 if tokio::time::Instant::now() >= deadline {
                     break;
                 }
-                if let Err(error) = interface.typing(&place).await {
+                if let Err(error) = messenger.typing(&place).await {
                     eprintln!("{error}");
                 }
             }
@@ -261,13 +261,13 @@ impl Interfaces {
             .message(token(reply, 'm')?)?
             .ok_or("unknown message")?;
         if let Some(Meta::Message {
-            interface,
+            messenger,
             place,
             to,
             ..
         }) = row.meta
         {
-            return Ok(Some((to, self.live(&interface, to, place))));
+            return Ok(Some((to, self.live(&messenger, to, place))));
         }
         Ok(None)
     }
@@ -282,12 +282,12 @@ impl Interfaces {
             pulse.abort();
         }
     }
-    fn find(&self, name: &str) -> Result<&dyn Interface, Error> {
-        self.interfaces
+    fn find(&self, name: &str) -> Result<&dyn Messenger, Error> {
+        self.messengers
             .iter()
             .find(|i| i.name() == name)
             .map(Arc::as_ref)
-            .ok_or_else(|| format!("unknown interface: {name}").into())
+            .ok_or_else(|| format!("unknown messenger: {name}").into())
     }
     fn place(&self, value: &str, channel: bool) -> Result<(String, Place), Error> {
         let (name, mut place) = self
@@ -300,13 +300,13 @@ impl Interfaces {
         Ok((name, place))
     }
     fn scope(&self, args: &LookupArgs) -> Result<(String, Scope), Error> {
-        match (&args.to, &args.interface) {
+        match (&args.to, &args.messenger) {
             (Some(to), None) => {
                 let (name, place) = self.place(to, args.channel)?;
                 Ok((name, Scope::Place(place)))
             }
-            (None, Some(name)) => Ok((name.clone(), Scope::Interface)),
-            _ => Err("exactly one of to or interface is required".into()),
+            (None, Some(name)) => Ok((name.clone(), Scope::Messenger)),
+            _ => Err("exactly one of to or messenger is required".into()),
         }
     }
     pub async fn send(&self, arguments: &str) -> Result<String, Error> {
@@ -325,14 +325,14 @@ impl Interfaces {
                     .ok_or("unknown message")?;
                 match row.meta {
                     Some(Meta::Message {
-                        interface,
+                        messenger,
                         place,
                         message,
                         author,
                         to,
                         ..
                     }) => (
-                        interface,
+                        messenger,
                         Target::Reply {
                             place,
                             message,
@@ -340,7 +340,7 @@ impl Interfaces {
                         },
                         to,
                     ),
-                    _ => return Err("message has no interface metadata".into()),
+                    _ => return Err("message has no messenger metadata".into()),
                 }
             }
             (None, Some(to)) => {
@@ -375,18 +375,18 @@ impl Interfaces {
         }
         match name {
             "message" => {
-                let (interface, place, message) = match (&args.link, &args.to, &args.message) {
+                let (messenger, place, message) = match (&args.link, &args.to, &args.message) {
                     (Some(link), None, None) => {
-                        let (interface, (place, message)) = self
-                            .interfaces
+                        let (messenger, (place, message)) = self
+                            .messengers
                             .iter()
-                            .find_map(|interface| {
-                                interface
+                            .find_map(|messenger| {
+                                messenger
                                     .parse_link(link)
-                                    .map(|parsed| (interface.as_ref(), parsed))
+                                    .map(|parsed| (messenger.as_ref(), parsed))
                             })
                             .ok_or("not a message link")?;
-                        (interface, place, message)
+                        (messenger, place, message)
                     }
                     (None, Some(to), Some(message)) => {
                         let (name, place) = self.place(to, args.channel)?;
@@ -394,7 +394,7 @@ impl Interfaces {
                     }
                     _ => return Err("exactly one of link or to plus message is required".into()),
                 };
-                Ok(element(&interface.message(&place, &message).await?))
+                Ok(element(&messenger.message(&place, &message).await?))
             }
             "history" => {
                 let to = args.to.as_deref().ok_or("to is required")?;

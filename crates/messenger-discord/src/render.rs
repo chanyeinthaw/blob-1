@@ -1,5 +1,5 @@
 use crate::{backend, channel, id, Discord};
-use interface::{InterfaceError, Outbound, Target};
+use messenger::{MessengerError, Outbound, Target};
 use twilight_http::{api_error::ApiError, error::ErrorType};
 use twilight_model::{
     channel::message::AllowedMentions,
@@ -17,7 +17,7 @@ async fn thread(
     discord: &Discord,
     parent: Id<ChannelMarker>,
     message: Id<MessageMarker>,
-) -> Result<(), InterfaceError> {
+) -> Result<(), MessengerError> {
     let source = discord
         .http
         .message(parent, message)
@@ -48,7 +48,7 @@ async fn thread(
     }
 }
 
-pub async fn send(discord: &Discord, outbound: Outbound) -> Result<(), InterfaceError> {
+pub async fn send(discord: &Discord, outbound: Outbound) -> Result<(), MessengerError> {
     let mut mentions = outbound.mention;
     let mut reference = None;
     let mut retry = None;

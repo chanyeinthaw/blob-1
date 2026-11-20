@@ -33,7 +33,7 @@ pub struct Outbound {
 #[derive(Debug, Clone)]
 pub enum Scope {
     Place(Place),
-    Interface,
+    Messenger,
 }
 
 #[derive(Debug, Clone)]
@@ -46,7 +46,7 @@ pub struct Fetched {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum InterfaceError {
+pub enum MessengerError {
     #[error("not supported: {0}")]
     Unsupported(String),
     #[error("{0}")]
@@ -56,25 +56,25 @@ pub enum InterfaceError {
 #[async_trait::async_trait]
 pub trait Lookup: Send + Sync {
     fn name(&self) -> &'static str;
-    async fn message(&self, place: &Place, id: &str) -> Result<Fetched, InterfaceError>;
+    async fn message(&self, place: &Place, id: &str) -> Result<Fetched, MessengerError>;
     fn parse_link(&self, link: &str) -> Option<(Place, String)>;
     async fn history(
         &self,
         place: &Place,
         before: Option<&str>,
         limit: u32,
-    ) -> Result<Vec<Fetched>, InterfaceError>;
+    ) -> Result<Vec<Fetched>, MessengerError>;
     async fn search(
         &self,
         scope: &Scope,
         query: &str,
         limit: u32,
-    ) -> Result<Vec<Fetched>, InterfaceError>;
+    ) -> Result<Vec<Fetched>, MessengerError>;
     async fn participants(
         &self,
         scope: &Scope,
         query: Option<&str>,
-    ) -> Result<Vec<Person>, InterfaceError>;
+    ) -> Result<Vec<Person>, MessengerError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,11 +86,11 @@ pub enum Mark {
 }
 
 #[async_trait::async_trait]
-pub trait Interface: Lookup {
-    async fn listen(&self, inbound: mpsc::Sender<Inbound>) -> Result<(), InterfaceError>;
-    async fn react(&self, place: &Place, message: &str, mark: Mark) -> Result<(), InterfaceError>;
+pub trait Messenger: Lookup {
+    async fn listen(&self, inbound: mpsc::Sender<Inbound>) -> Result<(), MessengerError>;
+    async fn react(&self, place: &Place, message: &str, mark: Mark) -> Result<(), MessengerError>;
     async fn unreact(&self, place: &Place, message: &str, mark: Mark)
-        -> Result<(), InterfaceError>;
-    async fn typing(&self, place: &Place) -> Result<(), InterfaceError>;
-    async fn send(&self, outbound: Outbound) -> Result<(), InterfaceError>;
+        -> Result<(), MessengerError>;
+    async fn typing(&self, place: &Place) -> Result<(), MessengerError>;
+    async fn send(&self, outbound: Outbound) -> Result<(), MessengerError>;
 }

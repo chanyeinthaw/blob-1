@@ -387,11 +387,11 @@ pub async fn run(
 
 fn admit(
     store: &Arc<SqliteStorage>,
-    discord: Arc<dyn interface::Interface>,
-    interfaces: &harness::Interfaces,
-    inbound: interface::Inbound,
+    discord: Arc<dyn messenger::Messenger>,
+    messengers: &harness::Messengers,
+    inbound: messenger::Inbound,
 ) -> Result<Option<(String, storage::Meta)>> {
-    use storage::InterfaceStore;
+    use storage::MessengerStore;
     if !store.allowed_users("discord")?.contains(&inbound.author.id) {
         return Ok(None);
     }
@@ -407,15 +407,15 @@ fn admit(
     let to = store.destination("discord", &dest)?;
     let (place, message) = (inbound.place.clone(), inbound.message.clone());
     tokio::spawn(async move {
-        if let Err(error) = discord.react(&place, &message, interface::Mark::Seen).await {
+        if let Err(error) = discord.react(&place, &message, messenger::Mark::Seen).await {
             eprintln!("{error}");
         }
     });
-    interfaces.live("discord", to, inbound.place.clone());
+    messengers.live("discord", to, inbound.place.clone());
     Ok(Some((
         inbound.text,
         storage::Meta::Message {
-            interface: "discord".into(),
+            messenger: "discord".into(),
             place: inbound.place,
             message: inbound.message,
             author: inbound.author,
@@ -435,9 +435,9 @@ pub async fn serve(
     token: String,
 ) -> Result<()> {
     let harness = chat_harness(store.clone(), workspace, skills_dir, None).await?;
-    let discord: Arc<dyn interface::Interface> = Arc::new(interface_discord::Discord::new(token));
-    let interfaces = harness::Interfaces::new(vec![discord.clone()], store.clone());
-    let harness = harness.with_interfaces(interfaces.clone());
+    let discord: Arc<dyn messenger::Messenger> = Arc::new(messenger_discord::Discord::new(token));
+    let messengers = harness::Messengers::new(vec![discord.clone()], store.clone());
+    let harness = harness.with_messengers(messengers.clone());
     let (tx, mut rx) = tokio::sync::mpsc::channel(128);
     let listener_discord = discord.clone();
     let listener = tokio::spawn(async move { listener_discord.listen(tx).await });
@@ -456,7 +456,7 @@ pub async fn serve(
                 _ = interrupt.recv() => { listener.abort(); return Ok(()); },
                 _ = terminate.recv() => { listener.abort(); return Ok(()); },
             };
-            let Some(next) = admit(&store, discord.clone(), &interfaces, inbound)? else {
+            let Some(next) = admit(&store, discord.clone(), &messengers, inbound)? else {
                 continue;
             };
             next
@@ -470,14 +470,14 @@ pub async fn serve(
             tokio::select! {
                 result = &mut run => { if let Err(error) = result { eprintln!("{error}"); } break; },
                 value = rx.recv() => match value {
-                    Some(inbound) => if let Some((text, meta)) = admit(&store, discord.clone(), &interfaces, inbound)? { harness.steer_message(text, Some(meta)); },
+                    Some(inbound) => if let Some((text, meta)) = admit(&store, discord.clone(), &messengers, inbound)? { harness.steer_message(text, Some(meta)); },
                     None => return match listener.await? { Err(error) => Err(error.into()), Ok(()) => Err("discord listener stopped".into()) },
                 },
                 _ = interrupt.recv() => { listener.abort(); return Ok(()); },
                 _ = terminate.recv() => { listener.abort(); return Ok(()); },
             }
         }
-        interfaces.quiet();
+        messengers.quiet();
         for (text, meta) in harness.take_steering().into_iter().rev() {
             if let Some(meta) = meta {
                 pending.push_front((text, meta));
@@ -485,13 +485,13 @@ pub async fn serve(
         }
         for (_, meta) in &pending {
             if let storage::Meta::Message {
-                interface,
+                messenger,
                 place,
                 to,
                 ..
             } = meta
             {
-                interfaces.live(interface, *to, place.clone());
+                messengers.live(messenger, *to, place.clone());
             }
         }
     }

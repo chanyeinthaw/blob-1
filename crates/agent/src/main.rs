@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use storage::{
-    ConfigStore, InterfaceStore, ModelRef, Provider, ProviderApi, ProviderId, ReasoningLevel,
+    ConfigStore, MessengerStore, ModelRef, Provider, ProviderApi, ProviderId, ReasoningLevel,
     SkillStore,
 };
 use storage_sqlite::SqliteStorage;
@@ -29,9 +29,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Serve,
-    Interface {
+    Messenger {
         #[command(subcommand)]
-        command: InterfaceCommand,
+        command: MessengerCommand,
     },
     Provider {
         #[command(subcommand)]
@@ -66,10 +66,10 @@ enum Command {
 }
 
 #[derive(Subcommand)]
-enum InterfaceCommand {
-    Allow { interface: String, user_id: String },
-    Disallow { interface: String, user_id: String },
-    List { interface: String },
+enum MessengerCommand {
+    Allow { messenger: String, user_id: String },
+    Disallow { messenger: String, user_id: String },
+    List { messenger: String },
 }
 
 #[derive(Subcommand)]
@@ -158,14 +158,14 @@ async fn main() -> Result<()> {
         dir => dir,
     };
     let path = data_dir.join("agent.db");
-    let store = Arc::new(if matches!(cli.command, Command::Interface { .. }) {
+    let store = Arc::new(if matches!(cli.command, Command::Messenger { .. }) {
         SqliteStorage::open_shared(path)?
     } else {
         SqliteStorage::open(path)?
     });
 
     match cli.command {
-        Command::Interface { command } => interface(&store, command),
+        Command::Messenger { command } => messenger(&store, command),
         Command::Serve => {
             let token =
                 std::env::var("DISCORD_BOT_TOKEN").map_err(|_| "DISCORD_BOT_TOKEN is not set")?;
@@ -450,14 +450,14 @@ fn skill(store: &SqliteStorage, command: SkillCommand) -> Result<()> {
     Ok(())
 }
 
-fn interface(store: &SqliteStorage, command: InterfaceCommand) -> Result<()> {
+fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<()> {
     match command {
-        InterfaceCommand::Allow { interface, user_id } => store.allow_user(&interface, &user_id)?,
-        InterfaceCommand::Disallow { interface, user_id } => {
-            store.disallow_user(&interface, &user_id)?;
+        MessengerCommand::Allow { messenger, user_id } => store.allow_user(&messenger, &user_id)?,
+        MessengerCommand::Disallow { messenger, user_id } => {
+            store.disallow_user(&messenger, &user_id)?;
         }
-        InterfaceCommand::List { interface } => {
-            for user in store.allowed_users(&interface)? {
+        MessengerCommand::List { messenger } => {
+            for user in store.allowed_users(&messenger)? {
                 println!("{user}");
             }
         }

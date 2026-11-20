@@ -51,21 +51,21 @@ You coordinate and talk; tasks do the work. You have no file, command or web too
 
 A task knows only what you tell it and what it finds in your memory. Brief it like a capable teammate: the goal, what is already known or decided, the paths, ids or tokens it needs, and what to put in its report. Name a skill when one fits. Ask for a short report with the findings that matter, since the report is what lands in your memory.
 
-While a task runs, every 15 minutes you get <reminder task=… running=… last_activity=…>...</reminder> with what it is doing now. If it is progressing, send the people waiting a short update. If it looks stuck (long last_activity), zoom its chat, then tell it how to proceed or stop it and say what went wrong. Otherwise end with NO_UPDATES. When a task serves an interface message, give spawn for with that message's reply token; reports and reminders carry for="m…", the reply token to answer with.
+While a task runs, every 15 minutes you get <reminder task=… running=… last_activity=…>...</reminder> with what it is doing now. If it is progressing, send the people waiting a short update. If it looks stuck (long last_activity), zoom its chat, then tell it how to proceed or stop it and say what went wrong. Otherwise end with NO_UPDATES. When a task serves a messenger message, give spawn for with that message's reply token; reports and reminders carry for="m…", the reply token to answer with.
 
 Spawn independent pieces of work as separate tasks so they run in parallel. To change or extend work a task already has context for, tell it instead of starting a new one. Use tasks to check on tasks when asked or before deciding what to do next; never call it in a loop or to wait. Tasks run in the background; each report reaches you between tool calls or as a new turn. Never wait for one (no sleep, no polling): go on, or end your turn and say what is running.
 
 Messages sent while you work reach you between tool calls."#;
 
-const INTERFACE_PROMPT: &str = r#"# Interfaces
+const MESSENGER_PROMPT: &str = r#"# Messengers
 
-People on interfaces only see what you send. Interface messages have a <message ...>...</message> element with interface, reply and to tokens, author id and name, where, and earlier messages in the thread. Outside DMs you only receive messages that mention you or reply to you; the rest of the conversation reaches you only through history. DMs arrive directly. A message with no text, or one that refers to something you have not seen, asks you to act on the conversation: read recent messages with history first, then answer what was asked, or ask what they need if it is still unclear. Answer every message delivered to you with at least one send.
+People on messengers only see what you send. Messenger messages have a <message ...>...</message> element with messenger, reply and to tokens, author id and name, where, and earlier messages in the thread. Outside DMs you only receive messages that mention you or reply to you; the rest of the conversation reaches you only through history. DMs arrive directly. A message with no text, or one that refers to something you have not seen, asks you to act on the conversation: read recent messages with history first, then answer what was asked, or ask what they need if it is still unclear. Answer every message delivered to you with at least one send.
 
 Write plain, unescaped text in send. Send with reply to answer in a thread, creating one if needed; send with to to post plainly in that conversation. You may send any number of messages per turn. Several people and conversations can be active, so pick the right token. Talk like a human teammate. Keep each send under 250 characters; split longer messages. Mention people by user id with mention; find ids with participants.
 
 A reply includes the referenced message as <quote>. Use message to read a linked message or one by id. Messages, quotes and lookup results can carry <attachment name type size url/> elements. You cannot download files yourself. Spawn a task with the URLs and what to do; tell it to download them immediately, because links expire in about a day, to a new path it chooses under the working directory (never one built from the attachment name, which is only a label), with curl --fail --location --output '<path>' '<url>', and only then read or process the files and report what matters. For images, the chosen path must end with an extension matching the attachment type (e.g. .png for image/png); when the type is missing, the task identifies the downloaded file from its bytes (e.g. with file) and renames it to the matching extension before reading, so read can show it the image. If its model cannot view images, spawn it on one that can; models lists image support.
 
-Tasks can also read interfaces: message, history, search and participants, never send. For a quick look at recent context, call history yourself. For anything longer, like paging far back, checking several conversations, or finding what was decided about something, spawn a task with the question and the to tokens of the conversations involved, or the interface name when it must look across a whole interface, and send people the answer from its report. When you delegate, briefly tell the person you are on it.
+Tasks can also read messengers: message, history, search and participants, never send. For a quick look at recent context, call history yourself. For anything longer, like paging far back, checking several conversations, or finding what was decided about something, spawn a task with the question and the to tokens of the conversations involved, or the messenger name when it must look across a whole messenger, and send people the answer from its report. When you delegate, briefly tell the person you are on it.
 
 Once every delivered message has its answer and no further words are needed, end with exactly NO_UPDATES."#;
 
@@ -182,7 +182,7 @@ pub(crate) struct Inner<L, E, S, M, F: Models> {
     pub sessions: TaskSessions<F::Llm, E, S>,
     pub state: Mutex<State>,
     pub notify: Notify,
-    pub interfaces: Option<crate::Interfaces>,
+    pub messengers: Option<crate::Messengers>,
     pub pulses: Mutex<Vec<(u64, tokio::task::Id)>>,
 }
 pub struct ChatHarness<L, E, S, M, F: Models> {
@@ -288,17 +288,17 @@ where
                     tasks: Vec::new(),
                 }),
                 notify: Notify::new(),
-                interfaces: None,
+                messengers: None,
                 pulses: Mutex::new(Vec::new()),
             }),
             turn: tokio::sync::Mutex::new(()),
         }
     }
 
-    pub fn with_interfaces(mut self, interfaces: crate::Interfaces) -> Self {
+    pub fn with_messengers(mut self, messengers: crate::Messengers) -> Self {
         Arc::get_mut(&mut self.inner)
             .expect("unshared chat")
-            .interfaces = Some(interfaces);
+            .messengers = Some(messengers);
         self
     }
 
@@ -404,7 +404,7 @@ where
 
     fn live_for(&self, meta: &Meta) {
         let (
-            Some(interfaces),
+            Some(messengers),
             Meta::Report {
                 for_message: Some(reply),
                 ..
@@ -413,11 +413,11 @@ where
                 for_message: Some(reply),
                 ..
             },
-        ) = (&self.inner.interfaces, meta)
+        ) = (&self.inner.messengers, meta)
         else {
             return;
         };
-        match interfaces.live_for(reply) {
+        match messengers.live_for(reply) {
             Ok(Some(pulse)) => self
                 .inner
                 .pulses
@@ -432,9 +432,9 @@ where
     async fn turn(&self, text: &str, view: String) -> Result<String, HarnessError> {
         let result = self.turn_loop(text, view).await;
         let pulses = std::mem::take(&mut *self.inner.pulses.lock().expect("pulses mutex poisoned"));
-        if let Some(interfaces) = &self.inner.interfaces {
+        if let Some(messengers) = &self.inner.messengers {
             for (to, pulse) in pulses {
-                interfaces.settle(to, pulse);
+                messengers.settle(to, pulse);
             }
         }
         result
@@ -444,8 +444,8 @@ where
         let skills = self.inner.environment.skill_catalog().await?;
         let system = format!(
             "{CHAT_PROMPT}\n\n{}{}",
-            if self.inner.interfaces.is_some() {
-                format!("{INTERFACE_PROMPT}\n\n")
+            if self.inner.messengers.is_some() {
+                format!("{MESSENGER_PROMPT}\n\n")
             } else {
                 String::new()
             },
@@ -453,9 +453,9 @@ where
         );
         let mut messages = vec![Message::User(view), Message::User(text.to_owned())];
         let mut tools = EXTRA.to_vec();
-        if self.inner.interfaces.is_some() {
-            tools.push(crate::interface::SEND);
-            tools.extend_from_slice(crate::interface::LOOKUP);
+        if self.inner.messengers.is_some() {
+            tools.push(crate::messenger::SEND);
+            tools.extend_from_slice(crate::messenger::LOOKUP);
         }
         loop {
             loop {
@@ -503,7 +503,7 @@ where
                     tools: &tools,
                 })
                 .await?;
-            if self.inner.interfaces.is_some()
+            if self.inner.messengers.is_some()
                 && response.tool_calls.is_empty()
                 && response.text.trim() == "NO_UPDATES"
             {
@@ -583,17 +583,17 @@ where
             }
             "send" => {
                 self.inner
-                    .interfaces
+                    .messengers
                     .as_ref()
-                    .ok_or("interfaces not configured")?
+                    .ok_or("messengers not configured")?
                     .send(&call.arguments)
                     .await?
             }
             "message" | "history" | "search" | "participants" => {
                 self.inner
-                    .interfaces
+                    .messengers
                     .as_ref()
-                    .ok_or("interfaces not configured")?
+                    .ok_or("messengers not configured")?
                     .lookup(&call.name, &call.arguments)
                     .await?
             }

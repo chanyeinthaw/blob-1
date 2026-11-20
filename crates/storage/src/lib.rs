@@ -392,7 +392,8 @@ pub enum Meta {
         for_message: Option<String>,
     },
     Message {
-        interface: String,
+        #[serde(alias = "interface")]
+        messenger: String,
         place: Place,
         message: String,
         author: Person,
@@ -484,7 +485,7 @@ impl Meta {
                 attribute(task), attribute(running), attribute(last_activity), for_attribute(for_message)
             ),
             Self::Message {
-                interface,
+                messenger,
                 author,
                 to,
                 location,
@@ -493,8 +494,8 @@ impl Meta {
                 attachments,
                 ..
             } => format!(
-                "<message interface=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}>\n{}{}{body}\n</message>",
-                attribute(interface),
+                "<message messenger=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}>\n{}{}{body}\n</message>",
+                attribute(messenger),
                 attribute(&author.id),
                 attribute(&author.name),
                 attribute(location),
@@ -513,11 +514,11 @@ impl Meta {
             Self::Report { task, status, .. } => format!("task {task}, {}", status.as_str()),
             Self::Reminder { task, .. } => format!("reminder for task {task}"),
             Self::Message {
-                interface,
+                messenger,
                 author,
                 location,
                 ..
-            } => format!("{interface} @{} in {location}", author.name),
+            } => format!("{messenger} @{} in {location}", author.name),
         }
     }
 }
@@ -603,28 +604,28 @@ impl<T: MemoryStore + ?Sized> MemoryStore for std::sync::Arc<T> {
     }
 }
 
-pub trait InterfaceStore: Send + Sync {
-    fn destination(&self, interface: &str, place: &Place) -> Result<u64, StoreError>;
+pub trait MessengerStore: Send + Sync {
+    fn destination(&self, messenger: &str, place: &Place) -> Result<u64, StoreError>;
     fn place(&self, id: u64) -> Result<Option<(String, Place)>, StoreError>;
-    fn allowed_users(&self, interface: &str) -> Result<Vec<String>, StoreError>;
-    fn allow_user(&self, interface: &str, user: &str) -> Result<(), StoreError>;
-    fn disallow_user(&self, interface: &str, user: &str) -> Result<bool, StoreError>;
+    fn allowed_users(&self, messenger: &str) -> Result<Vec<String>, StoreError>;
+    fn allow_user(&self, messenger: &str, user: &str) -> Result<(), StoreError>;
+    fn disallow_user(&self, messenger: &str, user: &str) -> Result<bool, StoreError>;
 }
 
-impl<T: InterfaceStore + ?Sized> InterfaceStore for std::sync::Arc<T> {
-    fn destination(&self, interface: &str, place: &Place) -> Result<u64, StoreError> {
-        (**self).destination(interface, place)
+impl<T: MessengerStore + ?Sized> MessengerStore for std::sync::Arc<T> {
+    fn destination(&self, messenger: &str, place: &Place) -> Result<u64, StoreError> {
+        (**self).destination(messenger, place)
     }
     fn place(&self, id: u64) -> Result<Option<(String, Place)>, StoreError> {
         (**self).place(id)
     }
-    fn allowed_users(&self, interface: &str) -> Result<Vec<String>, StoreError> {
-        (**self).allowed_users(interface)
+    fn allowed_users(&self, messenger: &str) -> Result<Vec<String>, StoreError> {
+        (**self).allowed_users(messenger)
     }
-    fn allow_user(&self, interface: &str, user: &str) -> Result<(), StoreError> {
-        (**self).allow_user(interface, user)
+    fn allow_user(&self, messenger: &str, user: &str) -> Result<(), StoreError> {
+        (**self).allow_user(messenger, user)
     }
-    fn disallow_user(&self, interface: &str, user: &str) -> Result<bool, StoreError> {
-        (**self).disallow_user(interface, user)
+    fn disallow_user(&self, messenger: &str, user: &str) -> Result<bool, StoreError> {
+        (**self).disallow_user(messenger, user)
     }
 }

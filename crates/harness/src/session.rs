@@ -77,7 +77,7 @@ pub trait MemoryTools: Send + Sync {
 pub struct SessionHarness<L, E, S> {
     llm: L,
     memory_tools: Option<Arc<dyn MemoryTools>>,
-    lookup_tools: Option<crate::Interfaces>,
+    lookup_tools: Option<crate::Messengers>,
     observer: Option<Arc<dyn Fn(Step) + Send + Sync>>,
     summarizer: Option<L>,
     environment: E,
@@ -113,7 +113,7 @@ where
         self
     }
 
-    pub fn with_lookup_tools(mut self, tools: crate::Interfaces) -> Self {
+    pub fn with_lookup_tools(mut self, tools: crate::Messengers) -> Self {
         self.lookup_tools = Some(tools);
         self
     }
@@ -176,7 +176,7 @@ where
         }
 
         if self.lookup_tools.is_some() {
-            tools.extend_from_slice(crate::interface::LOOKUP);
+            tools.extend_from_slice(crate::messenger::LOOKUP);
         }
 
         if let Some(user_message) = user_message {

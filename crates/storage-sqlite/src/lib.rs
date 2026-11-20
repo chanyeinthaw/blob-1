@@ -6,8 +6,8 @@ use rusqlite::Connection;
 use storage::StoreError;
 
 mod config;
-mod interface;
 mod memory;
+mod messenger;
 mod session;
 mod skill;
 
@@ -44,8 +44,8 @@ CREATE TABLE IF NOT EXISTS message_images (session_id TEXT NOT NULL, position IN
 CREATE TABLE IF NOT EXISTS skills (name TEXT PRIMARY KEY, description TEXT NOT NULL, hash TEXT NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS skill_files (skill TEXT NOT NULL REFERENCES skills (name) ON DELETE CASCADE, path TEXT NOT NULL, mode INTEGER NOT NULL, content BLOB NOT NULL, PRIMARY KEY (skill, path)) STRICT;
 
-CREATE TABLE IF NOT EXISTS destinations (id INTEGER PRIMARY KEY, interface TEXT NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, dm INTEGER NOT NULL CHECK (dm IN (0,1)), UNIQUE (interface, channel, thread)) STRICT;
-CREATE TABLE IF NOT EXISTS allowed_users (interface TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (interface, user_id)) STRICT;
+CREATE TABLE IF NOT EXISTS destinations (id INTEGER PRIMARY KEY, messenger TEXT NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, dm INTEGER NOT NULL CHECK (dm IN (0,1)), UNIQUE (messenger, channel, thread)) STRICT;
+CREATE TABLE IF NOT EXISTS allowed_users (messenger TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (messenger, user_id)) STRICT;
 
 CREATE TABLE IF NOT EXISTS providers (
     id TEXT PRIMARY KEY,
@@ -129,6 +129,27 @@ impl SqliteStorage {
             .pragma_update(None, "synchronous", "NORMAL")
             .map_err(backend)?;
         connection.execute_batch(SCHEMA).map_err(backend)?;
+        for table in ["destinations", "allowed_users"] {
+            let old_column: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = 'interface')",
+                    [table],
+                    |row| row.get(0),
+                )
+                .map_err(backend)?;
+            if old_column {
+                if owner.is_none() {
+                    return Err(StoreError::Backend(
+                        "this database needs an upgrade: stop agent serve and run any other agent command once".into(),
+                    ));
+                }
+                connection
+                    .execute_batch(&format!(
+                        "ALTER TABLE {table} RENAME COLUMN interface TO messenger"
+                    ))
+                    .map_err(backend)?;
+            }
+        }
         Ok(Self {
             connection: Mutex::new(connection),
             _owner: owner,
