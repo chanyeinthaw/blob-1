@@ -408,7 +408,7 @@ impl Messengers {
                                     thread: Some(message.clone()),
                                     dm: false,
                                 },
-                                prompt,
+                                Some(prompt),
                             ));
                         }
                         (
@@ -428,6 +428,9 @@ impl Messengers {
             }
             (None, Some(to)) => {
                 let (name, place) = self.place(&to, false)?;
+                if place.thread.is_some() && !place.dm {
+                    title_prompt = Some((place.clone(), None));
+                }
                 (name, Target::To(place), token(&to, 'd')?)
             }
             _ => return Err("exactly one of reply or to is required".into()),
@@ -449,6 +452,24 @@ impl Messengers {
                     .expect("messenger already found")
                     .clone();
                 tokio::spawn(async move {
+                    let prompt = match prompt {
+                        Some(prompt) => prompt,
+                        None => {
+                            let source = Place {
+                                channel: place.channel.clone(),
+                                thread: None,
+                                dm: false,
+                            };
+                            let id = place.thread.clone().expect("title place is a thread");
+                            match messenger.message(&source, &id).await {
+                                Ok(message) => message.text,
+                                Err(error) => {
+                                    eprintln!("{error}");
+                                    return;
+                                }
+                            }
+                        }
+                    };
                     match utility.generate("Write a short title (max 6 words) for a chat thread that starts with this message. Reply with the title only.", &prompt).await {
                     Ok(title) => {
                         let title: String = title.trim().trim_matches(['"', '\'']).split_whitespace().take(6).collect::<Vec<_>>().join(" ").chars().take(100).collect();
