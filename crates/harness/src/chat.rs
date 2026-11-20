@@ -24,7 +24,7 @@ Each message has a kind:
 - assistant: Agent's replies
 - tool: Agent's tool calls
 - echo: tool results
-- work: a task's report, arriving as `<report task="id" status="done|failed|stopped|crashed"/>` followed by its body
+- work: a task's report or reminder; a report arrives as `<report task="id" status="done|failed|stopped|crashed"/>` followed by its body
 - note: memories from before this chat
 
 The summaries form a binary tree: each message is compressed into a line (a short message is its own line), then adjacent lines are merged in pairs, again and again. So recent lines cover one message each, and older lines cover more. A message not summarized yet shows as "(not summarized yet: zoom it)". A text too long for one message is split over several in a row.
@@ -49,6 +49,8 @@ You coordinate and talk; tasks do the work. You have no file, command or web too
 
 A task knows only what you tell it and what it finds in your memory. Brief it like a capable teammate: the goal, what is already known or decided, the paths, ids or tokens it needs, and what to put in its report. Name a skill when one fits. Ask for a short report with the findings that matter, since the report is what lands in your memory.
 
+While a task runs, every 15 minutes you get <reminder task=… running=… last_activity=…/> with what it is doing now. If it is progressing, send the people waiting a short update. If it looks stuck (long last_activity), zoom its chat, then tell it how to proceed or stop it and say what went wrong. Otherwise end with NO_UPDATES. When a task serves an interface message, give spawn for with that message's reply token; reports and reminders carry for="m…", the reply token to answer with.
+
 Spawn independent pieces of work as separate tasks so they run in parallel. To change or extend work a task already has context for, tell it instead of starting a new one. Use tasks to check on tasks when asked or before deciding what to do next; never call it in a loop or to wait. Tasks run in the background; each report reaches you between tool calls or as a new turn. Never wait for one (no sleep, no polling): go on, or end your turn and say what is running.
 
 Messages sent while you work reach you between tool calls."#;
@@ -67,7 +69,7 @@ pub(crate) const EXTRA: &[ToolSpec] = &[
     ToolSpec { name: "zoom", description: "Open the line id+n of the view into the two lines of n/2 under it; n = 1 gives the message whole. With a task id, give that task's chat as stored, with older parts summarized if compacted. A long text comes in pages from character at, saying where to go on.", input_schema: r#"{"type":"object","properties":{"id":{"oneOf":[{"type":"integer"},{"type":"string"}]},"n":{"type":"integer"},"at":{"type":"integer"}},"required":["id"]}"# },
     ToolSpec { name: "date", description: "The date and time of message id.", input_schema: r#"{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}"# },
     ToolSpec { name: "models", description: "List the configured providers and models you can give to spawn: provider, model id, context window, supported reasoning levels. Use search to filter.", input_schema: r#"{"type":"object","properties":{"search":{"type":"string"}}}"# },
-    ToolSpec { name: "spawn", description: "Start one background task per item. Optionally specify provider, model and reasoning per task; call models to see available choices. Give provider and model together. Never wait or poll for it.", input_schema: r#"{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{"task":{"type":"string"},"provider":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string","enum":["off","low","medium","high","xhigh","max"]}},"required":["task"]}}},"required":["tasks"]}"# },
+    ToolSpec { name: "spawn", description: "Start one background task per item. Optionally specify provider, model and reasoning per task; call models to see available choices. Give provider and model together. Use for for the originating message reply token. Never wait or poll for it.", input_schema: r#"{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{"task":{"type":"string"},"for":{"type":"string","description":"Originating message reply token"},"provider":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string","enum":["off","low","medium","high","xhigh","max"]}},"required":["task"]}}},"required":["tasks"]}"# },
     ToolSpec { name: "tasks", description: "List tasks with their status, model, how long they have been running, and what each is doing now.", input_schema: r#"{"type":"object","properties":{}}"# },
     ToolSpec { name: "stop", description: "Stop a running task: cancels its work and kills its running commands. Its report says it was stopped.", input_schema: r#"{"type":"object","properties":{"task":{"type":"string"},"reason":{"type":"string"}},"required":["task"]}"# },
     ToolSpec { name: "tell", description: "Send a message to a task by id: delivered between its tool calls if it is working, or restarts it from its chat.", input_schema: r#"{"type":"object","properties":{"task":{"type":"string"},"text":{"type":"string"}},"required":["task","text"]}"# },
@@ -191,6 +193,8 @@ struct Spawn {
 #[derive(Deserialize)]
 pub(crate) struct SpawnTask {
     pub task: String,
+    #[serde(rename = "for")]
+    pub for_message: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub reasoning: Option<String>,

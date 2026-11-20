@@ -349,6 +349,15 @@ pub enum Meta {
     Report {
         task: String,
         status: ReportStatus,
+        #[serde(rename = "for", default)]
+        for_message: Option<String>,
+    },
+    Reminder {
+        task: String,
+        running: String,
+        last_activity: String,
+        #[serde(rename = "for")]
+        for_message: Option<String>,
     },
     Message {
         interface: String,
@@ -390,13 +399,22 @@ fn attribute(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn for_attribute(value: &Option<String>) -> String {
+    value.as_ref().map_or_else(String::new, |value| {
+        format!(" for=\"{}\"", attribute(value))
+    })
+}
+
 impl Meta {
     pub fn tag(&self, i: u64) -> String {
         match self {
-            Self::Report { task, status } => format!(
-                "<report task=\"{}\" status=\"{}\"/>",
-                attribute(task),
-                status.as_str()
+            Self::Report { task, status, for_message } => format!(
+                "<report task=\"{}\" status=\"{}\"{}/>",
+                attribute(task), status.as_str(), for_attribute(for_message)
+            ),
+            Self::Reminder { task, running, last_activity, for_message } => format!(
+                "<reminder task=\"{}\" running=\"{}\" last_activity=\"{}\"{}/>",
+                attribute(task), attribute(running), attribute(last_activity), for_attribute(for_message)
             ),
             Self::Message {
                 interface,
@@ -418,7 +436,8 @@ impl Meta {
 
     pub fn source(&self) -> String {
         match self {
-            Self::Report { task, status } => format!("task {task}, {}", status.as_str()),
+            Self::Report { task, status, .. } => format!("task {task}, {}", status.as_str()),
+            Self::Reminder { task, .. } => format!("reminder for task {task}"),
             Self::Message {
                 interface,
                 author,

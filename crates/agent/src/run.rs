@@ -382,6 +382,8 @@ pub async fn run(
 
 fn admit(
     store: &Arc<SqliteStorage>,
+    discord: Arc<dyn interface::Interface>,
+    interfaces: &harness::Interfaces,
     inbound: interface::Inbound,
 ) -> Result<Option<(String, storage::Meta)>> {
     use storage::InterfaceStore;
@@ -398,6 +400,13 @@ fn admit(
         }
     };
     let to = store.destination("discord", &dest)?;
+    let (place, message) = (inbound.place.clone(), inbound.message.clone());
+    tokio::spawn(async move {
+        if let Err(error) = discord.acknowledge(&place, &message).await {
+            eprintln!("{error}");
+        }
+    });
+    interfaces.live("discord", to, inbound.place.clone());
     Ok(Some((
         inbound.text,
         storage::Meta::Message {
@@ -420,12 +429,11 @@ pub async fn serve(
 ) -> Result<()> {
     let harness = chat_harness(store.clone(), workspace, skills_dir, None).await?;
     let discord: Arc<dyn interface::Interface> = Arc::new(interface_discord::Discord::new(token));
-    let harness = harness.with_interfaces(harness::Interfaces::new(
-        vec![discord.clone()],
-        store.clone(),
-    ));
+    let interfaces = harness::Interfaces::new(vec![discord.clone()], store.clone());
+    let harness = harness.with_interfaces(interfaces.clone());
     let (tx, mut rx) = tokio::sync::mpsc::channel(128);
-    let listener = tokio::spawn(async move { discord.listen(tx).await });
+    let listener_discord = discord.clone();
+    let listener = tokio::spawn(async move { listener_discord.listen(tx).await });
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
     let mut pending = std::collections::VecDeque::<(String, storage::Meta)>::new();
@@ -441,7 +449,7 @@ pub async fn serve(
                 _ = interrupt.recv() => { listener.abort(); return Ok(()); },
                 _ = terminate.recv() => { listener.abort(); return Ok(()); },
             };
-            let Some(next) = admit(&store, inbound)? else {
+            let Some(next) = admit(&store, discord.clone(), &interfaces, inbound)? else {
                 continue;
             };
             next
@@ -455,16 +463,28 @@ pub async fn serve(
             tokio::select! {
                 result = &mut run => { if let Err(error) = result { eprintln!("{error}"); } break; },
                 value = rx.recv() => match value {
-                    Some(inbound) => if let Some((text, meta)) = admit(&store, inbound)? { harness.steer_message(text, Some(meta)); },
+                    Some(inbound) => if let Some((text, meta)) = admit(&store, discord.clone(), &interfaces, inbound)? { harness.steer_message(text, Some(meta)); },
                     None => return match listener.await? { Err(error) => Err(error.into()), Ok(()) => Err("discord listener stopped".into()) },
                 },
                 _ = interrupt.recv() => { listener.abort(); return Ok(()); },
                 _ = terminate.recv() => { listener.abort(); return Ok(()); },
             }
         }
+        interfaces.quiet();
         for (text, meta) in harness.take_steering().into_iter().rev() {
             if let Some(meta) = meta {
                 pending.push_front((text, meta));
+            }
+        }
+        for (_, meta) in &pending {
+            if let storage::Meta::Message {
+                interface,
+                place,
+                to,
+                ..
+            } = meta
+            {
+                interfaces.live(interface, *to, place.clone());
             }
         }
     }

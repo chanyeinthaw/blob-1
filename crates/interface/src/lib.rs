@@ -75,5 +75,7 @@ pub trait Lookup: Send + Sync {
 #[async_trait::async_trait]
 pub trait Interface: Lookup {
     async fn listen(&self, inbound: mpsc::Sender<Inbound>) -> Result<(), InterfaceError>;
+    async fn acknowledge(&self, place: &Place, message: &str) -> Result<(), InterfaceError>;
+    async fn typing(&self, place: &Place) -> Result<(), InterfaceError>;
     async fn send(&self, outbound: Outbound) -> Result<(), InterfaceError>;
 }

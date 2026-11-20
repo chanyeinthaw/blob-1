@@ -197,6 +197,26 @@ impl Interface for Discord {
     async fn listen(&self, inbound: mpsc::Sender<Inbound>) -> Result<(), InterfaceError> {
         gateway::listen(self, inbound).await
     }
+    async fn acknowledge(&self, place: &Place, message: &str) -> Result<(), InterfaceError> {
+        self.http
+            .create_reaction(
+                channel(place)?,
+                id(message)?,
+                &twilight_http::request::channel::reaction::RequestReactionType::Unicode {
+                    name: "👀",
+                },
+            )
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
+    async fn typing(&self, place: &Place) -> Result<(), InterfaceError> {
+        self.http
+            .create_typing_trigger(channel(place)?)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
     async fn send(&self, outbound: Outbound) -> Result<(), InterfaceError> {
         render::send(self, outbound).await
     }

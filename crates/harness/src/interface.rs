@@ -1,4 +1,6 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use environment::ToolSpec;
 use interface::{Fetched, Interface, Outbound, Place, Scope, Target};
@@ -37,6 +39,18 @@ impl<T: InterfaceStore + MemoryStore> Store for T {}
 pub struct Interfaces {
     interfaces: Vec<Arc<dyn Interface>>,
     store: Arc<dyn Store>,
+    live: Arc<LiveState>,
+}
+
+#[derive(Default)]
+struct LiveState(Mutex<HashMap<u64, tokio::task::AbortHandle>>);
+
+impl Drop for LiveState {
+    fn drop(&mut self) {
+        for (_, pulse) in self.0.get_mut().expect("live mutex poisoned").drain() {
+            pulse.abort();
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -84,6 +98,43 @@ impl Interfaces {
         Self {
             interfaces,
             store: Arc::new(store),
+            live: Arc::default(),
+        }
+    }
+    pub fn live(&self, interface: &str, to: u64, place: Place) {
+        let interface = self
+            .interfaces
+            .iter()
+            .find(|i| i.name() == interface)
+            .expect("unknown interface")
+            .clone();
+        let pulse = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+            let mut ticks = tokio::time::interval(Duration::from_secs(8));
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticks.tick().await;
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                if let Err(error) = interface.typing(&place).await {
+                    eprintln!("{error}");
+                }
+            }
+        });
+        if let Some(old) = self
+            .live
+            .0
+            .lock()
+            .expect("live mutex poisoned")
+            .insert(to, pulse.abort_handle())
+        {
+            old.abort();
+        }
+    }
+    pub fn quiet(&self) {
+        for (_, pulse) in self.live.0.lock().expect("live mutex poisoned").drain() {
+            pulse.abort();
         }
     }
     fn find(&self, name: &str) -> Result<&dyn Interface, Error> {
@@ -121,7 +172,7 @@ impl Interfaces {
         if args.text.chars().count() > 250 {
             return Err("text exceeds 250 characters; shorten or split into several sends".into());
         }
-        let (name, target) = match (args.reply, args.to) {
+        let (name, target, destination) = match (args.reply, args.to) {
             (Some(reply), None) => {
                 let row = self
                     .store
@@ -133,6 +184,7 @@ impl Interfaces {
                         place,
                         message,
                         author,
+                        to,
                         ..
                     }) => (
                         interface,
@@ -141,13 +193,14 @@ impl Interfaces {
                             message,
                             author: author.id,
                         },
+                        to,
                     ),
                     _ => return Err("message has no interface metadata".into()),
                 }
             }
             (None, Some(to)) => {
                 let (name, place) = self.place(&to, false)?;
-                (name, Target::To(place))
+                (name, Target::To(place), token(&to, 'd')?)
             }
             _ => return Err("exactly one of reply or to is required".into()),
         };
@@ -158,6 +211,15 @@ impl Interfaces {
                 mention: args.mention,
             })
             .await?;
+        if let Some(pulse) = self
+            .live
+            .0
+            .lock()
+            .expect("live mutex poisoned")
+            .remove(&destination)
+        {
+            pulse.abort();
+        }
         Ok("sent".into())
     }
     pub async fn lookup(&self, name: &str, arguments: &str) -> Result<String, Error> {

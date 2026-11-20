@@ -12,6 +12,8 @@ use crate::{
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
+const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 #[derive(Clone)]
 pub(crate) struct Report {
     pub(crate) meta: Meta,
@@ -29,6 +31,8 @@ pub(crate) struct Task {
     step_started: Instant,
     step: Step,
     status: Status,
+    for_message: Option<String>,
+    watch: Option<tokio::task::AbortHandle>,
     work: Option<tokio::task::AbortHandle>,
     supervisor: Option<tokio::task::JoinHandle<()>>,
     run_id: u64,
@@ -105,10 +109,12 @@ where
 pub(crate) fn delivered<L, E, S, M, F: Models>(inner: &Inner<L, E, S, M, F>) {
     let mut state = inner.state.lock().expect("chat state mutex poisoned");
     if let Some(report) = state.reports.pop_front() {
-        if let Some(agent) = state.agents.get_mut(&report.name) {
-            if agent.run_id == report.run_id {
-                if let Status::Idle { delivered, .. } = &mut agent.status {
-                    *delivered = true;
+        if matches!(report.meta, Meta::Report { .. }) {
+            if let Some(agent) = state.agents.get_mut(&report.name) {
+                if agent.run_id == report.run_id {
+                    if let Status::Idle { delivered, .. } = &mut agent.status {
+                        *delivered = true;
+                    }
                 }
             }
         }
@@ -140,6 +146,10 @@ where
         let reason = reason.unwrap_or_else(|| "stopped by the main agent".into());
         let agent = state.agents.get_mut(name).expect("running agent tracked");
         agent.status = Status::Stopped(reason.clone());
+        if let Some(watch) = agent.watch.take() {
+            watch.abort();
+        }
+        let for_message = agent.for_message.clone();
         if let Some(work) = agent.work.take() {
             work.abort();
         }
@@ -157,6 +167,7 @@ where
             meta: Meta::Report {
                 task: name.to_owned(),
                 status: ReportStatus::Stopped,
+                for_message,
             },
             text: format!("stopped: {reason}"),
             name: name.to_owned(),
@@ -183,6 +194,15 @@ where
 {
     let mut prepared = Vec::new();
     for task in tasks {
+        if let Some(value) = &task.for_message {
+            let digits = value.strip_prefix('m').ok_or("invalid for token")?;
+            if digits.is_empty()
+                || !digits.bytes().all(|b| b.is_ascii_digit())
+                || digits.parse::<u64>().is_err()
+            {
+                return Err("invalid for token".into());
+            }
+        }
         let choice = match (&task.provider, &task.model) {
             (Some(provider), Some(model)) => Some((provider.as_str(), model.as_str())),
             (None, None) => None,
@@ -192,6 +212,7 @@ where
         let (llm, window, selection) = inner.models.connect(choice, reasoning)?;
         prepared.push((
             task.task,
+            task.for_message,
             llm,
             window,
             selection.provider,
@@ -202,7 +223,7 @@ where
     inner.memory.settle(inner.memory.count()?).await?;
     let view = inner.memory.view()?;
     let mut names = Vec::new();
-    for (task, llm, window, provider, model, reasoning) in prepared {
+    for (task, for_message, llm, window, provider, model, reasoning) in prepared {
         let text = format!("{view}\n\nYour task:\n\n{task}");
         let choice = TaskChoice {
             provider: provider.clone(),
@@ -239,6 +260,8 @@ where
                     step_started: now,
                     step: Step::Idle,
                     status: Status::Running,
+                    for_message,
+                    watch: None,
                     work: None,
                     supervisor: None,
                     run_id: 1,
@@ -320,10 +343,15 @@ where
             step_started: now,
             step: Step::Idle,
             status: Status::Running,
+            for_message: None,
+            watch: None,
             work: None,
             supervisor: None,
             run_id: 0,
         });
+        if let Some(watch) = agent.watch.take() {
+            watch.abort();
+        }
         agent.started = now;
         agent.activity = now;
         agent.step_started = now;
@@ -409,6 +437,44 @@ fn launch<L, E, S, M, F: Models>(
     let inner = Arc::clone(inner);
     let mut state = inner.state.lock().expect("chat state mutex poisoned");
     let run_id = state.agents.get(&name).expect("agent tracked").run_id;
+    let watch_inner = Arc::downgrade(&inner);
+    let watch_name = name.clone();
+    let watch = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(WATCH_INTERVAL).await;
+            let Some(inner) = watch_inner.upgrade() else {
+                break;
+            };
+            let mut state = inner.state.lock().expect("chat state mutex poisoned");
+            let Some(agent) = state
+                .agents
+                .get(&watch_name)
+                .filter(|agent| agent.run_id == run_id && agent.is_running())
+            else {
+                break;
+            };
+            let step = match &agent.step {
+                Step::Model => "model",
+                Step::Tool { name } => name,
+                Step::Idle => "idle",
+            };
+            let report = Report {
+                meta: Meta::Reminder {
+                    task: watch_name.clone(),
+                    running: duration(agent.started),
+                    last_activity: duration(agent.activity),
+                    for_message: agent.for_message.clone(),
+                },
+                text: format!("now: {step} ({})", duration(agent.step_started)),
+                name: watch_name.clone(),
+                run_id,
+            };
+            state.reports.push_back(report);
+            drop(state);
+            inner.notify.notify_one();
+        }
+    });
+    state.agents.get_mut(&name).expect("agent tracked").watch = Some(watch.abort_handle());
     let task_inner = Arc::clone(&inner);
     let session = inner
         .sessions
@@ -446,14 +512,20 @@ fn launch<L, E, S, M, F: Models>(
                 text = Some(next);
                 continue;
             }
-            state.agents.get_mut(&name).expect("agent tracked").status = Status::Idle {
+            let agent = state.agents.get_mut(&name).expect("agent tracked");
+            agent.status = Status::Idle {
                 finished: Instant::now(),
                 delivered: false,
             };
+            if let Some(watch) = agent.watch.take() {
+                watch.abort();
+            }
+            let for_message = agent.for_message.clone();
             state.reports.push_back(Report {
                 meta: Meta::Report {
                     task: name.clone(),
                     status,
+                    for_message,
                 },
                 text: result,
                 name: name.clone(),
@@ -491,15 +563,17 @@ fn launch<L, E, S, M, F: Models>(
             } else {
                 String::new()
             };
-            state
-                .agents
-                .get_mut(&crash_name)
-                .expect("agent tracked")
-                .status = Status::Crashed(message.to_owned());
+            let agent = state.agents.get_mut(&crash_name).expect("agent tracked");
+            agent.status = Status::Crashed(message.to_owned());
+            if let Some(watch) = agent.watch.take() {
+                watch.abort();
+            }
+            let for_message = agent.for_message.clone();
             state.reports.push_back(Report {
                 meta: Meta::Report {
                     task: crash_name.clone(),
                     status: ReportStatus::Crashed,
+                    for_message,
                 },
                 text: format!("error: task crashed: {message}{suffix}"),
                 name: crash_name.clone(),
