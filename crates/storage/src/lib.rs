@@ -44,7 +44,7 @@ pub struct SessionUsage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentChoice {
+pub struct TaskChoice {
     pub provider: String,
     pub model: String,
     pub reasoning: String,
@@ -71,14 +71,18 @@ pub enum StoreError {
 }
 
 pub trait SessionStore: Send + Sync {
+    fn create_session(&self, id: &SessionId) -> Result<bool, StoreError>;
     fn load(&self, id: &SessionId) -> Result<Option<Session>, StoreError>;
     fn save(&self, session: Session) -> Result<(), StoreError>;
     fn session_ids(&self, prefix: &str) -> Result<Vec<SessionId>, StoreError>;
-    fn save_agent_choice(&self, name: &str, choice: &AgentChoice) -> Result<(), StoreError>;
-    fn agent_choice(&self, name: &str) -> Result<Option<AgentChoice>, StoreError>;
+    fn save_task_choice(&self, name: &str, choice: &TaskChoice) -> Result<(), StoreError>;
+    fn task_choice(&self, name: &str) -> Result<Option<TaskChoice>, StoreError>;
 }
 
 impl<T: SessionStore + ?Sized> SessionStore for std::sync::Arc<T> {
+    fn create_session(&self, id: &SessionId) -> Result<bool, StoreError> {
+        (**self).create_session(id)
+    }
     fn load(&self, id: &SessionId) -> Result<Option<Session>, StoreError> {
         (**self).load(id)
     }
@@ -91,12 +95,12 @@ impl<T: SessionStore + ?Sized> SessionStore for std::sync::Arc<T> {
         (**self).session_ids(prefix)
     }
 
-    fn save_agent_choice(&self, name: &str, choice: &AgentChoice) -> Result<(), StoreError> {
-        (**self).save_agent_choice(name, choice)
+    fn save_task_choice(&self, name: &str, choice: &TaskChoice) -> Result<(), StoreError> {
+        (**self).save_task_choice(name, choice)
     }
 
-    fn agent_choice(&self, name: &str) -> Result<Option<AgentChoice>, StoreError> {
-        (**self).agent_choice(name)
+    fn task_choice(&self, name: &str) -> Result<Option<TaskChoice>, StoreError> {
+        (**self).task_choice(name)
     }
 }
 

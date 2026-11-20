@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     usage_boundary INTEGER
 ) STRICT;
 
-CREATE TABLE IF NOT EXISTS agent_choices (name TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, reasoning TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS task_choices (id TEXT PRIMARY KEY, provider TEXT NOT NULL, model TEXT NOT NULL, reasoning TEXT NOT NULL) STRICT;
 
 CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL REFERENCES sessions (id),

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use environment::Environment;
-use storage::{AgentChoice, MemoryStore, Message, Session, SessionId, SessionStore};
+use storage::{MemoryStore, Message, Session, SessionId, SessionStore, TaskChoice};
 
 use crate::{
     chat::{Inner, Models, Shared, SpawnTask},
@@ -18,7 +18,7 @@ pub(crate) struct Report {
     run_id: u64,
 }
 
-pub(crate) struct Agent {
+pub(crate) struct Task {
     provider: String,
     model: String,
     reasoning: String,
@@ -32,7 +32,7 @@ pub(crate) struct Agent {
     run_id: u64,
 }
 
-impl Agent {
+impl Task {
     pub(crate) fn is_running(&self) -> bool {
         matches!(self.status, Status::Running)
     }
@@ -60,7 +60,7 @@ pub(crate) fn list<L, E, S, M, F: Models>(
 where
     S: SessionStore,
 {
-    let stored = inner.store.session_ids("agent:")?;
+    let stored = inner.store.session_ids("task:")?;
     let state = inner.state.lock().expect("chat state mutex poisoned");
     let mut names: Vec<_> = state.agents.keys().collect();
     names.sort();
@@ -73,15 +73,15 @@ where
                 format!("{name}  running  {}  provider={} model={} reasoning={}\n        now: {step} ({})    last activity {} ago", duration(agent.started), agent.provider, agent.model, agent.reasoning, duration(agent.step_started), duration(agent.activity))
             }
             Status::Idle { finished, delivered } => format!("{name}  idle  finished {} ago    report {}", duration(*finished), if *delivered { "delivered" } else { "pending" }),
-            Status::Crashed(message) => format!("{name}  crashed  error: agent crashed: {message}"),
+            Status::Crashed(message) => format!("{name}  crashed  error: task crashed: {message}"),
             Status::Stopped(reason) => format!("{name}  stopped  {reason}"),
         };
         if agent.is_running() { row } else { format!("{row}  {selection}") }
     }).collect();
     for id in stored {
-        let name = id.0.strip_prefix("agent:").expect("matching prefix");
+        let name = id.0.strip_prefix("task:").expect("matching prefix");
         if !state.agents.contains_key(name) {
-            let choice = inner.store.agent_choice(name)?;
+            let choice = inner.store.task_choice(name)?;
             let suffix = choice
                 .map(|c| {
                     format!(
@@ -94,7 +94,7 @@ where
         }
     }
     Ok(if lines.is_empty() {
-        "No agents.".into()
+        "No tasks.".into()
     } else {
         lines.join("\n")
     })
@@ -124,16 +124,16 @@ where
 {
     let supervisor = {
         let mut state = inner.state.lock().expect("chat state mutex poisoned");
-        if !state.agents.get(name).is_some_and(Agent::is_running) {
+        if !state.agents.get(name).is_some_and(Task::is_running) {
             if state.agents.contains_key(name)
                 || inner
                     .store
-                    .load(&SessionId::new(format!("agent:{name}")))?
+                    .load(&SessionId::new(format!("task:{name}")))?
                     .is_some()
             {
                 return Ok(format!("{name} is not running."));
             }
-            return Ok(format!("unknown agent: {name}"));
+            return Ok(format!("unknown task: {name}"));
         }
         let reason = reason.unwrap_or_else(|| "stopped by the main agent".into());
         let agent = state.agents.get_mut(name).expect("running agent tracked");
@@ -149,7 +149,7 @@ where
             .expect("sessions mutex poisoned")
             .get(name)
         {
-            session.take_steering(&SessionId::new(format!("agent:{name}")));
+            session.take_steering(&SessionId::new(format!("task:{name}")));
         }
         state.reports.push_back(Report {
             text: format!("[{name}]\nstopped: {reason}\n\nChat: zoom(\"{name}\")"),
@@ -198,33 +198,27 @@ where
     let mut names = Vec::new();
     for (task, llm, window, provider, model, reasoning) in prepared {
         let name = loop {
-            let number = {
-                let mut state = inner.state.lock().expect("chat state mutex poisoned");
-                let n = state.next;
-                state.next += 1;
-                n
-            };
-            let name = format!("Agent{number}");
+            let name = nanoid::nanoid!(
+                10,
+                &[
+                    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+                    'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
+                    'w', 'x', 'y', 'z'
+                ]
+            );
             if inner
                 .store
-                .load(&SessionId::new(format!("agent:{name}")))?
-                .is_none()
-                && !inner
-                    .state
-                    .lock()
-                    .expect("chat state mutex poisoned")
-                    .agents
-                    .contains_key(&name)
+                .create_session(&SessionId::new(format!("task:{name}")))?
             {
                 break name;
             }
         };
         let text = format!("{view}\n\nYour task:\n\n{task}");
-        let mut initial = Session::new(SessionId::new(format!("agent:{name}")));
+        let mut initial = Session::new(SessionId::new(format!("task:{name}")));
         initial.push(Message::User(text));
-        inner.store.save_agent_choice(
+        inner.store.save_task_choice(
             &name,
-            &AgentChoice {
+            &TaskChoice {
                 provider: provider.clone(),
                 model: model.clone(),
                 reasoning: reasoning.clone(),
@@ -239,7 +233,7 @@ where
             .agents
             .insert(
                 name.clone(),
-                Agent {
+                Task {
                     provider,
                     model,
                     reasoning,
@@ -276,7 +270,7 @@ where
     S: SessionStore + MemoryStore + Clone + 'static,
     M: Llm + Send + Sync + 'static,
 {
-    let id = SessionId::new(format!("agent:{name}"));
+    let id = SessionId::new(format!("task:{name}"));
     let mut fallback = false;
     let mut state = inner.state.lock().expect("chat state mutex poisoned");
     let session = inner
@@ -285,14 +279,14 @@ where
         .expect("sessions mutex poisoned")
         .get(name)
         .cloned();
-    if state.agents.get(name).is_some_and(Agent::is_running) {
+    if state.agents.get(name).is_some_and(Task::is_running) {
         session
             .expect("running agent has session")
             .steer(&id, text)?;
     } else if inner.store.load(&id)?.is_some() {
         let mut selection = None;
         if session.is_none() {
-            let choice = inner.store.agent_choice(name)?;
+            let choice = inner.store.task_choice(name)?;
             let result = match &choice {
                 Some(choice) => inner.models.connect(
                     Some((&choice.provider, &choice.model)),
@@ -315,27 +309,24 @@ where
                 .insert(name.to_owned(), build_session(inner, llm, window, name));
         }
         let now = Instant::now();
-        let agent = state
-            .agents
-            .entry(name.to_owned())
-            .or_insert_with(|| Agent {
-                provider: selection.as_ref().expect("selection").provider.clone(),
-                model: selection.as_ref().expect("selection").model.clone(),
-                reasoning: selection
-                    .as_ref()
-                    .expect("selection")
-                    .reasoning
-                    .as_str()
-                    .to_owned(),
-                started: now,
-                activity: now,
-                step_started: now,
-                step: Step::Idle,
-                status: Status::Running,
-                work: None,
-                supervisor: None,
-                run_id: 0,
-            });
+        let agent = state.agents.entry(name.to_owned()).or_insert_with(|| Task {
+            provider: selection.as_ref().expect("selection").provider.clone(),
+            model: selection.as_ref().expect("selection").model.clone(),
+            reasoning: selection
+                .as_ref()
+                .expect("selection")
+                .reasoning
+                .as_str()
+                .to_owned(),
+            started: now,
+            activity: now,
+            step_started: now,
+            step: Step::Idle,
+            status: Status::Running,
+            work: None,
+            supervisor: None,
+            run_id: 0,
+        });
         agent.started = now;
         agent.activity = now;
         agent.step_started = now;
@@ -345,7 +336,7 @@ where
         drop(state);
         launch(inner, name.to_owned(), Some(text));
     } else {
-        return Err(format!("unknown agent: {name}").into());
+        return Err(format!("unknown task: {name}").into());
     }
     Ok(if fallback {
         format!("Sent to {name}; stored model was unavailable, using the default model.")
@@ -374,7 +365,7 @@ where
         inner.store.clone(),
         inner.paths.clone(),
     )
-    .with_memory_tools(Arc::new(AgentMemory(Arc::downgrade(inner))))
+    .with_memory_tools(Arc::new(TaskMemory(Arc::downgrade(inner))))
     .with_observer(Arc::new(move |step| {
         if let Some(inner) = weak.upgrade() {
             let mut state = inner.state.lock().expect("chat state mutex poisoned");
@@ -432,7 +423,7 @@ fn launch<L, E, S, M, F: Models>(
     let crash_session = Arc::clone(&session);
     let work = tokio::spawn(async move {
         let inner = task_inner;
-        let id = SessionId::new(format!("agent:{name}"));
+        let id = SessionId::new(format!("task:{name}"));
         let mut text = text;
         loop {
             let result = session
@@ -490,7 +481,7 @@ fn launch<L, E, S, M, F: Models>(
                 return;
             }
             let dropped = crash_session
-                .take_steering(&SessionId::new(format!("agent:{crash_name}")))
+                .take_steering(&SessionId::new(format!("task:{crash_name}")))
                 .len();
             let suffix = if dropped > 0 {
                 format!(" (dropped {dropped} pending messages)")
@@ -503,7 +494,7 @@ fn launch<L, E, S, M, F: Models>(
                 .expect("agent tracked")
                 .status = Status::Crashed(message.to_owned());
             state.reports.push_back(Report {
-                text: format!("[{crash_name}]\nerror: agent crashed: {message}{suffix}\n\nChat: zoom(\"{crash_name}\")"),
+                text: format!("[{crash_name}]\nerror: task crashed: {message}{suffix}\n\nChat: zoom(\"{crash_name}\")"),
                 name: crash_name.clone(),
                 run_id,
             });
@@ -529,8 +520,8 @@ where
 {
     let session = inner
         .store
-        .load(&SessionId::new(format!("agent:{name}")))?
-        .ok_or_else(|| HarnessError::Compaction(format!("unknown agent: {name}")))?;
+        .load(&SessionId::new(format!("task:{name}")))?
+        .ok_or_else(|| HarnessError::Compaction(format!("unknown task: {name}")))?;
     let text = session
         .messages
         .iter()
@@ -553,9 +544,9 @@ where
     Ok(page)
 }
 
-struct AgentMemory<L, E, S, M, F: Models>(std::sync::Weak<Inner<L, E, S, M, F>>);
+struct TaskMemory<L, E, S, M, F: Models>(std::sync::Weak<Inner<L, E, S, M, F>>);
 
-impl<L, E, S, M, F> crate::MemoryTools for AgentMemory<L, E, S, M, F>
+impl<L, E, S, M, F> crate::MemoryTools for TaskMemory<L, E, S, M, F>
 where
     L: Send + Sync + 'static,
     E: Send + Sync + 'static,

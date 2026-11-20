@@ -1,8 +1,8 @@
-mod agents;
 pub mod chat;
 mod compaction;
 pub mod prompt;
 pub mod session;
+mod tasks;
 
 pub use chat::{ChatHarness, ModelSelection, Models, ZoomId, CHAT_PROMPT, NAME};
 pub use llm::{CompletionRequest, CompletionResponse, Llm, LlmError, ToolCallRequest, Usage};

@@ -5,6 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+nanoid = "0.4"
 llm.workspace = true
 environment.workspace = true
 storage.workspace = true

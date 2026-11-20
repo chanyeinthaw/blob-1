@@ -234,7 +234,7 @@ pub async fn run(
         None
     };
 
-    let subagent_summarizer = summarizer.clone();
+    let task_summarizer = summarizer.clone();
     let compactor = if chat {
         Some(if let Some((llm, _)) = summarizer.take() {
             llm
@@ -297,7 +297,7 @@ pub async fn run(
                 store,
                 default_reasoning: reasoning.unwrap_or(settings.reasoning),
             },
-            subagent_summarizer,
+            task_summarizer,
         );
         let answer: Result<String> = tokio::select! {
             answer = harness.run(&prompt) => answer.map_err(Into::into),

@@ -1,6 +1,6 @@
 use rusqlite::{params, types::Type, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use storage::{AgentChoice, Message, Session, SessionId, SessionStore, SessionUsage, StoreError};
+use storage::{Message, Session, SessionId, SessionStore, SessionUsage, StoreError, TaskChoice};
 
 use crate::{backend, SqliteStorage};
 
@@ -172,18 +172,28 @@ impl SqliteStorage {
 }
 
 impl SessionStore for SqliteStorage {
-    fn save_agent_choice(&self, name: &str, choice: &AgentChoice) -> Result<(), StoreError> {
-        self.lock().execute("INSERT INTO agent_choices (name, provider, model, reasoning) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(name) DO UPDATE SET provider=excluded.provider, model=excluded.model, reasoning=excluded.reasoning", params![name, choice.provider, choice.model, choice.reasoning]).map_err(backend)?;
+    fn create_session(&self, id: &SessionId) -> Result<bool, StoreError> {
+        self.lock()
+            .execute(
+                "INSERT INTO sessions (id) VALUES (?1) ON CONFLICT(id) DO NOTHING",
+                [&id.0],
+            )
+            .map(|n| n == 1)
+            .map_err(backend)
+    }
+
+    fn save_task_choice(&self, name: &str, choice: &TaskChoice) -> Result<(), StoreError> {
+        self.lock().execute("INSERT INTO task_choices (id, provider, model, reasoning) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(id) DO UPDATE SET provider=excluded.provider, model=excluded.model, reasoning=excluded.reasoning", params![name, choice.provider, choice.model, choice.reasoning]).map_err(backend)?;
         Ok(())
     }
 
-    fn agent_choice(&self, name: &str) -> Result<Option<AgentChoice>, StoreError> {
+    fn task_choice(&self, name: &str) -> Result<Option<TaskChoice>, StoreError> {
         self.lock()
             .query_row(
-                "SELECT provider, model, reasoning FROM agent_choices WHERE name = ?1",
+                "SELECT provider, model, reasoning FROM task_choices WHERE id = ?1",
                 [name],
                 |row| {
-                    Ok(AgentChoice {
+                    Ok(TaskChoice {
                         provider: row.get(0)?,
                         model: row.get(1)?,
                         reasoning: row.get(2)?,
