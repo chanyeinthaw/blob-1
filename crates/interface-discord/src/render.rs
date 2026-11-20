@@ -26,7 +26,13 @@ async fn thread(
         .model()
         .await
         .map_err(backend)?;
-    let name: String = source.content.trim().chars().take(100).collect();
+    let content = source.mentions.iter().fold(source.content, |content, user| {
+        let name = format!("@{}", user.name);
+        content
+            .replace(&format!("<@{}>", user.id), &name)
+            .replace(&format!("<@!{}>", user.id), &name)
+    });
+    let name: String = content.trim().chars().take(100).collect();
     let name = if name.is_empty() { "thread" } else { &name };
     match discord
         .http
