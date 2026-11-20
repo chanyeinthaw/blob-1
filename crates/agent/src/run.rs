@@ -161,6 +161,7 @@ struct Setup {
     llm: llm_rig::RigLlm,
     environment: LocalEnvironment,
     summarizer: Option<(Model, Option<u32>)>,
+    utility: Option<harness::Utility>,
     compactor: Model,
     reasoning: ReasoningLevel,
 }
@@ -236,6 +237,32 @@ async fn setup(
         None
     };
 
+    let utility = if let Some((selected, reasoning)) = store.utility_model()? {
+        let provider = store
+            .providers()?
+            .into_iter()
+            .find(|provider| provider.id == selected.provider)
+            .ok_or_else(|| format!("unknown provider: {}", selected.provider.0))?;
+        let model = store
+            .models(&selected.provider)?
+            .into_iter()
+            .find(|model| model.id == selected.model)
+            .ok_or_else(|| {
+                format!(
+                    "unknown model {}/{}; run `agent models refresh` first",
+                    selected.provider.0, selected.model
+                )
+            })?;
+        Some(harness::Utility::new(llm_rig::connect(
+            &provider,
+            &api_key(&provider)?,
+            &model,
+            reasoning.unwrap_or(ReasoningLevel::Low),
+        )))
+    } else {
+        None
+    };
+
     let workspace = workspace.to_path_buf();
     let environment = LocalEnvironment::new(&workspace, skills_dir.map(Path::to_path_buf))?;
     let manifest = environment.managed_skills().await?;
@@ -282,6 +309,7 @@ async fn setup(
         llm: llm_main,
         environment,
         summarizer,
+        utility,
         compactor,
         reasoning: settings.reasoning,
     })
@@ -310,7 +338,7 @@ async fn chat_harness(
             store: store.clone(),
             default_reasoning: setup.reasoning,
         },
-        (setup.summarizer, store),
+        (setup.summarizer, setup.utility, store),
     ))
 }
 
@@ -354,16 +382,60 @@ pub async fn chat(
     failure.map_or(Ok(()), |error| Err(error.into()))
 }
 
-fn admit(
+async fn decide_inline(
+    utility: &harness::Utility,
+    history: &[messenger::Fetched],
+    inbound: &messenger::Inbound,
+) -> bool {
+    let history = history
+        .iter()
+        .map(|m| format!("{}: {}", m.author.name, m.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let quote = inbound.quote.as_ref().map_or("", |q| q.text.as_str());
+    let attachments = inbound
+        .attachments
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let prompt = format!(
+        "Recent messages:\n{history}\nMessage: {}\nQuote: {quote}\nAttachments: {attachments}",
+        inbound.text
+    );
+    utility.generate("Decide how a team chat bot should answer this message. Reply 'inline' for a quick question, greeting or short answer; reply 'thread' if it will need work, several messages, files or a longer discussion. Reply with one word.", &prompt).await.is_ok_and(|answer| harness::parse_inline(&answer))
+}
+
+async fn admit(
     store: &Arc<SqliteStorage>,
     discord: Arc<dyn messenger::Messenger>,
     messengers: &harness::Messengers,
     inbound: messenger::Inbound,
+    utility: Option<&harness::Utility>,
 ) -> Result<Option<(String, storage::Meta)>> {
     if !store.allowed_users("discord")?.contains(&inbound.author.id) {
         return Ok(None);
     }
-    let dest = if inbound.place.thread.is_some() || inbound.place.dm {
+    let inline = if inbound.place.thread.is_none() && !inbound.place.dm {
+        if let Some(utility) = utility {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let history = discord
+                    .history(&inbound.place, Some(&inbound.message), 5)
+                    .await
+                    .ok()?;
+                Some(decide_inline(utility, &history, &inbound).await)
+            })
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let dest = if inline || inbound.place.thread.is_some() || inbound.place.dm {
         inbound.place.clone()
     } else {
         storage::Place {
@@ -388,6 +460,7 @@ fn admit(
             message: inbound.message,
             author: inbound.author,
             to,
+            inline,
             location: inbound.location,
             earlier: inbound.earlier,
             quote: inbound.quote,
@@ -404,11 +477,41 @@ pub async fn serve(
 ) -> Result<()> {
     let harness = chat_harness(store.clone(), workspace, skills_dir).await?;
     let discord: Arc<dyn messenger::Messenger> = Arc::new(messenger_discord::Discord::new(token));
-    let messengers = harness::Messengers::new(vec![discord.clone()], store.clone());
+    let messengers = harness::Messengers::new(vec![discord.clone()], store.clone())
+        .with_utility(harness.utility().cloned());
     let harness = harness.with_messengers(messengers.clone());
     let (tx, mut rx) = tokio::sync::mpsc::channel(128);
     let listener_discord = discord.clone();
     let listener = tokio::spawn(async move { listener_discord.listen(tx).await });
+    let (admitted_tx, mut admitted_rx) = tokio::sync::mpsc::channel(128);
+    let admission_store = store.clone();
+    let admission_discord = discord.clone();
+    let admission_messengers = messengers.clone();
+    let utility = harness.utility().cloned();
+    let admission = tokio::spawn(async move {
+        while let Some(inbound) = rx.recv().await {
+            match admit(
+                &admission_store,
+                admission_discord.clone(),
+                &admission_messengers,
+                inbound,
+                utility.as_ref(),
+            )
+            .await
+            {
+                Ok(Some(next)) => {
+                    if admitted_tx.send(Ok(next)).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = admitted_tx.send(Err(error)).await;
+                    return;
+                }
+            }
+        }
+    });
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
     let mut pending = std::collections::VecDeque::<(String, storage::Meta)>::new();
@@ -420,11 +523,8 @@ pub async fn serve(
             Some(next)
         } else {
             tokio::select! {
-                value = rx.recv() => match value {
-                    Some(inbound) => match admit(&store, discord.clone(), &messengers, inbound)? {
-                        Some(next) => Some(next),
-                        None => continue,
-                    },
+                value = admitted_rx.recv() => match value {
+                    Some(next) => Some(next?),
                     None => return match listener.await? { Err(error) => Err(error.into()), Ok(()) => Err("discord listener stopped".into()) },
                 },
                 _ = async {
@@ -433,8 +533,8 @@ pub async fn serve(
                     }
                     harness.work().await
                 } => None,
-                _ = interrupt.recv() => { listener.abort(); return Ok(()); },
-                _ = terminate.recv() => { listener.abort(); return Ok(()); },
+                _ = interrupt.recv() => { listener.abort(); admission.abort(); return Ok(()); },
+                _ = terminate.recv() => { listener.abort(); admission.abort(); return Ok(()); },
             }
         };
         let run = async {
@@ -458,12 +558,12 @@ pub async fn serve(
                     }
                     break;
                 },
-                value = rx.recv() => match value {
-                    Some(inbound) => if let Some((text, meta)) = admit(&store, discord.clone(), &messengers, inbound)? { harness.steer_message(text, Some(meta)); },
+                value = admitted_rx.recv() => match value {
+                    Some(next) => { let (text, meta) = next?; harness.steer_message(text, Some(meta)); },
                     None => return match listener.await? { Err(error) => Err(error.into()), Ok(()) => Err("discord listener stopped".into()) },
                 },
-                _ = interrupt.recv() => { listener.abort(); return Ok(()); },
-                _ = terminate.recv() => { listener.abort(); return Ok(()); },
+                _ = interrupt.recv() => { listener.abort(); admission.abort(); return Ok(()); },
+                _ = terminate.recv() => { listener.abort(); admission.abort(); return Ok(()); },
             }
         }
         messengers.quiet();

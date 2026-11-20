@@ -20,6 +20,7 @@ pub enum Target {
         message: String,
         author: String,
         first: bool,
+        thread: bool,
     },
     To(Place),
 }
@@ -29,6 +30,11 @@ pub struct Outbound {
     pub target: Target,
     pub text: String,
     pub mention: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Sent {
+    pub created_thread: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -94,5 +100,6 @@ pub trait Messenger: Lookup {
     async fn unreact(&self, place: &Place, message: &str, mark: Mark)
         -> Result<(), MessengerError>;
     async fn typing(&self, place: &Place) -> Result<(), MessengerError>;
-    async fn send(&self, outbound: Outbound) -> Result<(), MessengerError>;
+    async fn send(&self, outbound: Outbound) -> Result<Sent, MessengerError>;
+    async fn rename(&self, place: &Place, name: &str) -> Result<(), MessengerError>;
 }

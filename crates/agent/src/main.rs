@@ -234,6 +234,11 @@ enum ModelCommand {
         #[arg(long)]
         reasoning: Option<ReasoningLevel>,
     },
+    Utility {
+        model: String,
+        #[arg(long)]
+        reasoning: Option<ReasoningLevel>,
+    },
     Map {
         model: String,
         pairs: Vec<String>,
@@ -280,7 +285,9 @@ async fn main() -> Result<()> {
     let store = Arc::new(
         if matches!(
             cli.command,
-            Command::Messenger { .. }
+            Command::Model {
+                command: ModelCommand::Utility { .. }
+            } | Command::Messenger { .. }
                 | Command::Identity { .. }
                 | Command::Timezone { .. }
                 | Command::Home { .. }
@@ -505,6 +512,7 @@ async fn models(store: &SqliteStorage, command: ModelsCommand) -> Result<()> {
             println!("reasoning: {}", settings.reasoning.as_str());
             let default = settings.default_model;
             let compaction = settings.compaction_model;
+            let utility = store.utility_model()?;
             for provider in store.providers()? {
                 for model in store.models(&provider.id)? {
                     let marker = match &default {
@@ -521,6 +529,25 @@ async fn models(store: &SqliteStorage, command: ModelsCommand) -> Result<()> {
                         "c"
                     } else {
                         " "
+                    };
+                    let utility_marker = if utility.as_ref().is_some_and(|(selected, _)| {
+                        selected.provider == model.provider && selected.model == model.id
+                    }) {
+                        "u"
+                    } else {
+                        " "
+                    };
+                    let utility_reasoning = if utility_marker == "u" {
+                        format!(
+                            "\tutility reasoning: {}",
+                            utility
+                                .as_ref()
+                                .and_then(|(_, level)| *level)
+                                .unwrap_or(ReasoningLevel::Low)
+                                .as_str()
+                        )
+                    } else {
+                        String::new()
                     };
                     let override_level = if compaction_marker == "c" {
                         settings
@@ -552,7 +579,7 @@ async fn models(store: &SqliteStorage, command: ModelsCommand) -> Result<()> {
                     };
                     let images = if model.images { "\timage" } else { "" };
                     println!(
-                        "{marker}{compaction_marker} {}/{}{context}{map}{override_level}{images}",
+                        "{marker}{compaction_marker}{utility_marker} {}/{}{context}{map}{override_level}{utility_reasoning}{images}",
                         provider.id.0, model.id
                     );
                 }
@@ -618,6 +645,21 @@ fn model_command(store: &SqliteStorage, command: ModelCommand) -> Result<()> {
                 settings.compaction_reasoning = reasoning;
             }
             store.save_settings(settings)?;
+        }
+        ModelCommand::Utility { model, reasoning } => {
+            let selected = if model == "off" {
+                None
+            } else {
+                let model = known_model(store, &model)?;
+                Some((
+                    ModelRef {
+                        provider: model.provider,
+                        model: model.id,
+                    },
+                    reasoning,
+                ))
+            };
+            store.set_utility_model(selected)?;
         }
         ModelCommand::Map { model, pairs } => {
             let model = known_model(store, &model)?;

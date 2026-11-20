@@ -13,8 +13,8 @@ const SEND_LIMIT: usize = 300;
 
 pub const SEND: ToolSpec = ToolSpec {
     name: "send",
-    description: "Send a message to people on a messenger. Give exactly one of reply (an m-token from a <message> tag: answers that message in its thread, starting one if needed) or to (a d-token: posts plainly in that conversation). At most 300 characters; split longer text into several sends. mention: user ids to mention; the system adds the mentions.",
-    input_schema: r#"{"type":"object","properties":{"text":{"type":"string"},"reply":{"type":"string","description":"m-token of the message to reply to"},"to":{"type":"string","description":"d-token of the conversation"},"mention":{"type":"array","items":{"type":"string"},"description":"User ids to mention"}},"required":["text"]}"#,
+    description: "Send a message to people on a messenger. Give exactly one of reply (an m-token from a <message> tag: answers that message) or to (a d-token: posts plainly in that conversation). At most 300 characters; split longer text into several sends. mention: user ids to mention; the system adds the mentions.",
+    input_schema: r#"{"type":"object","properties":{"text":{"type":"string"},"reply":{"type":"string","description":"m-token of the message to reply to"},"to":{"type":"string","description":"d-token of the conversation"},"mention":{"type":"array","items":{"type":"string"},"description":"User ids to mention"},"thread":{"type":"boolean","description":"thread: true moves the conversation into a thread started from the message you reply to; use it when an inline exchange turns into real work"}},"required":["text"]}"#,
 };
 pub const LOOKUP: &[ToolSpec] = &[
     ToolSpec {
@@ -46,8 +46,11 @@ impl<T: MessengerStore + MemoryStore> Store for T {}
 pub struct Messengers {
     messengers: Vec<Arc<dyn Messenger>>,
     store: Arc<dyn Store>,
+    utility: Option<crate::Utility>,
     live: Arc<LiveState>,
     answered: Arc<Mutex<std::collections::HashSet<u64>>>,
+    moved: Arc<Mutex<std::collections::HashSet<u64>>>,
+    threaded: Arc<Mutex<std::collections::HashSet<u64>>>,
     marks: tokio::sync::mpsc::UnboundedSender<MarkJob>,
 }
 
@@ -77,6 +80,8 @@ struct SendArgs {
     to: Option<String>,
     #[serde(default)]
     mention: Vec<String>,
+    #[serde(default)]
+    thread: bool,
 }
 #[derive(Deserialize)]
 struct LookupArgs {
@@ -157,8 +162,11 @@ impl Messengers {
         Self {
             messengers,
             store: Arc::new(store),
+            utility: None,
             live: Arc::default(),
             answered: Arc::default(),
+            moved: Arc::default(),
+            threaded: Arc::default(),
             marks: {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<MarkJob>();
                 tokio::spawn(async move {
@@ -182,6 +190,10 @@ impl Messengers {
                 tx
             },
         }
+    }
+    pub fn with_utility(mut self, utility: Option<crate::Utility>) -> Self {
+        self.utility = utility;
+        self
     }
     pub fn mark(&self, reply: &str, add: &[Mark], remove: &[Mark]) {
         let resolved = (|| -> Result<_, Error> {
@@ -264,8 +276,22 @@ impl Messengers {
             .store
             .message(token(reply, 'm')?)?
             .ok_or("unknown message")?;
-        if let Some(Meta::Message { messenger, to, .. }) = row.meta {
-            let (_, place) = self.store.place(to)?.ok_or("unknown destination")?;
+        if let Some(Meta::Message {
+            messenger,
+            to,
+            message,
+            ..
+        }) = row.meta
+        {
+            let (_, mut place) = self.store.place(to)?.ok_or("unknown destination")?;
+            if self
+                .moved
+                .lock()
+                .expect("moved mutex poisoned")
+                .contains(&token(reply, 'm')?)
+            {
+                place.thread = Some(message);
+            }
             return Ok(Some((to, self.live(&messenger, to, place))));
         }
         Ok(None)
@@ -326,6 +352,8 @@ impl Messengers {
             .into());
         }
         let mut answering = None;
+        let mut title_prompt = None;
+        let mut threading = false;
         let (name, target, destination) = match (args.reply, args.to) {
             (Some(reply), None) => {
                 let id = token(&reply, 'm')?;
@@ -338,21 +366,63 @@ impl Messengers {
                         message,
                         author,
                         to,
+                        quote,
+                        inline,
                         ..
-                    }) => (
-                        messenger,
-                        Target::Reply {
-                            place,
-                            message,
-                            author: author.id,
-                            first: !self
-                                .answered
+                    }) => {
+                        let first = !self
+                            .answered
+                            .lock()
+                            .expect("answered mutex poisoned")
+                            .contains(&id);
+                        let moved = self
+                            .moved
+                            .lock()
+                            .expect("moved mutex poisoned")
+                            .contains(&id);
+                        let thread = !inline || args.thread || moved;
+                        threading = thread && !place.dm && place.thread.is_none();
+                        let first = if threading {
+                            !self
+                                .threaded
                                 .lock()
-                                .expect("answered mutex poisoned")
-                                .contains(&id),
-                        },
-                        to,
-                    ),
+                                .expect("threaded mutex poisoned")
+                                .contains(&id)
+                        } else {
+                            first
+                        };
+                        if (first || inline)
+                            && thread
+                            && !place.dm
+                            && place.thread.is_none()
+                            && self.utility.is_some()
+                        {
+                            let mut prompt = row.text;
+                            if let Some(quote) = quote {
+                                prompt.push('\n');
+                                prompt.push_str(&quote.text);
+                            }
+                            title_prompt = Some((
+                                Place {
+                                    channel: place.channel.clone(),
+                                    thread: Some(message.clone()),
+                                    dm: false,
+                                },
+                                prompt,
+                            ));
+                        }
+                        (
+                            messenger,
+                            Target::Reply {
+                                place,
+                                message,
+                                author: author.id,
+                                first,
+                                thread,
+                            },
+                            to,
+                        )
+                    }
                     _ => return Err("message has no messenger metadata".into()),
                 }
             }
@@ -362,14 +432,47 @@ impl Messengers {
             }
             _ => return Err("exactly one of reply or to is required".into()),
         };
-        self.find(&name)?
+        let sent = self
+            .find(&name)?
             .send(Outbound {
                 target,
                 text: args.text,
                 mention: args.mention,
             })
             .await?;
+        if sent.created_thread {
+            if let (Some((place, prompt)), Some(utility)) = (title_prompt, self.utility.clone()) {
+                let messenger = self
+                    .messengers
+                    .iter()
+                    .find(|m| m.name() == name)
+                    .expect("messenger already found")
+                    .clone();
+                tokio::spawn(async move {
+                    match utility.generate("Write a short title (max 6 words) for a chat thread that starts with this message. Reply with the title only.", &prompt).await {
+                    Ok(title) => {
+                        let title: String = title.trim().trim_matches(['"', '\'']).split_whitespace().take(6).collect::<Vec<_>>().join(" ").chars().take(100).collect();
+                        if !title.is_empty() {
+                            if let Err(error) = messenger.rename(&place, &title).await {
+                                eprintln!("{error}");
+                            }
+                        }
+                    }
+                    Err(error) => eprintln!("{error}"),
+                }
+                });
+            }
+        }
         if let Some(id) = answering {
+            if threading {
+                self.threaded
+                    .lock()
+                    .expect("threaded mutex poisoned")
+                    .insert(id);
+            }
+            if args.thread && threading {
+                self.moved.lock().expect("moved mutex poisoned").insert(id);
+            }
             self.answered
                 .lock()
                 .expect("answered mutex poisoned")

@@ -1,5 +1,5 @@
 use crate::{backend, channel, id, Discord};
-use messenger::{MessengerError, Outbound, Target};
+use messenger::{MessengerError, Outbound, Sent, Target};
 use twilight_http::{api_error::ApiError, error::ErrorType};
 use twilight_model::{
     channel::message::AllowedMentions,
@@ -17,7 +17,7 @@ async fn thread(
     discord: &Discord,
     parent: Id<ChannelMarker>,
     message: Id<MessageMarker>,
-) -> Result<(), MessengerError> {
+) -> Result<bool, MessengerError> {
     let source = discord
         .http
         .message(parent, message)
@@ -42,13 +42,14 @@ async fn thread(
         .create_thread_from_message(parent, message, name)
         .await
     {
-        Ok(_) => Ok(()),
-        Err(error) if has_code(&error, 160004) => Ok(()),
+        Ok(_) => Ok(true),
+        Err(error) if has_code(&error, 160004) => Ok(false),
         Err(error) => Err(backend(error)),
     }
 }
 
-pub async fn send(discord: &Discord, outbound: Outbound) -> Result<(), MessengerError> {
+pub async fn send(discord: &Discord, outbound: Outbound) -> Result<Sent, MessengerError> {
+    let mut created_thread = false;
     let mut mentions = outbound.mention;
     let mut reference = None;
     let mut reply_author = None;
@@ -60,13 +61,15 @@ pub async fn send(discord: &Discord, outbound: Outbound) -> Result<(), Messenger
             message,
             author,
             first,
+            thread: true,
         } if !place.dm && place.thread.is_none() => {
             continuing = !first;
             let parent = channel(&place)?;
             let message = id(&message)?;
             if first {
-                thread(discord, parent, message).await?;
-            } else {
+                created_thread = thread(discord, parent, message).await?;
+            }
+            if !first {
                 mentions.retain(|m| m != &author);
             }
             reply_author = Some(author);
@@ -77,6 +80,7 @@ pub async fn send(discord: &Discord, outbound: Outbound) -> Result<(), Messenger
             message,
             author,
             first,
+            ..
         } => {
             continuing = !first;
             if continuing {
@@ -108,8 +112,7 @@ pub async fn send(discord: &Discord, outbound: Outbound) -> Result<(), Messenger
         mentions.retain(|m| m != &author);
         mentions.insert(0, author);
     }
-    let reference = reference.filter(|_| ping);
-    let replied_user = reference.is_some();
+    let replied_user = reference.is_some() && ping;
     let users: Vec<Id<UserMarker>> = mentions.iter().map(|m| id(m)).collect::<Result<_, _>>()?;
     let allowed = AllowedMentions {
         parse: vec![],
@@ -132,12 +135,12 @@ pub async fn send(discord: &Discord, outbound: Outbound) -> Result<(), Messenger
         }
     };
     match post().await {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(Sent { created_thread }),
         Err(error) if has_code(&error, 10003) && retry.is_some() => {
             let (parent, message) = retry.expect("retry checked");
-            thread(discord, parent, message).await?;
+            created_thread = thread(discord, parent, message).await?;
             post().await.map_err(backend)?;
-            Ok(())
+            Ok(Sent { created_thread })
         }
         Err(error) => Err(backend(error)),
     }

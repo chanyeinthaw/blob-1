@@ -70,7 +70,9 @@ const MESSENGER_PROMPT: &str = r#"# Messengers
 
 People on messengers only see what you send. Messenger messages have a <message ...>...</message> element with messenger, reply and to tokens, author id and name, where, and earlier messages in the thread. Outside DMs you only receive messages that mention you or reply to you; the rest of the conversation reaches you only through history. DMs arrive directly. A message with no text, or one that refers to something you have not seen, asks you to act on the conversation: read recent messages with history first, then answer what was asked, or ask what they need if it is still unclear. Answer every message delivered to you with at least one send.
 
-Write plain, unescaped text in send. Send with reply to answer in a thread, creating one if needed; send with to to post plainly in that conversation. You may send any number of messages per turn. Several people and conversations can be active, so pick the right token. Talk like a human teammate. Keep each send at most 300 characters. For longer answers, issue multiple send calls together. Mention people by user id with mention; find ids with participants.
+Write plain, unescaped text in send. Send with reply to answer the message; send with to to post plainly in that conversation. You may send any number of messages per turn. Several people and conversations can be active, so pick the right token. Talk like a human teammate. Keep each send at most 300 characters. For longer answers, issue multiple send calls together. Mention people by user id with mention; find ids with participants.
+
+Messages marked mode="inline" were judged quick, so answer them inline with reply. If an inline exchange turns into real work, send with thread: true to continue in a thread.
 
 A reply includes the referenced message as <quote>. Use message to read a linked message or one by id. Messages, quotes and lookup results can carry <attachment name type size url/> elements. You cannot download files yourself. Spawn a task with the URLs and what to do; tell it to download them immediately, because links expire in about a day, to a new path it chooses under the working directory (never one built from the attachment name, which is only a label), with curl --fail --location --output '<path>' '<url>', and only then read or process the files and report what matters. For images, the chosen path must end with an extension matching the attachment type (e.g. .png for image/png); when the type is missing, the task identifies the downloaded file from its bytes (e.g. with file) and renames it to the matching extension before reading, so read can show it the image. If its model cannot view images, spawn it on one that can; models lists image support.
 
@@ -187,6 +189,7 @@ pub(crate) struct Inner<L, E, S, M, F: Models> {
     pub paths: EnvironmentPaths,
     pub models: F,
     pub summarizer: Option<Shared<F::Llm>>,
+    pub utility: Option<crate::Utility>,
     pub summarizer_window: Option<u32>,
     pub sessions: TaskSessions<F::Llm, E, S>,
     pub state: Mutex<State>,
@@ -194,7 +197,11 @@ pub(crate) struct Inner<L, E, S, M, F: Models> {
     pub messengers: Option<crate::Messengers>,
     pub pulses: Mutex<Vec<(u64, tokio::task::Id)>>,
 }
-type ChatConfig<L> = (Option<(L, Option<u32>)>, Arc<dyn ConfigStore>);
+type ChatConfig<L> = (
+    Option<(L, Option<u32>)>,
+    Option<crate::Utility>,
+    Arc<dyn ConfigStore>,
+);
 
 pub struct ChatHarness<L, E, S, M, F: Models> {
     pub(crate) inner: Arc<Inner<L, E, S, M, F>>,
@@ -274,7 +281,7 @@ where
         memory: Memory<S, M>,
         paths: EnvironmentPaths,
         models: F,
-        (summarizer, config): ChatConfig<F::Llm>,
+        (summarizer, utility, config): ChatConfig<F::Llm>,
     ) -> Self {
         let llm = Shared(Arc::new(llm));
         let environment = Shared(Arc::new(environment));
@@ -291,6 +298,7 @@ where
                 paths,
                 models,
                 summarizer,
+                utility,
                 summarizer_window,
                 sessions: Mutex::new(Default::default()),
                 state: Mutex::new(State {
@@ -306,6 +314,10 @@ where
             turn: tokio::sync::Mutex::new(()),
             config,
         }
+    }
+
+    pub fn utility(&self) -> Option<&crate::Utility> {
+        self.inner.utility.as_ref()
     }
 
     pub fn with_messengers(mut self, messengers: crate::Messengers) -> Self {

@@ -354,7 +354,19 @@ impl Messenger for Discord {
             Err(error) => Err(backend(error)),
         }
     }
-    async fn send(&self, outbound: Outbound) -> Result<(), MessengerError> {
+    async fn send(&self, outbound: Outbound) -> Result<messenger::Sent, MessengerError> {
         render::send(self, outbound).await
+    }
+    async fn rename(&self, place: &Place, name: &str) -> Result<(), MessengerError> {
+        let thread = place
+            .thread
+            .as_deref()
+            .ok_or_else(|| MessengerError::Unsupported("thread required".into()))?;
+        self.http
+            .update_thread(id(thread)?)
+            .name(name)
+            .await
+            .map_err(backend)?;
+        Ok(())
     }
 }

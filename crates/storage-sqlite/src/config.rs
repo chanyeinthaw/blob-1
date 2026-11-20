@@ -265,6 +265,52 @@ impl ConfigStore for SqliteStorage {
         Ok(())
     }
 
+    fn utility_model(&self) -> Result<Option<(ModelRef, Option<ReasoningLevel>)>, StoreError> {
+        self.lock()
+            .query_row(
+                "SELECT provider, model, reasoning FROM utility_model WHERE id = 1",
+                [],
+                |row| {
+                    let reasoning = row
+                        .get::<_, Option<String>>(2)?
+                        .map(|value| {
+                            value.parse().map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    2,
+                                    Type::Text,
+                                    Box::new(error),
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    Ok((
+                        ModelRef {
+                            provider: ProviderId(row.get(0)?),
+                            model: row.get(1)?,
+                        },
+                        reasoning,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(backend)
+    }
+
+    fn set_utility_model(
+        &self,
+        model: Option<(ModelRef, Option<ReasoningLevel>)>,
+    ) -> Result<(), StoreError> {
+        let connection = self.lock();
+        match model {
+            Some((model, reasoning)) => connection.execute(
+                "INSERT INTO utility_model (id, provider, model, reasoning) VALUES (1, ?1, ?2, ?3) ON CONFLICT (id) DO UPDATE SET provider = excluded.provider, model = excluded.model, reasoning = excluded.reasoning",
+                params![model.provider.0, model.model, reasoning.map(ReasoningLevel::as_str)],
+            ),
+            None => connection.execute("DELETE FROM utility_model WHERE id = 1", []),
+        }.map_err(backend)?;
+        Ok(())
+    }
+
     fn settings(&self) -> Result<Settings, StoreError> {
         let (provider, model, reasoning, compaction_provider, compaction_model, compaction_reasoning) = self
             .lock()

@@ -7,6 +7,8 @@ mod compaction;
 pub mod prompt;
 pub mod session;
 mod tasks;
+mod utility;
+pub use utility::{parse_inline, Utility};
 
 pub use chat::{ChatHarness, ModelSelection, Models, ZoomId, CHAT_PROMPT, DEFAULT_IDENTITY};
 pub use llm::{CompletionRequest, CompletionResponse, Llm, LlmError, ToolCallRequest, Usage};

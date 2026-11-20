@@ -331,6 +331,11 @@ pub trait ConfigStore: Send + Sync {
         model: &str,
         map: BTreeMap<ReasoningLevel, Option<String>>,
     ) -> Result<(), StoreError>;
+    fn utility_model(&self) -> Result<Option<(ModelRef, Option<ReasoningLevel>)>, StoreError>;
+    fn set_utility_model(
+        &self,
+        model: Option<(ModelRef, Option<ReasoningLevel>)>,
+    ) -> Result<(), StoreError>;
     fn settings(&self) -> Result<Settings, StoreError>;
     fn save_settings(&self, settings: Settings) -> Result<(), StoreError>;
 }
@@ -428,6 +433,8 @@ pub enum Meta {
         message: String,
         author: Person,
         to: u64,
+        #[serde(default)]
+        inline: bool,
         #[serde(rename = "where")]
         location: String,
         earlier: Option<u32>,
@@ -538,14 +545,16 @@ impl Meta {
                 earlier,
                 quote,
                 attachments,
+                inline,
                 ..
             } => format!(
-                "<message messenger=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}>\n{}{}{body}\n</message>",
+                "<message messenger=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}{}>\n{}{}{body}\n</message>",
                 attribute(messenger),
                 attribute(&author.id),
                 attribute(&author.name),
                 attribute(location),
                 earlier.map_or_else(String::new, |n| format!(" earlier=\"{n}\"")),
+                if *inline { " mode=\"inline\"" } else { "" },
                 quote.as_ref().map_or_else(String::new, |quote| format!(
                     "<quote author=\"{}\" author_name=\"{}\" message=\"{}\">\n{}{}\n</quote>\n",
                     attribute(&quote.author.id), attribute(&quote.author.name), attribute(&quote.message), render_attachments(&quote.attachments), escape(&quote.text)
