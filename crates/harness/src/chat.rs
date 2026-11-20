@@ -5,7 +5,7 @@ use memory::{Kind, Memory};
 use serde::Deserialize;
 use storage::{
     ConfigStore, MemoryStore, Message, MessengerStore, Meta, ReasoningLevel, ScheduleStore,
-    SessionStore,
+    SessionStore, WatchStore,
 };
 use tokio::sync::Notify;
 
@@ -15,6 +15,8 @@ use crate::{
 
 pub const DEFAULT_IDENTITY: &str = "You are Blob-1.";
 pub const CHAT_PROMPT: &str = r#"Calendar: Schedule one-off (at) or recurring (cron) jobs. The timezone defaults to yours. When a job fires, you receive <scheduled …>text</scheduled>. If late is present, judge whether the job still matters and say so. to and for say where to answer; home is the home channel when there is no destination. Anyone you work for may ask you to schedule or cancel things.
+
+Keeping an eye on: Use watch to keep an eye on something until it is resolved. until is optional; to or reply says where to report. During check-ins you receive <checkin> with each item as <watch …>. Check each item, spawning tasks when it needs work. Report real changes where the item says, or home. Unwatch resolved items. End with NO_UPDATES when nothing changed.
 
 You are an AI agent in a single chat that never ends. Each call to you is a turn: the view below is followed by a new message or a task's report.
 
@@ -262,7 +264,7 @@ impl<L, E, S, M, F: Models> ChatHarness<L, E, S, M, F>
 where
     L: Llm + Send + Sync + 'static,
     E: Environment + 'static,
-    S: SessionStore + MemoryStore + MessengerStore + ScheduleStore + Clone + 'static,
+    S: SessionStore + MemoryStore + MessengerStore + ScheduleStore + WatchStore + Clone + 'static,
     M: Llm + Send + Sync + 'static,
 {
     pub fn new(
@@ -500,6 +502,7 @@ where
         let mut messages = vec![Message::User(view), Message::User(text.to_owned())];
         let mut tools = EXTRA.to_vec();
         tools.extend_from_slice(crate::schedule::TOOLS);
+        tools.extend_from_slice(crate::watch::TOOLS);
         if self.inner.messengers.is_some() {
             tools.push(crate::messenger::SEND);
             tools.extend_from_slice(crate::messenger::LOOKUP);
@@ -602,6 +605,12 @@ where
         call: &crate::ToolCallRequest,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         Ok(match call.name.as_str() {
+            "watch" | "unwatch" | "watches" => crate::watch::execute(
+                &self.inner.store,
+                self.config.as_ref(),
+                &call.name,
+                &call.arguments,
+            )?,
             "schedule" | "unschedule" | "schedules" => crate::schedule::execute(
                 &self.inner.store,
                 self.config.as_ref(),

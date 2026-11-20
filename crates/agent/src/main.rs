@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use storage::{
-    ConfigStore, MessengerStore, ModelRef, Provider, ProviderApi, ProviderId, ReasoningLevel,
-    SkillStore,
+    Checkin, CheckinStore, ConfigStore, MessengerStore, ModelRef, Provider, ProviderApi,
+    ProviderId, ReasoningLevel, SkillStore,
 };
 use storage_sqlite::SqliteStorage;
 
@@ -30,6 +30,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Serve,
+    Watch {
+        #[command(subcommand)]
+        command: WatchCommand,
+    },
+    Checkin {
+        #[command(subcommand)]
+        command: CheckinCommand,
+    },
     Schedule {
         #[command(subcommand)]
         command: ScheduleCommand,
@@ -73,6 +81,66 @@ enum Command {
     Chat {
         message: String,
     },
+}
+
+#[derive(Subcommand)]
+enum WatchCommand {
+    List,
+    Remove { id: String },
+}
+
+#[derive(Subcommand)]
+enum CheckinCommand {
+    Show,
+    Set {
+        #[arg(long)]
+        every: String,
+        #[arg(long)]
+        days: String,
+        #[arg(long)]
+        hours: String,
+    },
+    Off,
+}
+
+fn parse_checkin(every: &str, days: String, hours: &str) -> Result<Checkin> {
+    let (number, multiplier) = [("m", 60_i64), ("h", 3600), ("d", 86400)]
+        .into_iter()
+        .find_map(|(unit, seconds)| every.strip_suffix(unit).map(|number| (number, seconds)))
+        .ok_or("invalid interval")?;
+    let every = number
+        .parse::<i64>()?
+        .checked_mul(multiplier)
+        .ok_or("invalid interval")?;
+    if every < 300 {
+        return Err("interval must be at least 5 minutes".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for day in days.split(',') {
+        if !matches!(day, "sun" | "mon" | "tue" | "wed" | "thu" | "fri" | "sat")
+            || !seen.insert(day)
+        {
+            return Err("invalid days".into());
+        }
+    }
+    let (start, end) = hours.split_once('-').ok_or("invalid hours")?;
+    if start.len() != 2
+        || end.len() != 2
+        || !start.bytes().chain(end.bytes()).all(|b| b.is_ascii_digit())
+    {
+        return Err("invalid hours".into());
+    }
+    let start_hour: u8 = start.parse()?;
+    let end_hour: u8 = end.parse()?;
+    if start_hour >= end_hour || end_hour > 24 {
+        return Err("invalid hours".into());
+    }
+    Ok(Checkin {
+        every,
+        days,
+        start_hour,
+        end_hour,
+    })
 }
 
 #[derive(Subcommand)]
@@ -217,6 +285,8 @@ async fn main() -> Result<()> {
                 | Command::Timezone { .. }
                 | Command::Home { .. }
                 | Command::Schedule { .. }
+                | Command::Watch { .. }
+                | Command::Checkin { .. }
         ) {
             SqliteStorage::open_shared(path)?
         } else {
@@ -225,6 +295,30 @@ async fn main() -> Result<()> {
     );
 
     match cli.command {
+        Command::Watch { command } => {
+            let output = match command {
+                WatchCommand::List => harness::watch::list(&store, store.as_ref())?,
+                WatchCommand::Remove { id } => harness::watch::remove(&store, &id)?,
+            };
+            println!("{output}");
+            Ok(())
+        }
+        Command::Checkin { command } => {
+            match command {
+                CheckinCommand::Show => match store.checkin()? {
+                    Some(c) => println!(
+                        "every {}s days {} hours {:02}-{:02}",
+                        c.every, c.days, c.start_hour, c.end_hour
+                    ),
+                    None => println!("off"),
+                },
+                CheckinCommand::Set { every, days, hours } => {
+                    store.set_checkin(&parse_checkin(&every, days, &hours)?)?
+                }
+                CheckinCommand::Off => store.clear_checkin()?,
+            }
+            Ok(())
+        }
         Command::Schedule { command } => {
             let output = match command {
                 ScheduleCommand::Add {

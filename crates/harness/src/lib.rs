@@ -1,6 +1,7 @@
 pub mod chat;
 pub mod messenger;
 pub mod schedule;
+pub mod watch;
 pub use messenger::Messengers;
 mod compaction;
 pub mod prompt;

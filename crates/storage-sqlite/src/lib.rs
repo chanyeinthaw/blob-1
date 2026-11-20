@@ -5,16 +5,20 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use rusqlite::Connection;
 use storage::StoreError;
 
+mod checkin;
 mod config;
 mod memory;
 mod messenger;
 mod schedule;
 mod session;
 mod skill;
+mod watch;
 
 const SCHEMA: &str = "
 PRAGMA foreign_keys = ON;
 
+CREATE TABLE IF NOT EXISTS watches (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, to_dest INTEGER, reply TEXT, until INTEGER) STRICT;
+CREATE TABLE IF NOT EXISTS checkin (id INTEGER PRIMARY KEY CHECK (id = 1), every INTEGER NOT NULL, days TEXT NOT NULL, start_hour INTEGER NOT NULL, end_hour INTEGER NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS clock (id INTEGER PRIMARY KEY CHECK (id = 1), timezone TEXT NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS home (id INTEGER PRIMARY KEY CHECK (id = 1), messenger TEXT NOT NULL, target TEXT NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, at TEXT, cron TEXT, timezone TEXT NOT NULL, to_dest INTEGER, reply TEXT, next_due INTEGER NOT NULL, CHECK ((at IS NULL) != (cron IS NULL))) STRICT;

@@ -390,6 +390,11 @@ pub struct Quote {
 #[serde(tag = "type", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]
 pub enum Meta {
+    Checkin {
+        time: String,
+        #[serde(default)]
+        home: Option<u64>,
+    },
     Scheduled {
         id: String,
         due: String,
@@ -499,8 +504,16 @@ fn for_attribute(value: &Option<String>) -> String {
 
 impl Meta {
     pub fn render(&self, i: u64, body: &str) -> String {
+        if let Self::Checkin { time, home } = self {
+            return format!(
+                "<checkin time=\"{}\"{}>\n{body}\n</checkin>",
+                attribute(time),
+                home.map_or_else(String::new, |v| format!(" home=\"d{v}\""))
+            );
+        }
         let body = escape(body);
         match self {
+            Self::Checkin { .. } => unreachable!(),
             Self::Scheduled { id, due, late, timezone, to, for_message, home } => format!(
                 "<scheduled id=\"{}\" due=\"{} {}\"{}{}{}{}>\n{body}\n</scheduled>",
                 attribute(id), attribute(due), attribute(timezone),
@@ -544,6 +557,7 @@ impl Meta {
 
     pub fn source(&self) -> String {
         match self {
+            Self::Checkin { .. } => "checkin".into(),
             Self::Scheduled { id, .. } => format!("scheduled {id}"),
             Self::Report { task, status, .. } => format!("task {task}, {}", status.as_str()),
             Self::Reminder { task, .. } => format!("reminder for task {task}"),
@@ -700,4 +714,78 @@ impl<T: MessengerStore + ?Sized> MessengerStore for std::sync::Arc<T> {
     fn disallow_user(&self, messenger: &str, user: &str) -> Result<bool, StoreError> {
         (**self).disallow_user(messenger, user)
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct Watch {
+    pub id: u64,
+    pub text: String,
+    pub to_dest: Option<u64>,
+    pub reply: Option<String>,
+    pub until: Option<i64>,
+}
+
+pub trait WatchStore: Send + Sync {
+    fn add_watch(&self, watch: &Watch) -> Result<u64, StoreError>;
+    fn watches(&self) -> Result<Vec<Watch>, StoreError>;
+    fn remove_watch(&self, id: u64) -> Result<bool, StoreError>;
+}
+
+impl<T: WatchStore + ?Sized> WatchStore for std::sync::Arc<T> {
+    fn add_watch(&self, watch: &Watch) -> Result<u64, StoreError> {
+        (**self).add_watch(watch)
+    }
+    fn watches(&self) -> Result<Vec<Watch>, StoreError> {
+        (**self).watches()
+    }
+    fn remove_watch(&self, id: u64) -> Result<bool, StoreError> {
+        (**self).remove_watch(id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checkin {
+    pub every: i64,
+    pub days: String,
+    pub start_hour: u8,
+    pub end_hour: u8,
+}
+
+pub trait CheckinStore: Send + Sync {
+    fn checkin(&self) -> Result<Option<Checkin>, StoreError>;
+    fn set_checkin(&self, checkin: &Checkin) -> Result<(), StoreError>;
+    fn clear_checkin(&self) -> Result<(), StoreError>;
+}
+
+impl<T: CheckinStore + ?Sized> CheckinStore for std::sync::Arc<T> {
+    fn checkin(&self) -> Result<Option<Checkin>, StoreError> {
+        (**self).checkin()
+    }
+    fn set_checkin(&self, checkin: &Checkin) -> Result<(), StoreError> {
+        (**self).set_checkin(checkin)
+    }
+    fn clear_checkin(&self) -> Result<(), StoreError> {
+        (**self).clear_checkin()
+    }
+}
+
+pub fn render_checkin_body(watches: &[Watch], local: impl Fn(i64) -> String) -> String {
+    watches
+        .iter()
+        .map(|watch| {
+            format!(
+                "<watch id=\"w{}\"{}{}{}>\n{}\n</watch>",
+                watch.id,
+                watch.until.map_or_else(String::new, |until| {
+                    format!(" until=\"{}\"", attribute(&local(until)))
+                }),
+                watch
+                    .to_dest
+                    .map_or_else(String::new, |to| format!(" to=\"d{to}\"")),
+                for_attribute(&watch.reply),
+                escape(&watch.text)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

@@ -1,8 +1,11 @@
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use environment::ToolSpec;
 use serde::Deserialize;
-use storage::{ConfigStore, MemoryStore, MessengerStore, Meta, Schedule, ScheduleStore};
+use storage::{
+    Checkin, CheckinStore, ConfigStore, MemoryStore, MessengerStore, Meta, Schedule, ScheduleStore,
+    WatchStore,
+};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -34,7 +37,7 @@ pub struct Add {
     pub reply: Option<String>,
 }
 
-fn token(value: &str, prefix: char) -> Result<u64> {
+pub(crate) fn token(value: &str, prefix: char) -> Result<u64> {
     let number = value
         .strip_prefix(prefix)
         .ok_or_else(|| format!("expected {prefix} id"))?;
@@ -52,6 +55,81 @@ pub fn next_cron(cron: &str, tz: Tz, after: DateTime<Utc>) -> Result<DateTime<Ut
     Ok(cron
         .find_next_occurrence(&after.with_timezone(&tz), false)?
         .with_timezone(&Utc))
+}
+
+pub fn next_checkin(config: &Checkin, tz: Tz, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if config.every <= 0 || config.start_hour >= config.end_hour || config.end_hour > 24 {
+        return None;
+    }
+    let date = after.with_timezone(&tz).date_naive();
+    let mut next = None;
+    for day in 0..=8 {
+        let Some(date) = date.checked_add_days(chrono::Days::new(day)) else {
+            break;
+        };
+        let weekday = date.weekday().to_string().to_lowercase();
+        if !config.days.split(',').any(|day| day == weekday) {
+            continue;
+        }
+        let mut seconds = i64::from(config.start_hour) * 3600;
+        let end = i64::from(config.end_hour) * 3600;
+        while seconds < end {
+            let local = date.and_hms_opt(0, 0, 0)? + chrono::Duration::seconds(seconds);
+            let candidates = tz.from_local_datetime(&local);
+            for candidate in [candidates.earliest(), candidates.latest()]
+                .into_iter()
+                .flatten()
+            {
+                let candidate = candidate.with_timezone(&Utc);
+                if candidate > after && next.is_none_or(|current| candidate < current) {
+                    next = Some(candidate);
+                }
+            }
+            let Some(value) = seconds.checked_add(config.every) else {
+                break;
+            };
+            seconds = value;
+        }
+    }
+    next
+}
+
+pub(crate) fn target<S: MessengerStore + MemoryStore>(
+    store: &S,
+    to: Option<&str>,
+    reply: Option<&str>,
+) -> Result<Option<u64>> {
+    if to.is_some() && reply.is_some() {
+        return Err("specify at most one of to or reply".into());
+    }
+    let to_dest = if let Some(to) = to {
+        let id = token(to, 'd')?;
+        store.place(id)?.ok_or("destination not found")?;
+        Some(id)
+    } else {
+        None
+    };
+    if let Some(reply) = reply {
+        let id = token(reply, 'm')?;
+        if !matches!(
+            store.message(id)?.and_then(|m| m.meta),
+            Some(Meta::Message { .. })
+        ) {
+            return Err("reply message not found".into());
+        }
+    }
+    Ok(to_dest)
+}
+
+pub(crate) fn parse_time(value: &str, tz: Tz) -> Result<DateTime<Utc>> {
+    Ok(match DateTime::parse_from_rfc3339(value) {
+        Ok(value) => value.with_timezone(&Utc),
+        Err(_) => tz
+            .from_local_datetime(&NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M")?)
+            .single()
+            .ok_or("local time is ambiguous or does not exist")?
+            .with_timezone(&Utc),
+    })
 }
 
 pub fn add<S: ScheduleStore + MessengerStore + MemoryStore>(
@@ -72,14 +150,7 @@ pub fn add<S: ScheduleStore + MessengerStore + MemoryStore>(
     let tz: Tz = timezone.parse()?;
     let now = Utc::now();
     let due = if let Some(at) = &args.at {
-        let due = match DateTime::parse_from_rfc3339(at) {
-            Ok(value) => value.with_timezone(&Utc),
-            Err(_) => tz
-                .from_local_datetime(&NaiveDateTime::parse_from_str(at, "%Y-%m-%d %H:%M")?)
-                .single()
-                .ok_or("local time is ambiguous or does not exist")?
-                .with_timezone(&Utc),
-        };
+        let due = parse_time(at, tz)?;
         if due <= now {
             return Err("at must be in the future".into());
         }
@@ -87,22 +158,7 @@ pub fn add<S: ScheduleStore + MessengerStore + MemoryStore>(
     } else {
         next_cron(args.cron.as_deref().ok_or("missing cron")?, tz, now)?
     };
-    let to_dest = if let Some(to) = &args.to {
-        let id = token(to, 'd')?;
-        store.place(id)?.ok_or("destination not found")?;
-        Some(id)
-    } else {
-        None
-    };
-    if let Some(reply) = &args.reply {
-        let id = token(reply, 'm')?;
-        if !matches!(
-            store.message(id)?.and_then(|m| m.meta),
-            Some(Meta::Message { .. })
-        ) {
-            return Err("reply message not found".into());
-        }
-    }
+    let to_dest = target(store, args.to.as_deref(), args.reply.as_deref())?;
     let mut schedule = Schedule {
         id: 0,
         text: args.text,
@@ -190,7 +246,7 @@ async fn home<S: MessengerStore>(
     store: &S,
     config: &dyn ConfigStore,
     messengers: Option<&crate::Messengers>,
-    id: u64,
+    label: &str,
 ) -> Option<u64> {
     let result: Result<Option<u64>> = async {
         let Some(messengers) = messengers else {
@@ -215,7 +271,7 @@ async fn home<S: MessengerStore>(
     match result {
         Ok(value) => value,
         Err(error) => {
-            eprintln!("schedule s{id}: {error}");
+            eprintln!("{label}: {error}");
             None
         }
     }
@@ -223,12 +279,90 @@ async fn home<S: MessengerStore>(
 
 impl<L, E, S, M, F: crate::Models> crate::ChatHarness<L, E, S, M, F>
 where
-    S: ScheduleStore + MessengerStore,
+    S: ScheduleStore + MessengerStore + CheckinStore + WatchStore,
 {
     pub async fn run_schedules(&self) {
+        let mut active = None;
+        let mut next_checkin_at = None;
+        let mut last_slot: Option<DateTime<Utc>> = None;
         loop {
             let now = Utc::now();
             let result: Result<()> = async {
+                let config = self.inner.store.checkin()?;
+                let tz: Tz = self.config.timezone()?.parse()?;
+                if active.as_ref().map(|(config, tz)| (config, *tz))
+                    != config.as_ref().map(|config| (config, tz))
+                {
+                    let after = (now - chrono::Duration::minutes(2))
+                        .max(last_slot.unwrap_or(DateTime::<Utc>::MIN_UTC));
+                    next_checkin_at = config
+                        .as_ref()
+                        .and_then(|config| next_checkin(config, tz, after));
+                    active = config.clone().map(|config| (config, tz));
+                }
+                if next_checkin_at.is_some_and(|due| now >= due) {
+                    last_slot = next_checkin_at;
+                    if next_checkin_at.is_some_and(|due| now - due <= chrono::Duration::minutes(2))
+                    {
+                        let mut watches = self.inner.store.watches()?;
+                        for watch in &watches {
+                            if watch.until.is_some_and(|until| until <= now.timestamp()) {
+                                self.inner.store.remove_watch(watch.id)?;
+                            }
+                        }
+                        watches.retain(|watch| {
+                            watch.until.is_none_or(|until| until > now.timestamp())
+                        });
+                        if !watches.is_empty() {
+                            let time = format!(
+                                "{} {}",
+                                now.with_timezone(&tz).format("%Y-%m-%d %H:%M"),
+                                tz
+                            );
+                            let home = if watches
+                                .iter()
+                                .any(|watch| watch.to_dest.is_none() && watch.reply.is_none())
+                            {
+                                home(
+                                    &self.inner.store,
+                                    self.config.as_ref(),
+                                    self.inner.messengers.as_ref(),
+                                    "checkin",
+                                )
+                                .await
+                            } else {
+                                None
+                            };
+                            let report = crate::tasks::Report {
+                                meta: Meta::Checkin { time, home },
+                                text: storage::render_checkin_body(&watches, |until| {
+                                    chrono::DateTime::from_timestamp(until, 0).map_or_else(
+                                        || until.to_string(),
+                                        |until| {
+                                            format!(
+                                                "{} {}",
+                                                until.with_timezone(&tz).format("%Y-%m-%d %H:%M"),
+                                                tz
+                                            )
+                                        },
+                                    )
+                                }),
+                                name: String::new(),
+                                run_id: 0,
+                            };
+                            self.inner
+                                .state
+                                .lock()
+                                .expect("chat state mutex poisoned")
+                                .reports
+                                .push_back(report);
+                            self.inner.notify.notify_one();
+                        }
+                    }
+                    next_checkin_at = config
+                        .as_ref()
+                        .and_then(|config| next_checkin(config, tz, now));
+                }
                 for job in self.inner.store.due_schedules(now.timestamp())? {
                     let due = DateTime::from_timestamp(job.next_due, 0)
                         .ok_or("invalid schedule timestamp")?;
@@ -238,7 +372,7 @@ where
                             &self.inner.store,
                             self.config.as_ref(),
                             self.inner.messengers.as_ref(),
-                            job.id,
+                            &format!("schedule s{}", job.id),
                         )
                         .await
                     } else {
@@ -296,6 +430,7 @@ where
                 Ok(())
             }
             .await;
+            let failed = result.is_err();
             let wait = match result {
                 Err(error) => {
                     eprintln!("{error}");
@@ -323,6 +458,13 @@ where
                         std::time::Duration::from_secs(60)
                     }
                 },
+            };
+            let wait = if failed {
+                wait
+            } else {
+                next_checkin_at.map_or(wait, |due| {
+                    wait.min((due - Utc::now()).to_std().unwrap_or_default())
+                })
             };
             tokio::time::sleep(wait).await;
         }
