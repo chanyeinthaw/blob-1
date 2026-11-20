@@ -3,7 +3,10 @@ use std::sync::{Arc, Mutex};
 use environment::{Environment, ToolCall, ToolSpec};
 use memory::{Kind, Memory};
 use serde::Deserialize;
-use storage::{ConfigStore, MemoryStore, Message, Meta, ReasoningLevel, SessionStore};
+use storage::{
+    ConfigStore, MemoryStore, Message, MessengerStore, Meta, ReasoningLevel, ScheduleStore,
+    SessionStore,
+};
 use tokio::sync::Notify;
 
 use crate::{
@@ -11,7 +14,9 @@ use crate::{
 };
 
 pub const DEFAULT_IDENTITY: &str = "You are Blob-1.";
-pub const CHAT_PROMPT: &str = r#"You are an AI agent in a single chat that never ends. Each call to you is a turn: the view below is followed by a new message or a task's report.
+pub const CHAT_PROMPT: &str = r#"Calendar: Schedule one-off (at) or recurring (cron) jobs. The timezone defaults to yours. When a job fires, you receive <scheduled …>text</scheduled>. If late is present, judge whether the job still matters and say so. to and for say where to answer; home is the home channel when there is no destination. Anyone you work for may ask you to schedule or cancel things.
+
+You are an AI agent in a single chat that never ends. Each call to you is a turn: the view below is followed by a new message or a task's report.
 
 # The view
 
@@ -192,7 +197,7 @@ type ChatConfig<L> = (Option<(L, Option<u32>)>, Arc<dyn ConfigStore>);
 pub struct ChatHarness<L, E, S, M, F: Models> {
     pub(crate) inner: Arc<Inner<L, E, S, M, F>>,
     turn: tokio::sync::Mutex<()>,
-    config: Arc<dyn ConfigStore>,
+    pub(crate) config: Arc<dyn ConfigStore>,
 }
 
 impl<L, E, S, M, F: Models> Drop for ChatHarness<L, E, S, M, F> {
@@ -257,7 +262,7 @@ impl<L, E, S, M, F: Models> ChatHarness<L, E, S, M, F>
 where
     L: Llm + Send + Sync + 'static,
     E: Environment + 'static,
-    S: SessionStore + MemoryStore + Clone + 'static,
+    S: SessionStore + MemoryStore + MessengerStore + ScheduleStore + Clone + 'static,
     M: Llm + Send + Sync + 'static,
 {
     pub fn new(
@@ -494,6 +499,7 @@ where
         );
         let mut messages = vec![Message::User(view), Message::User(text.to_owned())];
         let mut tools = EXTRA.to_vec();
+        tools.extend_from_slice(crate::schedule::TOOLS);
         if self.inner.messengers.is_some() {
             tools.push(crate::messenger::SEND);
             tools.extend_from_slice(crate::messenger::LOOKUP);
@@ -596,6 +602,12 @@ where
         call: &crate::ToolCallRequest,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         Ok(match call.name.as_str() {
+            "schedule" | "unschedule" | "schedules" => crate::schedule::execute(
+                &self.inner.store,
+                self.config.as_ref(),
+                &call.name,
+                &call.arguments,
+            )?,
             "zoom" => {
                 let args: Zoom = serde_json::from_str(&call.arguments)?;
                 crate::MemoryTools::zoom(self.inner.as_ref(), args.id, args.n, args.at)?

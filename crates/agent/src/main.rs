@@ -30,6 +30,18 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Serve,
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommand,
+    },
+    Timezone {
+        #[command(subcommand)]
+        command: TimezoneCommand,
+    },
+    Home {
+        #[command(subcommand)]
+        command: HomeCommand,
+    },
     Identity {
         #[command(subcommand)]
         command: IdentityCommand,
@@ -61,6 +73,40 @@ enum Command {
     Chat {
         message: String,
     },
+}
+
+#[derive(Subcommand)]
+enum ScheduleCommand {
+    Add {
+        #[arg(long, conflicts_with = "cron", required_unless_present = "cron")]
+        at: Option<String>,
+        #[arg(long, conflicts_with = "at", required_unless_present = "at")]
+        cron: Option<String>,
+        #[arg(long)]
+        tz: Option<String>,
+        #[arg(long, conflicts_with = "reply")]
+        to: Option<String>,
+        #[arg(long, conflicts_with = "to")]
+        reply: Option<String>,
+        text: String,
+    },
+    List,
+    Remove {
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TimezoneCommand {
+    Show,
+    Set { timezone: String },
+}
+
+#[derive(Subcommand)]
+enum HomeCommand {
+    Show,
+    Set { messenger: String, target: String },
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -166,7 +212,11 @@ async fn main() -> Result<()> {
     let store = Arc::new(
         if matches!(
             cli.command,
-            Command::Messenger { .. } | Command::Identity { .. }
+            Command::Messenger { .. }
+                | Command::Identity { .. }
+                | Command::Timezone { .. }
+                | Command::Home { .. }
+                | Command::Schedule { .. }
         ) {
             SqliteStorage::open_shared(path)?
         } else {
@@ -175,6 +225,66 @@ async fn main() -> Result<()> {
     );
 
     match cli.command {
+        Command::Schedule { command } => {
+            let output = match command {
+                ScheduleCommand::Add {
+                    at,
+                    cron,
+                    tz,
+                    to,
+                    reply,
+                    text,
+                } => harness::schedule::add(
+                    &store,
+                    store.as_ref(),
+                    harness::schedule::Add {
+                        text,
+                        at,
+                        cron,
+                        tz,
+                        to,
+                        reply,
+                    },
+                )?,
+                ScheduleCommand::List => harness::schedule::list(&store)?,
+                ScheduleCommand::Remove { id } => harness::schedule::remove(&store, &id)?,
+            };
+            println!("{output}");
+            Ok(())
+        }
+        Command::Timezone { command } => {
+            match command {
+                TimezoneCommand::Show => println!("{}", store.timezone()?),
+                TimezoneCommand::Set { timezone } => store.set_timezone(&timezone)?,
+            }
+            Ok(())
+        }
+        Command::Home { command } => {
+            match command {
+                HomeCommand::Show => {
+                    if let Some(home) = store.home()? {
+                        println!("{} {}", home.messenger, home.target);
+                    }
+                }
+                HomeCommand::Set { messenger, target } => {
+                    if messenger != "discord" {
+                        return Err("home messenger must be discord".into());
+                    }
+                    let id = target.strip_prefix("dm:").unwrap_or(&target);
+                    if !id.bytes().all(|b| b.is_ascii_digit())
+                        || id.parse::<u64>().map_or(true, |id| id == 0)
+                    {
+                        return Err(
+                            "home target must be a numeric channel id or dm:<numeric user id>"
+                                .into(),
+                        );
+                    }
+                    store.set_home(Some(&storage::Home { messenger, target }))?
+                }
+                HomeCommand::Clear => store.set_home(None)?,
+            }
+            Ok(())
+        }
         Command::Identity { command } => identity(&store, command),
         Command::Messenger { command } => messenger(&store, command),
         Command::Serve => {

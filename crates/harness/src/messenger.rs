@@ -287,7 +287,7 @@ impl Messengers {
             pulse.abort();
         }
     }
-    fn find(&self, name: &str) -> Result<&dyn Messenger, Error> {
+    pub(crate) fn find(&self, name: &str) -> Result<&dyn Messenger, Error> {
         self.messengers
             .iter()
             .find(|i| i.name() == name)

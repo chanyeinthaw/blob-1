@@ -88,6 +88,7 @@ pub enum Mark {
 
 #[async_trait::async_trait]
 pub trait Messenger: Lookup {
+    async fn direct(&self, user: &str) -> Result<Place, MessengerError>;
     async fn listen(&self, inbound: mpsc::Sender<Inbound>) -> Result<(), MessengerError>;
     async fn react(&self, place: &Place, message: &str, mark: Mark) -> Result<(), MessengerError>;
     async fn unreact(&self, place: &Place, message: &str, mark: Mark)

@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 nanoid = "0.4"
+chrono.workspace = true
+chrono-tz.workspace = true
+croner.workspace = true
 llm.workspace = true
 environment.workspace = true
 storage.workspace = true

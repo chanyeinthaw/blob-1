@@ -9,6 +9,50 @@ use storage::{
 use crate::{backend, SqliteStorage};
 
 impl ConfigStore for SqliteStorage {
+    fn timezone(&self) -> Result<String, StoreError> {
+        Ok(self
+            .lock()
+            .query_row("SELECT timezone FROM clock WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(backend)?
+            .unwrap_or_else(|| "UTC".into()))
+    }
+
+    fn set_timezone(&self, timezone: &str) -> Result<(), StoreError> {
+        timezone
+            .parse::<chrono_tz::Tz>()
+            .map_err(|_| StoreError::Backend(format!("invalid timezone: {timezone}").into()))?;
+        self.lock().execute("INSERT INTO clock (id, timezone) VALUES (1, ?1) ON CONFLICT (id) DO UPDATE SET timezone = excluded.timezone", [timezone]).map_err(backend)?;
+        Ok(())
+    }
+
+    fn home(&self) -> Result<Option<storage::Home>, StoreError> {
+        self.lock()
+            .query_row(
+                "SELECT messenger, target FROM home WHERE id = 1",
+                [],
+                |row| {
+                    Ok(storage::Home {
+                        messenger: row.get(0)?,
+                        target: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(backend)
+    }
+
+    fn set_home(&self, home: Option<&storage::Home>) -> Result<(), StoreError> {
+        let connection = self.lock();
+        match home {
+            Some(home) => connection.execute("INSERT INTO home (id, messenger, target) VALUES (1, ?1, ?2) ON CONFLICT (id) DO UPDATE SET messenger = excluded.messenger, target = excluded.target", params![home.messenger, home.target]),
+            None => connection.execute("DELETE FROM home WHERE id = 1", []),
+        }.map_err(backend)?;
+        Ok(())
+    }
+
     fn identity(&self) -> Result<Option<String>, StoreError> {
         self.lock()
             .query_row("SELECT text FROM identity WHERE id = 1", [], |row| {

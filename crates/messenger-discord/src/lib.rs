@@ -304,6 +304,21 @@ impl Lookup for Discord {
 
 #[async_trait::async_trait]
 impl Messenger for Discord {
+    async fn direct(&self, user: &str) -> Result<Place, MessengerError> {
+        let channel = self
+            .http
+            .create_private_channel(id(user)?)
+            .await
+            .map_err(backend)?
+            .model()
+            .await
+            .map_err(backend)?;
+        Ok(Place {
+            channel: channel.id.to_string(),
+            thread: None,
+            dm: true,
+        })
+    }
     async fn listen(&self, inbound: mpsc::Sender<Inbound>) -> Result<(), MessengerError> {
         gateway::listen(self, inbound).await
     }

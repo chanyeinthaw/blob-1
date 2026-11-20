@@ -29,6 +29,9 @@ serde_json = "1"
 harness = { path = "crates/harness" }
 messenger = { path = "crates/messenger" }
 messenger-discord = { path = "crates/messenger-discord" }
+chrono-tz = "0.10.4"
+chrono = "0.4"
+croner = "4.0.3"
 environment-local = { path = "crates/environment-local" }
 llm = { path = "crates/llm" }
 memory = { path = "crates/memory" }

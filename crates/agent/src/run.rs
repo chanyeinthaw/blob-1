@@ -413,6 +413,8 @@ pub async fn serve(
     let mut terminate = signal(SignalKind::terminate())?;
     let mut pending = std::collections::VecDeque::<(String, storage::Meta)>::new();
     let mut backoff = false;
+    tokio::select! {
+        result = async {
     loop {
         let next = if let Some(next) = pending.pop_front() {
             Some(next)
@@ -468,5 +470,8 @@ pub async fn serve(
                 messengers.live(messenger, *to, destination);
             }
         }
+    }
+        } => result,
+        _ = harness.run_schedules() => unreachable!(),
     }
 }

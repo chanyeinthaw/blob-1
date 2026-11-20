@@ -291,7 +291,17 @@ pub struct Settings {
     pub compaction_reasoning: Option<ReasoningLevel>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Home {
+    pub messenger: String,
+    pub target: String,
+}
+
 pub trait ConfigStore: Send + Sync {
+    fn timezone(&self) -> Result<String, StoreError>;
+    fn set_timezone(&self, timezone: &str) -> Result<(), StoreError>;
+    fn home(&self) -> Result<Option<Home>, StoreError>;
+    fn set_home(&self, home: Option<&Home>) -> Result<(), StoreError>;
     fn identity(&self) -> Result<Option<String>, StoreError>;
     fn set_identity(&self, text: Option<&str>) -> Result<(), StoreError>;
     fn providers(&self) -> Result<Vec<Provider>, StoreError>;
@@ -380,6 +390,19 @@ pub struct Quote {
 #[serde(tag = "type", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]
 pub enum Meta {
+    Scheduled {
+        id: String,
+        due: String,
+        #[serde(default)]
+        late: Option<String>,
+        timezone: String,
+        #[serde(default)]
+        to: Option<u64>,
+        #[serde(rename = "for", default)]
+        for_message: Option<String>,
+        #[serde(default)]
+        home: Option<u64>,
+    },
     Report {
         task: String,
         status: ReportStatus,
@@ -478,6 +501,14 @@ impl Meta {
     pub fn render(&self, i: u64, body: &str) -> String {
         let body = escape(body);
         match self {
+            Self::Scheduled { id, due, late, timezone, to, for_message, home } => format!(
+                "<scheduled id=\"{}\" due=\"{} {}\"{}{}{}{}>\n{body}\n</scheduled>",
+                attribute(id), attribute(due), attribute(timezone),
+                late.as_ref().map_or_else(String::new, |v| format!(" late=\"{}\"", attribute(v))),
+                to.map_or_else(String::new, |v| format!(" to=\"d{v}\"")),
+                for_attribute(for_message),
+                home.map_or_else(String::new, |v| format!(" home=\"d{v}\""))
+            ),
             Self::Report { task, status, for_message } => format!(
                 "<report task=\"{}\" status=\"{}\"{}>\n{body}\n</report>",
                 attribute(task), status.as_str(), for_attribute(for_message)
@@ -513,6 +544,7 @@ impl Meta {
 
     pub fn source(&self) -> String {
         match self {
+            Self::Scheduled { id, .. } => format!("scheduled {id}"),
             Self::Report { task, status, .. } => format!("task {task}, {}", status.as_str()),
             Self::Reminder { task, .. } => format!("reminder for task {task}"),
             Self::Message {
@@ -603,6 +635,44 @@ impl<T: MemoryStore + ?Sized> MemoryStore for std::sync::Arc<T> {
     }
     fn view(&self, name: ViewName) -> Result<Option<MemoryView>, StoreError> {
         (**self).view(name)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Schedule {
+    pub id: u64,
+    pub text: String,
+    pub at: Option<String>,
+    pub cron: Option<String>,
+    pub timezone: String,
+    pub to_dest: Option<u64>,
+    pub reply: Option<String>,
+    pub next_due: i64,
+}
+
+pub trait ScheduleStore: Send + Sync {
+    fn add_schedule(&self, schedule: &Schedule) -> Result<u64, StoreError>;
+    fn schedules(&self) -> Result<Vec<Schedule>, StoreError>;
+    fn due_schedules(&self, now: i64) -> Result<Vec<Schedule>, StoreError>;
+    fn remove_schedule(&self, id: u64) -> Result<bool, StoreError>;
+    fn claim_schedule(&self, id: u64, due: i64, next_due: Option<i64>) -> Result<bool, StoreError>;
+}
+
+impl<T: ScheduleStore + ?Sized> ScheduleStore for std::sync::Arc<T> {
+    fn add_schedule(&self, schedule: &Schedule) -> Result<u64, StoreError> {
+        (**self).add_schedule(schedule)
+    }
+    fn schedules(&self) -> Result<Vec<Schedule>, StoreError> {
+        (**self).schedules()
+    }
+    fn due_schedules(&self, now: i64) -> Result<Vec<Schedule>, StoreError> {
+        (**self).due_schedules(now)
+    }
+    fn remove_schedule(&self, id: u64) -> Result<bool, StoreError> {
+        (**self).remove_schedule(id)
+    }
+    fn claim_schedule(&self, id: u64, due: i64, next_due: Option<i64>) -> Result<bool, StoreError> {
+        (**self).claim_schedule(id, due, next_due)
     }
 }
 

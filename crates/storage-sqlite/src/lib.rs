@@ -8,11 +8,16 @@ use storage::StoreError;
 mod config;
 mod memory;
 mod messenger;
+mod schedule;
 mod session;
 mod skill;
 
 const SCHEMA: &str = "
 PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS clock (id INTEGER PRIMARY KEY CHECK (id = 1), timezone TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS home (id INTEGER PRIMARY KEY CHECK (id = 1), messenger TEXT NOT NULL, target TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, at TEXT, cron TEXT, timezone TEXT NOT NULL, to_dest INTEGER, reply TEXT, next_due INTEGER NOT NULL, CHECK ((at IS NULL) != (cron IS NULL))) STRICT;
 
 CREATE TABLE IF NOT EXISTS memory_messages (i INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('user','assistant','tool','echo','work')), text TEXT NOT NULL, size INTEGER NOT NULL, date TEXT NOT NULL, more INTEGER NOT NULL CHECK (more IN (0,1)), meta TEXT) STRICT;
 CREATE TABLE IF NOT EXISTS memory_nodes (l INTEGER NOT NULL, i INTEGER NOT NULL, text TEXT NOT NULL, size INTEGER NOT NULL, PRIMARY KEY (l, i)) STRICT;

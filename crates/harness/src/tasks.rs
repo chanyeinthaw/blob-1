@@ -19,8 +19,8 @@ const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 
 pub(crate) struct Report {
     pub(crate) meta: Meta,
     pub(crate) text: String,
-    name: String,
-    run_id: u64,
+    pub(crate) name: String,
+    pub(crate) run_id: u64,
 }
 
 pub(crate) struct Task {
