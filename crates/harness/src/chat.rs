@@ -468,6 +468,7 @@ where
             for (to, pulse) in pulses {
                 messengers.settle(to, pulse);
             }
+            messengers.end_turn();
         }
         result
     }

@@ -47,6 +47,7 @@ pub struct Messengers {
     messengers: Vec<Arc<dyn Messenger>>,
     store: Arc<dyn Store>,
     live: Arc<LiveState>,
+    answered: Arc<Mutex<std::collections::HashSet<u64>>>,
     marks: tokio::sync::mpsc::UnboundedSender<MarkJob>,
 }
 
@@ -157,6 +158,7 @@ impl Messengers {
             messengers,
             store: Arc::new(store),
             live: Arc::default(),
+            answered: Arc::default(),
             marks: {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<MarkJob>();
                 tokio::spawn(async move {
@@ -274,6 +276,12 @@ impl Messengers {
             live.remove(&to).expect("checked").abort();
         }
     }
+    pub fn end_turn(&self) {
+        self.answered
+            .lock()
+            .expect("answered mutex poisoned")
+            .clear();
+    }
     pub fn quiet(&self) {
         for (_, pulse) in self.live.0.lock().expect("live mutex poisoned").drain() {
             pulse.abort();
@@ -317,12 +325,12 @@ impl Messengers {
             )
             .into());
         }
+        let mut answering = None;
         let (name, target, destination) = match (args.reply, args.to) {
             (Some(reply), None) => {
-                let row = self
-                    .store
-                    .message(token(&reply, 'm')?)?
-                    .ok_or("unknown message")?;
+                let id = token(&reply, 'm')?;
+                answering = Some(id);
+                let row = self.store.message(id)?.ok_or("unknown message")?;
                 match row.meta {
                     Some(Meta::Message {
                         messenger,
@@ -337,6 +345,11 @@ impl Messengers {
                             place,
                             message,
                             author: author.id,
+                            first: !self
+                                .answered
+                                .lock()
+                                .expect("answered mutex poisoned")
+                                .contains(&id),
                         },
                         to,
                     ),
@@ -356,6 +369,12 @@ impl Messengers {
                 mention: args.mention,
             })
             .await?;
+        if let Some(id) = answering {
+            self.answered
+                .lock()
+                .expect("answered mutex poisoned")
+                .insert(id);
+        }
         if let Some(pulse) = self
             .live
             .0

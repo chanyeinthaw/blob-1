@@ -53,19 +53,35 @@ pub async fn send(discord: &Discord, outbound: Outbound) -> Result<(), Messenger
     let mut reference = None;
     let mut reply_author = None;
     let mut retry = None;
+    let mut continuing = false;
     let destination = match outbound.target {
         Target::Reply {
             place,
             message,
             author,
+            first,
         } if !place.dm && place.thread.is_none() => {
+            continuing = !first;
             let parent = channel(&place)?;
             let message = id(&message)?;
-            thread(discord, parent, message).await?;
+            if first {
+                thread(discord, parent, message).await?;
+            } else {
+                mentions.retain(|m| m != &author);
+            }
             reply_author = Some(author);
             Id::new(message.get())
         }
-        Target::Reply { place, message, .. } => {
+        Target::Reply {
+            place,
+            message,
+            author,
+            first,
+        } => {
+            continuing = !first;
+            if continuing {
+                mentions.retain(|m| m != &author);
+            }
             reference = Some(id(&message)?);
             channel(&place)?
         }
@@ -81,7 +97,8 @@ pub async fn send(discord: &Discord, outbound: Outbound) -> Result<(), Messenger
         thread: None,
         dm: false,
     };
-    let ping = (reply_author.is_some() || reference.is_some())
+    let ping = !continuing
+        && (reply_author.is_some() || reference.is_some())
         && discord
             .ping_state(&place)
             .await

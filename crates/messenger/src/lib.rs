@@ -19,6 +19,7 @@ pub enum Target {
         place: Place,
         message: String,
         author: String,
+        first: bool,
     },
     To(Place),
 }
