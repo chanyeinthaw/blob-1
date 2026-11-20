@@ -100,7 +100,13 @@ pub(crate) fn context_tokens(
     usage: Option<SessionUsage>,
 ) -> u64 {
     match usage {
-        Some(usage) => usage.tokens + messages[usage.boundary..].iter().map(estimate).sum::<u64>(),
+        Some(usage) => {
+            usage.tokens
+                + messages[usage.view_boundary..]
+                    .iter()
+                    .map(estimate)
+                    .sum::<u64>()
+        }
         None => estimate_text(system) + messages.iter().map(estimate).sum::<u64>(),
     }
 }
@@ -257,12 +263,13 @@ pub(crate) async fn compact<L: Llm>(
     window: Option<u32>,
     reserve: u32,
     on_model: &(dyn Fn() + Sync),
-) -> Result<Option<Vec<Message>>, HarnessError> {
+) -> Result<Option<(Message, usize)>, HarnessError> {
     let previous = match messages.first() {
         Some(Message::Summary {
             text,
             read_files,
             modified_files,
+            ..
         }) => Some((text, read_files, modified_files)),
         _ => None,
     };
@@ -370,12 +377,13 @@ pub(crate) async fn compact<L: Llm>(
             "\n\n---\n\n**Turn Context (split turn):**\n\n{prefix_summary}"
         ));
     }
-    let mut result = Vec::with_capacity(1 + messages.len() - cut);
-    result.push(Message::Summary {
-        text,
-        read_files: read.into_iter().collect(),
-        modified_files: modified.into_iter().collect(),
-    });
-    result.extend_from_slice(&messages[cut..]);
-    Ok(Some(result))
+    Ok(Some((
+        Message::Summary {
+            text,
+            first_kept: 0,
+            read_files: read.into_iter().collect(),
+            modified_files: modified.into_iter().collect(),
+        },
+        cut,
+    )))
 }

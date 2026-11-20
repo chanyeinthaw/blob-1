@@ -13,6 +13,7 @@ impl SessionId {
 pub enum Message {
     Summary {
         text: String,
+        first_kept: usize,
         read_files: Vec<String>,
         modified_files: Vec<String>,
     },
@@ -40,7 +41,7 @@ pub struct Session {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionUsage {
     pub tokens: u64,
-    pub boundary: usize,
+    pub view_boundary: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +60,35 @@ impl Session {
         }
     }
 
+    pub fn view_indices(&self) -> Vec<usize> {
+        match self
+            .messages
+            .iter()
+            .rposition(|m| matches!(m, Message::Summary { .. }))
+        {
+            Some(s) => {
+                let Message::Summary { first_kept, .. } = &self.messages[s] else {
+                    unreachable!()
+                };
+                std::iter::once(s)
+                    .chain(
+                        (*first_kept..s)
+                            .filter(|&i| !matches!(self.messages[i], Message::Summary { .. })),
+                    )
+                    .chain(s + 1..self.messages.len())
+                    .collect()
+            }
+            None => (0..self.messages.len()).collect(),
+        }
+    }
+
+    pub fn view(&self) -> Vec<Message> {
+        self.view_indices()
+            .into_iter()
+            .map(|i| self.messages[i].clone())
+            .collect()
+    }
+
     pub fn push(&mut self, message: Message) {
         self.messages.push(message);
     }
@@ -71,17 +101,26 @@ pub enum StoreError {
 }
 
 pub trait SessionStore: Send + Sync {
-    fn create_session(&self, id: &SessionId) -> Result<bool, StoreError>;
+    fn create_task_session(
+        &self,
+        name: &str,
+        text: &str,
+        choice: &TaskChoice,
+    ) -> Result<bool, StoreError>;
     fn load(&self, id: &SessionId) -> Result<Option<Session>, StoreError>;
     fn save(&self, session: Session) -> Result<(), StoreError>;
     fn session_ids(&self, prefix: &str) -> Result<Vec<SessionId>, StoreError>;
-    fn save_task_choice(&self, name: &str, choice: &TaskChoice) -> Result<(), StoreError>;
     fn task_choice(&self, name: &str) -> Result<Option<TaskChoice>, StoreError>;
 }
 
 impl<T: SessionStore + ?Sized> SessionStore for std::sync::Arc<T> {
-    fn create_session(&self, id: &SessionId) -> Result<bool, StoreError> {
-        (**self).create_session(id)
+    fn create_task_session(
+        &self,
+        name: &str,
+        text: &str,
+        choice: &TaskChoice,
+    ) -> Result<bool, StoreError> {
+        (**self).create_task_session(name, text, choice)
     }
     fn load(&self, id: &SessionId) -> Result<Option<Session>, StoreError> {
         (**self).load(id)
@@ -93,10 +132,6 @@ impl<T: SessionStore + ?Sized> SessionStore for std::sync::Arc<T> {
 
     fn session_ids(&self, prefix: &str) -> Result<Vec<SessionId>, StoreError> {
         (**self).session_ids(prefix)
-    }
-
-    fn save_task_choice(&self, name: &str, choice: &TaskChoice) -> Result<(), StoreError> {
-        (**self).save_task_choice(name, choice)
     }
 
     fn task_choice(&self, name: &str) -> Result<Option<TaskChoice>, StoreError> {

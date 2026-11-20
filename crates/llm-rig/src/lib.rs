@@ -249,18 +249,34 @@ fn to_rig_request(
 ) -> Result<completion::CompletionRequest, LlmError> {
     let mut history: Vec<completion::Message> = Vec::new();
 
-    for message in request.messages {
+    for (index, message) in request.messages.iter().enumerate() {
         match message {
             Message::Summary {
                 text,
                 read_files,
                 modified_files,
-            } => history.push(completion::Message::user(summary_text(
-                text,
-                read_files,
-                modified_files,
-            ))),
-            Message::User(text) => history.push(completion::Message::user(text)),
+                ..
+            } => {
+                let mut text = summary_text(text, read_files, modified_files);
+                if matches!(
+                    request.messages.get(index + 1),
+                    Some(Message::User(_) | Message::Summary { .. })
+                ) {
+                    text.push_str("\n\n");
+                }
+                history.push(completion::Message::user(text));
+            }
+            Message::User(text) => {
+                let text = if matches!(
+                    request.messages.get(index + 1),
+                    Some(Message::User(_) | Message::Summary { .. })
+                ) {
+                    format!("{text}\n\n")
+                } else {
+                    text.clone()
+                };
+                history.push(completion::Message::user(text));
+            }
             Message::Assistant(text) => history.push(completion::Message::assistant(text)),
             Message::ToolCall {
                 id,

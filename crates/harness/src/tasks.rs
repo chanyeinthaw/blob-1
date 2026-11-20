@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use environment::Environment;
-use storage::{MemoryStore, Message, Session, SessionId, SessionStore, TaskChoice};
+use storage::{MemoryStore, Message, SessionId, SessionStore, TaskChoice};
 
 use crate::{
     chat::{Inner, Models, Shared, SpawnTask},
@@ -197,6 +197,12 @@ where
     let view = inner.memory.view()?;
     let mut names = Vec::new();
     for (task, llm, window, provider, model, reasoning) in prepared {
+        let text = format!("{view}\n\nYour task:\n\n{task}");
+        let choice = TaskChoice {
+            provider: provider.clone(),
+            model: model.clone(),
+            reasoning: reasoning.clone(),
+        };
         let name = loop {
             let name = nanoid::nanoid!(
                 10,
@@ -206,25 +212,10 @@ where
                     'w', 'x', 'y', 'z'
                 ]
             );
-            if inner
-                .store
-                .create_session(&SessionId::new(format!("task:{name}")))?
-            {
+            if inner.store.create_task_session(&name, &text, &choice)? {
                 break name;
             }
         };
-        let text = format!("{view}\n\nYour task:\n\n{task}");
-        let mut initial = Session::new(SessionId::new(format!("task:{name}")));
-        initial.push(Message::User(text));
-        inner.store.save_task_choice(
-            &name,
-            &TaskChoice {
-                provider: provider.clone(),
-                model: model.clone(),
-                reasoning: reasoning.clone(),
-            },
-        )?;
-        inner.store.save(initial)?;
         let now = Instant::now();
         inner
             .state

@@ -364,7 +364,11 @@ where
                     Ok(content) => content,
                     Err(error) => format!("error: {error}"),
                 };
-                let content = memory::clip_tool_output(&content);
+                let content = if call.name == "zoom" {
+                    content
+                } else {
+                    memory::clip_tool_output(&content)
+                };
                 self.inner.memory.append(Kind::Echo, &content)?;
                 messages.push(Message::ToolResult {
                     id: call.id,

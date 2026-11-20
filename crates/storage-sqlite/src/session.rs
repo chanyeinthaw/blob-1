@@ -6,6 +6,7 @@ use crate::{backend, SqliteStorage};
 
 #[derive(Serialize, Deserialize)]
 struct SummaryDetails {
+    first_kept: usize,
     read_files: Vec<String>,
     modified_files: Vec<String>,
 }
@@ -32,7 +33,7 @@ impl SqliteStorage {
                                         Box::new(e),
                                     )
                                 })?,
-                                boundary: usize::try_from(boundary).map_err(|e| {
+                                view_boundary: usize::try_from(boundary).map_err(|e| {
                                     rusqlite::Error::FromSqlConversionFailure(
                                         1,
                                         Type::Integer,
@@ -68,6 +69,7 @@ impl SqliteStorage {
                             })?;
                         Message::Summary {
                             text: content,
+                            first_kept: details.first_kept,
                             read_files: details.read_files,
                             modified_files: details.modified_files,
                         }
@@ -112,30 +114,39 @@ impl SqliteStorage {
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         let boundary = session
             .usage
-            .map(|u| i64::try_from(u.boundary))
+            .map(|u| i64::try_from(u.view_boundary))
             .transpose()
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         transaction.execute(
             "INSERT INTO sessions (id, usage_tokens, usage_boundary) VALUES (?1, ?2, ?3) ON CONFLICT(id) DO UPDATE SET usage_tokens = excluded.usage_tokens, usage_boundary = excluded.usage_boundary",
             params![session.id.0, tokens, boundary],
         )?;
-        transaction.execute(
-            "DELETE FROM messages WHERE session_id = ?1",
+        let stored: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(position) + 1, 0) FROM messages WHERE session_id = ?1",
             [&session.id.0],
+            |row| row.get(0),
         )?;
+        let stored = usize::try_from(stored).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, Type::Integer, Box::new(e))
+        })?;
+        if stored > session.messages.len() {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
         {
             let mut insert = transaction.prepare(
                 "INSERT INTO messages (session_id, position, role, content, tool_call_id, tool_name, details)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
-            for (position, message) in session.messages.iter().enumerate() {
+            for (position, message) in session.messages.iter().enumerate().skip(stored) {
                 let (role, content, tool_call_id, tool_name, details) = match message {
                     Message::Summary {
                         text,
+                        first_kept,
                         read_files,
                         modified_files,
                     } => {
                         let details = serde_json::to_string(&SummaryDetails {
+                            first_kept: *first_kept,
                             read_files: read_files.clone(),
                             modified_files: modified_files.clone(),
                         })
@@ -172,19 +183,36 @@ impl SqliteStorage {
 }
 
 impl SessionStore for SqliteStorage {
-    fn create_session(&self, id: &SessionId) -> Result<bool, StoreError> {
-        self.lock()
+    fn create_task_session(
+        &self,
+        name: &str,
+        text: &str,
+        choice: &TaskChoice,
+    ) -> Result<bool, StoreError> {
+        let mut connection = self.lock();
+        let tx = connection.transaction().map_err(backend)?;
+        let id = format!("task:{name}");
+        let inserted = tx
             .execute(
                 "INSERT INTO sessions (id) VALUES (?1) ON CONFLICT(id) DO NOTHING",
-                [&id.0],
+                [&id],
             )
-            .map(|n| n == 1)
-            .map_err(backend)
-    }
-
-    fn save_task_choice(&self, name: &str, choice: &TaskChoice) -> Result<(), StoreError> {
-        self.lock().execute("INSERT INTO task_choices (id, provider, model, reasoning) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(id) DO UPDATE SET provider=excluded.provider, model=excluded.model, reasoning=excluded.reasoning", params![name, choice.provider, choice.model, choice.reasoning]).map_err(backend)?;
-        Ok(())
+            .map_err(backend)?;
+        if inserted == 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO messages (session_id, position, role, content) VALUES (?1, 0, 'user', ?2)",
+            params![id, text],
+        )
+        .map_err(backend)?;
+        tx.execute(
+            "INSERT INTO task_choices (id, provider, model, reasoning) VALUES (?1, ?2, ?3, ?4)",
+            params![name, choice.provider, choice.model, choice.reasoning],
+        )
+        .map_err(backend)?;
+        tx.commit().map_err(backend)?;
+        Ok(true)
     }
 
     fn task_choice(&self, name: &str) -> Result<Option<TaskChoice>, StoreError> {

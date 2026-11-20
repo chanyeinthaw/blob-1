@@ -179,7 +179,7 @@ where
 
             if !retrying
                 && self.config.compaction.context_window.is_some_and(|window| {
-                    compaction::context_tokens(&system, &session.messages, session.usage)
+                    compaction::context_tokens(&system, &session.view(), session.usage)
                         > u64::from(window.saturating_sub(self.config.compaction.reserve_tokens))
                 })
             {
@@ -188,9 +188,10 @@ where
             retrying = false;
 
             self.observe(Step::Model);
+            let view = session.view();
             let response = match self.llm.complete(CompletionRequest {
                 system: &system,
-                messages: &session.messages,
+                messages: &view,
                 tools: &tools,
             }).await {
                 Ok(response) => response,
@@ -216,7 +217,7 @@ where
                 if let Some(value) = response.usage {
                     session.usage = Some(SessionUsage {
                         tokens: usage_tokens(value),
-                        boundary: session.messages.len(),
+                        view_boundary: session.view().len(),
                     });
                 }
                 if self.apply_steering(&mut session, id) {
@@ -237,7 +238,7 @@ where
             if let Some(value) = response.usage {
                 session.usage = Some(SessionUsage {
                     tokens: usage_tokens(value),
-                    boundary: session.messages.len(),
+                    view_boundary: session.view().len(),
                 });
             }
             for call in response.tool_calls {
@@ -267,7 +268,13 @@ where
                             _ => None,
                         });
                 let executed = if let Some(result) = memory_result {
-                    result.map(|content| memory::clip_tool_output(&content))
+                    result.map(|content| {
+                        if call.name == "zoom" {
+                            content
+                        } else {
+                            memory::clip_tool_output(&content)
+                        }
+                    })
                 } else {
                     match ToolInput::parse(&call.name, &call.arguments) {
                         Ok(input) => self
@@ -342,15 +349,17 @@ where
             });
         let keep = if overflow {
             u64::from(keep)
-                .min(compaction::context_tokens("", &session.messages, None) / 2)
+                .min(compaction::context_tokens("", &session.view(), None) / 2)
                 .max(1) as u32
         } else {
             keep
         };
         let observer = &self.observer;
-        let Some(messages) = compaction::compact(
+        let indices = session.view_indices();
+        let view = session.view();
+        let Some((mut summary, cut)) = compaction::compact(
             self.summarizer.as_ref().unwrap_or(&self.llm),
-            &session.messages,
+            &view,
             keep,
             config.summarizer_window,
             config.reserve_tokens,
@@ -364,13 +373,18 @@ where
         else {
             return Ok(false);
         };
+        if let Message::Summary { first_kept, .. } = &mut summary {
+            *first_kept = indices[cut];
+        }
+        let mut projected = vec![summary.clone()];
+        projected.extend_from_slice(&view[cut..]);
         if overflow
-            && compaction::context_tokens("", &messages, None)
-                >= compaction::context_tokens("", &session.messages, None)
+            && compaction::context_tokens("", &projected, None)
+                >= compaction::context_tokens("", &view, None)
         {
             return Ok(false);
         }
-        session.messages = messages;
+        session.push(summary);
         session.usage = None;
         self.store.save(session.clone())?;
         Ok(true)
