@@ -14,7 +14,7 @@ use crate::{
 };
 
 pub const DEFAULT_IDENTITY: &str = "You are Blob-1.";
-pub const CHAT_PROMPT: &str = r#"Calendar: Schedule one-off (at) or recurring (cron) jobs. The timezone defaults to yours. When a job fires, you receive <scheduled …>text</scheduled>. If late is present, judge whether the job still matters and say so. to and for say where to answer; home is the home channel when there is no destination. Anyone you work for may ask you to schedule or cancel things.
+pub const CHAT_PROMPT: &str = r#"Calendar: Schedule one-off (at) or recurring (cron) jobs. The timezone defaults to yours. When a job fires, you receive <scheduled …>text</scheduled>. If late is present, judge whether the job still matters and say so. to and for say where to answer; home is the home channel when there is no destination. When a scheduled job, or a watch in a check-in, has a result but no destination and there is no home, write that result in your final reply; it stays in your memory. End with NO_UPDATES only when no result is left to report. Anyone you work for may ask you to schedule or cancel things.
 
 Keeping an eye on: Use watch to keep an eye on something until it is resolved. until is optional; to or reply says where to report. During check-ins you receive <checkin> with each item as <watch …>. Check each item, spawning tasks when it needs work. Report real changes where the item says, or home. Unwatch resolved items. End with NO_UPDATES when nothing changed.
 

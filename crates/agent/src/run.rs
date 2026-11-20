@@ -449,7 +449,15 @@ pub async fn serve(
         }
         loop {
             tokio::select! {
-                result = &mut run => { backoff = result.is_err(); if let Err(error) = result { eprintln!("{error}"); } break; },
+                result = &mut run => {
+                    backoff = result.is_err();
+                    match result {
+                        Ok(answer) if !answer.is_empty() => println!("{answer}"),
+                        Ok(_) => {}
+                        Err(error) => eprintln!("{error}"),
+                    }
+                    break;
+                },
                 value = rx.recv() => match value {
                     Some(inbound) => if let Some((text, meta)) = admit(&store, discord.clone(), &messengers, inbound)? { harness.steer_message(text, Some(meta)); },
                     None => return match listener.await? { Err(error) => Err(error.into()), Ok(()) => Err("discord listener stopped".into()) },
