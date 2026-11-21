@@ -6,7 +6,8 @@ use messenger::{
     Scope,
 };
 use std::collections::HashSet;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, watch};
 use twilight_http::Client;
 use twilight_model::{
     channel::{message::MessageType, ChannelType, Message},
@@ -17,12 +18,30 @@ use twilight_model::{
     user::User,
 };
 
+/// The Discord messenger. It starts disconnected and swaps its HTTP client
+/// and gateway live when `connect` is called with a new token. Operations
+/// while disconnected fail with "Discord is not connected".
 pub struct Discord {
+    inner: watch::Sender<Option<Arc<Inner>>>,
+    connection: watch::Sender<Connection>,
+}
+
+/// One bot connection: its HTTP client plus the state the gateway fills in.
+pub(crate) struct Inner {
     token: String,
     http: Client,
     user: tokio::sync::OnceCell<Id<UserMarker>>,
     ready: std::sync::atomic::AtomicBool,
     directory: tokio::sync::Mutex<Option<(std::time::Instant, Directory)>>,
+}
+
+/// What the web settings reports for the bot connection.
+#[derive(Clone)]
+pub enum Connection {
+    Off,
+    Connecting,
+    Online { bot: String },
+    Error { message: String },
 }
 
 type Directory = (Vec<(String, String, String)>, Vec<Person>);
@@ -31,6 +50,10 @@ const DIRECTORY_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 fn backend(error: impl std::error::Error + Send + Sync + 'static) -> MessengerError {
     MessengerError::Backend(Box::new(error))
+}
+
+fn disconnected() -> MessengerError {
+    backend(std::io::Error::other("Discord is not connected"))
 }
 
 fn id<T>(value: &str) -> Result<Id<T>, MessengerError> {
@@ -84,9 +107,79 @@ fn fetched(message: Message) -> Fetched {
     }
 }
 
+impl Default for Discord {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Discord {
-    pub fn new(token: String) -> Self {
+    pub fn new() -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
+        Self {
+            inner: watch::channel(None).0,
+            connection: watch::channel(Connection::Off).0,
+        }
+    }
+
+    /// Connects with a bot token, replacing any current connection.
+    pub fn connect(&self, token: String) {
+        self.inner.send_replace(Some(Arc::new(Inner::new(token))));
+        self.connection.send_replace(Connection::Connecting);
+    }
+
+    /// Disconnects; the connection state reports off.
+    pub fn disconnect(&self) {
+        self.inner.send_replace(None);
+        self.connection.send_replace(Connection::Off);
+    }
+
+    /// Disconnects and reports a failure, e.g. a dead gateway or no main model.
+    pub fn error(&self, message: impl Into<String>) {
+        self.inner.send_replace(None);
+        self.connection.send_replace(Connection::Error {
+            message: message.into(),
+        });
+    }
+
+    /// Reports connecting until the supervisor picks up a newly stored token.
+    pub fn connecting(&self) {
+        self.connection.send_replace(Connection::Connecting);
+    }
+
+    /// Whether the live connection already uses this token.
+    pub fn uses_token(&self, token: &str) -> bool {
+        self.inner
+            .borrow()
+            .as_ref()
+            .is_some_and(|inner| inner.token == token)
+    }
+
+    pub(crate) fn set_connection(&self, connection: Connection) {
+        self.connection.send_replace(connection);
+    }
+
+    pub fn connection(&self) -> Connection {
+        self.connection.borrow().clone()
+    }
+
+    fn current(&self) -> Result<Arc<Inner>, MessengerError> {
+        self.inner.borrow().clone().ok_or_else(disconnected)
+    }
+
+    /// Channels and people the bot can see; empty while disconnected or not
+    /// yet ready.
+    pub async fn directory(&self) -> Result<Directory, MessengerError> {
+        let inner = self.inner.borrow().clone();
+        match inner {
+            Some(inner) => inner.directory().await,
+            None => Ok(Default::default()),
+        }
+    }
+}
+
+impl Inner {
+    fn new(token: String) -> Self {
         Self {
             http: Client::new(token.clone()),
             token,
@@ -96,11 +189,11 @@ impl Discord {
         }
     }
 
-    pub fn is_ready(&self) -> bool {
+    fn is_ready(&self) -> bool {
         self.ready.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub async fn directory(&self) -> Result<Directory, MessengerError> {
+    async fn directory(&self) -> Result<Directory, MessengerError> {
         if !self.is_ready() {
             return Ok(Default::default());
         }
@@ -174,7 +267,7 @@ impl Discord {
         Ok((channels, people))
     }
 
-    pub async fn ping_state(
+    async fn ping_state(
         &self,
         place: &Place,
     ) -> Result<(Option<Id<UserMarker>>, Id<UserMarker>, bool), MessengerError> {
@@ -223,6 +316,19 @@ impl Discord {
     }
 }
 
+/// Checks a bot token against `GET /users/@me` before it is stored.
+pub async fn validate_token(token: &str) -> Result<(), String> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Client::new(token.to_owned())
+        .current_user()
+        .await
+        .map_err(|_| "Discord rejected this token".to_owned())?
+        .model()
+        .await
+        .map_err(|_| "Discord rejected this token".to_owned())?;
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl Lookup for Discord {
     fn name(&self) -> &'static str {
@@ -231,6 +337,7 @@ impl Lookup for Discord {
 
     async fn message(&self, place: &Place, message: &str) -> Result<Fetched, MessengerError> {
         let message = self
+            .current()?
             .http
             .message(channel(place)?, id(message)?)
             .await
@@ -288,6 +395,7 @@ impl Lookup for Discord {
         limit: u32,
     ) -> Result<Vec<Fetched>, MessengerError> {
         Ok(self
+            .current()?
             .messages(place, before, limit)
             .await?
             .into_iter()
@@ -309,6 +417,7 @@ impl Lookup for Discord {
         };
         let query = query.to_lowercase();
         Ok(self
+            .current()?
             .messages(place, None, 100)
             .await?
             .into_iter()
@@ -323,12 +432,13 @@ impl Lookup for Discord {
         scope: &Scope,
         query: Option<&str>,
     ) -> Result<Vec<Person>, MessengerError> {
+        let inner = self.current()?;
         let mut seen = HashSet::new();
         let mut result = Vec::new();
         match scope {
             Scope::Place(place) => {
                 let query = query.map(str::to_lowercase);
-                for message in self.messages(place, None, 100).await? {
+                for message in inner.messages(place, None, 100).await? {
                     let user = message.author;
                     let p = person(&user);
                     if !user.bot
@@ -347,7 +457,7 @@ impl Lookup for Discord {
                 })?;
                 let mut after = None;
                 loop {
-                    let mut request = self.http.current_user_guilds().limit(200);
+                    let mut request = inner.http.current_user_guilds().limit(200);
                     if let Some(id) = after {
                         request = request.after(id);
                     }
@@ -358,7 +468,7 @@ impl Lookup for Discord {
                         .await
                         .map_err(backend)?;
                     for guild in &guilds {
-                        let members = self
+                        let members = inner
                             .http
                             .search_guild_members(guild.id, query)
                             .limit(50)
@@ -392,6 +502,7 @@ impl Lookup for Discord {
 impl Messenger for Discord {
     async fn direct(&self, user: &str) -> Result<Place, MessengerError> {
         let channel = self
+            .current()?
             .http
             .create_private_channel(id(user)?)
             .await
@@ -406,13 +517,11 @@ impl Messenger for Discord {
         })
     }
     async fn listen(&self, inbound: mpsc::Sender<Inbound>) -> Result<(), MessengerError> {
-        let result = gateway::listen(self, inbound).await;
-        self.ready
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        result
+        gateway::listen(self, inbound).await
     }
     async fn react(&self, place: &Place, message: &str, mark: Mark) -> Result<(), MessengerError> {
-        self.http
+        self.current()?
+            .http
             .create_reaction(channel(place)?, id(message)?, &reaction(mark))
             .await
             .map_err(backend)?;
@@ -424,17 +533,20 @@ impl Messenger for Discord {
         message: &str,
         mark: Mark,
     ) -> Result<(), MessengerError> {
-        self.http
+        self.current()?
+            .http
             .delete_current_user_reaction(channel(place)?, id(message)?, &reaction(mark))
             .await
             .map_err(backend)?;
         Ok(())
     }
     async fn typing(&self, place: &Place) -> Result<(), MessengerError> {
-        match self.http.create_typing_trigger(channel(place)?).await {
+        let inner = self.current()?;
+        match inner.http.create_typing_trigger(channel(place)?).await {
             Ok(_) => Ok(()),
             Err(error) if place.thread.is_some() && render::has_code(&error, 10003) => {
-                self.http
+                inner
+                    .http
                     .create_typing_trigger(id(&place.channel)?)
                     .await
                     .map_err(backend)?;
@@ -444,14 +556,16 @@ impl Messenger for Discord {
         }
     }
     async fn send(&self, outbound: Outbound) -> Result<messenger::Sent, MessengerError> {
-        render::send(self, outbound).await
+        let inner = self.current()?;
+        render::send(&inner, outbound).await
     }
     async fn rename(&self, place: &Place, name: &str) -> Result<(), MessengerError> {
         let thread = place
             .thread
             .as_deref()
             .ok_or_else(|| MessengerError::Unsupported("thread required".into()))?;
-        self.http
+        self.current()?
+            .http
             .update_thread(id(thread)?)
             .name(name)
             .await

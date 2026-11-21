@@ -15,12 +15,16 @@ pub const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: Cow::Borrowed("schedule"),
         description: Cow::Borrowed("Schedule a message at a time or on a cron schedule."),
-        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"text":{"type":"string"},"at":{"type":"string"},"cron":{"type":"string"},"tz":{"type":"string"},"to":{"type":"string"},"reply":{"type":"string"}},"required":["text"]}"#),
+        input_schema: Cow::Borrowed(
+            r#"{"type":"object","properties":{"text":{"type":"string"},"at":{"type":"string"},"cron":{"type":"string"},"tz":{"type":"string"},"to":{"type":"string"},"reply":{"type":"string"}},"required":["text"]}"#,
+        ),
     },
     ToolSpec {
         name: Cow::Borrowed("unschedule"),
         description: Cow::Borrowed("Remove a schedule by id."),
-        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#),
+        input_schema: Cow::Borrowed(
+            r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#,
+        ),
     },
     ToolSpec {
         name: Cow::Borrowed("schedules"),

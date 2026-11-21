@@ -3,13 +3,13 @@ import { Html, HtmlBuilder } from 'foldkit/html'
 
 import { Message } from './message'
 import { Connection, Page, SignedIn } from './model'
-import * as Discord from './page/settings/discord'
+import * as Chat from './page/settings/chat'
 import * as Identity from './page/settings/identity'
 import * as Mcp from './page/settings/mcp'
 import * as Models from './page/settings/models'
 import * as Providers from './page/settings/providers'
 import {
-  discordRouter,
+  chatRouter,
   identityRouter,
   mcpRouter,
   modelsRouter,
@@ -25,29 +25,27 @@ const isAwake = (connection: Connection): boolean =>
     Disconnected: () => false,
   })
 
-const statusView = (connection: Connection, h: HtmlBuilder<Message>): Html =>
-  h.p(
-    [
-      h.Class(
-        clsx(
-          'flex items-center gap-1.5 text-caption leading-tight',
-          isAwake(connection) ? 'text-mute' : 'text-alarm',
-        ),
-      ),
-    ],
+const statusDotView = (
+  connection: Connection,
+  h: HtmlBuilder<Message>,
+): Html => {
+  const label = isAwake(connection) ? 'Connected' : 'Offline'
+  return h.span(
+    [h.Title(label), h.Class('flex shrink-0 items-center')],
     [
       h.span([
         h.AriaHidden(true),
         h.Class(
           clsx(
-            'size-1.5 rounded-full',
+            'size-2 rounded-full',
             isAwake(connection) ? 'bg-ok' : 'bg-alarm',
           ),
         ),
       ]),
-      isAwake(connection) ? 'Connected' : 'Offline',
+      h.span([h.Class('sr-only')], [label]),
     ],
   )
+}
 
 type NavItem = Readonly<{
   label: string
@@ -76,9 +74,9 @@ const navItems = (page: Page): ReadonlyArray<NavItem> => [
     icon: Icon.server,
   },
   {
-    label: 'Discord',
-    href: discordRouter(),
-    isActive: page._tag === 'Discord',
+    label: 'Chat platforms',
+    href: chatRouter(),
+    isActive: page._tag === 'Chat',
     icon: Icon.chat,
   },
   {
@@ -92,116 +90,152 @@ const navItems = (page: Page): ReadonlyArray<NavItem> => [
 const focusClassName =
   'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring'
 
-const sidebarLinkView = (item: NavItem, h: HtmlBuilder<Message>): Html =>
-  h.a(
+const logoTileView = (
+  tileClassName: string,
+  iconClassName: string,
+  h: HtmlBuilder<Message>,
+): Html =>
+  h.span(
     [
-      h.Href(item.href),
-      ...(item.isActive ? [h.AriaCurrent('page')] : []),
       h.Class(
         clsx(
-          'flex h-8 items-center gap-2 rounded-md px-2 text-body',
-          focusClassName,
-          item.isActive
-            ? 'bg-hover font-medium text-ink'
-            : 'text-slate hover:bg-hover hover:text-ink',
+          'grid shrink-0 place-items-center rounded-lg bg-accent text-white',
+          tileClassName,
         ),
       ),
     ],
-    [item.icon('size-4 shrink-0'), item.label],
+    [Blob.view(iconClassName, h)],
   )
 
-const sidebarView = (
+const tooltipView = (label: string, h: HtmlBuilder<Message>): Html =>
+  h.span(
+    [
+      h.AriaHidden(true),
+      h.Class(
+        'pointer-events-none absolute left-full top-1/2 z-30 max-md:hidden ml-2.5 -translate-y-1/2 whitespace-nowrap rounded-md bg-accent px-3 py-1.5 text-caption font-medium text-white opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-hover:delay-300 group-focus-visible:opacity-100',
+      ),
+    ],
+    [
+      h.span([
+        h.Class(
+          'absolute left-0 top-1/2 size-2 -translate-x-1/2 -translate-y-1/2 rotate-45 rounded-[2px] bg-accent',
+        ),
+      ]),
+      label,
+    ],
+  )
+
+const signOutButtonView = (h: HtmlBuilder<Message>): Html =>
+  h.button(
+    [
+      h.Type('button'),
+      h.OnClick(Message.ClickedSignOut()),
+      h.AriaLabel('Sign out'),
+      h.Class(
+        clsx(
+          'group relative grid size-9 cursor-pointer place-items-center rounded-full text-mute hover:bg-hover hover:text-ink',
+          focusClassName,
+        ),
+      ),
+    ],
+    [Icon.signOut('size-4'), tooltipView('Sign out', h)],
+  )
+
+const railLinkView = (item: NavItem, h: HtmlBuilder<Message>): Html =>
+  h.a(
+    [
+      h.Href(item.href),
+      h.AriaLabel(item.label),
+      ...(item.isActive ? [h.AriaCurrent('page')] : []),
+      h.Class(
+        clsx(
+          'group relative grid size-9 place-items-center rounded-full',
+          focusClassName,
+          item.isActive
+            ? 'bg-chip text-ink'
+            : 'text-mute hover:bg-hover hover:text-ink',
+        ),
+      ),
+    ],
+    [item.icon('size-4'), tooltipView(item.label, h)],
+  )
+
+const railView = (
   connection: Connection,
   page: Page,
   h: HtmlBuilder<Message>,
 ): Html =>
   h.header(
-    [h.Class('fixed inset-y-0 left-0 hidden w-56 flex-col p-2 md:flex')],
-    [
-      h.div(
-        [h.Class('mb-2 flex items-center gap-2 p-2')],
-        [
-          h.span(
-            [
-              h.Class(
-                'grid size-8 shrink-0 place-items-center rounded-lg bg-accent text-white',
-              ),
-            ],
-            [Blob.view('size-4', h)],
-          ),
-          h.div(
-            [h.Class('min-w-0')],
-            [
-              h.p(
-                [h.Class('text-body font-semibold leading-tight text-ink')],
-                ['Blob-1'],
-              ),
-              statusView(connection, h),
-            ],
-          ),
-        ],
-      ),
-      h.p(
-        [
-          h.Class(
-            'flex h-8 items-center px-2 text-caption font-medium text-mute',
-          ),
-        ],
-        ['Settings'],
-      ),
-      h.nav(
-        [h.Class('flex flex-col gap-1'), h.AriaLabel('Settings')],
-        navItems(page).map(item => sidebarLinkView(item, h)),
-      ),
-      h.button(
-        [
-          h.Type('button'),
-          h.OnClick(Message.ClickedSignOut()),
-          h.Class(
-            clsx(
-              'mt-auto flex h-8 cursor-pointer items-center gap-2 rounded-md px-2 text-body text-slate hover:bg-hover hover:text-ink',
-              focusClassName,
-            ),
-          ),
-        ],
-        [Icon.signOut('size-4 shrink-0'), 'Sign out'],
-      ),
-    ],
-  )
-
-const tabClassName = (isActive: boolean): string =>
-  clsx(
-    'flex cursor-pointer flex-col items-center justify-center gap-0.5 rounded-lg text-[11px] font-medium',
-    focusClassName,
-    isActive ? 'text-ink' : 'text-mute',
-  )
-
-const tabBarView = (page: Page, h: HtmlBuilder<Message>): Html =>
-  h.nav(
     [
       h.Class(
-        'fixed inset-x-0 bottom-0 z-20 grid h-16 grid-cols-5 bg-shelf px-1.5 pb-2 pt-1.5 md:hidden',
+        'fixed inset-y-0 left-0 z-20 hidden w-16 flex-col items-center py-3 md:flex',
       ),
-      h.AriaLabel('Settings'),
     ],
     [
-      ...navItems(page).map(item =>
-        h.a(
-          [
-            h.Href(item.href),
-            ...(item.isActive ? [h.AriaCurrent('page')] : []),
-            h.Class(tabClassName(item.isActive)),
-          ],
-          [item.icon('size-5'), item.label],
+      logoTileView('size-8', 'size-4', h),
+      h.nav(
+        [
+          h.Class('mt-4 flex flex-col items-center gap-1'),
+          h.AriaLabel('Settings'),
+        ],
+        navItems(page).map(item => railLinkView(item, h)),
+      ),
+      h.div(
+        [h.Class('mt-auto flex flex-col items-center gap-3')],
+        [statusDotView(connection, h), signOutButtonView(h)],
+      ),
+    ],
+  )
+
+const mobileTabView = (item: NavItem, h: HtmlBuilder<Message>): Html =>
+  h.a(
+    [
+      h.Href(item.href),
+      ...(item.isActive
+        ? [h.AriaCurrent('page'), h.Id('active-nav-item')]
+        : []),
+      h.Class(
+        clsx(
+          'flex h-9 shrink-0 snap-start items-center gap-1.5 rounded-full px-3.5 text-body font-medium',
+          focusClassName,
+          item.isActive
+            ? 'bg-chip text-ink'
+            : 'text-mute hover:bg-hover hover:text-ink',
         ),
       ),
-      h.button(
+    ],
+    [item.icon('size-4'), item.label],
+  )
+
+const mobileHeaderView = (
+  connection: Connection,
+  page: Page,
+  h: HtmlBuilder<Message>,
+): Html =>
+  h.header(
+    [
+      h.Class(
+        'sticky top-0 z-20 bg-shelf shadow-[0_1px_3px_rgb(0_0_0/0.06)] md:hidden',
+      ),
+    ],
+    [
+      h.div(
+        [h.Class('flex h-14 items-center gap-2.5 px-4')],
         [
-          h.Type('button'),
-          h.OnClick(Message.ClickedSignOut()),
-          h.Class(tabClassName(false)),
+          logoTileView('size-7', 'size-3.5', h),
+          h.p([h.Class('text-body font-semibold text-ink')], ['Blob-1']),
+          statusDotView(connection, h),
+          h.div([h.Class('ml-auto -mr-1.5')], [signOutButtonView(h)]),
         ],
-        [Icon.signOut('size-5'), 'Sign out'],
+      ),
+      h.nav(
+        [
+          h.Class(
+            'scrollbar-hide flex snap-x snap-proximity gap-1 overflow-x-auto px-4 pb-2',
+          ),
+          h.AriaLabel('Settings'),
+        ],
+        navItems(page).map(item => mobileTabView(item, h)),
       ),
     ],
   )
@@ -229,12 +263,12 @@ const pageView = (page: Page, h: HtmlBuilder<Message>): Html =>
         view: Providers.view,
         toParentMessage: message => Message.GotProvidersMessage({ message }),
       }),
-    Discord: ({ model }) =>
+    Chat: ({ model }) =>
       h.submodel({
-        slotId: 'discord',
+        slotId: 'chat',
         model,
-        view: Discord.view,
-        toParentMessage: message => Message.GotDiscordMessage({ message }),
+        view: Chat.view,
+        toParentMessage: message => Message.GotChatMessage({ message }),
       }),
     Mcp: ({ model }) =>
       h.submodel({
@@ -247,14 +281,18 @@ const pageView = (page: Page, h: HtmlBuilder<Message>): Html =>
 
 export const shellView = (signedIn: SignedIn, h: HtmlBuilder<Message>): Html =>
   h.div(
-    [h.Class('min-h-dvh bg-shelf')],
+    [h.Class('flex min-h-dvh flex-col bg-shelf')],
     [
-      sidebarView(signedIn.connection, signedIn.page, h),
+      railView(signedIn.connection, signedIn.page, h),
+      mobileHeaderView(signedIn.connection, signedIn.page, h),
       h.main(
-        [h.Class('min-w-0 pb-16 md:ml-56 md:h-dvh md:p-2 md:pb-2 md:pl-0')],
+        [
+          h.Class(
+            'flex min-w-0 flex-1 flex-col md:ml-16 md:h-dvh md:max-h-dvh md:min-h-0',
+          ),
+        ],
         [pageView(signedIn.page, h)],
       ),
-      tabBarView(signedIn.page, h),
       Toast.view(
         signedIn.toast,
         message => Message.GotToastMessage({ message }),

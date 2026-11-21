@@ -25,13 +25,19 @@ type ViewConfig<Message> = Readonly<{
   triggerClassName: string
   panelClassName: string
   placement?: 'bottom-start' | 'bottom-end'
+  isCompact?: boolean
   isDisabled?: boolean
   className?: string
   toParentMessage: (message: Listbox.Message) => Message
 }>
 
-const itemClassName =
-  'group flex min-h-8 cursor-pointer items-center gap-2 rounded-sm px-2 py-1 text-body text-ink data-[active]:bg-hover data-[disabled]:cursor-not-allowed data-[disabled]:opacity-50'
+const itemClassName = (isCompact: boolean): string =>
+  clsx(
+    'group flex cursor-pointer items-center gap-2 text-ink data-[active]:bg-hover data-[disabled]:cursor-not-allowed data-[disabled]:opacity-50',
+    isCompact
+      ? 'min-h-7 rounded-md px-2 text-caption'
+      : 'min-h-8 rounded-lg px-2 py-1 text-body',
+  )
 
 export const init = (id: string): Listbox.Model => Listbox.init({ id })
 
@@ -61,13 +67,10 @@ export const view = <Message>(
       itemToConfig: value => {
         const item = find(value)
         return {
-          className: itemClassName,
+          className: itemClassName(config.isCompact === true),
           content: h.div(
             [h.Class('flex min-w-0 flex-1 items-center gap-2')],
             [
-              Icon.check(
-                'size-3.5 shrink-0 text-ink invisible group-data-[selected]:visible',
-              ),
               h.span(
                 [
                   h.Class(
@@ -94,6 +97,13 @@ export const view = <Message>(
                   ),
                 ],
               ),
+              ...(config.selected === undefined
+                ? []
+                : [
+                    Icon.check(
+                      'size-3.5 shrink-0 text-ink invisible group-data-[selected]:visible',
+                    ),
+                  ]),
             ],
           ),
         }
@@ -106,7 +116,8 @@ export const view = <Message>(
       itemsAttributes: childAttributes([
         h.Class(
           clsx(
-            'z-30 overflow-hidden rounded-md border border-hair bg-white p-1 shadow-md outline-none',
+            'z-30 overflow-hidden border border-hair bg-white p-1 shadow-md outline-none',
+            config.isCompact === true ? 'rounded-lg' : 'rounded-xl',
             config.panelClassName,
           ),
         ),

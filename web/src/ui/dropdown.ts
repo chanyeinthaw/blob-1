@@ -25,13 +25,13 @@ type ViewConfig<Message> = Readonly<{
 }>
 
 const triggerClassName =
-  'flex h-8 w-full cursor-pointer items-center justify-between gap-2 rounded-md border border-control bg-white px-2.5 text-left shadow-xs text-body text-ink select-none hover:bg-hover focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 data-[disabled]:cursor-not-allowed data-[disabled]:bg-chip data-[disabled]:text-mute'
+  'flex h-8 w-full cursor-pointer items-center justify-between gap-2 rounded-full border border-control bg-white px-3.5 text-left shadow-xs text-body text-ink select-none hover:bg-hover focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 data-[disabled]:cursor-not-allowed data-[disabled]:bg-chip data-[disabled]:text-mute'
 
 const itemsClassName =
-  'z-30 w-[var(--button-width,12rem)] max-w-[calc(100vw-16px)] overflow-hidden rounded-md border border-hair bg-white p-1 shadow-md outline-none'
+  'z-30 w-[var(--button-width,12rem)] max-w-[calc(100vw-16px)] overflow-hidden rounded-xl border border-hair bg-white p-1 shadow-md outline-none'
 
 const itemClassName =
-  'group flex h-7 cursor-pointer items-center gap-2 rounded-sm px-2 text-body text-ink data-[active]:bg-hover'
+  'group flex h-7 cursor-pointer items-center gap-2 rounded-lg px-2 text-body text-ink data-[active]:bg-hover'
 
 export const view = <Message>(
   config: ViewConfig<Message>,
@@ -59,12 +59,12 @@ export const view = <Message>(
         content: h.div(
           [h.Class('flex min-w-0 flex-1 items-center gap-2')],
           [
-            Icon.check(
-              'size-3.5 shrink-0 text-ink invisible group-data-[selected]:visible',
-            ),
             h.span(
               [h.Class(clsx('truncate', textClassName))],
               [labelOf(value)],
+            ),
+            Icon.check(
+              'ml-auto size-3.5 shrink-0 text-ink invisible group-data-[selected]:visible',
             ),
           ],
         ),

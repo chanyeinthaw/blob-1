@@ -64,9 +64,19 @@ export const Home = Schema.Union([
 ])
 export type Home = typeof Home.Type
 
+export const DiscordConnection = Schema.Union([
+  Schema.Struct({ state: Schema.Literal('off') }),
+  Schema.Struct({ state: Schema.Literal('connecting') }),
+  Schema.Struct({ state: Schema.Literal('online'), bot: Schema.String }),
+  Schema.Struct({ state: Schema.Literal('error'), message: Schema.String }),
+])
+export type DiscordConnection = typeof DiscordConnection.Type
+
 export const Discord = Schema.Struct({
   allowed: Schema.Array(Schema.String),
   home: Home,
+  token: Schema.Literals(['set', 'missing']),
+  connection: DiscordConnection,
 })
 export type Discord = typeof Discord.Type
 
@@ -202,6 +212,11 @@ export const requests = {
     payload: Schema.Struct({ home: Home }),
     reply: Discord,
   },
+  'discord.setToken': {
+    payload: Schema.Struct({ token: Schema.String }),
+    reply: Discord,
+  },
+  'discord.clearToken': { payload: NoPayload, reply: Discord },
   'mcp.list': { payload: NoPayload, reply: Schema.Array(McpServer) },
   'mcp.add': { payload: McpAddPayload, reply: Schema.Array(McpServer) },
   'mcp.remove': {

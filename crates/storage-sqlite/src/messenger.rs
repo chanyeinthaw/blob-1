@@ -65,6 +65,42 @@ impl MessengerStore for SqliteStorage {
         Ok(())
     }
 
+    fn messenger_token(&self, messenger: &str) -> Result<Option<String>, StoreError> {
+        self.lock()
+            .query_row(
+                "SELECT token FROM messenger_tokens WHERE messenger = ?1",
+                params![messenger],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(backend)?
+            .map(|token| self.unseal(&token))
+            .transpose()
+    }
+
+    fn set_messenger_token(&self, messenger: &str, token: Option<&str>) -> Result<(), StoreError> {
+        match token {
+            Some(token) => {
+                let token = self.seal(token)?;
+                self.lock()
+                    .execute(
+                        "INSERT INTO messenger_tokens (messenger, token) VALUES (?1, ?2) ON CONFLICT (messenger) DO UPDATE SET token = excluded.token",
+                        params![messenger, token],
+                    )
+                    .map_err(backend)?;
+            }
+            None => {
+                self.lock()
+                    .execute(
+                        "DELETE FROM messenger_tokens WHERE messenger = ?1",
+                        params![messenger],
+                    )
+                    .map_err(backend)?;
+            }
+        }
+        Ok(())
+    }
+
     fn disallow_user(&self, messenger: &str, user: &str) -> Result<bool, StoreError> {
         self.lock()
             .execute(

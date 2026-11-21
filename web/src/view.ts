@@ -12,7 +12,7 @@ const pageTitle = (page: Page): string =>
     Identity: () => 'Identity',
     Models: () => 'Models',
     Providers: () => 'Providers',
-    Discord: () => 'Discord',
+    Chat: () => 'Chat platforms',
     Mcp: () => 'MCP servers',
   })
 

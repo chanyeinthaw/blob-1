@@ -4,7 +4,7 @@ import { UrlRequest } from 'foldkit/navigation'
 import { Url } from 'foldkit/url'
 
 import * as Login from './page/login'
-import * as Discord from './page/settings/discord'
+import * as Chat from './page/settings/chat'
 import * as Identity from './page/settings/identity'
 import * as Mcp from './page/settings/mcp'
 import * as Models from './page/settings/models'
@@ -16,6 +16,7 @@ export const Message = defineMessageUnion({
   ChangedUrl: { url: Url },
   CompletedNavigateInternal: {},
   CompletedLoadExternal: {},
+  CompletedScrollActiveNav: {},
   ClickedSignOut: {},
   CompletedSignOut: {},
   FailedSignOut: {},
@@ -25,7 +26,7 @@ export const Message = defineMessageUnion({
   GotIdentityMessage: { message: Identity.Message },
   GotModelsMessage: { message: Models.Message },
   GotProvidersMessage: { message: Providers.Message },
-  GotDiscordMessage: { message: Discord.Message },
+  GotChatMessage: { message: Chat.Message },
   GotMcpMessage: { message: Mcp.Message },
   GotToastMessage: { message: Toast.Message },
 })

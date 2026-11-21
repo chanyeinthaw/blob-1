@@ -1,6 +1,6 @@
-use std::{borrow::Cow, collections::HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{borrow::Cow, collections::HashMap};
 
 use environment::ToolSpec;
 use messenger::{Fetched, Mark, Messenger, Outbound, Place, Scope, Target};

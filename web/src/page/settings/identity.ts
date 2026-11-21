@@ -346,7 +346,7 @@ const identityFieldView = (
       h.div(
         [
           h.Class(
-            `grid grid-cols-1 rounded-lg border bg-white focus-within:ring-[3px] focus-within:ring-ring/50 ${Option.isSome(loaded.maybeError) ? 'border-alarm' : 'border-control focus-within:border-ring'}`,
+            `grid grid-cols-1 rounded-2xl border bg-white focus-within:ring-[3px] focus-within:ring-ring/50 ${Option.isSome(loaded.maybeError) ? 'border-alarm' : 'border-control focus-within:border-ring'}`,
           ),
         ],
         [

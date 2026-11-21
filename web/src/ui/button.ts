@@ -12,7 +12,7 @@ export type Variant =
   | 'danger'
 
 const interactionClassName =
-  'cursor-pointer rounded-md text-body font-medium focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring data-[disabled]:cursor-not-allowed'
+  'cursor-pointer rounded-full text-body font-medium focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring data-[disabled]:cursor-not-allowed'
 
 const variantClassNames: Record<Variant, string> = {
   primary:
@@ -108,7 +108,7 @@ export const iconView = <Message>(
             h.Title(config.label),
             h.Class(
               clsx(
-                'inline-flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-md focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring data-[disabled]:cursor-not-allowed data-[disabled]:opacity-40',
+                'inline-flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-full focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring data-[disabled]:cursor-not-allowed data-[disabled]:opacity-40',
                 config.isOutlined === true
                   ? 'border border-control bg-white text-ink shadow-xs'
                   : 'text-mute',

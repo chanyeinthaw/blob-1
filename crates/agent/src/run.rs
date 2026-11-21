@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use environment::{Environment, SkillBundle};
 use environment_local::LocalEnvironment;
 use harness::{ChatHarness, EnvironmentPaths, Models};
-use storage::{ConfigStore, MessengerStore, Provider, ReasoningLevel, SkillStore};
+use messenger::Messenger;
+use storage::{ConfigStore, McpStore, MessengerStore, Provider, ReasoningLevel, SkillStore};
 use storage_sqlite::SqliteStorage;
 use tokio::signal::unix::{signal, SignalKind};
 
@@ -525,7 +526,6 @@ async fn chat_harness(
     models: ModelFactory,
     mcp: mcp::Mcp,
 ) -> Result<Chat> {
-    models.current()?;
     let environment = environment(&store, workspace, skills_dir).await?;
     let memory = memory::Memory::open(
         store.clone(),
@@ -554,6 +554,10 @@ pub async fn chat(
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
     let models = ModelFactory::new(store.clone());
+    models.current()?;
+    // Surface "set BLOB_1_APP_KEY" instead of silently dropping MCP servers
+    // whose secrets can't be decrypted.
+    store.mcp_servers()?;
     let mcp = mcp::Mcp::new(store.clone());
     let mcp_shutdown = mcp.clone();
     let harness = chat_harness(store, workspace, skills_dir, models, mcp).await?;
@@ -688,40 +692,22 @@ pub async fn serve(
     store: Arc<SqliteStorage>,
     workspace: &Path,
     skills_dir: Option<&Path>,
-    token: String,
-    shared_discord: Arc<std::sync::OnceLock<Arc<messenger_discord::Discord>>>,
+    discord: Arc<messenger_discord::Discord>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     mcp: mcp::Mcp,
 ) -> Result<()> {
     let models = ModelFactory::new(store.clone());
-    if models.current().is_err() {
-        eprintln!("Discord waiting for a main model; set one in the web settings");
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-                    if models.current().is_ok() {
-                        break;
-                    }
-                }
-                _ = shutdown.changed() => return Ok(()),
-            }
-        }
-    }
-    let harness = chat_harness(store.clone(), workspace, skills_dir, models.clone(), mcp.clone()).await?;
-    let client = Arc::new(messenger_discord::Discord::new(token));
-    let _ = shared_discord.set(client.clone());
-    let warm = client.clone();
-    tokio::spawn(async move {
-        while !warm.is_ready() {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
-        if let Err(error) = warm.directory().await {
-            eprintln!("discord directory: {error}");
-        }
-    });
-    let discord: Arc<dyn messenger::Messenger> = client;
-    let messengers = harness::Messengers::new(vec![discord.clone()], store.clone())
-        .with_utility({
+    let harness = chat_harness(
+        store.clone(),
+        workspace,
+        skills_dir,
+        models.clone(),
+        mcp.clone(),
+    )
+    .await?;
+    let outgoing: Arc<dyn messenger::Messenger> = discord.clone();
+    let messengers =
+        harness::Messengers::new(vec![outgoing.clone()], store.clone()).with_utility({
             let models = models.clone();
             move || models.current().ok().and_then(|current| current.utility)
         });
@@ -729,6 +715,53 @@ pub async fn serve(
     let (tx, mut rx) = tokio::sync::mpsc::channel(128);
     let listener_discord = discord.clone();
     let listener = tokio::spawn(async move { listener_discord.listen(tx).await });
+    let supervisor = {
+        let store = store.clone();
+        let models = models.clone();
+        let discord = discord.clone();
+        let mut shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            // Connects Discord whenever a bot token and a main model resolve,
+            // and swaps or drops the connection live on token changes. A
+            // gateway failure stays reported until the token changes.
+            let mut connected: Option<String> = None;
+            loop {
+                let token = match store.messenger_token("discord") {
+                    Ok(token) => token,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        None
+                    }
+                };
+                match token {
+                    Some(token) => {
+                        if models.current().is_ok() {
+                            let resaved = !discord.uses_token(&token)
+                                && matches!(
+                                    discord.connection(),
+                                    messenger_discord::Connection::Connecting
+                                );
+                            if connected.as_deref() != Some(token.as_str()) || resaved {
+                                discord.connect(token.clone());
+                                connected = Some(token);
+                            }
+                        } else {
+                            connected = None;
+                            discord.error("Waiting for a main model");
+                        }
+                    }
+                    None => {
+                        connected = None;
+                        discord.disconnect();
+                    }
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                    _ = shutdown.changed() => break,
+                }
+            }
+        })
+    };
     let (admitted_tx, mut admitted_rx) = tokio::sync::mpsc::channel(128);
     let admission_store = store.clone();
     let admission_discord = discord.clone();
@@ -781,7 +814,7 @@ pub async fn serve(
                     }
                     harness.work().await
                 } => None,
-                _ = shutdown.changed() => { listener.abort(); admission.abort(); return Ok(()); },
+                _ = shutdown.changed() => { listener.abort(); admission.abort(); supervisor.abort(); return Ok(()); },
             }
         };
         let run = async {
@@ -809,7 +842,7 @@ pub async fn serve(
                     Some(next) => { let (text, meta) = next?; harness.steer_message(text, Some(meta)); },
                     None => return match listener.await? { Err(error) => Err(error.into()), Ok(()) => Err("discord listener stopped".into()) },
                 },
-                _ = shutdown.changed() => { listener.abort(); admission.abort(); return Ok(()); },
+                _ = shutdown.changed() => { listener.abort(); admission.abort(); supervisor.abort(); return Ok(()); },
             }
         }
         messengers.quiet();

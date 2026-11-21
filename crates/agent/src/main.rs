@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use storage::{
-    Checkin, CheckinStore, ConfigStore, McpStore, MessengerStore, ModelRef, Provider,
-    ProviderApi, ProviderId, ReasoningLevel, SkillStore,
+    Checkin, CheckinStore, ConfigStore, McpStore, MessengerStore, ModelRef, Provider, ProviderApi,
+    ProviderId, ReasoningLevel, SkillStore,
 };
-use storage_sqlite::SqliteStorage;
+use storage_sqlite::{AppKey, SqliteStorage};
 
 mod import;
 mod run;
@@ -216,9 +216,32 @@ enum IdentityCommand {
 
 #[derive(Subcommand)]
 enum MessengerCommand {
-    Allow { messenger: String, user_id: String },
-    Disallow { messenger: String, user_id: String },
-    List { messenger: String },
+    Allow {
+        messenger: String,
+        user_id: String,
+    },
+    Disallow {
+        messenger: String,
+        user_id: String,
+    },
+    List {
+        messenger: String,
+    },
+    Token {
+        #[command(subcommand)]
+        command: MessengerTokenCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum MessengerTokenCommand {
+    /// Reads the token from stdin, never from argv.
+    Set {
+        messenger: String,
+    },
+    Clear {
+        messenger: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -349,6 +372,15 @@ async fn main() -> Result<()> {
         dir => dir,
     };
     let path = data_dir.join("agent.db");
+    let app_key = std::env::var("BLOB_1_APP_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+        .map(AppKey::new);
+    let app_key = if matches!(cli.command, Command::Serve { .. }) {
+        Some(app_key.ok_or("set BLOB_1_APP_KEY")?)
+    } else {
+        app_key
+    };
     let store = Arc::new(
         if matches!(
             cli.command,
@@ -366,9 +398,9 @@ async fn main() -> Result<()> {
                 | Command::Watch { .. }
                 | Command::Checkin { .. }
         ) {
-            SqliteStorage::open_shared(path)?
+            SqliteStorage::open_shared(path, app_key)?
         } else {
-            SqliteStorage::open(path)?
+            SqliteStorage::open(path, app_key)?
         },
     );
 
@@ -446,7 +478,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Identity { command } => identity(&store, command),
-        Command::Messenger { command } => messenger(&store, command),
+        Command::Messenger { command } => messenger(&store, command).await,
         Command::Mcp { command } => mcp_command(&store, command).await,
         Command::Web {
             command:
@@ -458,9 +490,7 @@ async fn main() -> Result<()> {
             web: addr,
             public_url,
         } => {
-            let public_url = public_url
-                .map(|raw| web::public_url(&raw))
-                .transpose()?;
+            let public_url = public_url.map(|raw| web::public_url(&raw)).transpose()?;
             store.set_public_url(
                 public_url
                     .as_ref()
@@ -468,44 +498,34 @@ async fn main() -> Result<()> {
             )?;
             let listener = tokio::net::TcpListener::bind(addr).await?;
             let web_store = store.clone();
-            let discord_client = Arc::new(std::sync::OnceLock::new());
-            let discord_for_run = discord_client.clone();
+            let discord = Arc::new(messenger_discord::Discord::new());
+            let discord_for_web = discord.clone();
             let mcp = mcp::Mcp::new(store.clone());
             let mcp_for_web = mcp.clone();
             let mcp_shutdown = mcp.clone();
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             let shutdown_tx = Arc::new(shutdown_tx);
-            let discord_shutdown = shutdown_rx.clone();
+            let harness_shutdown = shutdown_rx.clone();
             let mut interrupt =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
             let mut terminate =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-            let token = std::env::var("DISCORD_BOT_TOKEN");
-            let discord_task = match token {
-                Ok(token) => {
-                    std::fs::create_dir_all(&workspace)?;
-                    let workspace = workspace.canonicalize()?;
-                    let stop = shutdown_tx.clone();
-                    Some(tokio::spawn(async move {
-                        let result = run::serve(
-                            store,
-                            &workspace,
-                            skills_dir.as_deref(),
-                            token,
-                            discord_for_run,
-                            discord_shutdown,
-                            mcp,
-                        )
-                        .await;
-                        let _ = stop.send(true);
-                        result
-                    }))
-                }
-                Err(_) => {
-                    eprintln!("Discord disabled: DISCORD_BOT_TOKEN is not set");
-                    None
-                }
-            };
+            std::fs::create_dir_all(&workspace)?;
+            let workspace = workspace.canonicalize()?;
+            let stop = shutdown_tx.clone();
+            let harness_task = tokio::spawn(async move {
+                let result = run::serve(
+                    store,
+                    &workspace,
+                    skills_dir.as_deref(),
+                    discord,
+                    harness_shutdown,
+                    mcp,
+                )
+                .await;
+                let _ = stop.send(true);
+                result
+            });
             let signal_tx = shutdown_tx.clone();
             tokio::spawn(async move {
                 tokio::select! { _ = interrupt.recv() => {}, _ = terminate.recv() => {} }
@@ -514,18 +534,15 @@ async fn main() -> Result<()> {
             web::serve(
                 listener,
                 web_store,
-                discord_client,
+                discord_for_web,
                 mcp_for_web,
                 shutdown_rx,
                 public_url,
             )
             .await?;
-            let result = match discord_task {
-                Some(task) => match task.await {
-                    Ok(result) => result,
-                    Err(error) => Err(error.into()),
-                },
-                None => Ok(()),
+            let result = match harness_task.await {
+                Ok(result) => result,
+                Err(error) => Err(error.into()),
             };
             mcp_shutdown.shutdown().await;
             result
@@ -863,7 +880,7 @@ fn skill(store: &SqliteStorage, command: SkillCommand) -> Result<()> {
     Ok(())
 }
 
-fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<()> {
+async fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<()> {
     match command {
         MessengerCommand::Allow { messenger, user_id } => store.allow_user(&messenger, &user_id)?,
         MessengerCommand::Disallow { messenger, user_id } => {
@@ -874,8 +891,38 @@ fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<()> {
                 println!("{user}");
             }
         }
+        MessengerCommand::Token { command } => {
+            if command.messenger() != "discord" {
+                return Err(format!("unknown messenger: {}", command.messenger()).into());
+            }
+            match command {
+                MessengerTokenCommand::Set { messenger } => {
+                    let mut token = String::new();
+                    std::io::stdin().read_to_string(&mut token)?;
+                    let token = token.trim().to_owned();
+                    if token.is_empty() {
+                        return Err("token cannot be empty".into());
+                    }
+                    if let Err(error) = messenger_discord::validate_token(&token).await {
+                        return Err(error.into());
+                    }
+                    store.set_messenger_token(&messenger, Some(&token))?;
+                }
+                MessengerTokenCommand::Clear { messenger } => {
+                    store.set_messenger_token(&messenger, None)?;
+                }
+            }
+        }
     }
     Ok(())
+}
+
+impl MessengerTokenCommand {
+    fn messenger(&self) -> &str {
+        match self {
+            Self::Set { messenger } | Self::Clear { messenger } => messenger,
+        }
+    }
 }
 
 fn api_key(provider: &Provider) -> Result<String> {
@@ -903,9 +950,13 @@ async fn mcp_command(store: &Arc<SqliteStorage>, command: McpCommand) -> Result<
         McpCommand::List => {
             for server in store.mcp_servers()? {
                 let (transport, detail) = match &server.transport {
-                    storage::McpTransport::Stdio { command, args, .. } => {
-                        ("stdio", std::iter::once(command.clone()).chain(args.iter().cloned()).collect::<Vec<_>>().join(" "))
-                    }
+                    storage::McpTransport::Stdio { command, args, .. } => (
+                        "stdio",
+                        std::iter::once(command.clone())
+                            .chain(args.iter().cloned())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    ),
                     storage::McpTransport::Http { url, .. } => ("http", url.clone()),
                 };
                 println!(
@@ -955,9 +1006,7 @@ async fn mcp_command(store: &Arc<SqliteStorage>, command: McpCommand) -> Result<
                 (Some(_), false) => {
                     return Err("give either --url or a command after --, not both".into())
                 }
-                (None, true) => {
-                    return Err("give a command after -- or --url <url>".into())
-                }
+                (None, true) => return Err("give a command after -- or --url <url>".into()),
             };
             store.save_mcp_server(&storage::McpServer {
                 id: id.clone(),

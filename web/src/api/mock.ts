@@ -46,6 +46,7 @@ type State = Readonly<{
   providers: ReadonlyArray<ProviderRecord>
   allowed: ReadonlyArray<string>
   home: Home
+  hasToken: boolean
   mcpServers: ReadonlyArray<McpServer>
 }>
 
@@ -75,6 +76,7 @@ const seedState = (): State => ({
   ],
   allowed: ['435482941515104257'],
   home: { kind: 'none' },
+  hasToken: true,
   mcpServers: [
     {
       id: 'filesystem',
@@ -116,7 +118,18 @@ const providersReply = (state: State): ReadonlyArray<Provider> =>
 const discordReply = (state: State): Discord => ({
   allowed: state.allowed,
   home: state.home,
+  token: state.hasToken ? 'set' : 'missing',
+  connection: state.hasToken
+    ? { state: 'online', bot: 'Blob-1' }
+    : { state: 'off' },
 })
+
+const setToken = (state: State, token: string): Effect.Effect<State, string> =>
+  token.trim() === ''
+    ? Effect.fail('Token is required')
+    : token.trim().length < 20
+      ? Effect.fail('Discord rejected this token')
+      : Effect.succeed(modifyFields(state, { hasToken: () => true }))
 
 const hasModel = (state: State, providerId: string, modelId: string): boolean =>
   state.providers.some(
@@ -461,6 +474,16 @@ const handlers: { readonly [K in RequestType]: Handler<K> } = {
     transition(state, current => setHome(current, home)).pipe(
       Effect.map(discordReply),
     ),
+
+  'discord.setToken': ({ token }, state) =>
+    transition(state, current => setToken(current, token)).pipe(
+      Effect.map(discordReply),
+    ),
+
+  'discord.clearToken': (_payload, state) =>
+    transition(state, current =>
+      Effect.succeed(modifyFields(current, { hasToken: () => false })),
+    ).pipe(Effect.map(discordReply)),
 
   'mcp.list': (_payload, state) =>
     Ref.get(state).pipe(Effect.map(current => current.mcpServers)),

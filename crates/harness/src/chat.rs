@@ -1,4 +1,7 @@
-use std::{borrow::Cow, sync::{Arc, Mutex}};
+use std::{
+    borrow::Cow,
+    sync::{Arc, Mutex},
+};
 
 use environment::{Environment, ToolCall, ToolSpec};
 use memory::{Kind, Memory};
@@ -667,8 +670,8 @@ where
     ) -> Result<(String, Vec<storage::Image>), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(mcp) = &self.inner.mcp_session {
             if let Some(result) = mcp.execute(&call.name, &call.arguments).await {
-                let outcome = result
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                let outcome =
+                    result.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
                 return Ok((
                     outcome.content,
                     outcome

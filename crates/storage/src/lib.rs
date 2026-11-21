@@ -725,6 +725,9 @@ pub trait MessengerStore: Send + Sync {
     fn allowed_users(&self, messenger: &str) -> Result<Vec<String>, StoreError>;
     fn allow_user(&self, messenger: &str, user: &str) -> Result<(), StoreError>;
     fn disallow_user(&self, messenger: &str, user: &str) -> Result<bool, StoreError>;
+    /// The bot token for a chat platform (e.g. `discord`); stored encrypted.
+    fn messenger_token(&self, messenger: &str) -> Result<Option<String>, StoreError>;
+    fn set_messenger_token(&self, messenger: &str, token: Option<&str>) -> Result<(), StoreError>;
 }
 
 impl<T: MessengerStore + ?Sized> MessengerStore for std::sync::Arc<T> {
@@ -742,6 +745,12 @@ impl<T: MessengerStore + ?Sized> MessengerStore for std::sync::Arc<T> {
     }
     fn disallow_user(&self, messenger: &str, user: &str) -> Result<bool, StoreError> {
         (**self).disallow_user(messenger, user)
+    }
+    fn messenger_token(&self, messenger: &str) -> Result<Option<String>, StoreError> {
+        (**self).messenger_token(messenger)
+    }
+    fn set_messenger_token(&self, messenger: &str, token: Option<&str>) -> Result<(), StoreError> {
+        (**self).set_messenger_token(messenger, token)
     }
 }
 

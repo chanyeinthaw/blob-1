@@ -432,7 +432,7 @@ const providerRowView = (
         [
           h.AriaHidden(true),
           h.Class(
-            'grid size-10 shrink-0 place-items-center rounded-md border border-hair bg-shelf text-slate',
+            'grid size-10 shrink-0 place-items-center rounded-full border border-hair bg-shelf text-slate',
           ),
         ],
         [Icon.server('size-5')],
@@ -447,7 +447,7 @@ const providerRowView = (
               h.span(
                 [
                   h.Class(
-                    'rounded-md bg-chip px-1.5 py-px text-caption font-medium text-ink',
+                    'rounded-full bg-chip px-2 py-px text-caption font-medium text-ink',
                   ),
                 ],
                 [apiLabels[provider.api]],
@@ -657,6 +657,7 @@ export const view = Submodel.defineView<Model, Message>((model, h) =>
   Layout.page(
     {
       title: 'Providers',
+      wide: true,
       actions: model.isAddOpen
         ? []
         : [

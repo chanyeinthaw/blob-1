@@ -6,7 +6,7 @@ services:
     restart: unless-stopped
     environment:
       CPA1_KEY: ${CPA1_KEY:?}
-      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:?}
+      BLOB_1_APP_KEY: ${BLOB_1_APP_KEY:?}
     volumes:
       - agent-data:/data
 

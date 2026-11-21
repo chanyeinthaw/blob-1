@@ -32,6 +32,14 @@
   --text-heading--line-height: 1.3;
 }
 
+@utility scrollbar-hide {
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
 @layer base {
   body {
     @apply bg-shelf font-sans text-body text-ink antialiased;

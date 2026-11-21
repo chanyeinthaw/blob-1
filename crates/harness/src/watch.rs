@@ -11,12 +11,16 @@ pub const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: Cow::Borrowed("watch"),
         description: Cow::Borrowed("Keep an eye on something."),
-        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"text":{"type":"string"},"to":{"type":"string"},"reply":{"type":"string"},"until":{"type":"string"}},"required":["text"]}"#),
+        input_schema: Cow::Borrowed(
+            r#"{"type":"object","properties":{"text":{"type":"string"},"to":{"type":"string"},"reply":{"type":"string"},"until":{"type":"string"}},"required":["text"]}"#,
+        ),
     },
     ToolSpec {
         name: Cow::Borrowed("unwatch"),
         description: Cow::Borrowed("Remove a watch."),
-        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#),
+        input_schema: Cow::Borrowed(
+            r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#,
+        ),
     },
     ToolSpec {
         name: Cow::Borrowed("watches"),

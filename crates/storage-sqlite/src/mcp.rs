@@ -8,44 +8,52 @@ fn map_json<T: serde::de::DeserializeOwned + Default>(text: &str) -> T {
 
 impl McpStore for SqliteStorage {
     fn mcp_servers(&self) -> Result<Vec<McpServer>, StoreError> {
-        let connection = self.lock();
-        let rows = connection
+        let rows = self
+            .lock()
             .prepare(
-                "SELECT id, transport, command, args, env, url, headers, enabled FROM mcp_servers ORDER BY id",
+                "SELECT id, command, args, env, url, headers, enabled FROM mcp_servers ORDER BY id",
             )
             .map_err(backend)?
             .query_map([], |row| {
-                let transport = match (row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(5)?) {
-                    (_, Some(command), _) => McpTransport::Stdio {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?;
+        rows.into_iter()
+            .map(|(id, command, args, env, url, headers, enabled)| {
+                let transport = match (command, url) {
+                    (Some(command), _) => McpTransport::Stdio {
                         command,
-                        args: map_json(&row.get::<_, String>(3)?),
-                        env: map_json(&row.get::<_, String>(4)?),
+                        args: map_json(&args),
+                        env: map_json(&self.unseal_map(&env)?),
                     },
-                    (_, _, Some(url)) => McpTransport::Http {
+                    (_, Some(url)) => McpTransport::Http {
                         url,
-                        headers: map_json(&row.get::<_, String>(6)?),
+                        headers: map_json(&self.unseal_map(&headers)?),
                     },
                     _ => unreachable!("CHECK forces a transport"),
                 };
                 Ok(McpServer {
-                    id: row.get(0)?,
+                    id,
                     transport,
-                    enabled: row.get::<_, i64>(7)? == 1,
+                    enabled: enabled == 1,
                 })
             })
-            .map_err(backend)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(backend);
-        rows
+            .collect()
     }
 
     fn save_mcp_server(&self, server: &McpServer) -> Result<(), StoreError> {
         let (transport, command, args, env, url, headers) = match &server.transport {
-            McpTransport::Stdio {
-                command,
-                args,
-                env,
-            } => (
+            McpTransport::Stdio { command, args, env } => (
                 "stdio",
                 Some(command.as_str()),
                 serde_json::to_string(args).unwrap(),
@@ -62,8 +70,8 @@ impl McpStore for SqliteStorage {
                 serde_json::to_string(headers).unwrap(),
             ),
         };
-        let connection = self.lock();
-        let replaced = connection
+        let old = self
+            .lock()
             .query_row(
                 "SELECT transport, command, args, env, url, headers FROM mcp_servers WHERE id = ?1",
                 params![server.id],
@@ -79,9 +87,17 @@ impl McpStore for SqliteStorage {
                 },
             )
             .optional()
-            .map_err(backend)?
-            .is_some_and(|old| {
-                old != (
+            .map_err(backend)?;
+        let replaced = match old {
+            Some(old) => {
+                (
+                    old.0,
+                    old.1,
+                    old.2,
+                    self.unseal_map(&old.3)?,
+                    old.4,
+                    self.unseal_map(&old.5)?,
+                ) != (
                     transport.to_string(),
                     command.map(str::to_string),
                     args.clone(),
@@ -89,7 +105,12 @@ impl McpStore for SqliteStorage {
                     url.map(str::to_string),
                     headers.clone(),
                 )
-            });
+            }
+            None => false,
+        };
+        let env = self.seal_map(&env)?;
+        let headers = self.seal_map(&headers)?;
+        let connection = self.lock();
         connection
             .execute(
                 "INSERT INTO mcp_servers (id, transport, command, args, env, url, headers, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -108,7 +129,10 @@ impl McpStore for SqliteStorage {
             .map_err(backend)?;
         if replaced {
             connection
-                .execute("DELETE FROM mcp_tokens WHERE server = ?1", params![server.id])
+                .execute(
+                    "DELETE FROM mcp_tokens WHERE server = ?1",
+                    params![server.id],
+                )
                 .map_err(backend)?;
             connection
                 .execute(
@@ -132,23 +156,29 @@ impl McpStore for SqliteStorage {
         &self,
         server: &str,
     ) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>), StoreError> {
-        Ok(self
+        let row = self
             .lock()
             .query_row(
                 "SELECT credentials, registration FROM mcp_tokens WHERE server = ?1",
                 params![server],
                 |row| {
                     Ok((
-                        row.get::<_, Option<String>>(0)?
-                            .map(|s| serde_json::from_str(&s).unwrap_or_default()),
-                        row.get::<_, Option<String>>(1)?
-                            .map(|s| serde_json::from_str(&s).unwrap_or_default()),
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
                     ))
                 },
             )
             .optional()
-            .map_err(backend)?
-            .unwrap_or_default())
+            .map_err(backend)?;
+        let Some((credentials, registration)) = row else {
+            return Ok((None, None));
+        };
+        let credentials = credentials.map(|s| self.unseal(&s)).transpose()?;
+        let registration = registration.map(|s| self.unseal(&s)).transpose()?;
+        Ok((
+            credentials.map(|s| serde_json::from_str(&s).unwrap_or_default()),
+            registration.map(|s| serde_json::from_str(&s).unwrap_or_default()),
+        ))
     }
 
     fn save_mcp_credentials(
@@ -160,7 +190,13 @@ impl McpStore for SqliteStorage {
             .execute(
                 "INSERT INTO mcp_tokens (server, credentials) VALUES (?1, ?2)
                  ON CONFLICT (server) DO UPDATE SET credentials = excluded.credentials",
-                params![server, credentials.map(|c| serde_json::to_string(c).unwrap())],
+                params![
+                    server,
+                    credentials
+                        .map(|c| serde_json::to_string(c).unwrap())
+                        .map(|s| self.seal(&s))
+                        .transpose()?
+                ],
             )
             .map_err(backend)?;
         Ok(())
@@ -175,7 +211,10 @@ impl McpStore for SqliteStorage {
             .execute(
                 "INSERT INTO mcp_tokens (server, registration) VALUES (?1, ?2)
                  ON CONFLICT (server) DO UPDATE SET registration = excluded.registration",
-                params![server, serde_json::to_string(registration).unwrap()],
+                params![
+                    server,
+                    self.seal(&serde_json::to_string(registration).unwrap())?
+                ],
             )
             .map_err(backend)?;
         Ok(())
@@ -189,15 +228,15 @@ impl McpStore for SqliteStorage {
             .query_row(
                 "SELECT server, state FROM mcp_oauth_states WHERE csrf = ?1",
                 params![csrf],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        serde_json::from_str(&row.get::<_, String>(1)?).unwrap_or_default(),
-                    ))
-                },
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
-            .map_err(backend)
+            .map_err(backend)?
+            .map(|(server, state)| {
+                self.unseal(&state)
+                    .map(|state| (server, serde_json::from_str(&state).unwrap_or_default()))
+            })
+            .transpose()
     }
 
     fn save_mcp_oauth_state(
@@ -210,7 +249,7 @@ impl McpStore for SqliteStorage {
         self.lock()
             .execute(
                 "INSERT OR REPLACE INTO mcp_oauth_states (csrf, server, state, created) VALUES (?1, ?2, ?3, ?4)",
-                params![csrf, server, serde_json::to_string(state).unwrap(), created],
+                params![csrf, server, self.seal(&serde_json::to_string(state).unwrap())?, created],
             )
             .map_err(backend)?;
         Ok(())

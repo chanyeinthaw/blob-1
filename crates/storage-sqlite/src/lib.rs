@@ -2,11 +2,13 @@ use std::fs::{File, TryLockError};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use chacha20poly1305::XChaCha20Poly1305;
 use rusqlite::Connection;
 use storage::StoreError;
 
 mod checkin;
 mod config;
+mod crypto;
 mod mcp;
 mod memory;
 mod messenger;
@@ -15,6 +17,8 @@ mod session;
 mod skill;
 mod watch;
 mod web_auth;
+
+pub use crypto::AppKey;
 
 const SCHEMA: &str = "
 PRAGMA foreign_keys = ON;
@@ -106,6 +110,9 @@ CREATE TABLE IF NOT EXISTS mcp_oauth_states (
     state TEXT NOT NULL,
     created INTEGER NOT NULL
 ) STRICT;
+
+CREATE TABLE IF NOT EXISTS app_key (id INTEGER PRIMARY KEY CHECK (id = 1), salt BLOB NOT NULL, canary BLOB NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS messenger_tokens (messenger TEXT PRIMARY KEY, token TEXT NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS model_images (provider TEXT NOT NULL, model TEXT NOT NULL, PRIMARY KEY (provider, model), FOREIGN KEY (provider, model) REFERENCES models (provider, id) ON DELETE CASCADE) STRICT;
 CREATE TABLE IF NOT EXISTS model_reasoning (
     provider TEXT NOT NULL,
@@ -133,11 +140,12 @@ INSERT OR IGNORE INTO settings (id) VALUES (1);
 
 pub struct SqliteStorage {
     connection: Mutex<Connection>,
+    pub(crate) key: Option<XChaCha20Poly1305>,
     _owner: Option<File>,
 }
 
 impl SqliteStorage {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+    pub fn open(path: impl AsRef<Path>, app_key: Option<AppKey>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         let owner = File::options()
             .create(true)
@@ -154,14 +162,21 @@ impl SqliteStorage {
             }
             Err(TryLockError::Error(error)) => return Err(StoreError::Backend(Box::new(error))),
         }
-        Self::connect(path, Some(owner))
+        Self::connect(path, Some(owner), app_key)
     }
 
-    pub fn open_shared(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        Self::connect(path.as_ref(), None)
+    pub fn open_shared(
+        path: impl AsRef<Path>,
+        app_key: Option<AppKey>,
+    ) -> Result<Self, StoreError> {
+        Self::connect(path.as_ref(), None, app_key)
     }
 
-    fn connect(path: &Path, owner: Option<File>) -> Result<Self, StoreError> {
+    fn connect(
+        path: &Path,
+        owner: Option<File>,
+        app_key: Option<AppKey>,
+    ) -> Result<Self, StoreError> {
         let connection = Connection::open(path).map_err(backend)?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
@@ -194,8 +209,16 @@ impl SqliteStorage {
                     .map_err(backend)?;
             }
         }
+        let key = match app_key {
+            Some(app_key) => Some(crypto::setup(&connection, &app_key)?),
+            None => None,
+        };
+        if let Some(cipher) = &key {
+            crypto::migrate(&connection, cipher)?;
+        }
         Ok(Self {
             connection: Mutex::new(connection),
+            key,
             _owner: owner,
         })
     }

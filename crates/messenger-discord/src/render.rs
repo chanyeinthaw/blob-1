@@ -1,4 +1,4 @@
-use crate::{backend, channel, id, Discord};
+use crate::{backend, channel, id, Inner};
 use messenger::{MessengerError, Outbound, Sent, Target};
 use twilight_http::{api_error::ApiError, error::ErrorType};
 use twilight_model::{
@@ -14,11 +14,11 @@ pub(crate) fn has_code(error: &twilight_http::Error, code: u64) -> bool {
 }
 
 async fn thread(
-    discord: &Discord,
+    inner: &Inner,
     parent: Id<ChannelMarker>,
     message: Id<MessageMarker>,
 ) -> Result<bool, MessengerError> {
-    let source = discord
+    let source = inner
         .http
         .message(parent, message)
         .await
@@ -37,7 +37,7 @@ async fn thread(
         });
     let name: String = content.trim().chars().take(100).collect();
     let name = if name.is_empty() { "thread" } else { &name };
-    match discord
+    match inner
         .http
         .create_thread_from_message(parent, message, name)
         .await
@@ -48,7 +48,7 @@ async fn thread(
     }
 }
 
-pub async fn send(discord: &Discord, outbound: Outbound) -> Result<Sent, MessengerError> {
+pub async fn send(inner: &Inner, outbound: Outbound) -> Result<Sent, MessengerError> {
     let mut created_thread = false;
     let mut mentions = outbound.mention;
     let mut reference = None;
@@ -67,7 +67,7 @@ pub async fn send(discord: &Discord, outbound: Outbound) -> Result<Sent, Messeng
             let parent = channel(&place)?;
             let message = id(&message)?;
             if first {
-                created_thread = thread(discord, parent, message).await?;
+                created_thread = thread(inner, parent, message).await?;
             }
             if !first {
                 mentions.retain(|m| m != &author);
@@ -103,7 +103,7 @@ pub async fn send(discord: &Discord, outbound: Outbound) -> Result<Sent, Messeng
     };
     let ping = !continuing
         && (reply_author.is_some() || reference.is_some())
-        && discord
+        && inner
             .ping_state(&place)
             .await
             .map(|(_, _, ping)| ping)
@@ -123,7 +123,7 @@ pub async fn send(discord: &Discord, outbound: Outbound) -> Result<Sent, Messeng
     let prefix: String = mentions.iter().map(|m| format!("<@{m}> ")).collect();
     let text = format!("{prefix}{}", outbound.text);
     let post = || {
-        let request = discord
+        let request = inner
             .http
             .create_message(destination)
             .content(&text)
@@ -138,7 +138,7 @@ pub async fn send(discord: &Discord, outbound: Outbound) -> Result<Sent, Messeng
         Ok(_) => Ok(Sent { created_thread }),
         Err(error) if has_code(&error, 10003) && retry.is_some() => {
             let (parent, message) = retry.expect("retry checked");
-            created_thread = thread(discord, parent, message).await?;
+            created_thread = thread(inner, parent, message).await?;
             post().await.map_err(backend)?;
             Ok(Sent { created_thread })
         }

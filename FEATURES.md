@@ -27,7 +27,7 @@ Where each feature lives: code, CLI, model tools and storage.
 - The session cookie is `HttpOnly; SameSite=Lax` so the cross-site OAuth callback's top-level GET still carries it.
 - HTTP endpoints: `/api/session`, `/api/login`, `/api/logout`, `/api/mcp/login`, `/api/mcp/callback`, `/ws`.
 - Tables: `web_password`, `web_sessions`, `public_url`.
-- Discord starts once `DISCORD_BOT_TOKEN` is set and a main model resolves, including while `serve` is already running; otherwise `serve` runs web-only until then. A Discord failure exits the process.
+- The Discord settings live on the **Chat platforms** page at `/settings/chat/discord`: token Replace/Remove, connection status (`off` / `connecting` / `online` with the bot name / `error` with a short message), the user allowlist and the home channel or DM. Discord is the only chat platform today.
 - Model and provider changes apply to the running bot without a restart: each turn, spawned task, compaction pass and utility call resolves from current settings; a run already in progress keeps its model, a task keeps the model it was spawned with for its lifetime, and a role whose settings no longer resolve keeps its last working model. The `model`, `models`, `provider` and `reasoning` commands run while `serve` holds the data directory; `serve`, `chat` and `skill` still need it exclusively.
 - The mock transport is enabled only with `VITE_MOCK=1`.
 
@@ -96,8 +96,10 @@ One-shot generation: one request, no tools, no memory, no session.
 - Typing: pulses every 8 seconds in the conversation while a message is unanswered (up to 10 minutes) and while the bot answers a task report
 - References: replied-to message as `<quote>`; attachments as `<attachment>`
 - Tools: `send` (chat only), `history`, `search`, `participants`, `message` (chat and tasks)
-- CLI: `agent serve` (needs `DISCORD_BOT_TOKEN`), `agent messenger allow | disallow | list`
-- Tables: `destinations`, `allowed_users`
+- The bot token lives in `messenger_tokens`, not the environment: `agent messenger token set discord` reads it from stdin and validates it against `GET /users/@me` before storing; `agent messenger token clear discord` removes it; the **Chat platforms** page does the same over `discord.setToken` / `discord.clearToken`. `serve` polls the row and connects, swaps or drops the gateway live — no restart; with no token sends fail with `Discord is not connected`; a token with no main model reports `Waiting for a main model`; a gateway failure reports an error state and retries instead of exiting the process
+- Web protocol: `discord.get`, `discord.allow`, `discord.disallow`, `discord.setHome`, `discord.directory` (empty lists while disconnected), `discord.setToken`, `discord.clearToken`; `Discord` replies carry `token: "set"|"missing"` and `connection` (`off`, `connecting`, `online` + bot name, `error` + message) alongside `allowed` and `home`
+- CLI: `agent serve` (needs `BLOB_1_APP_KEY`), `agent messenger allow | disallow | list`, `agent messenger token set | clear <messenger>`
+- Tables: `destinations`, `allowed_users`, `messenger_tokens`
 
 ## Calendar
 
@@ -141,8 +143,16 @@ Blob-1 is an MCP client: chat and background tasks can call tools, read resource
 - CLI: `agent mcp list`, `agent mcp add <id> [--env K=V] -- <command> [args]`, `agent mcp add <id> --url <url> [--header 'Name: ENV_VAR']`, `agent mcp remove <id>`, `agent mcp enable | disable <id>`, `agent mcp login <id>` (prints the stored `--public-url` base when `serve` set one, else `--web`), `agent mcp tools <id>`
 - Tables: `mcp_servers`, `mcp_tokens`, `mcp_oauth_states`
 
+## Secrets at rest
+
+- Code: `crates/storage-sqlite/src/crypto.rs`; `SqliteStorage::open`/`open_shared` take `Option<AppKey>`
+- `BLOB_1_APP_KEY` is any non-empty passphrase; `serve` requires it. Argon2id derives the 256-bit key once per open over a random 16-byte salt stored in `app_key (id=1)`, whose `canary` decrypts to a fixed value — a wrong key fails with `BLOB_1_APP_KEY does not match this database`. Secret reads and writes without a key fail with `set BLOB_1_APP_KEY`
+- Values are XChaCha20-Poly1305 with a random 24-byte nonce, stored as `enc:v1:<base64(nonce‖ciphertext)>`; encryption stays inside the storage layer so callers keep plain types. Plaintext rows seal idempotently on the first keyed open; key rotation is not supported yet
+- Encrypted columns: `mcp_servers.env`, `mcp_servers.headers`, `mcp_tokens.credentials`, `mcp_tokens.registration`, `mcp_oauth_states.state`, `messenger_tokens.token` (empty JSON maps stay plaintext). Web password/session hashes and provider `api_key_env` names are not encrypted
+- Table: `app_key`
+
 ## Dev server
 
 - Files: `Dockerfile`, `compose.yaml`
-- `docker compose up -d --build` runs `agent serve` with host networking and the `agent-data` volume; `CPA1_KEY` and `DISCORD_BOT_TOKEN` come from the shell
+- `docker compose up -d --build` runs `agent serve` with host networking and the `agent-data` volume; `CPA1_KEY` and `BLOB_1_APP_KEY` come from the shell
 - The runtime stage is `ubuntu:24.04` with the utility packages plus Node.js LTS (`npm`, `npx`, `corepack`) and Python 3 with `uv`/`uvx`, so stdio MCP servers can run inside the container

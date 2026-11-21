@@ -30,7 +30,7 @@ const entryView = <ParentMessage>(
     [
       h.Class(
         clsx(
-          'w-[min(356px,calc(100vw-2rem))] rounded-lg border border-hair bg-white px-4 py-3 text-body font-medium text-ink shadow-lg motion-safe:transition-opacity motion-safe:data-[closed]:opacity-0',
+          'w-[min(356px,calc(100vw-2rem))] rounded-full border border-hair bg-white px-4 py-3 text-body font-medium text-ink shadow-lg motion-safe:transition-opacity motion-safe:data-[closed]:opacity-0',
           entry.variant === 'Error' && 'text-alarm',
         ),
       ),

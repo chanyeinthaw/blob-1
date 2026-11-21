@@ -86,15 +86,10 @@ export const view = <Message>(
       },
       itemToConfig: (value, context) => ({
         className:
-          'flex min-h-7 cursor-pointer items-center rounded-sm px-2 py-1 text-body text-ink data-[active]:bg-hover',
+          'flex min-h-7 cursor-pointer items-center rounded-lg px-2 py-1 text-body text-ink data-[active]:bg-hover',
         content: h.div(
-          [h.Class('flex min-w-0 items-center gap-2')],
+          [h.Class('flex min-w-0 flex-1 items-center gap-2')],
           [
-            Icon.check(
-              context.isSelected
-                ? 'size-3.5 shrink-0 text-ink'
-                : 'invisible size-3.5 shrink-0 text-ink',
-            ),
             h.div(
               [h.Class('min-w-0 wrap-anywhere')],
               [
@@ -108,13 +103,18 @@ export const view = <Message>(
                 ),
               ],
             ),
+            Icon.check(
+              context.isSelected
+                ? 'ml-auto size-3.5 shrink-0 text-ink'
+                : 'invisible ml-auto size-3.5 shrink-0 text-ink',
+            ),
           ],
         ),
       }),
       inputAttributes: childAttributes([
         h.Class(
           clsx(
-            'h-8 w-full rounded-md border border-control bg-white pl-2.5 shadow-xs pr-9 text-body text-ink placeholder:text-mute focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 data-[disabled]:cursor-not-allowed data-[disabled]:bg-chip data-[disabled]:text-mute',
+            'h-8 w-full rounded-full border border-control bg-white pl-3.5 shadow-xs pr-9 text-body text-ink placeholder:text-mute focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 data-[disabled]:cursor-not-allowed data-[disabled]:bg-chip data-[disabled]:text-mute',
             config.isMono && 'font-mono placeholder:font-sans',
           ),
         ),
@@ -134,7 +134,7 @@ export const view = <Message>(
       ]),
       itemsAttributes: childAttributes([
         h.Class(
-          'z-30 w-[var(--button-width,12rem)] max-w-[calc(100vw-16px)] overflow-hidden rounded-md border border-hair bg-white p-1 shadow-md outline-none',
+          'z-30 w-[var(--button-width,12rem)] max-w-[calc(100vw-16px)] overflow-hidden rounded-xl border border-hair bg-white p-1 shadow-md outline-none',
         ),
       ]),
       backdropAttributes: childAttributes([h.Class('fixed inset-0 z-20')]),

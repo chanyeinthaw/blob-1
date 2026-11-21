@@ -843,8 +843,9 @@ const roleChipView = (
           selected: slot.reasoning,
           label: `${roleLabels[role]} reasoning: ${slot.reasoning}`,
           triggerClassName:
-            'inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-md bg-chip pl-2 pr-1.5 text-caption font-medium text-ink hover:bg-hair focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring data-[disabled]:cursor-not-allowed data-[disabled]:opacity-60',
-          panelClassName: 'w-40',
+            'inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-full bg-chip pl-2.5 pr-1.5 text-caption font-medium text-ink hover:bg-hair focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring data-[disabled]:cursor-not-allowed data-[disabled]:opacity-60',
+          panelClassName: 'w-32',
+          isCompact: true,
           isDisabled: isSaving(loaded, role),
           triggerContent: h.span(
             [h.Class('inline-flex items-center gap-1.5')],
@@ -892,7 +893,7 @@ const assignMenuView = (
       }),
       label: `Use ${entry.info.id} as a role`,
       triggerClassName:
-        'flex size-8 cursor-pointer items-center justify-center rounded-md text-mute hover:bg-hover hover:text-ink focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring aria-expanded:opacity-100 data-[disabled]:cursor-not-allowed data-[disabled]:opacity-40 sm:opacity-0 sm:group-hover:opacity-100',
+        'flex size-8 cursor-pointer items-center justify-center rounded-full text-mute hover:bg-hover hover:text-ink focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring aria-expanded:opacity-100 data-[disabled]:cursor-not-allowed data-[disabled]:opacity-40 sm:opacity-0 sm:group-hover:opacity-100',
       panelClassName: 'w-[300px] max-w-[calc(100vw-16px)]',
       placement: 'bottom-end',
       isDisabled: isBusy,
@@ -940,7 +941,7 @@ const contextInputView = (
     [
       h.input([
         h.Class(
-          `h-7 w-24 rounded-md border px-2 text-right font-mono tabular-nums placeholder:text-mute focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 ${isInvalid ? 'border-alarm' : 'focus-visible:border-ring'} ${info.limit === null ? 'border-transparent bg-transparent text-ink hover:border-control' : 'border-control bg-white text-ink shadow-xs'}`,
+          `h-7 w-24 rounded-full border px-3 text-right font-mono tabular-nums placeholder:text-mute focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 ${isInvalid ? 'border-alarm' : 'focus-visible:border-ring'} ${info.limit === null ? 'border-transparent bg-transparent text-ink hover:border-control' : 'border-control bg-white text-ink shadow-xs'}`,
         ),
         h.AriaLabel(`Context override for ${info.id}`),
         h.Attribute('aria-invalid', String(isInvalid)),
@@ -1113,7 +1114,7 @@ const catalogView = (loaded: LoadedModel, h: HtmlBuilder<Message>): Html => {
 }
 
 const searchInputClassName =
-  'h-8 w-full rounded-md border border-control bg-white pl-8 pr-2.5 shadow-xs text-body text-ink placeholder:text-mute focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50'
+  'h-8 w-full rounded-full border border-control bg-white pl-9 pr-3.5 shadow-xs text-body text-ink placeholder:text-mute focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50'
 
 const filtersView = (loaded: LoadedModel, h: HtmlBuilder<Message>): Html => {
   const providers = loaded.shown.providers
@@ -1146,7 +1147,7 @@ const filtersView = (loaded: LoadedModel, h: HtmlBuilder<Message>): Html => {
                     h.span(
                       [
                         h.Class(
-                          'pointer-events-none absolute inset-y-0 left-2.5 flex items-center text-mute',
+                          'pointer-events-none absolute inset-y-0 left-3 flex items-center text-mute',
                         ),
                       ],
                       [Icon.search('size-4')],
@@ -1177,10 +1178,10 @@ const filtersView = (loaded: LoadedModel, h: HtmlBuilder<Message>): Html => {
           selected: loaded.providerFilter === '' ? ALL : loaded.providerFilter,
           label: 'Provider',
           triggerClassName:
-            'flex h-8 w-full cursor-pointer items-center justify-between gap-2 rounded-md border border-control bg-white px-2.5 text-left text-body font-medium text-ink shadow-xs hover:bg-hover focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50',
-          panelClassName: 'w-[220px] max-w-[calc(100vw-16px)]',
+            'flex h-8 w-full cursor-pointer items-center justify-between gap-2 rounded-full border border-control bg-white px-3.5 text-left text-body font-medium text-ink shadow-xs hover:bg-hover focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50',
+          panelClassName: 'w-44',
           placement: 'bottom-end',
-          className: 'w-32 shrink-0 md:w-[140px]',
+          className: 'w-36 shrink-0 md:w-44',
           triggerContent: h.span(
             [h.Class('flex min-w-0 flex-1 items-center justify-between gap-2')],
             [
@@ -1206,7 +1207,7 @@ const filtersView = (loaded: LoadedModel, h: HtmlBuilder<Message>): Html => {
           h.AriaPressed(String(loaded.isInUseOnly)),
           h.OnClick(Message.ToggledInUseOnly()),
           h.Class(
-            `inline-flex h-8 shrink-0 cursor-pointer items-center gap-1.5 rounded-md px-2.5 text-body font-medium focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring border shadow-xs ${loaded.isInUseOnly ? 'border-accent bg-accent text-white hover:bg-accent/90' : 'border-control bg-white text-ink hover:bg-hover'}`,
+            `inline-flex h-8 shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3.5 text-body font-medium focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring border shadow-xs ${loaded.isInUseOnly ? 'border-accent bg-accent text-white hover:bg-accent/90' : 'border-control bg-white text-ink hover:bg-hover'}`,
           ),
         ],
         [
@@ -1214,7 +1215,7 @@ const filtersView = (loaded: LoadedModel, h: HtmlBuilder<Message>): Html => {
           h.span(
             [
               h.Class(
-                `rounded px-1 text-[11px] font-medium ${loaded.isInUseOnly ? 'bg-white/20 text-white' : 'bg-chip text-mute'}`,
+                `rounded-full px-1.5 text-[11px] font-medium ${loaded.isInUseOnly ? 'bg-white/20 text-white' : 'bg-chip text-mute'}`,
               ),
             ],
             [String(inUseCount)],
@@ -1229,6 +1230,7 @@ export const view = Submodel.defineView<Model, Message>((model, h) =>
   Layout.page(
     {
       title: 'Models',
+      wide: true,
       wideActions: true,
       actions: Model.match<ReadonlyArray<Html>>(model, {
         Loading: () => [],

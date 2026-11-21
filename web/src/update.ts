@@ -1,5 +1,6 @@
 import { Effect, Match, Option, Schema } from 'effect'
 import { Command, Update } from 'foldkit'
+import * as Dom from 'foldkit/dom'
 import { UrlRequest, load, pushUrl, replaceUrl } from 'foldkit/navigation'
 import { modifyFields } from 'foldkit/struct'
 import { toString as urlToString } from 'foldkit/url'
@@ -8,7 +9,7 @@ import type { Api } from './api/client'
 import { Message } from './message'
 import { Connection, Model, Page, SignedIn, SignedOut } from './model'
 import * as Login from './page/login'
-import * as Discord from './page/settings/discord'
+import * as Chat from './page/settings/chat'
 import * as Identity from './page/settings/identity'
 import * as Mcp from './page/settings/mcp'
 import * as Models from './page/settings/models'
@@ -49,6 +50,14 @@ export const RedirectToIdentity = Command.define('RedirectToIdentity', {
   messages: [Message.CompletedNavigateInternal],
   execute: replaceUrl(identityRouter()).pipe(
     Effect.as(Message.CompletedNavigateInternal()),
+  ),
+})
+
+const ScrollActiveNav = Command.define('ScrollActiveNav', {
+  messages: [Message.CompletedScrollActiveNav],
+  execute: Dom.scrollIntoView('#active-nav-item', { block: 'nearest' }).pipe(
+    Effect.as(Message.CompletedScrollActiveNav()),
+    Effect.catch(() => Effect.succeed(Message.CompletedScrollActiveNav())),
   ),
 })
 
@@ -103,11 +112,17 @@ const enterPage = (route: SettingsRoute): PageEntry =>
           model => Page.Providers({ model }),
           message => Message.GotProvidersMessage({ message }),
         ),
-      Discord: () =>
+      Chat: () =>
         liftPageInit(
-          Discord.init(),
-          model => Page.Discord({ model }),
-          message => Message.GotDiscordMessage({ message }),
+          Chat.init(true),
+          model => Page.Chat({ model }),
+          message => Message.GotChatMessage({ message }),
+        ),
+      ChatDiscord: () =>
+        liftPageInit(
+          Chat.init(false),
+          model => Page.Chat({ model }),
+          message => Message.GotChatMessage({ message }),
         ),
       Mcp: () =>
         liftPageInit(
@@ -127,7 +142,7 @@ export const enterSignedIn = (route: SettingsRoute): SignedInEntry => {
       toast: Toast.init({ id: 'toast' }),
       page: entry.page,
     }),
-    commands: entry.commands,
+    commands: [...entry.commands, ScrollActiveNav()],
   }
 }
 
@@ -266,20 +281,20 @@ const foldProviders = Update.foldChild({
   }),
 })
 
-const readDiscordPage = (page: Page): Option.Option<Discord.Model> =>
+const readChatPage = (page: Page): Option.Option<Chat.Model> =>
   Match.value(page).pipe(
-    Match.tag('Discord', ({ model }) => Option.some(model)),
+    Match.tag('Chat', ({ model }) => Option.some(model)),
     Match.orElse(() => Option.none()),
   )
 
-const foldDiscord = Update.foldChild({
-  update: Discord.update,
+const foldChat = Update.foldChild({
+  update: Chat.update,
   read: (model: Model) =>
-    Option.flatMap(readSignedIn(model), ({ page }) => readDiscordPage(page)),
-  write: (model: Model, nextDiscord: Discord.Model) =>
-    writePage(model, Page.Discord({ model: nextDiscord })),
-  toParentMessage: message => Message.GotDiscordMessage({ message }),
-  foldOutMessage: Discord.OutMessage.match<Update.Step<Model, Message, Api>>({
+    Option.flatMap(readSignedIn(model), ({ page }) => readChatPage(page)),
+  write: (model: Model, nextChat: Chat.Model) =>
+    writePage(model, Page.Chat({ model: nextChat })),
+  toParentMessage: message => Message.GotChatMessage({ message }),
+  foldOutMessage: Chat.OutMessage.match<Update.Step<Model, Message, Api>>({
     ShowedToast: foldShowedToast,
   }),
 })
@@ -327,12 +342,26 @@ const receivedApiStatus = (model: Model, connected: boolean): UpdateReturn =>
     Match.orElse(() => ({ model })),
   )
 
+const pageTagOf = (route: SettingsRoute): Page['_tag'] =>
+  route._tag === 'ChatDiscord' ? 'Chat' : route._tag
+
 const showPage = (
   model: Model,
   signedIn: SignedIn,
   route: SettingsRoute,
 ): UpdateReturn => {
-  if (signedIn.page._tag === route._tag) {
+  const { page } = signedIn
+  if (page._tag === 'Chat' && pageTagOf(route) === 'Chat') {
+    return {
+      model: modifyFields(signedIn, {
+        page: () =>
+          Page.Chat({
+            model: Chat.showList(page.model, route._tag === 'Chat'),
+          }),
+      }),
+    }
+  }
+  if (page._tag === pageTagOf(route)) {
     return { model }
   }
 
@@ -340,7 +369,7 @@ const showPage = (
 
   return {
     model: modifyFields(signedIn, { page: () => entry.page }),
-    commands: entry.commands,
+    commands: [...entry.commands, ScrollActiveNav()],
   }
 }
 
@@ -394,12 +423,13 @@ export const update = (model: Model, message: Message) =>
     GotIdentityMessage: ({ message }) => foldIdentity(model, message),
     GotModelsMessage: ({ message }) => foldModels(model, message),
     GotProvidersMessage: ({ message }) => foldProviders(model, message),
-    GotDiscordMessage: ({ message }) => foldDiscord(model, message),
+    GotChatMessage: ({ message }) => foldChat(model, message),
     GotMcpMessage: ({ message }) => foldMcp(model, message),
     GotToastMessage: ({ message }) => foldToast(model, message),
 
     CompletedNavigateInternal: () => ({ model }),
     CompletedLoadExternal: () => ({ model }),
+    CompletedScrollActiveNav: () => ({ model }),
     CompletedSignOut: () =>
       model._tag === 'SignedIn'
         ? {

@@ -8,7 +8,8 @@ export const AppRoute = defineRouteUnion({
   Identity: {},
   Models: {},
   Providers: {},
-  Discord: {},
+  Chat: {},
+  ChatDiscord: {},
   Mcp: {},
   NotFound: { path: Schema.String },
 })
@@ -19,7 +20,8 @@ export const SettingsRoute = AppRoute.subset([
   'Identity',
   'Models',
   'Providers',
-  'Discord',
+  'Chat',
+  'ChatDiscord',
   'Mcp',
 ])
 
@@ -43,9 +45,15 @@ export const providersRouter = pipe(
   settingsPath('providers'),
   Route.mapTo(AppRoute.Providers),
 )
-export const discordRouter = pipe(
+export const chatRouter = pipe(settingsPath('chat'), Route.mapTo(AppRoute.Chat))
+export const chatDiscordRouter = pipe(
+  settingsPath('chat'),
+  slash(literal('discord')),
+  Route.mapTo(AppRoute.ChatDiscord),
+)
+const legacyDiscordRouter = pipe(
   settingsPath('discord'),
-  Route.mapTo(AppRoute.Discord),
+  Route.mapTo(AppRoute.ChatDiscord),
 )
 export const mcpRouter = pipe(settingsPath('mcp'), Route.mapTo(AppRoute.Mcp))
 
@@ -54,7 +62,9 @@ const routeParser = Route.oneOf(
   identityRouter,
   modelsRouter,
   providersRouter,
-  discordRouter,
+  chatDiscordRouter,
+  chatRouter,
+  legacyDiscordRouter,
   mcpRouter,
   homeRouter,
 )
@@ -72,7 +82,8 @@ export const maybeSettingsRoute = (
       'Identity',
       'Models',
       'Providers',
-      'Discord',
+      'Chat',
+      'ChatDiscord',
       'Mcp',
       settingsRoute => Option.some(settingsRoute),
     ),

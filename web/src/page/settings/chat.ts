@@ -1,3 +1,4 @@
+import { clsx } from 'clsx'
 import { Array, Effect, Match, Option, Schema } from 'effect'
 import { Command, Submodel, Update } from 'foldkit'
 import { type Html, type HtmlBuilder } from 'foldkit/html'
@@ -8,7 +9,13 @@ import { modifyFields } from 'foldkit/struct'
 import { Combobox, Dialog, RadioGroup } from '@foldkit/ui'
 
 import { type Api, request } from '../../api/client'
-import { Discord, DiscordDirectory, Home } from '../../api/protocol'
+import {
+  Discord,
+  DiscordConnection,
+  DiscordDirectory,
+  Home,
+} from '../../api/protocol'
+import { chatDiscordRouter, chatRouter } from '../../route'
 import * as Button from '../../ui/button'
 import * as SharedCombobox from '../../ui/combobox'
 import * as ConfirmDialog from '../../ui/confirmDialog'
@@ -33,6 +40,12 @@ const State = defineTaggedUnion({
   Loading: {},
   Failed: { error: Schema.String },
   Loaded: {
+    token: Schema.Literals(['set', 'missing']),
+    connection: DiscordConnection,
+    isEditingToken: Schema.Boolean,
+    tokenInput: Schema.String,
+    maybeTokenError: Schema.Option(Schema.String),
+    isSavingToken: Schema.Boolean,
     allowed: Schema.Array(Schema.String),
     savedHome: Home,
     directory: DiscordDirectory,
@@ -50,8 +63,12 @@ const State = defineTaggedUnion({
 type State = typeof State.Type
 type Loaded = typeof State.Loaded.Type
 
+const Confirming = Schema.Literals(['RemoveUser', 'RemoveToken'])
+
 export const Model = Schema.Struct({
+  isListView: Schema.Boolean,
   state: State,
+  confirming: Confirming,
   confirm: Dialog.Model,
   homeKindGroup: RadioGroup.Model,
   channelDropdown: Combobox.Model,
@@ -76,6 +93,18 @@ export const Message = defineMessageUnion({
   GotPersonDropdownMessage: { message: Combobox.Message },
   SucceededSetHome: { discord: Discord, home: Home },
   FailedSetHome: { error: Schema.String, home: Home },
+  ClickedReplaceToken: {},
+  ClickedCancelToken: {},
+  UpdatedTokenInput: { value: Schema.String },
+  SubmittedToken: {},
+  SucceededSaveToken: { discord: Discord },
+  FailedSaveToken: { error: Schema.String },
+  ClickedRemoveToken: {},
+  ConfirmedRemoveToken: {},
+  SucceededRemoveToken: { discord: Discord },
+  FailedRemoveToken: { error: Schema.String },
+  SucceededRefreshStatus: { discord: Discord },
+  FailedRefreshStatus: {},
 })
 export type Message = typeof Message.Type
 
@@ -124,6 +153,12 @@ const homeKindOf = (home: Home): HomeKind =>
 
 const loadedFrom = (discord: Discord, directory: DiscordDirectory): Loaded =>
   State.Loaded({
+    token: discord.token,
+    connection: discord.connection,
+    isEditingToken: discord.token === 'missing',
+    tokenInput: '',
+    maybeTokenError: Option.none(),
+    isSavingToken: false,
     allowed: discord.allowed,
     savedHome: discord.home,
     directory,
@@ -210,6 +245,46 @@ const SetHome = Command.define('SetHome', {
       ),
     ),
 })
+
+const SaveToken = Command.define('SaveToken', {
+  args: { token: Schema.String },
+  messages: [Message.SucceededSaveToken, Message.FailedSaveToken],
+  execute: ({ token }) =>
+    request('discord.setToken', { token }).pipe(
+      Effect.map(discord => Message.SucceededSaveToken({ discord })),
+      Effect.catch(error =>
+        Effect.succeed(Message.FailedSaveToken({ error: error.message })),
+      ),
+    ),
+})
+
+const RemoveToken = Command.define('RemoveToken', {
+  messages: [Message.SucceededRemoveToken, Message.FailedRemoveToken],
+  execute: request('discord.clearToken', {}).pipe(
+    Effect.map(discord => Message.SucceededRemoveToken({ discord })),
+    Effect.catch(error =>
+      Effect.succeed(Message.FailedRemoveToken({ error: error.message })),
+    ),
+  ),
+})
+
+const RefreshStatus = Command.define('RefreshStatus', {
+  messages: [Message.SucceededRefreshStatus, Message.FailedRefreshStatus],
+  execute: Effect.sleep('2 seconds').pipe(
+    Effect.andThen(request('discord.get', {})),
+    Effect.map(discord => Message.SucceededRefreshStatus({ discord })),
+    Effect.catch(() => Effect.succeed(Message.FailedRefreshStatus())),
+  ),
+})
+
+const refreshWhileConnecting = (discord: Discord) =>
+  discord.connection.state === 'connecting' ? [RefreshStatus()] : []
+
+const withDiscord = (loaded: Loaded, discord: Discord): Loaded =>
+  modifyFields(loaded, {
+    token: () => discord.token,
+    connection: () => discord.connection,
+  })
 
 const foldConfirmOutMessage = Dialog.OutMessage.match<
   Update.Step<Model, Message, Api>
@@ -398,9 +473,13 @@ const foldPerson = Update.foldChild({
   }),
 })
 
-export const init = (): Update.Return<Model, Message, Api> => ({
+export const init = (
+  isListView: boolean,
+): Update.Return<Model, Message, Api> => ({
   model: {
+    isListView,
     state: State.Loading(),
+    confirming: 'RemoveUser',
     confirm: Dialog.init({ id: 'remove-discord-user' }),
     homeKindGroup: RadioGroup.init({ id: 'discord-home-kind' }),
     channelDropdown: SharedCombobox.init('discord-channel'),
@@ -409,11 +488,15 @@ export const init = (): Update.Return<Model, Message, Api> => ({
   commands: [LoadDiscord()],
 })
 
+export const showList = (model: Model, isListView: boolean): Model =>
+  modifyFields(model, { isListView: () => isListView })
+
 export const update = (model: Model, message: Message) =>
   Message.match<UpdateReturn>(message, {
     SucceededLoadDiscord: ({ discord, directory }) => {
       const home = discord.home
       return {
+        commands: refreshWhileConnecting(discord),
         model: modifyFields(model, {
           state: () => loadedFrom(discord, directory),
           channelDropdown: dropdown =>
@@ -499,8 +582,10 @@ export const update = (model: Model, message: Message) =>
 
     ClickedRemove: ({ user }) =>
       foldConfirmOpen(
-        updateLoaded(model, loaded =>
-          modifyFields(loaded, { maybeRemoving: () => Option.some(user) }),
+        updateLoaded(
+          modifyFields(model, { confirming: () => 'RemoveUser' as const }),
+          loaded =>
+            modifyFields(loaded, { maybeRemoving: () => Option.some(user) }),
         ),
       ),
 
@@ -562,13 +647,112 @@ export const update = (model: Model, message: Message) =>
         }),
       ),
     }),
+
+    ClickedReplaceToken: () => ({
+      model: updateLoaded(model, loaded =>
+        modifyFields(loaded, {
+          isEditingToken: () => true,
+          tokenInput: () => '',
+          maybeTokenError: () => Option.none(),
+        }),
+      ),
+    }),
+
+    ClickedCancelToken: () => ({
+      model: updateLoaded(model, loaded =>
+        modifyFields(loaded, {
+          isEditingToken: () => loaded.token === 'missing',
+          tokenInput: () => '',
+          maybeTokenError: () => Option.none(),
+        }),
+      ),
+    }),
+
+    UpdatedTokenInput: ({ value }) => ({
+      model: updateLoaded(model, loaded =>
+        modifyFields(loaded, {
+          tokenInput: () => value,
+          maybeTokenError: () => Option.none(),
+        }),
+      ),
+    }),
+
+    SubmittedToken: () =>
+      withLoaded(model, loaded =>
+        loaded.isSavingToken || loaded.tokenInput.trim() === ''
+          ? { model }
+          : {
+              model: updateLoaded(model, current =>
+                modifyFields(current, {
+                  isSavingToken: () => true,
+                  maybeTokenError: () => Option.none(),
+                }),
+              ),
+              commands: [SaveToken({ token: loaded.tokenInput.trim() })],
+            },
+      ),
+
+    SucceededSaveToken: ({ discord }) => ({
+      model: updateLoaded(model, loaded =>
+        modifyFields(withDiscord(loaded, discord), {
+          isEditingToken: () => false,
+          tokenInput: () => '',
+          isSavingToken: () => false,
+        }),
+      ),
+      commands: refreshWhileConnecting(discord),
+    }),
+
+    FailedSaveToken: ({ error }) => ({
+      model: updateLoaded(model, loaded =>
+        modifyFields(loaded, {
+          isSavingToken: () => false,
+          maybeTokenError: () => Option.some(error),
+        }),
+      ),
+    }),
+
+    ClickedRemoveToken: () =>
+      foldConfirmOpen(
+        modifyFields(model, { confirming: () => 'RemoveToken' as const }),
+      ),
+
+    ConfirmedRemoveToken: () => {
+      const dialogClose = foldConfirmClose(model)
+      return {
+        model: dialogClose.model,
+        commands: [...(dialogClose.commands ?? []), RemoveToken()],
+      }
+    },
+
+    SucceededRemoveToken: ({ discord }) => ({
+      model: updateLoaded(model, loaded =>
+        modifyFields(withDiscord(loaded, discord), {
+          isEditingToken: () => true,
+          tokenInput: () => '',
+          maybeTokenError: () => Option.none(),
+        }),
+      ),
+    }),
+
+    FailedRemoveToken: ({ error }) => ({
+      model,
+      outMessage: OutMessage.ShowedToast({ variant: 'Error', title: error }),
+    }),
+
+    SucceededRefreshStatus: ({ discord }) => ({
+      model: updateLoaded(model, loaded => withDiscord(loaded, discord)),
+      commands: refreshWhileConnecting(discord),
+    }),
+
+    FailedRefreshStatus: () => ({ model }),
   })
 
 const segmentedGroupClassName =
-  'inline-flex h-8 items-center rounded-lg bg-chip p-[3px]'
+  'inline-flex h-8 items-center rounded-full bg-chip p-[3px]'
 
 const segmentClassName =
-  'h-full cursor-pointer rounded-md px-3 text-body font-medium text-slate hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring data-[checked]:bg-white data-[checked]:text-ink data-[checked]:shadow-sm'
+  'h-full cursor-pointer rounded-full px-3 text-body font-medium text-slate hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring data-[checked]:bg-white data-[checked]:text-ink data-[checked]:shadow-sm'
 
 const homeKindGroupView = (
   render: RadioGroup.RenderInfo<HomeKind>,
@@ -852,23 +1036,176 @@ const removeDialogView = (
   loaded: Loaded,
   h: HtmlBuilder<Message>,
 ): Html =>
-  ConfirmDialog.view(
-    {
-      model: model.confirm,
-      title: 'Remove from allowlist?',
-      ...Option.match(loaded.maybeRemoving, {
-        onNone: () => ({}),
-        onSome: user => ({
-          maybeDetail:
-            personName(loaded, user) === undefined
-              ? user
-              : `${personName(loaded, user)} (${user})`,
-        }),
+  model.confirming === 'RemoveToken'
+    ? ConfirmDialog.view(
+        {
+          model: model.confirm,
+          title: 'Remove the Discord token?',
+          maybeDetail: 'Blob-1 disconnects from Discord.',
+          confirmLabel: 'Remove',
+          onConfirm: Message.ConfirmedRemoveToken(),
+          toParentMessage: message => Message.GotConfirmMessage({ message }),
+        },
+        h,
+      )
+    : ConfirmDialog.view(
+        {
+          model: model.confirm,
+          title: 'Remove from allowlist?',
+          ...Option.match(loaded.maybeRemoving, {
+            onNone: () => ({}),
+            onSome: user => ({
+              maybeDetail:
+                personName(loaded, user) === undefined
+                  ? user
+                  : `${personName(loaded, user)} (${user})`,
+            }),
+          }),
+          confirmLabel: 'Remove',
+          onConfirm: Message.ConfirmedRemove(),
+          toParentMessage: message => Message.GotConfirmMessage({ message }),
+        },
+        h,
+      )
+
+type Status = Readonly<{ label: string; dotClassName: string }>
+
+const statusOf = (connection: DiscordConnection): Status =>
+  Match.value(connection).pipe(
+    Match.withReturnType<Status>(),
+    Match.discriminatorsExhaustive('state')({
+      off: () => ({ label: 'Not connected', dotClassName: 'bg-ring' }),
+      connecting: () => ({ label: 'Connecting…', dotClassName: 'bg-ring' }),
+      online: ({ bot }) => ({
+        label: `Online as ${bot}`,
+        dotClassName: 'bg-ok',
       }),
-      confirmLabel: 'Remove',
-      onConfirm: Message.ConfirmedRemove(),
-      toParentMessage: message => Message.GotConfirmMessage({ message }),
-    },
+      error: ({ message }) => ({ label: message, dotClassName: 'bg-alarm' }),
+    }),
+  )
+
+const statusDot = (className: string, h: HtmlBuilder<Message>): Html =>
+  h.span([
+    h.AriaHidden(true),
+    h.Class(clsx('size-2 shrink-0 rounded-full', className)),
+  ])
+
+const statusBadgeView = (loaded: Loaded, h: HtmlBuilder<Message>): Html => {
+  const status = statusOf(loaded.connection)
+  return h.span(
+    [
+      h.Class(
+        clsx(
+          'inline-flex h-7 max-w-full items-center gap-2 rounded-full bg-chip px-3 text-caption font-medium',
+          loaded.connection.state === 'error' ? 'text-alarm' : 'text-slate',
+        ),
+      ),
+      h.AriaLive('polite'),
+    ],
+    [
+      statusDot(status.dotClassName, h),
+      h.span([h.Class('truncate')], [status.label]),
+    ],
+  )
+}
+
+const tokenEditView = (loaded: Loaded, h: HtmlBuilder<Message>): Html =>
+  h.form(
+    [h.OnSubmit(Message.SubmittedToken())],
+    [
+      h.label([h.For('discord-token'), h.Class('sr-only')], ['Bot token']),
+      h.div(
+        [h.Class('flex flex-wrap items-start gap-2')],
+        [
+          h.div(
+            [h.Class('min-w-0 flex-1 basis-64')],
+            [
+              Input.view(
+                {
+                  id: 'discord-token',
+                  type: 'password',
+                  value: loaded.tokenInput,
+                  onInput: value => Message.UpdatedTokenInput({ value }),
+                  maybeError: loaded.maybeTokenError,
+                  isMono: true,
+                  isAutofocus: loaded.token === 'set',
+                  autoComplete: 'off',
+                  placeholder: 'Bot token',
+                },
+                h,
+              ),
+            ],
+          ),
+          h.div(
+            [h.Class('flex items-center gap-2')],
+            [
+              ...(loaded.token === 'set'
+                ? [
+                    Button.view(
+                      {
+                        label: 'Cancel',
+                        variant: 'secondary',
+                        maybeOnClick: Option.some(Message.ClickedCancelToken()),
+                      },
+                      h,
+                    ),
+                  ]
+                : []),
+              Button.view(
+                {
+                  label: loaded.isSavingToken ? 'Connecting…' : 'Save',
+                  variant: 'primary',
+                  type: 'submit',
+                  isDisabled:
+                    loaded.isSavingToken || loaded.tokenInput.trim() === '',
+                },
+                h,
+              ),
+            ],
+          ),
+        ],
+      ),
+    ],
+  )
+
+const tokenSavedView = (h: HtmlBuilder<Message>): Html =>
+  h.div(
+    [h.Class('flex min-h-10 flex-wrap items-center gap-x-3 gap-y-2')],
+    [
+      Icon.key('size-4 shrink-0 text-mute'),
+      h.span(
+        [h.Class('mr-auto font-mono text-body tracking-widest text-slate')],
+        ['••••••••••••••••'],
+      ),
+      h.div(
+        [h.Class('flex items-center gap-1')],
+        [
+          Button.view(
+            {
+              label: 'Replace',
+              variant: 'outline',
+              maybeOnClick: Option.some(Message.ClickedReplaceToken()),
+            },
+            h,
+          ),
+          Button.iconView(
+            {
+              label: 'Remove token',
+              icon: Icon.trash('size-4'),
+              tone: 'danger',
+              onClick: Message.ClickedRemoveToken(),
+            },
+            h,
+          ),
+        ],
+      ),
+    ],
+  )
+
+const tokenSectionView = (loaded: Loaded, h: HtmlBuilder<Message>): Html =>
+  Layout.section(
+    'Bot token',
+    [loaded.isEditingToken ? tokenEditView(loaded, h) : tokenSavedView(h)],
     h,
   )
 
@@ -880,6 +1217,7 @@ const loadedView = (
   h.div(
     [],
     [
+      tokenSectionView(loaded, h),
       allowSectionView(loaded, h),
       homeSectionView(model, loaded, h),
       removeDialogView(model, loaded, h),
@@ -894,6 +1232,48 @@ const contentView = (model: Model, h: HtmlBuilder<Message>): Html =>
     Loaded: loaded => loadedView(model, loaded, h),
   })
 
+const discordItemView = (model: Model, h: HtmlBuilder<Message>): Html =>
+  Layout.splitItem(
+    {
+      href: chatDiscordRouter(),
+      label: 'Discord',
+      icon: Icon.discord('size-4 shrink-0 text-[#5865F2]'),
+      isActive: true,
+      ...Option.match(readLoaded(model), {
+        onNone: () => ({}),
+        onSome: loaded => {
+          const status = statusOf(loaded.connection)
+          return {
+            trailing: h.span(
+              [h.Title(status.label), h.Class('flex items-center')],
+              [
+                statusDot(status.dotClassName, h),
+                h.span([h.Class('sr-only')], [status.label]),
+              ],
+            ),
+          }
+        },
+      }),
+    },
+    h,
+  )
+
 export const view = Submodel.defineView<Model, Message>((model, h) =>
-  Layout.page({ title: 'Discord', children: [contentView(model, h)] }, h),
+  Layout.splitPage(
+    {
+      title: 'Chat platforms',
+      isListView: model.isListView,
+      items: [discordItemView(model, h)],
+      detail: {
+        title: 'Discord',
+        backHref: chatRouter(),
+        actions: Option.match(readLoaded(model), {
+          onNone: () => [],
+          onSome: loaded => [statusBadgeView(loaded, h)],
+        }),
+        children: [contentView(model, h)],
+      },
+    },
+    h,
+  ),
 )

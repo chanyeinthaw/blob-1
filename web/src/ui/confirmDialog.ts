@@ -17,7 +17,7 @@ const dialogClassName =
   'bg-transparent p-0 open:flex items-center justify-center'
 
 const panelClassName =
-  'relative m-auto w-[min(420px,calc(100vw-2rem))] rounded-lg border border-hair bg-white p-6 shadow-lg'
+  'relative m-auto w-[min(420px,calc(100vw-2rem))] rounded-2xl border border-hair bg-white p-6 shadow-lg'
 
 export const view = <Message>(
   config: ViewConfig<Message>,

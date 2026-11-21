@@ -61,9 +61,7 @@ fn duration(time: Instant) -> String {
     }
 }
 
-pub(crate) fn list<E, S, M, F: Models>(
-    inner: &Inner<E, S, M, F>,
-) -> Result<String, HarnessError>
+pub(crate) fn list<E, S, M, F: Models>(inner: &Inner<E, S, M, F>) -> Result<String, HarnessError>
 where
     S: SessionStore,
 {
@@ -447,11 +445,8 @@ where
     Arc::new(session)
 }
 
-fn launch<E, S, M, F: Models>(
-    inner: &Arc<Inner<E, S, M, F>>,
-    name: String,
-    text: Option<String>,
-) where
+fn launch<E, S, M, F: Models>(inner: &Arc<Inner<E, S, M, F>>, name: String, text: Option<String>)
+where
     E: Environment + 'static,
     S: SessionStore + MemoryStore + Clone + 'static,
     M: llm::Source + 'static,

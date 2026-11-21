@@ -15,11 +15,11 @@ type ViewConfig<Message> = Readonly<{
   isDisabled?: boolean
   placeholder?: string
   inputMode?: 'numeric'
-  autoComplete?: 'current-password'
+  autoComplete?: 'current-password' | 'off'
 }>
 
 const inputClassName =
-  'h-8 w-full rounded-md border bg-white shadow-xs px-2.5 text-body text-ink placeholder:text-mute focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 data-[disabled]:opacity-60'
+  'h-8 w-full rounded-full border bg-white shadow-xs px-3.5 text-body text-ink placeholder:text-mute focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 data-[disabled]:opacity-60'
 
 export const view = <Message>(
   config: ViewConfig<Message>,

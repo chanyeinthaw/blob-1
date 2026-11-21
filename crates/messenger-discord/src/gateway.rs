@@ -1,10 +1,11 @@
-use crate::{attachments, backend, person, Discord};
+use crate::{attachments, backend, person, Connection, Discord, Inner};
 use messenger::{Inbound, MessengerError, Place, Quote};
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, watch};
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, ShardState, StreamExt};
 use twilight_model::channel::{ChannelType, Message};
 
-async fn quote(discord: &Discord, message: &Message) -> Option<Quote> {
+async fn quote(inner: &Inner, message: &Message) -> Option<Quote> {
     if let Some(quoted) = &message.referenced_message {
         return Some(Quote {
             message: quoted.id.to_string(),
@@ -15,7 +16,7 @@ async fn quote(discord: &Discord, message: &Message) -> Option<Quote> {
     }
     let reference = message.reference.as_ref()?;
     let (channel, id) = (reference.channel_id?, reference.message_id?);
-    let quoted = match discord.http.message(channel, id).await {
+    let quoted = match inner.http.message(channel, id).await {
         Ok(response) => response.model().await.map_err(|error| error.to_string()),
         Err(error) => Err(error.to_string()),
     };
@@ -33,24 +34,72 @@ async fn quote(discord: &Discord, message: &Message) -> Option<Quote> {
     }
 }
 
+/// Runs the gateway for whichever connection `inner` currently holds. A token
+/// change swaps `inner`, which tears down the shard and reconnects; a fatal
+/// gateway error disconnects and reports the failure instead of exiting.
 pub async fn listen(discord: &Discord, tx: mpsc::Sender<Inbound>) -> Result<(), MessengerError> {
     let intents = Intents::GUILDS
         | Intents::GUILD_MESSAGES
         | Intents::DIRECT_MESSAGES
         | Intents::MESSAGE_CONTENT;
-    let mut shard = Shard::new(ShardId::ONE, discord.token.clone(), intents);
+    let mut inners = discord.inner.subscribe();
+    loop {
+        let inner = loop {
+            if let Some(inner) = inners.borrow_and_update().clone() {
+                break inner;
+            }
+            if inners.changed().await.is_err() {
+                return Ok(());
+            }
+        };
+        if let Outcome::Exit = run(discord, inner, &mut inners, &tx, intents).await {
+            return Ok(());
+        }
+    }
+}
+
+enum Outcome {
+    /// The connection was swapped or failed; take the current `inner` again.
+    Swap,
+    /// The caller is gone; stop listening.
+    Exit,
+}
+
+async fn run(
+    discord: &Discord,
+    inner: Arc<Inner>,
+    inners: &mut watch::Receiver<Option<Arc<Inner>>>,
+    tx: &mpsc::Sender<Inbound>,
+    intents: Intents,
+) -> Outcome {
+    let mut shard = Shard::new(ShardId::ONE, inner.token.clone(), intents);
     let mut bot = None;
     loop {
         let event = tokio::select! {
-            _ = tx.closed() => return Ok(()),
+            _ = tx.closed() => return Outcome::Exit,
+            changed = inners.changed() => {
+                if changed.is_err() {
+                    return Outcome::Exit;
+                }
+                return Outcome::Swap;
+            },
             event = shard.next_event(EventTypeFlags::all()) => event,
         };
         match event {
             Some(Ok(Event::Ready(ready))) => {
                 bot = Some(ready.user.id);
-                discord
+                inner
                     .ready
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+                discord.set_connection(Connection::Online {
+                    bot: ready.user.name.clone(),
+                });
+                let warm = inner.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = warm.fetch_directory().await {
+                        eprintln!("discord directory: {error}");
+                    }
+                });
             }
             Some(Ok(Event::MessageCreate(message))) => {
                 let Some(bot) = bot else { continue };
@@ -85,7 +134,7 @@ pub async fn listen(discord: &Discord, tx: mpsc::Sender<Inbound>) -> Result<(), 
                             None,
                         )
                     } else {
-                        let channel = discord
+                        let channel = inner
                             .http
                             .channel(message.channel_id)
                             .await
@@ -102,7 +151,7 @@ pub async fn listen(discord: &Discord, tx: mpsc::Sender<Inbound>) -> Result<(), 
                             let parent = channel.parent_id.ok_or_else(|| {
                                 backend(std::io::Error::other("thread has no parent"))
                             })?;
-                            let parent_channel = discord
+                            let parent_channel = inner
                                 .http
                                 .channel(parent)
                                 .await
@@ -150,24 +199,33 @@ pub async fn listen(discord: &Discord, tx: mpsc::Sender<Inbound>) -> Result<(), 
                     message: message.id.to_string(),
                     author: person(&message.author),
                     text,
-                    quote: quote(discord, &message).await,
+                    quote: quote(&inner, &message).await,
                     attachments: attachments(&message.attachments),
                     location,
                     earlier,
                 };
                 if tx.send(inbound).await.is_err() {
-                    return Ok(());
+                    return Outcome::Exit;
                 }
             }
             Some(Ok(Event::GatewayClose(frame))) if shard.state() == ShardState::FatallyClosed => {
-                return Err(backend(std::io::Error::other(format!(
-                    "gateway closed: {frame:?}"
-                ))));
+                eprintln!("discord gateway closed: {frame:?}");
+                discord.error(match frame.as_ref().map(|frame| frame.code) {
+                    Some(4004) => "Discord rejected this token",
+                    Some(4013 | 4014) => {
+                        "Enable the Message Content and Server Members intents for this bot"
+                    }
+                    _ => "Discord closed the connection",
+                });
+                return Outcome::Swap;
             }
             Some(Err(error)) => {
                 eprintln!("discord gateway: {error}");
             }
-            None => return Err(backend(std::io::Error::other("gateway stopped"))),
+            None => {
+                discord.error("Discord connection stopped");
+                return Outcome::Swap;
+            }
             _ => {}
         }
     }

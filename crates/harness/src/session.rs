@@ -447,10 +447,7 @@ where
         } else {
             keep
         };
-        let resolved = self
-            .summarizer
-            .as_ref()
-            .and_then(|resolve| resolve());
+        let resolved = self.summarizer.as_ref().and_then(|resolve| resolve());
         let (llm, window) = match &resolved {
             Some((llm, window)) => (llm, *window),
             None => (&self.llm, config.summarizer_window),
@@ -458,19 +455,13 @@ where
         let observer = &self.observer;
         let indices = session.view_indices();
         let view = session.view();
-        let Some((mut summary, cut)) = compaction::compact(
-            llm,
-            &view,
-            keep,
-            window,
-            config.reserve_tokens,
-            &|| {
+        let Some((mut summary, cut)) =
+            compaction::compact(llm, &view, keep, window, config.reserve_tokens, &|| {
                 if let Some(observer) = observer {
                     observer(Step::Model);
                 }
-            },
-        )
-        .await?
+            })
+            .await?
         else {
             return Ok(false);
         };

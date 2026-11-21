@@ -562,10 +562,10 @@ export const update = (model: Model, message: Message) =>
   })
 
 const segmentedGroupClassName =
-  'inline-flex h-8 items-center rounded-lg bg-chip p-[3px]'
+  'inline-flex h-8 items-center rounded-full bg-chip p-[3px]'
 
 const segmentClassName =
-  'h-full cursor-pointer rounded-md px-3 text-body font-medium text-slate hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring data-[checked]:bg-white data-[checked]:text-ink data-[checked]:shadow-sm'
+  'h-full cursor-pointer rounded-full px-3 text-body font-medium text-slate hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring data-[checked]:bg-white data-[checked]:text-ink data-[checked]:shadow-sm'
 
 const addKindGroupView = (
   render: RadioGroup.RenderInfo<AddKind>,
@@ -591,7 +591,7 @@ const statusBadge = (server: McpServer, h: HtmlBuilder<Message>): Html => {
       [
         h.Class(
           clsx(
-            'inline-flex items-center gap-1.5 rounded-md bg-chip px-1.5 py-px text-caption font-medium',
+            'inline-flex items-center gap-1.5 rounded-full bg-chip px-2 py-px text-caption font-medium',
             className,
           ),
         ),
@@ -669,7 +669,7 @@ const serverRowView = (server: McpServer, h: HtmlBuilder<Message>): Html =>
         [
           h.AriaHidden(true),
           h.Class(
-            'grid size-10 shrink-0 place-items-center rounded-md border border-hair bg-shelf text-slate',
+            'grid size-10 shrink-0 place-items-center rounded-full border border-hair bg-shelf text-slate',
           ),
         ],
         [Icon.server('size-5')],
@@ -1006,6 +1006,7 @@ export const view = Submodel.defineView<Model, Message>((model, h) =>
   Layout.page(
     {
       title: 'MCP',
+      wide: true,
       actions: Option.match(readLoaded(model), {
         onNone: () => [],
         onSome: loaded =>
