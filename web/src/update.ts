@@ -10,6 +10,7 @@ import { Connection, Model, Page, SignedIn, SignedOut } from './model'
 import * as Login from './page/login'
 import * as Discord from './page/settings/discord'
 import * as Identity from './page/settings/identity'
+import * as Mcp from './page/settings/mcp'
 import * as Models from './page/settings/models'
 import * as Providers from './page/settings/providers'
 import {
@@ -107,6 +108,12 @@ const enterPage = (route: SettingsRoute): PageEntry =>
           Discord.init(),
           model => Page.Discord({ model }),
           message => Message.GotDiscordMessage({ message }),
+        ),
+      Mcp: () =>
+        liftPageInit(
+          Mcp.init(),
+          model => Page.Mcp({ model }),
+          message => Message.GotMcpMessage({ message }),
         ),
     }),
   )
@@ -277,6 +284,27 @@ const foldDiscord = Update.foldChild({
   }),
 })
 
+const readMcpPage = (page: Page): Option.Option<Mcp.Model> =>
+  Match.value(page).pipe(
+    Match.tag('Mcp', ({ model }) => Option.some(model)),
+    Match.orElse(() => Option.none()),
+  )
+
+const foldMcp = Update.foldChild({
+  update: Mcp.update,
+  read: (model: Model) =>
+    Option.flatMap(readSignedIn(model), ({ page }) => readMcpPage(page)),
+  write: (model: Model, nextMcp: Mcp.Model) =>
+    writePage(model, Page.Mcp({ model: nextMcp })),
+  toParentMessage: message => Message.GotMcpMessage({ message }),
+  foldOutMessage: Mcp.OutMessage.match<Update.Step<Model, Message, Api>>({
+    ShowedToast: foldShowedToast,
+    RequestedLogin:
+      ({ url }) =>
+      model => ({ model, commands: [LoadExternal({ href: url })] }),
+  }),
+})
+
 const signOut = (model: Model): UpdateReturn =>
   Match.value(model).pipe(
     withUpdateReturn,
@@ -367,6 +395,7 @@ export const update = (model: Model, message: Message) =>
     GotModelsMessage: ({ message }) => foldModels(model, message),
     GotProvidersMessage: ({ message }) => foldProviders(model, message),
     GotDiscordMessage: ({ message }) => foldDiscord(model, message),
+    GotMcpMessage: ({ message }) => foldMcp(model, message),
     GotToastMessage: ({ message }) => foldToast(model, message),
 
     CompletedNavigateInternal: () => ({ model }),

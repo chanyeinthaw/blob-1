@@ -7,6 +7,7 @@ use storage::StoreError;
 
 mod checkin;
 mod config;
+mod mcp;
 mod memory;
 mod messenger;
 mod schedule;
@@ -61,6 +62,7 @@ CREATE TABLE IF NOT EXISTS destinations (id INTEGER PRIMARY KEY, messenger TEXT 
 CREATE TABLE IF NOT EXISTS allowed_users (messenger TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (messenger, user_id)) STRICT;
 
 CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK (id = 1), text TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS public_url (id INTEGER PRIMARY KEY CHECK (id = 1), url TEXT NOT NULL) STRICT;
 
 CREATE TABLE IF NOT EXISTS providers (
     id TEXT PRIMARY KEY,
@@ -78,6 +80,32 @@ CREATE TABLE IF NOT EXISTS models (
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS utility_model (id INTEGER PRIMARY KEY CHECK (id = 1), provider TEXT NOT NULL, model TEXT NOT NULL, reasoning TEXT CHECK (reasoning IN ('off','low','medium','high','xhigh','max')), FOREIGN KEY (provider, model) REFERENCES models (provider, id) ON DELETE CASCADE) STRICT;
+
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    id TEXT PRIMARY KEY,
+    transport TEXT NOT NULL CHECK (transport IN ('stdio','http')),
+    command TEXT,
+    args TEXT NOT NULL DEFAULT '[]',
+    env TEXT NOT NULL DEFAULT '{}',
+    url TEXT,
+    headers TEXT NOT NULL DEFAULT '{}',
+    enabled INTEGER NOT NULL CHECK (enabled IN (0,1)),
+    CHECK ((transport = 'stdio') = (command IS NOT NULL)),
+    CHECK ((transport = 'http') = (url IS NOT NULL))
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS mcp_tokens (
+    server TEXT PRIMARY KEY REFERENCES mcp_servers (id) ON DELETE CASCADE,
+    credentials TEXT,
+    registration TEXT
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS mcp_oauth_states (
+    csrf TEXT PRIMARY KEY,
+    server TEXT NOT NULL REFERENCES mcp_servers (id) ON DELETE CASCADE,
+    state TEXT NOT NULL,
+    created INTEGER NOT NULL
+) STRICT;
 CREATE TABLE IF NOT EXISTS model_images (provider TEXT NOT NULL, model TEXT NOT NULL, PRIMARY KEY (provider, model), FOREIGN KEY (provider, model) REFERENCES models (provider, id) ON DELETE CASCADE) STRICT;
 CREATE TABLE IF NOT EXISTS model_reasoning (
     provider TEXT NOT NULL,

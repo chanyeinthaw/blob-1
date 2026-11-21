@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{borrow::Cow, collections::BTreeMap, path::PathBuf};
 
 use serde::Deserialize;
 
@@ -133,33 +133,47 @@ pub struct ToolResult {
     pub images: Vec<Image>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSpec {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub input_schema: &'static str,
+    pub name: Cow<'static, str>,
+    pub description: Cow<'static, str>,
+    pub input_schema: Cow<'static, str>,
+}
+
+impl ToolSpec {
+    pub const fn new(
+        name: &'static str,
+        description: &'static str,
+        input_schema: &'static str,
+    ) -> Self {
+        Self {
+            name: Cow::Borrowed(name),
+            description: Cow::Borrowed(description),
+            input_schema: Cow::Borrowed(input_schema),
+        }
+    }
 }
 
 pub const CATALOG: &[ToolSpec] = &[
     ToolSpec {
-        name: "read",
-        description: "Read a text or image file. Text output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large text files. When you need the full file, continue with offset until complete.",
-        input_schema: r#"{"type":"object","required":["path"],"properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"integer","minimum":1,"description":"Line number to start reading from (1-indexed)"},"limit":{"type":"integer","minimum":0,"description":"Maximum number of lines to read"}}}"#,
+        name: Cow::Borrowed("read"),
+        description: Cow::Borrowed("Read a text or image file. Text output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large text files. When you need the full file, continue with offset until complete."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","required":["path"],"properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"integer","minimum":1,"description":"Line number to start reading from (1-indexed)"},"limit":{"type":"integer","minimum":0,"description":"Maximum number of lines to read"}}}"#),
     },
     ToolSpec {
-        name: "write",
-        description: "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
-        input_schema: r#"{"type":"object","required":["path","content"],"properties":{"path":{"type":"string","description":"Path to the file to write (relative or absolute)"},"content":{"type":"string","description":"Content to write to the file"}}}"#,
+        name: Cow::Borrowed("write"),
+        description: Cow::Borrowed("Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","required":["path","content"],"properties":{"path":{"type":"string","description":"Path to the file to write (relative or absolute)"},"content":{"type":"string","description":"Content to write to the file"}}}"#),
     },
     ToolSpec {
-        name: "edit",
-        description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
-        input_schema: r#"{"type":"object","required":["path","edits"],"properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","description":"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.","items":{"type":"object","required":["oldText","newText"],"properties":{"oldText":{"type":"string","description":"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."},"newText":{"type":"string","description":"Replacement text for this targeted edit."}}}}}}"#,
+        name: Cow::Borrowed("edit"),
+        description: Cow::Borrowed("Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","required":["path","edits"],"properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","description":"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.","items":{"type":"object","required":["oldText","newText"],"properties":{"oldText":{"type":"string","description":"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."},"newText":{"type":"string","description":"Replacement text for this targeted edit."}}}}}}"#),
     },
     ToolSpec {
-        name: "bash",
-        description: "Execute a bash command in the workspace directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). Optionally provide a timeout in seconds.",
-        input_schema: r#"{"type":"object","required":["command"],"properties":{"command":{"type":"string","description":"Shell command to execute"},"timeout":{"type":"number","description":"Timeout in seconds (optional, no default timeout)"}}}"#,
+        name: Cow::Borrowed("bash"),
+        description: Cow::Borrowed("Execute a bash command in the workspace directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). Optionally provide a timeout in seconds."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","required":["command"],"properties":{"command":{"type":"string","description":"Shell command to execute"},"timeout":{"type":"number","description":"Timeout in seconds (optional, no default timeout)"}}}"#),
     },
 ];
 

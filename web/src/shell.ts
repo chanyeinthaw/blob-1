@@ -5,11 +5,13 @@ import { Message } from './message'
 import { Connection, Page, SignedIn } from './model'
 import * as Discord from './page/settings/discord'
 import * as Identity from './page/settings/identity'
+import * as Mcp from './page/settings/mcp'
 import * as Models from './page/settings/models'
 import * as Providers from './page/settings/providers'
 import {
   discordRouter,
   identityRouter,
+  mcpRouter,
   modelsRouter,
   providersRouter,
 } from './route'
@@ -78,6 +80,12 @@ const navItems = (page: Page): ReadonlyArray<NavItem> => [
     href: discordRouter(),
     isActive: page._tag === 'Discord',
     icon: Icon.chat,
+  },
+  {
+    label: 'MCP',
+    href: mcpRouter(),
+    isActive: page._tag === 'Mcp',
+    icon: Icon.link,
   },
 ]
 
@@ -227,6 +235,13 @@ const pageView = (page: Page, h: HtmlBuilder<Message>): Html =>
         model,
         view: Discord.view,
         toParentMessage: message => Message.GotDiscordMessage({ message }),
+      }),
+    Mcp: ({ model }) =>
+      h.submodel({
+        slotId: 'mcp',
+        model,
+        view: Mcp.view,
+        toParentMessage: message => Message.GotMcpMessage({ message }),
       }),
   })
 

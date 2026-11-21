@@ -15,6 +15,7 @@ import {
   Discord,
   Home,
   Identity,
+  McpServer,
   ModelInfo,
   Models,
   Provider,
@@ -45,6 +46,7 @@ type State = Readonly<{
   providers: ReadonlyArray<ProviderRecord>
   allowed: ReadonlyArray<string>
   home: Home
+  mcpServers: ReadonlyArray<McpServer>
 }>
 
 const DEFAULT_IDENTITY = 'You are Blob-1.'
@@ -73,6 +75,18 @@ const seedState = (): State => ({
   ],
   allowed: ['435482941515104257'],
   home: { kind: 'none' },
+  mcpServers: [
+    {
+      id: 'filesystem',
+      transport: 'stdio',
+      command: 'npx',
+      args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp'],
+      enabled: true,
+      auth: 'none',
+      status: 'connected',
+      toolCount: 11,
+    },
+  ],
 })
 
 const identityReply = (state: State): Identity => ({
@@ -237,6 +251,56 @@ const setHome = (state: State, home: Home): Effect.Effect<State, string> =>
     return modifyFields(state, { home: () => home })
   })
 
+const MCP_ID = /^[a-z0-9-]+$/
+
+const addMcpServer = (
+  state: State,
+  payload: RequestPayload<'mcp.add'>,
+): Effect.Effect<State, string> =>
+  Effect.gen(function* () {
+    const { id } = payload
+    if (!MCP_ID.test(id)) {
+      return yield* Effect.fail(
+        'Invalid id: use lowercase letters, digits and -',
+      )
+    }
+    if (state.mcpServers.some(server => server.id === id)) {
+      return yield* Effect.fail(`MCP server ${id} already exists`)
+    }
+    const detail = payload.transport === 'stdio' ? payload.command : payload.url
+    if (detail.trim() === '') {
+      return yield* Effect.fail(
+        payload.transport === 'stdio'
+          ? 'Command is required'
+          : 'URL is required',
+      )
+    }
+
+    const server: McpServer =
+      payload.transport === 'stdio'
+        ? {
+            id,
+            transport: 'stdio',
+            command: payload.command,
+            args: payload.args ?? [],
+            enabled: true,
+            auth: 'none',
+            status: 'idle',
+          }
+        : {
+            id,
+            transport: 'http',
+            url: payload.url,
+            enabled: true,
+            auth: 'oauth',
+            status: 'needs-login',
+          }
+
+    return modifyFields(state, {
+      mcpServers: servers => Array.append(servers, server),
+    })
+  })
+
 const transition = (
   state: Ref.Ref<State>,
   step: (current: State) => Effect.Effect<State, string>,
@@ -396,6 +460,56 @@ const handlers: { readonly [K in RequestType]: Handler<K> } = {
   'discord.setHome': ({ home }, state) =>
     transition(state, current => setHome(current, home)).pipe(
       Effect.map(discordReply),
+    ),
+
+  'mcp.list': (_payload, state) =>
+    Ref.get(state).pipe(Effect.map(current => current.mcpServers)),
+
+  'mcp.add': (payload, state) =>
+    transition(state, current => addMcpServer(current, payload)).pipe(
+      Effect.map(current => current.mcpServers),
+    ),
+
+  'mcp.remove': ({ id }, state) =>
+    transition(state, current =>
+      current.mcpServers.some(server => server.id === id)
+        ? Effect.succeed(
+            modifyFields(current, {
+              mcpServers: servers =>
+                Array.filter(servers, server => server.id !== id),
+            }),
+          )
+        : Effect.fail(`Unknown MCP server ${id}`),
+    ).pipe(Effect.map(current => current.mcpServers)),
+
+  'mcp.setEnabled': ({ id, enabled }, state) =>
+    transition(state, current =>
+      current.mcpServers.some(server => server.id === id)
+        ? Effect.succeed(
+            modifyFields(current, {
+              mcpServers: servers =>
+                servers.map(server =>
+                  server.id === id
+                    ? modifyFields(server, {
+                        enabled: () => enabled,
+                        status: () => (enabled ? 'idle' : 'disconnected'),
+                      })
+                    : server,
+                ),
+            }),
+          )
+        : Effect.fail(`Unknown MCP server ${id}`),
+    ).pipe(Effect.map(current => current.mcpServers)),
+
+  'mcp.login': ({ id }, state) =>
+    Ref.get(state).pipe(
+      Effect.flatMap(current =>
+        current.mcpServers.some(
+          server => server.id === id && server.transport === 'http',
+        )
+          ? Effect.succeed({ url: `/settings/mcp?logged-in=${id}` })
+          : Effect.fail(`MCP server '${id}' is not an HTTP server`),
+      ),
     ),
 }
 

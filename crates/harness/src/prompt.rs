@@ -34,7 +34,21 @@ decision, a past attempt or where a file is, before you act, guess or
 ask. date(id) gives the date and time of message id. zoom("id") gives
 a task's chat."#;
 
-pub fn build(workspace: &Path, skills: &[SkillEntry]) -> String {
+/// `mcp` holds `(id, one-line description)` for each enabled MCP server;
+/// empty when no server is configured.
+fn mcp_section(mcp: &[(String, String)]) -> Option<String> {
+    if mcp.is_empty() {
+        return None;
+    }
+    let servers = mcp
+        .iter()
+        .map(|(id, description)| format!("- {id}: {description}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!("MCP servers provide extra tools, resources and prompts. Call mcp_search {{query}} to find a server's tools and load them into this session, then call them by name. mcp_resources {{server?, query?}} and mcp_read {{server, uri}} cover resources; mcp_prompts {{server?, query?}} and mcp_prompt {{server, name, arguments?}} cover prompts.\n\n{servers}"))
+}
+
+pub fn build(workspace: &Path, skills: &[SkillEntry], mcp: &[(String, String)]) -> String {
     let mut sections = Vec::new();
     if !BASE_PROMPT.is_empty() {
         sections.push(BASE_PROMPT.to_owned());
@@ -57,10 +71,13 @@ pub fn build(workspace: &Path, skills: &[SkillEntry]) -> String {
             "The following skills provide specialized instructions for specific tasks.\nUse the read tool to load a skill's file when the task matches its description.\n\n<available_skills>\n{entries}\n</available_skills>"
         ));
     }
+    if let Some(section) = mcp_section(mcp) {
+        sections.push(section);
+    }
     sections.join("\n\n")
 }
 
-pub fn build_chat(workspace: &Path, skills: &[SkillEntry]) -> String {
+pub fn build_chat(workspace: &Path, skills: &[SkillEntry], mcp: &[(String, String)]) -> String {
     let mut sections = vec![format!("Working directory: {}", workspace.display())];
     if !skills.is_empty() {
         let entries = skills
@@ -75,6 +92,9 @@ pub fn build_chat(workspace: &Path, skills: &[SkillEntry]) -> String {
             .collect::<Vec<_>>()
             .join("\n");
         sections.push(format!("Tasks can load these skills; name the skill in the task when it fits.\n\n<available_skills>\n{entries}\n</available_skills>"));
+    }
+    if let Some(section) = mcp_section(mcp) {
+        sections.push(section);
     }
     sections.join("\n\n")
 }

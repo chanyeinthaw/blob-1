@@ -13,6 +13,7 @@ const pageTitle = (page: Page): string =>
     Models: () => 'Models',
     Providers: () => 'Providers',
     Discord: () => 'Discord',
+    Mcp: () => 'MCP servers',
   })
 
 const signedOutView = (login: Login.Model, h: HtmlBuilder<Message>): Html =>

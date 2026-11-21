@@ -523,6 +523,7 @@ async fn chat_harness(
     workspace: &Path,
     skills_dir: Option<&Path>,
     models: ModelFactory,
+    mcp: mcp::Mcp,
 ) -> Result<Chat> {
     models.current()?;
     let environment = environment(&store, workspace, skills_dir).await?;
@@ -540,7 +541,8 @@ async fn chat_harness(
         },
         models,
         store,
-    ))
+    )
+    .with_mcp(mcp))
 }
 
 pub async fn chat(
@@ -552,36 +554,47 @@ pub async fn chat(
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
     let models = ModelFactory::new(store.clone());
-    let harness = chat_harness(store, workspace, skills_dir, models).await?;
+    let mcp = mcp::Mcp::new(store.clone());
+    let mcp_shutdown = mcp.clone();
+    let harness = chat_harness(store, workspace, skills_dir, models, mcp).await?;
     let mut failure = None;
-    let answer = tokio::select! {
-        answer = harness.run(&prompt) => answer,
-        _ = interrupt.recv() => return Err("interrupted".into()),
-        _ = terminate.recv() => return Err("terminated".into()),
+    let signal_text = tokio::select! {
+        answer = harness.run(&prompt) => {
+            match answer {
+                Ok(answer) => println!("{answer}"),
+                Err(error) => failure = Some(error),
+            }
+            None
+        },
+        _ = interrupt.recv() => Some("interrupted"),
+        _ = terminate.recv() => Some("terminated"),
     };
-    match answer {
-        Ok(answer) => println!("{answer}"),
-        Err(error) => failure = Some(error),
-    }
-    while harness.tasks_running() || harness.has_work() {
-        let answer = tokio::select! {
+    let mut signal_text = signal_text;
+    while signal_text.is_none() && (harness.tasks_running() || harness.has_work()) {
+        signal_text = tokio::select! {
             answer = async {
                 harness.work().await;
                 harness.resume().await
-            } => answer,
-            _ = interrupt.recv() => return Err("interrupted".into()),
-            _ = terminate.recv() => return Err("terminated".into()),
+            } => {
+                match answer {
+                    Ok(answer) if !answer.is_empty() => println!("{answer}"),
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!("{error}");
+                        failure.get_or_insert(error);
+                    }
+                }
+                None
+            },
+            _ = interrupt.recv() => Some("interrupted"),
+            _ = terminate.recv() => Some("terminated"),
         };
-        match answer {
-            Ok(answer) if !answer.is_empty() => println!("{answer}"),
-            Ok(_) => {}
-            Err(error) => {
-                eprintln!("{error}");
-                failure.get_or_insert(error);
-            }
-        }
     }
-    failure.map_or(Ok(()), |error| Err(error.into()))
+    mcp_shutdown.shutdown().await;
+    match signal_text {
+        Some(signal) => Err(signal.into()),
+        None => failure.map_or(Ok(()), |error| Err(error.into())),
+    }
 }
 
 async fn decide_inline(
@@ -678,6 +691,7 @@ pub async fn serve(
     token: String,
     shared_discord: Arc<std::sync::OnceLock<Arc<messenger_discord::Discord>>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    mcp: mcp::Mcp,
 ) -> Result<()> {
     let models = ModelFactory::new(store.clone());
     if models.current().is_err() {
@@ -693,7 +707,7 @@ pub async fn serve(
             }
         }
     }
-    let harness = chat_harness(store.clone(), workspace, skills_dir, models.clone()).await?;
+    let harness = chat_harness(store.clone(), workspace, skills_dir, models.clone(), mcp.clone()).await?;
     let client = Arc::new(messenger_discord::Discord::new(token));
     let _ = shared_discord.set(client.clone());
     let warm = client.clone();

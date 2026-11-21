@@ -70,6 +70,24 @@ impl ConfigStore for SqliteStorage {
         }.map_err(backend)?;
         Ok(())
     }
+
+    fn public_url(&self) -> Result<Option<String>, StoreError> {
+        self.lock()
+            .query_row("SELECT url FROM public_url WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(backend)
+    }
+
+    fn set_public_url(&self, url: Option<&str>) -> Result<(), StoreError> {
+        let connection = self.lock();
+        match url {
+            Some(url) => connection.execute("INSERT INTO public_url (id, url) VALUES (1, ?1) ON CONFLICT (id) DO UPDATE SET url = excluded.url", [url]),
+            None => connection.execute("DELETE FROM public_url WHERE id = 1", []),
+        }.map_err(backend)?;
+        Ok(())
+    }
     fn providers(&self) -> Result<Vec<Provider>, StoreError> {
         let connection = self.lock();
         let mut statement = connection

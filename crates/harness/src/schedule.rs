@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use chrono::{DateTime, Datelike, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use environment::ToolSpec;
@@ -11,19 +13,19 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 
 pub const TOOLS: &[ToolSpec] = &[
     ToolSpec {
-        name: "schedule",
-        description: "Schedule a message at a time or on a cron schedule.",
-        input_schema: r#"{"type":"object","properties":{"text":{"type":"string"},"at":{"type":"string"},"cron":{"type":"string"},"tz":{"type":"string"},"to":{"type":"string"},"reply":{"type":"string"}},"required":["text"]}"#,
+        name: Cow::Borrowed("schedule"),
+        description: Cow::Borrowed("Schedule a message at a time or on a cron schedule."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"text":{"type":"string"},"at":{"type":"string"},"cron":{"type":"string"},"tz":{"type":"string"},"to":{"type":"string"},"reply":{"type":"string"}},"required":["text"]}"#),
     },
     ToolSpec {
-        name: "unschedule",
-        description: "Remove a schedule by id.",
-        input_schema: r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#,
+        name: Cow::Borrowed("unschedule"),
+        description: Cow::Borrowed("Remove a schedule by id."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#),
     },
     ToolSpec {
-        name: "schedules",
-        description: "List schedules.",
-        input_schema: r#"{"type":"object","properties":{}}"#,
+        name: Cow::Borrowed("schedules"),
+        description: Cow::Borrowed("List schedules."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{}}"#),
     },
 ];
 

@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use storage::{
-    Checkin, CheckinStore, ConfigStore, MessengerStore, ModelRef, Provider, ProviderApi,
-    ProviderId, ReasoningLevel, SkillStore,
+    Checkin, CheckinStore, ConfigStore, McpStore, MessengerStore, ModelRef, Provider,
+    ProviderApi, ProviderId, ReasoningLevel, SkillStore,
 };
 use storage_sqlite::SqliteStorage;
 
@@ -33,6 +33,11 @@ enum Command {
     Serve {
         #[arg(long, default_value = "127.0.0.1:7878")]
         web: std::net::SocketAddr,
+        /// Absolute http(s) URL the web app is publicly reached at (e.g. via
+        /// Tailscale Serve); OAuth callbacks and WebSocket origins use it
+        /// instead of the Host header.
+        #[arg(long)]
+        public_url: Option<String>,
     },
     Web {
         #[command(subcommand)]
@@ -61,6 +66,10 @@ enum Command {
     Identity {
         #[command(subcommand)]
         command: IdentityCommand,
+    },
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
     },
     Messenger {
         #[command(subcommand)]
@@ -213,6 +222,43 @@ enum MessengerCommand {
 }
 
 #[derive(Subcommand)]
+enum McpCommand {
+    List,
+    /// stdio: `agent mcp add <id> [--env K=V] -- <command> [args]`;
+    /// http: `agent mcp add <id> --url <url> [--header 'Name: ENV_VAR']`
+    Add {
+        id: String,
+        #[arg(long)]
+        env: Vec<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        header: Vec<String>,
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    Remove {
+        id: String,
+    },
+    Enable {
+        id: String,
+    },
+    Disable {
+        id: String,
+    },
+    /// Prints the URL to open in a logged-in browser.
+    Login {
+        id: String,
+        #[arg(long, default_value = "127.0.0.1:7878")]
+        web: String,
+    },
+    /// Connect to a server and list its tools.
+    Tools {
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ProviderCommand {
     Add {
         id: String,
@@ -312,6 +358,7 @@ async fn main() -> Result<()> {
                 | Command::Reasoning { .. }
                 | Command::Web { .. }
                 | Command::Messenger { .. }
+                | Command::Mcp { .. }
                 | Command::Identity { .. }
                 | Command::Timezone { .. }
                 | Command::Home { .. }
@@ -400,17 +447,32 @@ async fn main() -> Result<()> {
         }
         Command::Identity { command } => identity(&store, command),
         Command::Messenger { command } => messenger(&store, command),
+        Command::Mcp { command } => mcp_command(&store, command).await,
         Command::Web {
             command:
                 WebCommand::Password {
                     command: WebPasswordCommand::Set,
                 },
         } => web::set_password(&store),
-        Command::Serve { web: addr } => {
+        Command::Serve {
+            web: addr,
+            public_url,
+        } => {
+            let public_url = public_url
+                .map(|raw| web::public_url(&raw))
+                .transpose()?;
+            store.set_public_url(
+                public_url
+                    .as_ref()
+                    .map(|url| url.as_str().trim_end_matches('/')),
+            )?;
             let listener = tokio::net::TcpListener::bind(addr).await?;
             let web_store = store.clone();
             let discord_client = Arc::new(std::sync::OnceLock::new());
             let discord_for_run = discord_client.clone();
+            let mcp = mcp::Mcp::new(store.clone());
+            let mcp_for_web = mcp.clone();
+            let mcp_shutdown = mcp.clone();
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             let shutdown_tx = Arc::new(shutdown_tx);
             let discord_shutdown = shutdown_rx.clone();
@@ -432,6 +494,7 @@ async fn main() -> Result<()> {
                             token,
                             discord_for_run,
                             discord_shutdown,
+                            mcp,
                         )
                         .await;
                         let _ = stop.send(true);
@@ -448,11 +511,24 @@ async fn main() -> Result<()> {
                 tokio::select! { _ = interrupt.recv() => {}, _ = terminate.recv() => {} }
                 let _ = signal_tx.send(true);
             });
-            web::serve(listener, web_store, discord_client, shutdown_rx).await?;
-            match discord_task {
-                Some(task) => task.await?,
+            web::serve(
+                listener,
+                web_store,
+                discord_client,
+                mcp_for_web,
+                shutdown_rx,
+                public_url,
+            )
+            .await?;
+            let result = match discord_task {
+                Some(task) => match task.await {
+                    Ok(result) => result,
+                    Err(error) => Err(error.into()),
+                },
                 None => Ok(()),
-            }
+            };
+            mcp_shutdown.shutdown().await;
+            result
         }
         Command::Provider { command } => provider(&store, command),
         Command::Models { command } => models(&store, command).await,
@@ -813,4 +889,117 @@ fn default_data_dir() -> Result<PathBuf> {
     }
     let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
     Ok(PathBuf::from(home).join(".local/share/agent"))
+}
+
+async fn mcp_command(store: &Arc<SqliteStorage>, command: McpCommand) -> Result<()> {
+    let find = |id: &str| -> Result<storage::McpServer> {
+        store
+            .mcp_servers()?
+            .into_iter()
+            .find(|server| server.id == id)
+            .ok_or_else(|| format!("no MCP server '{id}'").into())
+    };
+    match command {
+        McpCommand::List => {
+            for server in store.mcp_servers()? {
+                let (transport, detail) = match &server.transport {
+                    storage::McpTransport::Stdio { command, args, .. } => {
+                        ("stdio", std::iter::once(command.clone()).chain(args.iter().cloned()).collect::<Vec<_>>().join(" "))
+                    }
+                    storage::McpTransport::Http { url, .. } => ("http", url.clone()),
+                };
+                println!(
+                    "{}{}\t{transport}\t{detail}",
+                    server.id,
+                    if server.enabled { "" } else { " (disabled)" }
+                );
+            }
+        }
+        McpCommand::Add {
+            id,
+            env,
+            url,
+            header,
+            command,
+        } => {
+            if !mcp::valid_id(&id) {
+                return Err("Invalid id: use lowercase letters, digits and -".into());
+            }
+            let parse_pair = |pair: &str, what: &str| -> Result<(String, String)> {
+                let (key, value) = pair
+                    .split_once(':')
+                    .or_else(|| pair.split_once('='))
+                    .ok_or_else(|| format!("expected {what} as 'Name: VALUE', got '{pair}'"))?;
+                Ok((key.trim().to_string(), value.trim().to_string()))
+            };
+            let transport = match (url, command.is_empty()) {
+                (Some(url), true) => storage::McpTransport::Http {
+                    url,
+                    headers: header
+                        .iter()
+                        .map(|h| parse_pair(h, "--header"))
+                        .collect::<Result<_>>()?,
+                },
+                (None, false) => storage::McpTransport::Stdio {
+                    command: command[0].clone(),
+                    args: command[1..].to_vec(),
+                    env: env
+                        .iter()
+                        .map(|e| {
+                            e.split_once('=')
+                                .map(|(k, v)| (k.to_string(), v.to_string()))
+                                .ok_or_else(|| format!("expected --env K=V, got '{e}'").into())
+                        })
+                        .collect::<Result<_>>()?,
+                },
+                (Some(_), false) => {
+                    return Err("give either --url or a command after --, not both".into())
+                }
+                (None, true) => {
+                    return Err("give a command after -- or --url <url>".into())
+                }
+            };
+            store.save_mcp_server(&storage::McpServer {
+                id: id.clone(),
+                transport,
+                enabled: true,
+            })?;
+            println!("added {id}");
+        }
+        McpCommand::Remove { id } => {
+            if !store.remove_mcp_server(&id)? {
+                return Err(format!("no MCP server '{id}'").into());
+            }
+        }
+        McpCommand::Enable { id } => {
+            let mut server = find(&id)?;
+            server.enabled = true;
+            store.save_mcp_server(&server)?;
+        }
+        McpCommand::Disable { id } => {
+            let mut server = find(&id)?;
+            server.enabled = false;
+            store.save_mcp_server(&server)?;
+        }
+        McpCommand::Login { id, web } => {
+            let server = find(&id)?;
+            if !matches!(server.transport, storage::McpTransport::Http { .. }) {
+                return Err(format!("MCP server '{id}' is not an HTTP server").into());
+            }
+            match store.public_url()? {
+                Some(base) => println!("{base}/api/mcp/login?id={id}"),
+                None => println!("http://{web}/api/mcp/login?id={id}"),
+            }
+        }
+        McpCommand::Tools { id } => {
+            find(&id)?;
+            let mcp = mcp::Mcp::new(store.clone());
+            let result = mcp.tools(&id).await;
+            mcp.shutdown().await;
+            for (name, description) in result? {
+                println!("{name}\t{description}");
+            }
+        }
+    }
+    Ok(())
 }

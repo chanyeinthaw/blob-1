@@ -4,6 +4,7 @@ import { defineTaggedUnion, taggedStruct } from 'foldkit/schema'
 import * as Login from './page/login'
 import * as Discord from './page/settings/discord'
 import * as Identity from './page/settings/identity'
+import * as Mcp from './page/settings/mcp'
 import * as Models from './page/settings/models'
 import * as Providers from './page/settings/providers'
 import * as Toast from './ui/toast'
@@ -19,6 +20,7 @@ export const Page = defineTaggedUnion({
   Models: { model: Models.Model },
   Providers: { model: Providers.Model },
   Discord: { model: Discord.Model },
+  Mcp: { model: Mcp.Model },
 })
 export type Page = typeof Page.Type
 

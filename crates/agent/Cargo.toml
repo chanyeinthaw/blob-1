@@ -11,6 +11,7 @@ clap.workspace = true
 environment-local.workspace = true
 harness.workspace = true
 llm-rig.workspace = true
+mcp.workspace = true
 storage.workspace = true
 storage-sqlite.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }

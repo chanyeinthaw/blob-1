@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,30 +12,30 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 const SEND_LIMIT: usize = 300;
 
 pub const SEND: ToolSpec = ToolSpec {
-    name: "send",
-    description: "Send a message to people on a messenger. Give exactly one of reply (an m-token from a <message> tag: answers that message) or to (a d-token: posts plainly in that conversation). At most 300 characters; split longer text into several sends. mention: user ids to mention; the system adds the mentions.",
-    input_schema: r#"{"type":"object","properties":{"text":{"type":"string"},"reply":{"type":"string","description":"m-token of the message to reply to"},"to":{"type":"string","description":"d-token of the conversation"},"mention":{"type":"array","items":{"type":"string"},"description":"User ids to mention"},"thread":{"type":"boolean","description":"thread: true moves the conversation into a thread started from the message you reply to; use it when an inline exchange turns into real work"}},"required":["text"]}"#,
+    name: Cow::Borrowed("send"),
+    description: Cow::Borrowed("Send a message to people on a messenger. Give exactly one of reply (an m-token from a <message> tag: answers that message) or to (a d-token: posts plainly in that conversation). At most 300 characters; split longer text into several sends. mention: user ids to mention; the system adds the mentions."),
+    input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"text":{"type":"string"},"reply":{"type":"string","description":"m-token of the message to reply to"},"to":{"type":"string","description":"d-token of the conversation"},"mention":{"type":"array","items":{"type":"string"},"description":"User ids to mention"},"thread":{"type":"boolean","description":"thread: true moves the conversation into a thread started from the message you reply to; use it when an inline exchange turns into real work"}},"required":["text"]}"#),
 };
 pub const LOOKUP: &[ToolSpec] = &[
     ToolSpec {
-        name: "message",
-        description: "Read one message: by link (a message link someone pasted), or by to (d-token) plus message id (ids appear in history/search results); channel: true means the thread's parent channel.",
-        input_schema: r#"{"type":"object","properties":{"link":{"type":"string"},"to":{"type":"string"},"message":{"type":"string"},"channel":{"type":"boolean"}}}"#,
+        name: Cow::Borrowed("message"),
+        description: Cow::Borrowed("Read one message: by link (a message link someone pasted), or by to (d-token) plus message id (ids appear in history/search results); channel: true means the thread's parent channel."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"link":{"type":"string"},"to":{"type":"string"},"message":{"type":"string"},"channel":{"type":"boolean"}}}"#),
     },
     ToolSpec {
-        name: "history",
-        description: "Read earlier messages of a conversation (to = d-token), oldest first; channel: true reads the thread's parent channel instead. before: a message id to page further back. limit 1-50, default 20.",
-        input_schema: r#"{"type":"object","properties":{"to":{"type":"string","description":"d-token of the conversation"},"channel":{"type":"boolean","description":"Use the parent channel instead of the thread"},"before":{"type":"string","description":"Message id to page before"},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":["to"]}"#,
+        name: Cow::Borrowed("history"),
+        description: Cow::Borrowed("Read earlier messages of a conversation (to = d-token), oldest first; channel: true reads the thread's parent channel instead. before: a message id to page further back. limit 1-50, default 20."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"to":{"type":"string","description":"d-token of the conversation"},"channel":{"type":"boolean","description":"Use the parent channel instead of the thread"},"before":{"type":"string","description":"Message id to page before"},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":["to"]}"#),
     },
     ToolSpec {
-        name: "search",
-        description: "Search messages containing query, in one conversation (to = d-token, channel: true for its parent channel) or across a whole messenger (messenger = name, if supported). limit 1-50, default 20.",
-        input_schema: r#"{"type":"object","properties":{"query":{"type":"string"},"to":{"type":"string","description":"d-token of the conversation"},"channel":{"type":"boolean","description":"Use the parent channel instead of the thread"},"messenger":{"type":"string","description":"Messenger name for a messenger-wide lookup"},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":["query"]}"#,
+        name: Cow::Borrowed("search"),
+        description: Cow::Borrowed("Search messages containing query, in one conversation (to = d-token, channel: true for its parent channel) or across a whole messenger (messenger = name, if supported). limit 1-50, default 20."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"query":{"type":"string"},"to":{"type":"string","description":"d-token of the conversation"},"channel":{"type":"boolean","description":"Use the parent channel instead of the thread"},"messenger":{"type":"string","description":"Messenger name for a messenger-wide lookup"},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":["query"]}"#),
     },
     ToolSpec {
-        name: "participants",
-        description: "Find people and their user ids, in one conversation (to, channel) or across a whole messenger (messenger + query). Use the ids with send's mention.",
-        input_schema: r#"{"type":"object","properties":{"to":{"type":"string","description":"d-token of the conversation"},"channel":{"type":"boolean","description":"Use the parent channel instead of the thread"},"messenger":{"type":"string","description":"Messenger name for a messenger-wide lookup"},"query":{"type":"string"}}}"#,
+        name: Cow::Borrowed("participants"),
+        description: Cow::Borrowed("Find people and their user ids, in one conversation (to, channel) or across a whole messenger (messenger + query). Use the ids with send's mention."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"to":{"type":"string","description":"d-token of the conversation"},"channel":{"type":"boolean","description":"Use the parent channel instead of the thread"},"messenger":{"type":"string","description":"Messenger name for a messenger-wide lookup"},"query":{"type":"string"}}}"#),
     },
 ];
 

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::schedule::{parse_time, target, token, Result};
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -7,19 +9,19 @@ use storage::{ConfigStore, MemoryStore, MessengerStore, Watch, WatchStore};
 
 pub const TOOLS: &[ToolSpec] = &[
     ToolSpec {
-        name: "watch",
-        description: "Keep an eye on something.",
-        input_schema: r#"{"type":"object","properties":{"text":{"type":"string"},"to":{"type":"string"},"reply":{"type":"string"},"until":{"type":"string"}},"required":["text"]}"#,
+        name: Cow::Borrowed("watch"),
+        description: Cow::Borrowed("Keep an eye on something."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"text":{"type":"string"},"to":{"type":"string"},"reply":{"type":"string"},"until":{"type":"string"}},"required":["text"]}"#),
     },
     ToolSpec {
-        name: "unwatch",
-        description: "Remove a watch.",
-        input_schema: r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#,
+        name: Cow::Borrowed("unwatch"),
+        description: Cow::Borrowed("Remove a watch."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#),
     },
     ToolSpec {
-        name: "watches",
-        description: "List watches.",
-        input_schema: r#"{"type":"object","properties":{}}"#,
+        name: Cow::Borrowed("watches"),
+        description: Cow::Borrowed("List watches."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{}}"#),
     },
 ];
 

@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::{borrow::Cow, sync::{Arc, Mutex}};
 
 use environment::{Environment, ToolCall, ToolSpec};
 use memory::{Kind, Memory};
@@ -82,39 +82,39 @@ Once every delivered message has its answer and no further words are needed, end
 
 pub(crate) const EXTRA: &[ToolSpec] = &[
     ToolSpec {
-        name: "zoom",
-        description: "Open the line id+n of the view into the two lines of n/2 under it; n = 1 gives the message whole. With a task id, give that task's chat as stored, with older parts summarized if compacted. A long text comes in pages from character at, saying where to go on.",
-        input_schema: r#"{"type":"object","properties":{"id":{"oneOf":[{"type":"integer"},{"type":"string"}]},"n":{"type":"integer"},"at":{"type":"integer"}},"required":["id"]}"#,
+        name: Cow::Borrowed("zoom"),
+        description: Cow::Borrowed("Open the line id+n of the view into the two lines of n/2 under it; n = 1 gives the message whole. With a task id, give that task's chat as stored, with older parts summarized if compacted. A long text comes in pages from character at, saying where to go on."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"id":{"oneOf":[{"type":"integer"},{"type":"string"}]},"n":{"type":"integer"},"at":{"type":"integer"}},"required":["id"]}"#),
     },
     ToolSpec {
-        name: "date",
-        description: "The date and time of message id.",
-        input_schema: r#"{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}"#,
+        name: Cow::Borrowed("date"),
+        description: Cow::Borrowed("The date and time of message id."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}"#),
     },
     ToolSpec {
-        name: "models",
-        description: "List the configured providers and models you can give to spawn: provider, model id, context window, supported reasoning levels. Use search to filter.",
-        input_schema: r#"{"type":"object","properties":{"search":{"type":"string"}}}"#,
+        name: Cow::Borrowed("models"),
+        description: Cow::Borrowed("List the configured providers and models you can give to spawn: provider, model id, context window, supported reasoning levels. Use search to filter."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"search":{"type":"string"}}}"#),
     },
     ToolSpec {
-        name: "spawn",
-        description: "Start one background task per item. Optionally specify provider, model and reasoning per task; call models to see available choices. Give provider and model together. Use for for the originating message reply token. Never wait or poll for it.",
-        input_schema: r#"{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{"task":{"type":"string"},"for":{"type":"string","description":"Originating message reply token"},"provider":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string","enum":["off","low","medium","high","xhigh","max"]}},"required":["task"]}}},"required":["tasks"]}"#,
+        name: Cow::Borrowed("spawn"),
+        description: Cow::Borrowed("Start one background task per item. Optionally specify provider, model and reasoning per task; call models to see available choices. Give provider and model together. Use for for the originating message reply token. Never wait or poll for it."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object","properties":{"task":{"type":"string"},"for":{"type":"string","description":"Originating message reply token"},"provider":{"type":"string"},"model":{"type":"string"},"reasoning":{"type":"string","enum":["off","low","medium","high","xhigh","max"]}},"required":["task"]}}},"required":["tasks"]}"#),
     },
     ToolSpec {
-        name: "tasks",
-        description: "List tasks with their status, model, how long they have been running, and what each is doing now.",
-        input_schema: r#"{"type":"object","properties":{}}"#,
+        name: Cow::Borrowed("tasks"),
+        description: Cow::Borrowed("List tasks with their status, model, how long they have been running, and what each is doing now."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{}}"#),
     },
     ToolSpec {
-        name: "stop",
-        description: "Stop a running task: cancels its work and kills its running commands. Its report says it was stopped.",
-        input_schema: r#"{"type":"object","properties":{"task":{"type":"string"},"reason":{"type":"string"}},"required":["task"]}"#,
+        name: Cow::Borrowed("stop"),
+        description: Cow::Borrowed("Stop a running task: cancels its work and kills its running commands. Its report says it was stopped."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"task":{"type":"string"},"reason":{"type":"string"}},"required":["task"]}"#),
     },
     ToolSpec {
-        name: "tell",
-        description: "Send a message to a task by id: delivered between its tool calls if it is working, or restarts it from its chat.",
-        input_schema: r#"{"type":"object","properties":{"task":{"type":"string"},"text":{"type":"string"}},"required":["task","text"]}"#,
+        name: Cow::Borrowed("tell"),
+        description: Cow::Borrowed("Send a message to a task by id: delivered between its tool calls if it is working, or restarts it from its chat."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"task":{"type":"string"},"text":{"type":"string"}},"required":["task","text"]}"#),
     },
 ];
 
@@ -208,6 +208,9 @@ pub(crate) struct Inner<E, S, M, F: Models> {
     pub state: Mutex<State>,
     pub notify: Notify,
     pub messengers: Option<crate::Messengers>,
+    pub mcp: Option<mcp::Mcp>,
+    pub mcp_session: Option<Arc<mcp::SessionTools>>,
+    pub mcp_view_generation: Mutex<u64>,
     pub pulses: Mutex<Vec<(u64, tokio::task::Id)>>,
 }
 
@@ -306,6 +309,9 @@ where
                 }),
                 notify: Notify::new(),
                 messengers: None,
+                mcp: None,
+                mcp_session: None,
+                mcp_view_generation: Mutex::new(0),
                 pulses: Mutex::new(Vec::new()),
             }),
             turn: tokio::sync::Mutex::new(()),
@@ -317,6 +323,13 @@ where
         Arc::get_mut(&mut self.inner)
             .expect("unshared chat")
             .messengers = Some(messengers);
+        self
+    }
+
+    pub fn with_mcp(mut self, mcp: mcp::Mcp) -> Self {
+        let inner = Arc::get_mut(&mut self.inner).expect("unshared chat");
+        inner.mcp_session = Some(Arc::new(mcp::SessionTools::new(mcp.clone())));
+        inner.mcp = Some(mcp);
         self
     }
 
@@ -354,6 +367,22 @@ where
         self.run_message(text.to_owned(), None).await
     }
 
+    fn refresh_mcp_session(&self) {
+        let Some(mcp) = &self.inner.mcp_session else {
+            return;
+        };
+        let generation = self.inner.memory.chat_generation();
+        let mut seen = self
+            .inner
+            .mcp_view_generation
+            .lock()
+            .expect("mcp view generation mutex poisoned");
+        if *seen != generation {
+            *seen = generation;
+            mcp.clear();
+        }
+    }
+
     pub async fn run_message(
         &self,
         text: String,
@@ -362,6 +391,7 @@ where
         let _guard = self.turn.lock().await;
         self.inner.memory.settle(self.inner.memory.count()?).await?;
         let view = self.inner.memory.view()?;
+        self.refresh_mcp_session();
         let text = self.append_user(&text, meta.as_ref())?;
         let answer = self.turn(&text, view).await?;
         self.resume_loop(vec![answer]).await
@@ -418,6 +448,7 @@ where
             if let Some((text, meta)) = steering {
                 self.inner.memory.settle(self.inner.memory.count()?).await?;
                 let view = self.inner.memory.view()?;
+                self.refresh_mcp_session();
                 let text = self.append_user(&text, meta.as_ref())?;
                 self.inner
                     .state
@@ -430,6 +461,7 @@ where
             if let Some(report) = report {
                 self.inner.memory.settle(self.inner.memory.count()?).await?;
                 let view = self.inner.memory.view()?;
+                self.refresh_mcp_session();
                 self.inner
                     .memory
                     .append(Kind::Work, &report.text, Some(&report.meta))?;
@@ -491,8 +523,12 @@ where
 
     async fn turn_loop(&self, text: &str, view: String) -> Result<String, HarnessError> {
         // The turn keeps the model it starts on; the next turn resolves again.
-        let llm = self.inner.models.current()?.main;
+        let (llm, _, selection) = self.inner.models.connect(None, None)?;
         let skills = self.inner.environment.skill_catalog().await?;
+        let mcp_servers = match &self.inner.mcp {
+            Some(mcp) => mcp.describe().await,
+            None => Vec::new(),
+        };
         let identity = self
             .config
             .identity()?
@@ -504,7 +540,7 @@ where
             } else {
                 String::new()
             },
-            prompt::build_chat(&self.inner.paths.workspace, &skills)
+            prompt::build_chat(&self.inner.paths.workspace, &skills, &mcp_servers)
         );
         let mut messages = vec![Message::User(view), Message::User(text.to_owned())];
         let mut tools = EXTRA.to_vec();
@@ -550,11 +586,15 @@ where
                 self.live_for(&report.meta);
                 messages.push(Message::User(report.meta.render(0, &report.text)));
             }
+            let mut request_tools = tools.clone();
+            if let Some(mcp) = &self.inner.mcp_session {
+                request_tools.extend(mcp.specs().await);
+            }
             let response = llm
                 .complete(CompletionRequest {
                     system: &system,
                     messages: &messages,
-                    tools: &tools,
+                    tools: &request_tools,
                 })
                 .await?;
             if self.inner.messengers.is_some()
@@ -585,21 +625,37 @@ where
                     &format!("{} {}", call.name, call.arguments),
                     None,
                 )?;
-                let content = match self.execute(&call).await {
-                    Ok(content) => content,
-                    Err(error) => format!("error: {error}"),
+                let (mut content, mut images) = match self.execute(&call).await {
+                    Ok(result) => result,
+                    Err(error) => (format!("error: {error}"), Vec::new()),
                 };
-                let content = if matches!(call.name.as_str(), "zoom" | "history" | "search") {
-                    content
+                let echo = if images.is_empty() {
+                    content.clone()
                 } else {
-                    memory::clip_tool_output(&content)
+                    let echo = format!("{content}\n[{} image(s) omitted]", images.len());
+                    if !selection.images {
+                        images.clear();
+                        content = echo.clone();
+                    }
+                    echo
                 };
-                self.inner.memory.append(Kind::Echo, &content, None)?;
+                let clip = !matches!(call.name.as_str(), "zoom" | "history" | "search");
+                let content = if clip {
+                    memory::clip_tool_output(&content)
+                } else {
+                    content
+                };
+                let echo = if clip {
+                    memory::clip_tool_output(&echo)
+                } else {
+                    echo
+                };
+                self.inner.memory.append(Kind::Echo, &echo, None)?;
                 messages.push(Message::ToolResult {
                     id: call.id,
                     name: call.name,
                     content,
-                    images: Vec::new(),
+                    images,
                 });
             }
         }
@@ -608,8 +664,25 @@ where
     async fn execute(
         &self,
         call: &crate::ToolCallRequest,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(match call.name.as_str() {
+    ) -> Result<(String, Vec<storage::Image>), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(mcp) = &self.inner.mcp_session {
+            if let Some(result) = mcp.execute(&call.name, &call.arguments).await {
+                let outcome = result
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                return Ok((
+                    outcome.content,
+                    outcome
+                        .images
+                        .into_iter()
+                        .map(|image| storage::Image {
+                            mime: image.mime,
+                            data: image.data,
+                        })
+                        .collect(),
+                ));
+            }
+        }
+        let content = match call.name.as_str() {
             "watch" | "unwatch" | "watches" => crate::watch::execute(
                 &self.inner.store,
                 self.config.as_ref(),
@@ -664,7 +737,8 @@ where
                     .await?
             }
             _ => return Err(format!("unknown tool: {}", call.name).into()),
-        })
+        };
+        Ok((content, Vec::new()))
     }
 }
 

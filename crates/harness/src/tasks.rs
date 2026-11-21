@@ -441,6 +441,9 @@ where
     if let Some(messengers) = &inner.messengers {
         session = session.with_lookup_tools(messengers.clone());
     }
+    if let Some(mcp) = &inner.mcp {
+        session = session.with_mcp_tools(Arc::new(mcp::SessionTools::new(mcp.clone())));
+    }
     Arc::new(session)
 }
 

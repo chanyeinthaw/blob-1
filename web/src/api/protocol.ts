@@ -89,6 +89,45 @@ export const DiscordDirectory = Schema.Struct({
 })
 export type DiscordDirectory = typeof DiscordDirectory.Type
 
+export const McpServer = Schema.Struct({
+  id: Schema.String,
+  transport: Schema.Literals(['stdio', 'http']),
+  command: Schema.optional(Schema.String),
+  args: Schema.optional(Schema.Array(Schema.String)),
+  url: Schema.optional(Schema.String),
+  enabled: Schema.Boolean,
+  auth: Schema.Literals(['none', 'headers', 'oauth']),
+  status: Schema.Literals([
+    'connected',
+    'connecting',
+    'idle',
+    'disconnected',
+    'needs-login',
+    'error',
+  ]),
+  error: Schema.optional(Schema.String),
+  toolCount: Schema.optional(Schema.Number),
+})
+export type McpServer = typeof McpServer.Type
+
+const StringMap = Schema.Record(Schema.String, Schema.String)
+
+export const McpAddPayload = Schema.Union([
+  Schema.Struct({
+    id: Schema.String,
+    transport: Schema.Literal('stdio'),
+    command: Schema.String,
+    args: Schema.optional(Schema.Array(Schema.String)),
+    env: Schema.optional(StringMap),
+  }),
+  Schema.Struct({
+    id: Schema.String,
+    transport: Schema.Literal('http'),
+    url: Schema.String,
+    headers: Schema.optional(StringMap),
+  }),
+])
+
 const NoPayload = Schema.Struct({})
 
 export const requests = {
@@ -162,6 +201,20 @@ export const requests = {
   'discord.setHome': {
     payload: Schema.Struct({ home: Home }),
     reply: Discord,
+  },
+  'mcp.list': { payload: NoPayload, reply: Schema.Array(McpServer) },
+  'mcp.add': { payload: McpAddPayload, reply: Schema.Array(McpServer) },
+  'mcp.remove': {
+    payload: Schema.Struct({ id: Schema.String }),
+    reply: Schema.Array(McpServer),
+  },
+  'mcp.setEnabled': {
+    payload: Schema.Struct({ id: Schema.String, enabled: Schema.Boolean }),
+    reply: Schema.Array(McpServer),
+  },
+  'mcp.login': {
+    payload: Schema.Struct({ id: Schema.String }),
+    reply: Schema.Struct({ url: Schema.String }),
   },
 }
 

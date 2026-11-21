@@ -4,6 +4,7 @@ use std::{collections::HashMap, sync::Mutex};
 
 use environment::{Environment, ToolCall, ToolInput};
 pub use llm::{CompletionRequest, CompletionResponse, Llm, LlmError, ToolCallRequest, Usage};
+use mcp::SessionTools;
 use storage::{Message, Session, SessionId, SessionStore, SessionUsage, StoreError};
 
 use crate::{compaction, prompt};
@@ -78,6 +79,7 @@ pub struct SessionHarness<L, E, S> {
     llm: L,
     memory_tools: Option<Arc<dyn MemoryTools>>,
     lookup_tools: Option<crate::Messengers>,
+    mcp_tools: Option<Arc<SessionTools>>,
     observer: Option<Arc<dyn Fn(Step) + Send + Sync>>,
     summarizer: Option<Arc<dyn Fn() -> Option<(L, Option<u32>)> + Send + Sync>>,
     environment: E,
@@ -98,6 +100,7 @@ where
             llm,
             memory_tools: None,
             lookup_tools: None,
+            mcp_tools: None,
             observer: None,
             summarizer: None,
             environment,
@@ -115,6 +118,13 @@ where
 
     pub fn with_lookup_tools(mut self, tools: crate::Messengers) -> Self {
         self.lookup_tools = Some(tools);
+        self
+    }
+
+    /// MCP session tools: `mcp_*` built-ins plus per-session tools loaded by
+    /// `mcp_search`, scoped to this session's lifetime.
+    pub fn with_mcp_tools(mut self, tools: Arc<SessionTools>) -> Self {
+        self.mcp_tools = Some(tools);
         self
     }
 
@@ -166,7 +176,11 @@ where
         };
 
         let skills = self.environment.skill_catalog().await?;
-        let system = prompt::build(&self.paths.workspace, &skills);
+        let mcp_servers = match &self.mcp_tools {
+            Some(tools) => tools.mcp().describe().await,
+            None => Vec::new(),
+        };
+        let system = prompt::build(&self.paths.workspace, &skills, &mcp_servers);
         let system = if self.memory_tools.is_some() {
             format!("{}\n\n{}", prompt::SUB_PROMPT, system)
         } else {
@@ -216,10 +230,14 @@ where
                     }
                 }
             }
+            let mut request_tools = tools.clone();
+            if let Some(mcp) = &self.mcp_tools {
+                request_tools.extend(mcp.specs().await);
+            }
             let response = match self.llm.complete(CompletionRequest {
                 system: &system,
                 messages: &view,
-                tools: &tools,
+                tools: &request_tools,
             }).await {
                 Ok(response) => response,
                 Err(LlmError::ContextOverflow(_)) if !overflow_retried => {
@@ -320,6 +338,21 @@ where
                             }
                         })
                         .map_err(|e| e.to_string())
+                } else if let Some(result) = match &self.mcp_tools {
+                    Some(mcp) => mcp.execute(&call.name, &call.arguments).await,
+                    None => None,
+                } {
+                    result.map(|outcome| {
+                        images = outcome
+                            .images
+                            .into_iter()
+                            .map(|image| storage::Image {
+                                mime: image.mime,
+                                data: image.data,
+                            })
+                            .collect();
+                        outcome.content
+                    })
                 } else {
                     match ToolInput::parse(&call.name, &call.arguments) {
                         Ok(input) => self

@@ -5,10 +5,10 @@ use argon2::{
 use axum::{
     extract::{
         ws::{CloseFrame, Message, WebSocket},
-        State, WebSocketUpgrade,
+        Query, State, WebSocketUpgrade,
     },
     http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -19,10 +19,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{BTreeMap, HashMap},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
-use storage::{ConfigStore, MessengerStore, ReasoningLevel, WebAuthStore};
+use storage::{ConfigStore, McpServer, McpStore, McpTransport, MessengerStore, ReasoningLevel, WebAuthStore};
 use storage_sqlite::SqliteStorage;
 
 const LIFETIME: i64 = 30 * 86400;
@@ -31,6 +32,15 @@ struct WebContext {
     store: Arc<SqliteStorage>,
     discord: Arc<std::sync::OnceLock<Arc<messenger_discord::Discord>>>,
     settings_lock: tokio::sync::Mutex<()>,
+    mcp: mcp::Mcp,
+    public_url: Option<url::Url>,
+}
+impl WebContext {
+    fn secure_cookie(&self) -> bool {
+        self.public_url
+            .as_ref()
+            .is_some_and(|url| url.scheme() == "https")
+    }
 }
 impl std::ops::Deref for WebContext {
     type Target = SqliteStorage;
@@ -70,21 +80,41 @@ pub fn set_password(store: &SqliteStorage) -> crate::Result<()> {
     Ok(())
 }
 
+/// Validate `--public-url`: an absolute http(s) base URL the deployment is
+/// reached at (e.g. a TLS-terminating proxy like Tailscale Serve). No path,
+/// query or fragment.
+pub fn public_url(raw: &str) -> crate::Result<url::Url> {
+    let url = url::Url::parse(raw).map_err(|error| format!("invalid --public-url '{raw}': {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") || !url.has_host() {
+        return Err("--public-url must be an absolute http(s) URL".into());
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return Err("--public-url must not have a path, query or fragment".into());
+    }
+    Ok(url)
+}
+
 pub async fn serve(
     listener: tokio::net::TcpListener,
     store: Arc<SqliteStorage>,
     discord: Arc<std::sync::OnceLock<Arc<messenger_discord::Discord>>>,
+    mcp: mcp::Mcp,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    public_url: Option<url::Url>,
 ) -> crate::Result<()> {
     let store = Arc::new(WebContext {
         store,
         discord,
         settings_lock: tokio::sync::Mutex::new(()),
+        mcp,
+        public_url,
     });
     let app = Router::new()
         .route("/api/session", get(session))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
+        .route("/api/mcp/login", get(mcp_login))
+        .route("/api/mcp/callback", get(mcp_callback))
         .route("/ws", get(ws))
         .fallback(assets)
         .with_state(store);
@@ -120,14 +150,15 @@ fn hash(token: &str) -> Option<Vec<u8>> {
     }
     Some(Sha256::digest(bytes).to_vec())
 }
-fn cookie(token: &str) -> HeaderValue {
+fn cookie(token: &str, secure: bool) -> HeaderValue {
     HeaderValue::from_str(&format!(
-        "{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={LIFETIME}"
+        "{COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={LIFETIME}{}",
+        if secure { "; Secure" } else { "" }
     ))
     .unwrap()
 }
 fn authenticated(
-    store: &SqliteStorage,
+    ctx: &WebContext,
     headers: &HeaderMap,
 ) -> Result<Option<HeaderValue>, StatusCode> {
     let Some(token) = token(headers) else {
@@ -137,9 +168,9 @@ fn authenticated(
         return Ok(None);
     };
     let now = now();
-    store
+    ctx.store
         .authenticate_web_session(&hash, now, now + LIFETIME)
-        .map(|valid| valid.then(|| cookie(token)))
+        .map(|valid| valid.then(|| cookie(token, ctx.secure_cookie())))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 async fn session(State(store): State<Context>, headers: HeaderMap) -> Response {
@@ -195,7 +226,7 @@ async fn login(State(store): State<Context>, Json(input): Json<Login>) -> Respon
     }
     (
         StatusCode::NO_CONTENT,
-        [(header::SET_COOKIE, cookie(&token))],
+        [(header::SET_COOKIE, cookie(&token, store.secure_cookie()))],
     )
         .into_response()
 }
@@ -209,7 +240,7 @@ async fn logout(State(store): State<Context>, headers: HeaderMap) -> Response {
         StatusCode::NO_CONTENT,
         [(
             header::SET_COOKIE,
-            HeaderValue::from_static("blob_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"),
+            HeaderValue::from_static("blob_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"),
         )],
     )
         .into_response()
@@ -224,17 +255,11 @@ async fn ws(
         Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
         Err(e) => return e.into_response(),
     };
-    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
     let origin = headers
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<Uri>().ok());
-    if !origin.as_ref().is_some_and(|o| {
-        matches!(o.scheme_str(), Some("http" | "https"))
-            && o.authority().map(|a| a.as_str()) == host
-            && matches!(o.path(), "" | "/")
-            && o.query().is_none()
-    }) {
+    if !origin_ok(origin.as_ref(), &headers, store.public_url.as_ref()) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let mut response = upgrade
@@ -243,6 +268,118 @@ async fn ws(
     response.headers_mut().insert(header::SET_COOKIE, cookie);
     response
 }
+/// A bare origin (`scheme://host[:port]`) must equal the public URL's; a
+/// browser omits the port when it is the scheme's default.
+fn origin_ok(origin: Option<&Uri>, headers: &HeaderMap, public_url: Option<&url::Url>) -> bool {
+    let Some(origin) = origin else {
+        return false;
+    };
+    if !(matches!(origin.path(), "" | "/") && origin.query().is_none()) {
+        return false;
+    }
+    match public_url {
+        Some(url) => {
+            let port = origin.port_u16().or_else(|| match origin.scheme_str() {
+                Some("http") => Some(80),
+                Some("https") => Some(443),
+                _ => None,
+            });
+            origin.scheme_str() == Some(url.scheme())
+                && origin.host() == url.host_str()
+                && port == url.port_or_known_default()
+        }
+        None => {
+            let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+            matches!(origin.scheme_str(), Some("http" | "https"))
+                && origin.authority().map(|a| a.as_str()) == host
+        }
+    }
+}
+/// Scheme+host for the OAuth redirect/callback URI: the `--public-url` base
+/// when set, else the Host header honoring a TLS-terminating proxy via
+/// X-Forwarded-Proto (e.g. Tailscale).
+fn request_origin(ctx: &WebContext, headers: &HeaderMap) -> Option<String> {
+    if let Some(url) = &ctx.public_url {
+        return Some(url.as_str().trim_end_matches('/').to_string());
+    }
+    let host = headers.get(header::HOST)?.to_str().ok()?;
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    Some(format!("{scheme}://{host}"))
+}
+
+/// `/api/mcp/login?id=<server>` begins the OAuth flow and redirects to the
+/// authorization URL. Session-authenticated like the rest of the web API.
+async fn mcp_login(
+    State(ctx): State<Context>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    match authenticated(&ctx, &headers) {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(e) => return e.into_response(),
+    }
+    let Some(id) = params.get("id") else {
+        return (StatusCode::BAD_REQUEST, "missing ?id=").into_response();
+    };
+    let Some(origin) = request_origin(&ctx, &headers) else {
+        return (StatusCode::BAD_REQUEST, "missing Host header").into_response();
+    };
+    match ctx
+        .mcp
+        .begin_login(id, &format!("{origin}/api/mcp/callback"))
+        .await
+    {
+        Ok(url) => Redirect::to(&url).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
+    }
+}
+
+/// `/api/mcp/callback` completes OAuth and lands the browser on the MCP
+/// settings page. The `state` parameter identifies the server and is checked
+/// against stored OAuth state.
+async fn mcp_callback(
+    State(ctx): State<Context>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    match authenticated(&ctx, &headers) {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(e) => return e.into_response(),
+    }
+    let (Some(code), Some(state)) = (params.get("code"), params.get("state")) else {
+        return (StatusCode::BAD_REQUEST, "missing ?code= or ?state=").into_response();
+    };
+    match ctx
+        .mcp
+        .complete_login(code, state, params.get("iss").map(String::as_str))
+        .await
+    {
+        Ok(_) => Redirect::to("/settings/mcp").into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
+    }
+}
+
+async fn mcp_reply(mcp: &mcp::Mcp) -> crate::Result<Value> {
+    Ok(serde_json::to_value(mcp.server_statuses().await)?)
+}
+
+fn str_map(payload: &Value, key: &str) -> BTreeMap<String, String> {
+    payload
+        .get(key)
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn identity_reply(store: &SqliteStorage) -> crate::Result<Value> {
     let identity = store.identity()?;
     Ok(
@@ -300,7 +437,12 @@ fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
 fn numeric(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
-async fn handle(ctx: &Context, request_type: &str, payload: Value) -> Result<Value, String> {
+async fn handle(
+    ctx: &Context,
+    request_type: &str,
+    payload: Value,
+    headers: &HeaderMap,
+) -> Result<Value, String> {
     let store = &ctx.store;
     let result: crate::Result<Value> = async {
         let invalid = || format!("Invalid {request_type} payload");
@@ -373,6 +515,35 @@ async fn handle(ctx: &Context, request_type: &str, payload: Value) -> Result<Val
                 } discord_reply(store)
             },
             "discord.directory" => { if let Some(client) = ctx.discord.get() { let (channels,people) = match client.directory().await { Ok(result) => result, Err(error) => { eprintln!("discord directory: {error}"); Default::default() } }; Ok(json!({"channels":channels.into_iter().map(|(id,name,server)| json!({"id":id,"name":name,"server":server})).collect::<Vec<_>>(),"people":people.into_iter().map(|p| json!({"id":p.id,"name":p.name})).collect::<Vec<_>>() })) } else { Ok(json!({"channels":[],"people":[]})) } },
+            "mcp.list" => Ok(mcp_reply(&ctx.mcp).await?),
+            "mcp.add" => {
+                let id = get("id")?;
+                if !mcp::valid_id(id) { return Err("Invalid id: use lowercase letters, digits and -".into()); }
+                let args = payload.get("args").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+                let transport = match get("transport")? {
+                    "stdio" => McpTransport::Stdio { command: get("command")?.to_string(), args, env: str_map(&payload, "env") },
+                    "http" => McpTransport::Http { url: get("url")?.to_string(), headers: str_map(&payload, "headers") },
+                    _ => return Err(invalid().into()),
+                };
+                store.save_mcp_server(&McpServer { id: id.to_string(), transport, enabled: true })?;
+                Ok(mcp_reply(&ctx.mcp).await?)
+            },
+            "mcp.remove" => { let id = get("id")?; store.remove_mcp_server(id)?; Ok(mcp_reply(&ctx.mcp).await?) },
+            "mcp.setEnabled" => {
+                let id = get("id")?;
+                let enabled = payload.get("enabled").and_then(Value::as_bool).ok_or_else(invalid)?;
+                let mut server = store.mcp_servers()?.into_iter().find(|server| server.id == id).ok_or_else(|| format!("no MCP server '{id}'"))?;
+                server.enabled = enabled;
+                store.save_mcp_server(&server)?;
+                Ok(mcp_reply(&ctx.mcp).await?)
+            },
+            "mcp.login" => {
+                let id = get("id")?;
+                let server = store.mcp_servers()?.into_iter().find(|server| server.id == id).ok_or_else(|| format!("no MCP server '{id}'"))?;
+                if !matches!(server.transport, McpTransport::Http { .. }) { return Err(format!("MCP server '{id}' is not an HTTP server").into()); }
+                let origin = request_origin(ctx, headers).ok_or("missing Host header")?;
+                Ok(json!({"url": format!("{origin}/api/mcp/login?id={id}")}))
+            },
             _ => Err(format!("Unknown request: {request_type}").into()),
         }
     }.await;
@@ -417,8 +588,9 @@ async fn socket_loop(socket: WebSocket, ctx: Context, headers: HeaderMap) {
         };
         let tx = tx.clone();
         let ctx = ctx.clone();
+        let headers = headers.clone();
         tokio::spawn(async move {
-            let reply = match handle(&ctx, &kind, payload).await {
+            let reply = match handle(&ctx, &kind, payload, &headers).await {
                 Ok(payload) => json!({"id": id, "ok": true, "payload": payload}),
                 Err(error) => json!({"id": id, "ok": false, "error": error}),
             };

@@ -6,6 +6,7 @@ import { Url } from 'foldkit/url'
 import * as Login from './page/login'
 import * as Discord from './page/settings/discord'
 import * as Identity from './page/settings/identity'
+import * as Mcp from './page/settings/mcp'
 import * as Models from './page/settings/models'
 import * as Providers from './page/settings/providers'
 import * as Toast from './ui/toast'
@@ -25,6 +26,7 @@ export const Message = defineMessageUnion({
   GotModelsMessage: { message: Models.Message },
   GotProvidersMessage: { message: Providers.Message },
   GotDiscordMessage: { message: Discord.Message },
+  GotMcpMessage: { message: Mcp.Message },
   GotToastMessage: { message: Toast.Message },
 })
 

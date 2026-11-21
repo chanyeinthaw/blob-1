@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
@@ -322,6 +322,8 @@ pub trait ConfigStore: Send + Sync {
     fn set_home(&self, home: Option<&Home>) -> Result<(), StoreError>;
     fn identity(&self) -> Result<Option<String>, StoreError>;
     fn set_identity(&self, text: Option<&str>) -> Result<(), StoreError>;
+    fn public_url(&self) -> Result<Option<String>, StoreError>;
+    fn set_public_url(&self, url: Option<&str>) -> Result<(), StoreError>;
     fn providers(&self) -> Result<Vec<Provider>, StoreError>;
     fn save_provider(&self, provider: Provider) -> Result<(), StoreError>;
     fn remove_provider(&self, id: &ProviderId) -> Result<(), StoreError>;
@@ -815,4 +817,120 @@ pub fn render_checkin_body(watches: &[Watch], local: impl Fn(i64) -> String) -> 
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Configured MCP server. `env` carries literal values into the child
+/// process; `headers` maps a header name to the environment variable
+/// holding its value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpTransport {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+    },
+    Http {
+        url: String,
+        headers: BTreeMap<String, String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServer {
+    pub id: String,
+    pub transport: McpTransport,
+    pub enabled: bool,
+}
+
+/// MCP server configuration plus OAuth state. Token `credentials` and
+/// client `registration` are rmcp-serialized JSON; states live in
+/// `mcp_oauth_states` keyed by CSRF.
+pub trait McpStore: Send + Sync {
+    fn mcp_servers(&self) -> Result<Vec<McpServer>, StoreError>;
+    fn save_mcp_server(&self, server: &McpServer) -> Result<(), StoreError>;
+    fn remove_mcp_server(&self, id: &str) -> Result<bool, StoreError>;
+    fn mcp_oauth(
+        &self,
+        server: &str,
+    ) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>), StoreError>;
+    fn save_mcp_credentials(
+        &self,
+        server: &str,
+        credentials: Option<&serde_json::Value>,
+    ) -> Result<(), StoreError>;
+    fn save_mcp_registration(
+        &self,
+        server: &str,
+        registration: &serde_json::Value,
+    ) -> Result<(), StoreError>;
+    fn mcp_oauth_state(
+        &self,
+        csrf: &str,
+    ) -> Result<Option<(String, serde_json::Value)>, StoreError>;
+    fn save_mcp_oauth_state(
+        &self,
+        server: &str,
+        csrf: &str,
+        state: &serde_json::Value,
+        created: i64,
+    ) -> Result<(), StoreError>;
+    fn delete_mcp_oauth_state(&self, csrf: &str) -> Result<(), StoreError>;
+}
+
+impl<T: McpStore + ?Sized> McpStore for Arc<T> {
+    fn mcp_servers(&self) -> Result<Vec<McpServer>, StoreError> {
+        (**self).mcp_servers()
+    }
+
+    fn save_mcp_server(&self, server: &McpServer) -> Result<(), StoreError> {
+        (**self).save_mcp_server(server)
+    }
+
+    fn remove_mcp_server(&self, id: &str) -> Result<bool, StoreError> {
+        (**self).remove_mcp_server(id)
+    }
+
+    fn mcp_oauth(
+        &self,
+        server: &str,
+    ) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>), StoreError> {
+        (**self).mcp_oauth(server)
+    }
+
+    fn save_mcp_credentials(
+        &self,
+        server: &str,
+        credentials: Option<&serde_json::Value>,
+    ) -> Result<(), StoreError> {
+        (**self).save_mcp_credentials(server, credentials)
+    }
+
+    fn save_mcp_registration(
+        &self,
+        server: &str,
+        registration: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        (**self).save_mcp_registration(server, registration)
+    }
+
+    fn mcp_oauth_state(
+        &self,
+        csrf: &str,
+    ) -> Result<Option<(String, serde_json::Value)>, StoreError> {
+        (**self).mcp_oauth_state(csrf)
+    }
+
+    fn save_mcp_oauth_state(
+        &self,
+        server: &str,
+        csrf: &str,
+        state: &serde_json::Value,
+        created: i64,
+    ) -> Result<(), StoreError> {
+        (**self).save_mcp_oauth_state(server, csrf, state, created)
+    }
+
+    fn delete_mcp_oauth_state(&self, csrf: &str) -> Result<(), StoreError> {
+        (**self).delete_mcp_oauth_state(csrf)
+    }
 }

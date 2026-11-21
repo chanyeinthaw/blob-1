@@ -375,10 +375,10 @@ fn to_rig_request(
 }
 
 fn tool_definition(spec: &ToolSpec) -> Result<ToolDefinition, LlmError> {
-    let parameters = serde_json::from_str(spec.input_schema).map_err(request_error)?;
+    let parameters = serde_json::from_str(&spec.input_schema).map_err(request_error)?;
     Ok(ToolDefinition::new(
-        tool_name(spec.name)?,
-        spec.description,
+        tool_name(&spec.name)?,
+        spec.description.clone(),
         parameters,
     ))
 }

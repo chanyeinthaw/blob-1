@@ -65,6 +65,12 @@ export const chat = (className: string): Html =>
     'M21 12c0 4.4-4 8-9 8a9.8 9.8 0 01-2.6-.35A6 6 0 015.4 21a6 6 0 01-.5-.07 4.5 4.5 0 001-2.05c.1-.45-.13-.9-.47-1.22C3.9 16.2 3 14.2 3 12c0-4.4 4-8 9-8s9 3.6 9 8z',
   )
 
+export const terminal = (className: string): Html =>
+  stroke(
+    className,
+    'M3.75 4.5h16.5a.75.75 0 01.75.75v13.5a.75.75 0 01-.75.75H3.75a.75.75 0 01-.75-.75V5.25a.75.75 0 01.75-.75zM7.5 9l3 3-3 3m5.25 0h3.75',
+  )
+
 export const link = (className: string): Html =>
   stroke(
     className,

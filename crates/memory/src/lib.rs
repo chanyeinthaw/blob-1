@@ -54,6 +54,7 @@ struct State {
     seen: MemoryView,
     chat_size: usize,
     seen_size: usize,
+    chat_generation: u64,
 }
 
 struct Inner<S, C> {
@@ -274,6 +275,7 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
             seen: store.view(ViewName::Seen)?.unwrap_or_default(),
             chat_size: 0,
             seen_size: 0,
+            chat_generation: 0,
         };
         state.chat_size = state
             .chat
@@ -424,6 +426,9 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
             notified.await;
         }
     }
+    pub fn chat_generation(&self) -> u64 {
+        self.lock().chat_generation
+    }
     pub fn view(&self) -> Result<String, MemoryError> {
         let s = self.lock();
         Ok(render(&s.chat, &s.nodes, u64::MAX, false))
@@ -546,11 +551,14 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
                 let result = self
                     .inner
                     .store
-                    .put_node(node, &[chat_change, seen_change])
+                    .put_node(node, &[chat_change.clone(), seen_change])
                     .map_err(MemoryError::from);
                 if result.is_ok() {
                     state.nodes.insert(p, text);
                     if let Some(chat) = chat {
+                        if !chat_change.removed.is_empty() {
+                            state.chat_generation += 1;
+                        }
                         state.chat = chat;
                     }
                     if let Some(seen) = seen {
