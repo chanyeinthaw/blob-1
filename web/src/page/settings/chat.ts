@@ -105,6 +105,8 @@ export const Message = defineMessageUnion({
   FailedRemoveToken: { error: Schema.String },
   SucceededRefreshStatus: { discord: Discord },
   FailedRefreshStatus: {},
+  SucceededLoadDirectory: { directory: DiscordDirectory },
+  FailedLoadDirectory: {},
 })
 export type Message = typeof Message.Type
 
@@ -277,8 +279,55 @@ const RefreshStatus = Command.define('RefreshStatus', {
   ),
 })
 
+const LoadDirectory = Command.define('LoadDirectory', {
+  messages: [Message.SucceededLoadDirectory, Message.FailedLoadDirectory],
+  execute: request('discord.directory', {}).pipe(
+    Effect.map(directory => Message.SucceededLoadDirectory({ directory })),
+    Effect.catch(() => Effect.succeed(Message.FailedLoadDirectory())),
+  ),
+})
+
+const emptyDirectory: DiscordDirectory = { channels: [], people: [] }
+
 const refreshWhileConnecting = (discord: Discord) =>
   discord.connection.state === 'connecting' ? [RefreshStatus()] : []
+
+const afterStatus = (model: Model, discord: Discord) => [
+  ...refreshWhileConnecting(discord),
+  ...(discord.connection.state === 'online' &&
+  Option.exists(
+    readLoaded(model),
+    loaded => loaded.connection.state !== 'online',
+  )
+    ? [LoadDirectory()]
+    : []),
+]
+
+const withDirectory = (model: Model, directory: DiscordDirectory): Model =>
+  Option.match(readLoaded(model), {
+    onNone: () => model,
+    onSome: loaded => {
+      const home = loaded.savedHome
+      return modifyFields(model, {
+        state: () => modifyFields(loaded, { directory: () => directory }),
+        channelDropdown: dropdown =>
+          SharedCombobox.setSelection(
+            dropdown,
+            home.kind === 'channel'
+              ? `#${directory.channels.find(channel => channel.id === home.id)?.name ?? home.id}`
+              : '',
+          ),
+        personDropdown: dropdown =>
+          SharedCombobox.setSelection(
+            dropdown,
+            home.kind === 'dm'
+              ? (directory.people.find(person => person.id === home.user)
+                  ?.name ?? home.user)
+              : '',
+          ),
+      })
+    },
+  })
 
 const withDiscord = (loaded: Loaded, discord: Discord): Loaded =>
   modifyFields(loaded, {
@@ -693,12 +742,16 @@ export const update = (model: Model, message: Message) =>
       ),
 
     SucceededSaveToken: ({ discord }) => ({
-      model: updateLoaded(model, loaded =>
-        modifyFields(withDiscord(loaded, discord), {
-          isEditingToken: () => false,
-          tokenInput: () => '',
-          isSavingToken: () => false,
-        }),
+      model: updateLoaded(
+        discord.connection.state === 'online'
+          ? model
+          : withDirectory(model, emptyDirectory),
+        loaded =>
+          modifyFields(withDiscord(loaded, discord), {
+            isEditingToken: () => false,
+            tokenInput: () => '',
+            isSavingToken: () => false,
+          }),
       ),
       commands: refreshWhileConnecting(discord),
     }),
@@ -726,7 +779,7 @@ export const update = (model: Model, message: Message) =>
     },
 
     SucceededRemoveToken: ({ discord }) => ({
-      model: updateLoaded(model, loaded =>
+      model: updateLoaded(withDirectory(model, emptyDirectory), loaded =>
         modifyFields(withDiscord(loaded, discord), {
           isEditingToken: () => true,
           tokenInput: () => '',
@@ -742,10 +795,29 @@ export const update = (model: Model, message: Message) =>
 
     SucceededRefreshStatus: ({ discord }) => ({
       model: updateLoaded(model, loaded => withDiscord(loaded, discord)),
-      commands: refreshWhileConnecting(discord),
+      commands: afterStatus(model, discord),
     }),
 
-    FailedRefreshStatus: () => ({ model }),
+    FailedRefreshStatus: () => ({
+      model,
+      commands: Option.exists(
+        readLoaded(model),
+        loaded => loaded.connection.state === 'connecting',
+      )
+        ? [RefreshStatus()]
+        : [],
+    }),
+
+    SucceededLoadDirectory: ({ directory }) => ({
+      model: Option.exists(
+        readLoaded(model),
+        loaded => loaded.connection.state === 'online',
+      )
+        ? withDirectory(model, directory)
+        : model,
+    }),
+
+    FailedLoadDirectory: () => ({ model }),
   })
 
 const segmentedGroupClassName =
@@ -1145,6 +1217,7 @@ const tokenEditView = (loaded: Loaded, h: HtmlBuilder<Message>): Html =>
                       {
                         label: 'Cancel',
                         variant: 'secondary',
+                        isDisabled: loaded.isSavingToken,
                         maybeOnClick: Option.some(Message.ClickedCancelToken()),
                       },
                       h,

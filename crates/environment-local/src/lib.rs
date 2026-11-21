@@ -259,6 +259,7 @@ impl LocalEnvironment {
         let mut child = tokio::process::Command::new("bash")
             .arg("-c")
             .arg(command)
+            .env_remove("BLOB_1_APP_KEY")
             .current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(writer.try_clone().map_err(io_error)?)

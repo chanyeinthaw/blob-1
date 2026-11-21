@@ -711,7 +711,19 @@ pub async fn serve(
             let models = models.clone();
             move || models.current().ok().and_then(|current| current.utility)
         });
-    let harness = harness.with_messengers(messengers.clone());
+    let harness = harness
+        .with_messengers(messengers.clone())
+        .with_schedule_gate({
+            let models = models.clone();
+            let discord = discord.clone();
+            move || {
+                models.current().is_ok()
+                    && matches!(
+                        discord.connection(),
+                        messenger_discord::Connection::Online { .. }
+                    )
+            }
+        });
     let (tx, mut rx) = tokio::sync::mpsc::channel(128);
     let listener_discord = discord.clone();
     let listener = tokio::spawn(async move { listener_discord.listen(tx).await });

@@ -281,7 +281,11 @@ impl Mcp {
             match &config.transport {
                 McpTransport::Stdio { command, args, env } => {
                     let mut process = tokio::process::Command::new(command);
-                    process.args(args).envs(env).kill_on_drop(true);
+                    process
+                        .args(args)
+                        .env_remove("BLOB_1_APP_KEY")
+                        .envs(env)
+                        .kill_on_drop(true);
                     let mut process = process_wrap::tokio::CommandWrap::from(process);
                     process.wrap(process_wrap::tokio::ProcessGroup::leader());
                     match TokioChildProcess::new(process) {

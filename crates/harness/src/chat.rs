@@ -215,6 +215,7 @@ pub(crate) struct Inner<E, S, M, F: Models> {
     pub mcp_session: Option<Arc<mcp::SessionTools>>,
     pub mcp_view_generation: Mutex<u64>,
     pub pulses: Mutex<Vec<(u64, tokio::task::Id)>>,
+    pub schedule_gate: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 pub struct ChatHarness<E, S, M, F: Models> {
@@ -316,6 +317,7 @@ where
                 mcp_session: None,
                 mcp_view_generation: Mutex::new(0),
                 pulses: Mutex::new(Vec::new()),
+                schedule_gate: None,
             }),
             turn: tokio::sync::Mutex::new(()),
             config,
@@ -326,6 +328,14 @@ where
         Arc::get_mut(&mut self.inner)
             .expect("unshared chat")
             .messengers = Some(messengers);
+        self
+    }
+
+    /// Schedules and check-ins wait while `ready` is false; due jobs then fire late.
+    pub fn with_schedule_gate(mut self, ready: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("unshared chat")
+            .schedule_gate = Some(Arc::new(ready));
         self
     }
 

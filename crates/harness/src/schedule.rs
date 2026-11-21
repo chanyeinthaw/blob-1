@@ -292,6 +292,15 @@ where
         let mut next_checkin_at = None;
         let mut last_slot: Option<DateTime<Utc>> = None;
         loop {
+            if self
+                .inner
+                .schedule_gate
+                .as_ref()
+                .is_some_and(|ready| !ready())
+            {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
             let now = Utc::now();
             let result: Result<()> = async {
                 let config = self.inner.store.checkin()?;

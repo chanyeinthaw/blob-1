@@ -895,6 +895,7 @@ async fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<(
             if command.messenger() != "discord" {
                 return Err(format!("unknown messenger: {}", command.messenger()).into());
             }
+            store.require_key()?;
             match command {
                 MessengerTokenCommand::Set { messenger } => {
                     let mut token = String::new();

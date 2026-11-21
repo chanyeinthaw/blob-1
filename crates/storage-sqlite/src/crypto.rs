@@ -124,12 +124,34 @@ pub(super) fn setup(
     }
 }
 
-/// Encrypts plaintext secrets left over from before the database was keyed;
-/// idempotent, so racing opens converge.
+/// Encrypts plaintext secrets left over from before the database was keyed.
+/// Runs in one immediate transaction and only rewrites rows that still hold
+/// plaintext, so it never overwrites a concurrent update. Freed plaintext is
+/// zeroed and checkpointed out of the WAL.
 pub(super) fn migrate(
     connection: &Connection,
     cipher: &XChaCha20Poly1305,
 ) -> Result<(), StoreError> {
+    connection
+        .execute_batch("PRAGMA secure_delete = ON; BEGIN IMMEDIATE")
+        .map_err(backend)?;
+    match seal_plaintext(connection, cipher) {
+        Ok(0) => connection.execute_batch("COMMIT").map_err(backend),
+        Ok(_) => connection
+            .execute_batch("COMMIT; PRAGMA wal_checkpoint(TRUNCATE)")
+            .map_err(backend),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn seal_plaintext(
+    connection: &Connection,
+    cipher: &XChaCha20Poly1305,
+) -> Result<usize, StoreError> {
+    let mut sealed = 0;
     let servers = connection
         .prepare("SELECT id, env, headers FROM mcp_servers")
         .map_err(backend)?
@@ -144,14 +166,18 @@ pub(super) fn migrate(
         .collect::<Result<Vec<_>, _>>()
         .map_err(backend)?;
     for (id, env, headers) in servers {
+        let (new_env, new_headers) = (
+            seal_map_with(cipher, &env)?,
+            seal_map_with(cipher, &headers)?,
+        );
+        if new_env == env && new_headers == headers {
+            continue;
+        }
+        sealed += 1;
         connection
             .execute(
                 "UPDATE mcp_servers SET env = ?2, headers = ?3 WHERE id = ?1",
-                params![
-                    id,
-                    seal_map_with(cipher, &env)?,
-                    seal_map_with(cipher, &headers)?
-                ],
+                params![id, new_env, new_headers],
             )
             .map_err(backend)?;
     }
@@ -169,18 +195,21 @@ pub(super) fn migrate(
         .collect::<Result<Vec<_>, _>>()
         .map_err(backend)?;
     for (server, credentials, registration) in tokens {
+        let seal = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(|v| seal_secret_with(cipher, v))
+                .transpose()
+        };
+        let (new_credentials, new_registration) = (seal(&credentials)?, seal(&registration)?);
+        if new_credentials == credentials && new_registration == registration {
+            continue;
+        }
+        sealed += 1;
         connection
             .execute(
                 "UPDATE mcp_tokens SET credentials = ?2, registration = ?3 WHERE server = ?1",
-                params![
-                    server,
-                    credentials
-                        .map(|v| seal_secret_with(cipher, &v))
-                        .transpose()?,
-                    registration
-                        .map(|v| seal_secret_with(cipher, &v))
-                        .transpose()?,
-                ],
+                params![server, new_credentials, new_registration],
             )
             .map_err(backend)?;
     }
@@ -194,6 +223,10 @@ pub(super) fn migrate(
         .collect::<Result<Vec<_>, _>>()
         .map_err(backend)?;
     for (csrf, state) in states {
+        if state.starts_with(PREFIX) {
+            continue;
+        }
+        sealed += 1;
         connection
             .execute(
                 "UPDATE mcp_oauth_states SET state = ?2 WHERE csrf = ?1",
@@ -211,6 +244,10 @@ pub(super) fn migrate(
         .collect::<Result<Vec<_>, _>>()
         .map_err(backend)?;
     for (messenger, token) in messengers {
+        if token.starts_with(PREFIX) {
+            continue;
+        }
+        sealed += 1;
         connection
             .execute(
                 "UPDATE messenger_tokens SET token = ?2 WHERE messenger = ?1",
@@ -218,10 +255,15 @@ pub(super) fn migrate(
             )
             .map_err(backend)?;
     }
-    Ok(())
+    Ok(sealed)
 }
 
 impl SqliteStorage {
+    /// Fails with "set BLOB_1_APP_KEY" when the store was opened without a key.
+    pub fn require_key(&self) -> Result<(), StoreError> {
+        self.cipher().map(|_| ())
+    }
+
     fn cipher(&self) -> Result<&XChaCha20Poly1305, StoreError> {
         self.key
             .as_ref()
