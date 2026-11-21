@@ -127,7 +127,8 @@ pub(super) fn setup(
 /// Encrypts plaintext secrets left over from before the database was keyed.
 /// Runs in one immediate transaction and only rewrites rows that still hold
 /// plaintext, so it never overwrites a concurrent update. Freed plaintext is
-/// zeroed and checkpointed out of the WAL.
+/// zeroed, and `secret_scrub` stays set until a truncating checkpoint clears
+/// the old pages out of the WAL; later opens retry it.
 pub(super) fn migrate(
     connection: &Connection,
     cipher: &XChaCha20Poly1305,
@@ -135,16 +136,35 @@ pub(super) fn migrate(
     connection
         .execute_batch("PRAGMA secure_delete = ON; BEGIN IMMEDIATE")
         .map_err(backend)?;
-    match seal_plaintext(connection, cipher) {
-        Ok(0) => connection.execute_batch("COMMIT").map_err(backend),
-        Ok(_) => connection
-            .execute_batch("COMMIT; PRAGMA wal_checkpoint(TRUNCATE)")
-            .map_err(backend),
-        Err(error) => {
-            let _ = connection.execute_batch("ROLLBACK");
-            Err(error)
+    let sealed = seal_plaintext(connection, cipher).and_then(|sealed| {
+        if sealed > 0 {
+            connection
+                .execute("INSERT OR IGNORE INTO secret_scrub (id) VALUES (1)", [])
+                .map_err(backend)?;
+        }
+        Ok(())
+    });
+    if let Err(error) = sealed {
+        let _ = connection.execute_batch("ROLLBACK");
+        return Err(error);
+    }
+    connection.execute_batch("COMMIT").map_err(backend)?;
+    let pending = connection
+        .query_row("SELECT 1 FROM secret_scrub", [], |_| Ok(()))
+        .optional()
+        .map_err(backend)?
+        .is_some();
+    if pending {
+        let busy: i64 = connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .map_err(backend)?;
+        if busy == 0 {
+            connection
+                .execute("DELETE FROM secret_scrub", [])
+                .map_err(backend)?;
         }
     }
+    Ok(())
 }
 
 fn seal_plaintext(

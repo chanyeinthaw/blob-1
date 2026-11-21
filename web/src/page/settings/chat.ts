@@ -46,6 +46,7 @@ const State = defineTaggedUnion({
     tokenInput: Schema.String,
     maybeTokenError: Schema.Option(Schema.String),
     isSavingToken: Schema.Boolean,
+    tokenGeneration: Schema.String,
     allowed: Schema.Array(Schema.String),
     savedHome: Home,
     directory: DiscordDirectory,
@@ -67,6 +68,7 @@ const Confirming = Schema.Literals(['RemoveUser', 'RemoveToken'])
 
 export const Model = Schema.Struct({
   isListView: Schema.Boolean,
+  loadId: Schema.String,
   state: State,
   confirming: Confirming,
   confirm: Dialog.Model,
@@ -77,8 +79,13 @@ export const Model = Schema.Struct({
 export type Model = typeof Model.Type
 
 export const Message = defineMessageUnion({
-  SucceededLoadDiscord: { discord: Discord, directory: DiscordDirectory },
-  FailedLoadDiscord: { error: Schema.String },
+  SucceededLoadDiscord: {
+    discord: Discord,
+    directory: DiscordDirectory,
+    tokenGeneration: Schema.String,
+  },
+  FailedLoadDiscord: { error: Schema.String, loadId: Schema.String },
+  CreatedLoadId: { loadId: Schema.String },
   UpdatedAllowInput: { value: Schema.String },
   SubmittedAllowUser: {},
   SucceededAllowUser: { discord: Discord },
@@ -97,15 +104,18 @@ export const Message = defineMessageUnion({
   ClickedCancelToken: {},
   UpdatedTokenInput: { value: Schema.String },
   SubmittedToken: {},
-  SucceededSaveToken: { discord: Discord },
+  SucceededSaveToken: { discord: Discord, tokenGeneration: Schema.String },
   FailedSaveToken: { error: Schema.String },
   ClickedRemoveToken: {},
   ConfirmedRemoveToken: {},
-  SucceededRemoveToken: { discord: Discord },
+  SucceededRemoveToken: { discord: Discord, tokenGeneration: Schema.String },
   FailedRemoveToken: { error: Schema.String },
   SucceededRefreshStatus: { discord: Discord },
   FailedRefreshStatus: {},
-  SucceededLoadDirectory: { directory: DiscordDirectory },
+  SucceededLoadDirectory: {
+    directory: DiscordDirectory,
+    tokenGeneration: Schema.String,
+  },
   FailedLoadDirectory: {},
 })
 export type Message = typeof Message.Type
@@ -153,7 +163,11 @@ const homeKindOf = (home: Home): HomeKind =>
     }),
   )
 
-const loadedFrom = (discord: Discord, directory: DiscordDirectory): Loaded =>
+const loadedFrom = (
+  discord: Discord,
+  directory: DiscordDirectory,
+  tokenGeneration: string,
+): Loaded =>
   State.Loaded({
     token: discord.token,
     connection: discord.connection,
@@ -161,6 +175,7 @@ const loadedFrom = (discord: Discord, directory: DiscordDirectory): Loaded =>
     tokenInput: '',
     maybeTokenError: Option.none(),
     isSavingToken: false,
+    tokenGeneration,
     allowed: discord.allowed,
     savedHome: discord.home,
     directory,
@@ -194,22 +209,41 @@ const isSameHome = (left: Home, right: Home): boolean => {
   return left.kind === 'none' && right.kind === 'none'
 }
 
-const LoadDiscord = Command.define('LoadDiscord', {
-  messages: [Message.SucceededLoadDiscord, Message.FailedLoadDiscord],
-  execute: Effect.all(
-    {
-      discord: request('discord.get', {}),
-      directory: request('discord.directory', {}),
-    },
-    { concurrency: 'unbounded' },
-  ).pipe(
-    Effect.map(({ discord, directory }) =>
-      Message.SucceededLoadDiscord({ discord, directory }),
-    ),
-    Effect.catch(error =>
-      Effect.succeed(Message.FailedLoadDiscord({ error: error.message })),
-    ),
+const newGeneration = Effect.sync(
+  () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+)
+
+const NewLoadId = Command.define('NewLoadId', {
+  messages: [Message.CreatedLoadId],
+  execute: Effect.map(newGeneration, loadId =>
+    Message.CreatedLoadId({ loadId }),
   ),
+})
+
+const LoadDiscord = Command.define('LoadDiscord', {
+  args: { loadId: Schema.String },
+  messages: [Message.SucceededLoadDiscord, Message.FailedLoadDiscord],
+  execute: ({ loadId }) =>
+    Effect.all(
+      {
+        discord: request('discord.get', {}),
+        directory: request('discord.directory', {}),
+      },
+      { concurrency: 'unbounded' },
+    ).pipe(
+      Effect.map(({ discord, directory }) =>
+        Message.SucceededLoadDiscord({
+          discord,
+          directory,
+          tokenGeneration: loadId,
+        }),
+      ),
+      Effect.catch(error =>
+        Effect.succeed(
+          Message.FailedLoadDiscord({ error: error.message, loadId }),
+        ),
+      ),
+    ),
 })
 
 const AllowUser = Command.define('AllowUser', {
@@ -253,7 +287,11 @@ const SaveToken = Command.define('SaveToken', {
   messages: [Message.SucceededSaveToken, Message.FailedSaveToken],
   execute: ({ token }) =>
     request('discord.setToken', { token }).pipe(
-      Effect.map(discord => Message.SucceededSaveToken({ discord })),
+      Effect.flatMap(discord =>
+        Effect.map(newGeneration, tokenGeneration =>
+          Message.SucceededSaveToken({ discord, tokenGeneration }),
+        ),
+      ),
       Effect.catch(error =>
         Effect.succeed(Message.FailedSaveToken({ error: error.message })),
       ),
@@ -263,7 +301,11 @@ const SaveToken = Command.define('SaveToken', {
 const RemoveToken = Command.define('RemoveToken', {
   messages: [Message.SucceededRemoveToken, Message.FailedRemoveToken],
   execute: request('discord.clearToken', {}).pipe(
-    Effect.map(discord => Message.SucceededRemoveToken({ discord })),
+    Effect.flatMap(discord =>
+      Effect.map(newGeneration, tokenGeneration =>
+        Message.SucceededRemoveToken({ discord, tokenGeneration }),
+      ),
+    ),
     Effect.catch(error =>
       Effect.succeed(Message.FailedRemoveToken({ error: error.message })),
     ),
@@ -280,11 +322,15 @@ const RefreshStatus = Command.define('RefreshStatus', {
 })
 
 const LoadDirectory = Command.define('LoadDirectory', {
+  args: { tokenGeneration: Schema.String },
   messages: [Message.SucceededLoadDirectory, Message.FailedLoadDirectory],
-  execute: request('discord.directory', {}).pipe(
-    Effect.map(directory => Message.SucceededLoadDirectory({ directory })),
-    Effect.catch(() => Effect.succeed(Message.FailedLoadDirectory())),
-  ),
+  execute: ({ tokenGeneration }) =>
+    request('discord.directory', {}).pipe(
+      Effect.map(directory =>
+        Message.SucceededLoadDirectory({ directory, tokenGeneration }),
+      ),
+      Effect.catch(() => Effect.succeed(Message.FailedLoadDirectory())),
+    ),
 })
 
 const emptyDirectory: DiscordDirectory = { channels: [], people: [] }
@@ -294,13 +340,14 @@ const refreshWhileConnecting = (discord: Discord) =>
 
 const afterStatus = (model: Model, discord: Discord) => [
   ...refreshWhileConnecting(discord),
-  ...(discord.connection.state === 'online' &&
-  Option.exists(
-    readLoaded(model),
-    loaded => loaded.connection.state !== 'online',
-  )
-    ? [LoadDirectory()]
-    : []),
+  ...Option.match(readLoaded(model), {
+    onNone: () => [],
+    onSome: loaded =>
+      discord.connection.state === 'online' &&
+      loaded.connection.state !== 'online'
+        ? [LoadDirectory({ tokenGeneration: loaded.tokenGeneration })]
+        : [],
+  }),
 ]
 
 const withDirectory = (model: Model, directory: DiscordDirectory): Model =>
@@ -527,6 +574,7 @@ export const init = (
 ): Update.Return<Model, Message, Api> => ({
   model: {
     isListView,
+    loadId: '',
     state: State.Loading(),
     confirming: 'RemoveUser',
     confirm: Dialog.init({ id: 'remove-discord-user' }),
@@ -534,7 +582,7 @@ export const init = (
     channelDropdown: SharedCombobox.init('discord-channel'),
     personDropdown: SharedCombobox.init('discord-person'),
   },
-  commands: [LoadDiscord()],
+  commands: [NewLoadId()],
 })
 
 export const showList = (model: Model, isListView: boolean): Model =>
@@ -542,12 +590,20 @@ export const showList = (model: Model, isListView: boolean): Model =>
 
 export const update = (model: Model, message: Message) =>
   Message.match<UpdateReturn>(message, {
-    SucceededLoadDiscord: ({ discord, directory }) => {
+    CreatedLoadId: ({ loadId }) => ({
+      model: modifyFields(model, { loadId: () => loadId }),
+      commands: [LoadDiscord({ loadId })],
+    }),
+
+    SucceededLoadDiscord: ({ discord, directory, tokenGeneration }) => {
+      if (tokenGeneration !== model.loadId) {
+        return { model }
+      }
       const home = discord.home
       return {
         commands: refreshWhileConnecting(discord),
         model: modifyFields(model, {
-          state: () => loadedFrom(discord, directory),
+          state: () => loadedFrom(discord, directory, tokenGeneration),
           channelDropdown: dropdown =>
             SharedCombobox.setSelection(
               dropdown,
@@ -567,8 +623,11 @@ export const update = (model: Model, message: Message) =>
       }
     },
 
-    FailedLoadDiscord: ({ error }) => ({
-      model: modifyFields(model, { state: () => State.Failed({ error }) }),
+    FailedLoadDiscord: ({ error, loadId }) => ({
+      model:
+        loadId === model.loadId
+          ? modifyFields(model, { state: () => State.Failed({ error }) })
+          : model,
     }),
 
     UpdatedAllowInput: ({ value }) => ({
@@ -741,7 +800,7 @@ export const update = (model: Model, message: Message) =>
             },
       ),
 
-    SucceededSaveToken: ({ discord }) => ({
+    SucceededSaveToken: ({ discord, tokenGeneration }) => ({
       model: updateLoaded(
         discord.connection.state === 'online'
           ? model
@@ -751,6 +810,8 @@ export const update = (model: Model, message: Message) =>
             isEditingToken: () => false,
             tokenInput: () => '',
             isSavingToken: () => false,
+            tokenGeneration: current =>
+              discord.connection.state === 'online' ? current : tokenGeneration,
           }),
       ),
       commands: refreshWhileConnecting(discord),
@@ -778,12 +839,13 @@ export const update = (model: Model, message: Message) =>
       }
     },
 
-    SucceededRemoveToken: ({ discord }) => ({
+    SucceededRemoveToken: ({ discord, tokenGeneration }) => ({
       model: updateLoaded(withDirectory(model, emptyDirectory), loaded =>
         modifyFields(withDiscord(loaded, discord), {
           isEditingToken: () => true,
           tokenInput: () => '',
           maybeTokenError: () => Option.none(),
+          tokenGeneration: () => tokenGeneration,
         }),
       ),
     }),
@@ -808,10 +870,12 @@ export const update = (model: Model, message: Message) =>
         : [],
     }),
 
-    SucceededLoadDirectory: ({ directory }) => ({
+    SucceededLoadDirectory: ({ directory, tokenGeneration }) => ({
       model: Option.exists(
         readLoaded(model),
-        loaded => loaded.connection.state === 'online',
+        loaded =>
+          loaded.connection.state === 'online' &&
+          loaded.tokenGeneration === tokenGeneration,
       )
         ? withDirectory(model, directory)
         : model,

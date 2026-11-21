@@ -149,7 +149,7 @@ Blob-1 is an MCP client: chat and background tasks can call tools, read resource
 - `BLOB_1_APP_KEY` is any non-empty passphrase; `serve` requires it. Argon2id derives the 256-bit key once per open over a random 16-byte salt stored in `app_key (id=1)`, whose `canary` decrypts to a fixed value — a wrong key fails with `BLOB_1_APP_KEY does not match this database`. Secret reads and writes without a key fail with `set BLOB_1_APP_KEY`
 - Values are XChaCha20-Poly1305 with a random 24-byte nonce, stored as `enc:v1:<base64(nonce‖ciphertext)>`; encryption stays inside the storage layer so callers keep plain types. Plaintext rows seal idempotently on the first keyed open; key rotation is not supported yet
 - Encrypted columns: `mcp_servers.env`, `mcp_servers.headers`, `mcp_tokens.credentials`, `mcp_tokens.registration`, `mcp_oauth_states.state`, `messenger_tokens.token` (empty JSON maps stay plaintext). Web password/session hashes and provider `api_key_env` names are not encrypted
-- Table: `app_key`
+- Tables: `app_key`, `secret_scrub` (set while freed plaintext may still sit in the WAL; every keyed open retries a truncating checkpoint until it succeeds)
 
 ## Dev server
 
