@@ -1,0 +1,48 @@
+@import 'tailwindcss';
+@import '@fontsource-variable/inter/standard.css';
+@import '@fontsource-variable/jetbrains-mono/wght.css';
+
+@theme {
+  --color-fog: #ffffff;
+  --color-shelf: #fafafa;
+  --color-hover: #f4f4f5;
+  --color-ink: #09090b;
+  --color-slate: #52525b;
+  --color-mute: #71717a;
+  --color-hair: #e4e4e7;
+  --color-chip: #f4f4f5;
+  --color-control: #e4e4e7;
+  --color-track: #e4e4e7;
+  --color-accent: #18181b;
+  --color-ring: #a1a1aa;
+  --color-ok: #16a34a;
+  --color-tint: #f4f4f5;
+  --color-alarm: #dc2626;
+
+  --font-sans: 'Inter Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono Variable', ui-monospace, monospace;
+
+  --text-caption: 12px;
+  --text-caption--line-height: 1.45;
+  --text-body: 13px;
+  --text-body--line-height: 1.5;
+  --text-subheading: 14px;
+  --text-subheading--line-height: 1.45;
+  --text-heading: 20px;
+  --text-heading--line-height: 1.3;
+}
+
+@layer base {
+  body {
+    @apply bg-shelf font-sans text-body text-ink antialiased;
+    font-feature-settings: 'cv11', 'ss01';
+  }
+
+  ::selection {
+    @apply bg-hair text-ink;
+  }
+
+  .font-mono {
+    font-size: 0.95em;
+  }
+}

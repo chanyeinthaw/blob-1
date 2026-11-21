@@ -277,7 +277,7 @@ async fn home<S: MessengerStore>(
     }
 }
 
-impl<L, E, S, M, F: crate::Models> crate::ChatHarness<L, E, S, M, F>
+impl<E, S, M, F: crate::Models> crate::ChatHarness<E, S, M, F>
 where
     S: ScheduleStore + MessengerStore + CheckinStore + WatchStore,
 {

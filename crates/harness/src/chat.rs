@@ -126,6 +126,23 @@ pub trait Models: Send + Sync + 'static {
         choice: Option<(&str, &str)>,
         reasoning: Option<ReasoningLevel>,
     ) -> Result<(Self::Llm, Option<u32>, ModelSelection), HarnessError>;
+    /// The models the harness itself runs on, resolved from current settings.
+    /// Implementations keep the last working model per role when the current
+    /// settings no longer resolve.
+    fn current(&self) -> Result<Current<Self::Llm>, HarnessError>;
+}
+
+/// The models the harness itself uses, resolved from current settings at the
+/// start of each unit of work.
+pub struct Current<L> {
+    /// The main chat model.
+    pub main: L,
+    /// The configured compaction model and its usable context window.
+    pub summarizer: Option<(L, Option<u32>)>,
+    /// The model memory compaction uses.
+    pub compactor: L,
+    /// The utility model, when configured.
+    pub utility: Option<crate::Utility>,
 }
 
 #[derive(Clone)]
@@ -181,35 +198,26 @@ pub(crate) struct State {
 type TaskSessions<L, E, S> =
     Mutex<std::collections::HashMap<String, Arc<SessionHarness<Shared<L>, Shared<E>, S>>>>;
 
-pub(crate) struct Inner<L, E, S, M, F: Models> {
-    pub llm: Shared<L>,
+pub(crate) struct Inner<E, S, M, F: Models> {
     pub environment: Shared<E>,
     pub store: S,
     pub memory: Memory<S, M>,
     pub paths: EnvironmentPaths,
     pub models: F,
-    pub summarizer: Option<Shared<F::Llm>>,
-    pub utility: Option<crate::Utility>,
-    pub summarizer_window: Option<u32>,
     pub sessions: TaskSessions<F::Llm, E, S>,
     pub state: Mutex<State>,
     pub notify: Notify,
     pub messengers: Option<crate::Messengers>,
     pub pulses: Mutex<Vec<(u64, tokio::task::Id)>>,
 }
-type ChatConfig<L> = (
-    Option<(L, Option<u32>)>,
-    Option<crate::Utility>,
-    Arc<dyn ConfigStore>,
-);
 
-pub struct ChatHarness<L, E, S, M, F: Models> {
-    pub(crate) inner: Arc<Inner<L, E, S, M, F>>,
+pub struct ChatHarness<E, S, M, F: Models> {
+    pub(crate) inner: Arc<Inner<E, S, M, F>>,
     turn: tokio::sync::Mutex<()>,
     pub(crate) config: Arc<dyn ConfigStore>,
 }
 
-impl<L, E, S, M, F: Models> Drop for ChatHarness<L, E, S, M, F> {
+impl<E, S, M, F: Models> Drop for ChatHarness<E, S, M, F> {
     fn drop(&mut self) {
         let state = self.inner.state.lock().expect("chat state mutex poisoned");
         for task in &state.tasks {
@@ -267,39 +275,28 @@ struct Tell {
     text: String,
 }
 
-impl<L, E, S, M, F: Models> ChatHarness<L, E, S, M, F>
+impl<E, S, M, F: Models> ChatHarness<E, S, M, F>
 where
-    L: Llm + Send + Sync + 'static,
     E: Environment + 'static,
     S: SessionStore + MemoryStore + MessengerStore + ScheduleStore + WatchStore + Clone + 'static,
-    M: Llm + Send + Sync + 'static,
+    M: llm::Source + 'static,
 {
     pub fn new(
-        llm: L,
         environment: E,
         store: S,
         memory: Memory<S, M>,
         paths: EnvironmentPaths,
         models: F,
-        (summarizer, utility, config): ChatConfig<F::Llm>,
+        config: Arc<dyn ConfigStore>,
     ) -> Self {
-        let llm = Shared(Arc::new(llm));
         let environment = Shared(Arc::new(environment));
-        let (summarizer, summarizer_window) = match summarizer {
-            Some((llm, window)) => (Some(Shared(Arc::new(llm))), window),
-            None => (None, None),
-        };
         Self {
             inner: Arc::new(Inner {
-                llm,
                 environment,
                 store,
                 memory,
                 paths,
                 models,
-                summarizer,
-                utility,
-                summarizer_window,
                 sessions: Mutex::new(Default::default()),
                 state: Mutex::new(State {
                     agents: Default::default(),
@@ -314,10 +311,6 @@ where
             turn: tokio::sync::Mutex::new(()),
             config,
         }
-    }
-
-    pub fn utility(&self) -> Option<&crate::Utility> {
-        self.inner.utility.as_ref()
     }
 
     pub fn with_messengers(mut self, messengers: crate::Messengers) -> Self {
@@ -497,6 +490,8 @@ where
     }
 
     async fn turn_loop(&self, text: &str, view: String) -> Result<String, HarnessError> {
+        // The turn keeps the model it starts on; the next turn resolves again.
+        let llm = self.inner.models.current()?.main;
         let skills = self.inner.environment.skill_catalog().await?;
         let identity = self
             .config
@@ -555,9 +550,7 @@ where
                 self.live_for(&report.meta);
                 messages.push(Message::User(report.meta.render(0, &report.text)));
             }
-            let response = self
-                .inner
-                .llm
+            let response = llm
                 .complete(CompletionRequest {
                     system: &system,
                     messages: &messages,
@@ -675,12 +668,11 @@ where
     }
 }
 
-impl<L, E, S, M, F> crate::MemoryTools for Inner<L, E, S, M, F>
+impl<E, S, M, F> crate::MemoryTools for Inner<E, S, M, F>
 where
-    L: Send + Sync + 'static,
     E: Send + Sync + 'static,
     S: SessionStore + MemoryStore + Clone + 'static,
-    M: Llm + Send + Sync + 'static,
+    M: llm::Source + 'static,
     F: Models,
 {
     fn zoom(&self, id: ZoomId, n: u64, at: usize) -> Result<String, HarnessError> {

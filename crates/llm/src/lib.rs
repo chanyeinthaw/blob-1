@@ -86,3 +86,11 @@ pub trait Llm {
         request: CompletionRequest<'_>,
     ) -> Result<CompletionResponse, LlmError>;
 }
+
+/// Resolves the model a role should use now. Callers resolve once at the
+/// start of a unit of work (a turn, a compaction pass, a one-shot call) and
+/// keep the returned client until it finishes; the next unit resolves again.
+pub trait Source: Send + Sync {
+    type Llm: Llm + Send;
+    fn current(&self) -> Result<Self::Llm, LlmError>;
+}

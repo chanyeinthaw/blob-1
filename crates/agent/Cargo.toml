@@ -16,6 +16,17 @@ storage-sqlite.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 environment.workspace = true
 sha2 = "0.10"
+url = "2"
+axum = { version = "0.8", features = ["ws"] }
+rust-embed = { version = "8", features = ["debug-embed"] }
+mime_guess = "2"
+argon2 = "0.5"
+rpassword = "7"
+rand = "0.8"
+hex = "0.4"
+serde.workspace = true
+serde_json.workspace = true
+futures-util = "0.3"
 memory.workspace = true
 messenger = { path = "../messenger" }
 messenger-discord = { path = "../messenger-discord" }

@@ -8,7 +8,7 @@ use storage::{MemoryStore, Message, SessionId, SessionStore, TaskChoice};
 
 use crate::{
     chat::{Inner, Models, Shared, SpawnTask},
-    CompactionConfig, HarnessConfig, HarnessError, Llm, SessionHarness, Step,
+    CompactionConfig, HarnessConfig, HarnessError, SessionHarness, Step,
 };
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -61,8 +61,8 @@ fn duration(time: Instant) -> String {
     }
 }
 
-pub(crate) fn list<L, E, S, M, F: Models>(
-    inner: &Inner<L, E, S, M, F>,
+pub(crate) fn list<E, S, M, F: Models>(
+    inner: &Inner<E, S, M, F>,
 ) -> Result<String, HarnessError>
 where
     S: SessionStore,
@@ -107,7 +107,7 @@ where
     })
 }
 
-pub(crate) fn delivered<L, E, S, M, F: Models>(inner: &Inner<L, E, S, M, F>) {
+pub(crate) fn delivered<E, S, M, F: Models>(inner: &Inner<E, S, M, F>) {
     let mut state = inner.state.lock().expect("chat state mutex poisoned");
     if let Some(report) = state.reports.pop_front() {
         if matches!(report.meta, Meta::Report { .. }) {
@@ -122,8 +122,8 @@ pub(crate) fn delivered<L, E, S, M, F: Models>(inner: &Inner<L, E, S, M, F>) {
     }
 }
 
-pub(crate) async fn stop<L, E, S, M, F: Models>(
-    inner: &Inner<L, E, S, M, F>,
+pub(crate) async fn stop<E, S, M, F: Models>(
+    inner: &Inner<E, S, M, F>,
     name: &str,
     reason: Option<String>,
 ) -> Result<String, HarnessError>
@@ -192,15 +192,14 @@ where
     Ok(format!("Stopped {name}."))
 }
 
-pub(crate) async fn spawn<L, E, S, M, F: Models>(
-    inner: &Arc<Inner<L, E, S, M, F>>,
+pub(crate) async fn spawn<E, S, M, F: Models>(
+    inner: &Arc<Inner<E, S, M, F>>,
     tasks: Vec<SpawnTask>,
 ) -> Result<Vec<String>, Error>
 where
-    L: Llm + Send + Sync + 'static,
     E: Environment + 'static,
     S: SessionStore + MemoryStore + Clone + 'static,
-    M: Llm + Send + Sync + 'static,
+    M: llm::Source + 'static,
 {
     let mut prepared = Vec::new();
     for task in tasks {
@@ -293,16 +292,15 @@ where
     Ok(names)
 }
 
-pub(crate) fn tell<L, E, S, M, F: Models>(
-    inner: &Arc<Inner<L, E, S, M, F>>,
+pub(crate) fn tell<E, S, M, F: Models>(
+    inner: &Arc<Inner<E, S, M, F>>,
     name: &str,
     text: String,
 ) -> Result<String, Error>
 where
-    L: Llm + Send + Sync + 'static,
     E: Environment + 'static,
     S: SessionStore + MemoryStore + Clone + 'static,
-    M: Llm + Send + Sync + 'static,
+    M: llm::Source + 'static,
 {
     let id = SessionId::new(format!("task:{name}"));
     let mut fallback = false;
@@ -388,20 +386,20 @@ where
     })
 }
 
-fn build_session<L, E, S, M, F: Models>(
-    inner: &Arc<Inner<L, E, S, M, F>>,
+fn build_session<E, S, M, F: Models>(
+    inner: &Arc<Inner<E, S, M, F>>,
     llm: F::Llm,
     window: Option<u32>,
     name: &str,
     images: bool,
 ) -> Arc<SessionHarness<Shared<F::Llm>, Shared<E>, S>>
 where
-    L: Llm + Send + Sync + 'static,
-    M: Llm + Send + Sync + 'static,
+    M: llm::Source + 'static,
     E: Environment + 'static,
     S: SessionStore + MemoryStore + Clone + 'static,
 {
     let weak = Arc::downgrade(inner);
+    let summarizer_weak = Arc::downgrade(inner);
     let name = name.to_owned();
     let mut session = SessionHarness::new(
         Shared(Arc::new(llm)),
@@ -423,36 +421,37 @@ where
             }
         }
     }))
+    .with_summarizer(Arc::new(move || {
+        summarizer_weak
+            .upgrade()?
+            .models
+            .current()
+            .ok()?
+            .summarizer
+            .map(|(llm, window)| (Shared(Arc::new(llm)), window))
+    }))
     .with_config(HarnessConfig {
         images,
         compaction: CompactionConfig {
             context_window: window,
-            summarizer_window: if inner.summarizer.is_some() {
-                inner.summarizer_window
-            } else {
-                window
-            },
+            summarizer_window: window,
             ..CompactionConfig::default()
         },
     });
     if let Some(messengers) = &inner.messengers {
         session = session.with_lookup_tools(messengers.clone());
     }
-    if let Some(summarizer) = &inner.summarizer {
-        session = session.with_summarizer(Shared(Arc::clone(&summarizer.0)));
-    }
     Arc::new(session)
 }
 
-fn launch<L, E, S, M, F: Models>(
-    inner: &Arc<Inner<L, E, S, M, F>>,
+fn launch<E, S, M, F: Models>(
+    inner: &Arc<Inner<E, S, M, F>>,
     name: String,
     text: Option<String>,
 ) where
-    L: Llm + Send + Sync + 'static,
     E: Environment + 'static,
     S: SessionStore + MemoryStore + Clone + 'static,
-    M: Llm + Send + Sync + 'static,
+    M: llm::Source + 'static,
 {
     let inner = Arc::clone(inner);
     let mut state = inner.state.lock().expect("chat state mutex poisoned");
@@ -636,8 +635,8 @@ fn launch<L, E, S, M, F: Models>(
     state.tasks.push(work_abort);
 }
 
-pub(crate) fn zoom<L, E, S, M, F: Models>(
-    inner: &Inner<L, E, S, M, F>,
+pub(crate) fn zoom<E, S, M, F: Models>(
+    inner: &Inner<E, S, M, F>,
     name: &str,
     at: usize,
 ) -> Result<String, HarnessError>
@@ -670,14 +669,13 @@ where
     Ok(page)
 }
 
-struct TaskMemory<L, E, S, M, F: Models>(std::sync::Weak<Inner<L, E, S, M, F>>);
+struct TaskMemory<E, S, M, F: Models>(std::sync::Weak<Inner<E, S, M, F>>);
 
-impl<L, E, S, M, F> crate::MemoryTools for TaskMemory<L, E, S, M, F>
+impl<E, S, M, F> crate::MemoryTools for TaskMemory<E, S, M, F>
 where
-    L: Send + Sync + 'static,
     E: Send + Sync + 'static,
     S: SessionStore + MemoryStore + Clone + 'static,
-    M: Llm + Send + Sync + 'static,
+    M: llm::Source + 'static,
     F: Models,
 {
     fn zoom(&self, id: crate::chat::ZoomId, n: u64, at: usize) -> Result<String, HarnessError> {

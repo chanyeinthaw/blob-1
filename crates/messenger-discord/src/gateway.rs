@@ -48,6 +48,9 @@ pub async fn listen(discord: &Discord, tx: mpsc::Sender<Inbound>) -> Result<(), 
         match event {
             Some(Ok(Event::Ready(ready))) => {
                 bot = Some(ready.user.id);
+                discord
+                    .ready
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
             Some(Ok(Event::MessageCreate(message))) => {
                 let Some(bot) = bot else { continue };

@@ -2,6 +2,8 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use llm::Llm;
+
 pub use storage::MemoryKind as Kind;
 use storage::{MemoryMessage, MemoryNode, MemoryStore, MemoryView, ViewChange, ViewName};
 pub use storage::{Meta, ReportStatus};
@@ -54,19 +56,19 @@ struct State {
     seen_size: usize,
 }
 
-struct Inner<S, L> {
+struct Inner<S, C> {
     store: S,
-    llm: L,
+    compactor: C,
     config: MemoryConfig,
     state: Mutex<State>,
     changed: tokio::sync::Notify,
 }
 
-pub struct Memory<S, L> {
-    inner: Arc<Inner<S, L>>,
+pub struct Memory<S, C> {
+    inner: Arc<Inner<S, C>>,
 }
 
-impl<S, L> Clone for Memory<S, L> {
+impl<S, C> Clone for Memory<S, C> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -243,8 +245,8 @@ fn plan_view(
     (Some(next), size, change)
 }
 
-impl<S: MemoryStore + 'static, L: llm::Llm + Send + Sync + 'static> Memory<S, L> {
-    pub fn open(store: S, compactor: L, config: MemoryConfig) -> Result<Self, MemoryError> {
+impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
+    pub fn open(store: S, compactor: C, config: MemoryConfig) -> Result<Self, MemoryError> {
         if config.jobs == 0 || config.tries == 0 || config.node_bytes == 0 {
             return Err(MemoryError::Invalid(
                 "jobs, tries and node_bytes must be positive".into(),
@@ -295,7 +297,7 @@ impl<S: MemoryStore + 'static, L: llm::Llm + Send + Sync + 'static> Memory<S, L>
         let memory = Self {
             inner: Arc::new(Inner {
                 store,
-                llm: compactor,
+                compactor,
                 config,
                 state: Mutex::new(state),
                 changed: tokio::sync::Notify::new(),
@@ -624,13 +626,12 @@ impl<S: MemoryStore + 'static, L: llm::Llm + Send + Sync + 'static> Memory<S, L>
             )
         };
         let base = format!("{view}\n\n{task}");
+        let llm = self.inner.compactor.current()?;
         let mut prompt = base.clone();
         let mut shortest: Option<String> = None;
         for _ in 0..self.inner.config.tries {
             let messages = [storage::Message::User(prompt)];
-            let response = self
-                .inner
-                .llm
+            let response = llm
                 .complete(llm::CompletionRequest {
                     system: COMPACTION_PROMPT,
                     messages: &messages,

@@ -79,7 +79,7 @@ pub struct SessionHarness<L, E, S> {
     memory_tools: Option<Arc<dyn MemoryTools>>,
     lookup_tools: Option<crate::Messengers>,
     observer: Option<Arc<dyn Fn(Step) + Send + Sync>>,
-    summarizer: Option<L>,
+    summarizer: Option<Arc<dyn Fn() -> Option<(L, Option<u32>)> + Send + Sync>>,
     environment: E,
     store: S,
     paths: EnvironmentPaths,
@@ -129,8 +129,14 @@ where
         }
     }
 
-    pub fn with_summarizer(mut self, llm: L) -> Self {
-        self.summarizer = Some(llm);
+    /// Resolves the compaction model and its usable window at the start of
+    /// each compaction pass; a pass keeps the model it resolved. When the
+    /// resolver yields no model the session's own model summarizes.
+    pub fn with_summarizer(
+        mut self,
+        resolve: Arc<dyn Fn() -> Option<(L, Option<u32>)> + Send + Sync>,
+    ) -> Self {
+        self.summarizer = Some(resolve);
         self
     }
 
@@ -408,14 +414,22 @@ where
         } else {
             keep
         };
+        let resolved = self
+            .summarizer
+            .as_ref()
+            .and_then(|resolve| resolve());
+        let (llm, window) = match &resolved {
+            Some((llm, window)) => (llm, *window),
+            None => (&self.llm, config.summarizer_window),
+        };
         let observer = &self.observer;
         let indices = session.view_indices();
         let view = session.view();
         let Some((mut summary, cut)) = compaction::compact(
-            self.summarizer.as_ref().unwrap_or(&self.llm),
+            llm,
             &view,
             keep,
-            config.summarizer_window,
+            window,
             config.reserve_tokens,
             &|| {
                 if let Some(observer) = observer {

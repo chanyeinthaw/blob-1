@@ -46,7 +46,7 @@ impl<T: MessengerStore + MemoryStore> Store for T {}
 pub struct Messengers {
     messengers: Vec<Arc<dyn Messenger>>,
     store: Arc<dyn Store>,
-    utility: Option<crate::Utility>,
+    utility: Option<Arc<dyn Fn() -> Option<crate::Utility> + Send + Sync>>,
     live: Arc<LiveState>,
     answered: Arc<Mutex<std::collections::HashSet<u64>>>,
     moved: Arc<Mutex<std::collections::HashSet<u64>>>,
@@ -191,8 +191,13 @@ impl Messengers {
             },
         }
     }
-    pub fn with_utility(mut self, utility: Option<crate::Utility>) -> Self {
-        self.utility = utility;
+    /// Resolves the utility model each time it is needed, so changes apply
+    /// without rebuilding the messengers.
+    pub fn with_utility(
+        mut self,
+        utility: impl Fn() -> Option<crate::Utility> + Send + Sync + 'static,
+    ) -> Self {
+        self.utility = Some(Arc::new(utility));
         self
     }
     pub fn mark(&self, reply: &str, add: &[Mark], remove: &[Mark]) {
@@ -395,7 +400,7 @@ impl Messengers {
                             && thread
                             && !place.dm
                             && place.thread.is_none()
-                            && self.utility.is_some()
+                            && self.utility.as_ref().is_some_and(|u| u().is_some())
                         {
                             let mut prompt = row.text;
                             if let Some(quote) = quote {
@@ -444,7 +449,9 @@ impl Messengers {
             })
             .await?;
         if sent.created_thread {
-            if let (Some((place, prompt)), Some(utility)) = (title_prompt, self.utility.clone()) {
+            if let (Some((place, prompt)), Some(utility)) =
+                (title_prompt, self.utility.as_ref().and_then(|u| u()))
+            {
                 let messenger = self
                     .messengers
                     .iter()

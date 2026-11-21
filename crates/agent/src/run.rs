@@ -1,18 +1,65 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use environment::{Environment, SkillBundle};
 use environment_local::LocalEnvironment;
-use harness::{ChatHarness, EnvironmentPaths};
-use storage::{ConfigStore, MessengerStore, ReasoningLevel, SkillStore};
+use harness::{ChatHarness, EnvironmentPaths, Models};
+use storage::{ConfigStore, MessengerStore, Provider, ReasoningLevel, SkillStore};
 use storage_sqlite::SqliteStorage;
 use tokio::signal::unix::{signal, SignalKind};
 
 use crate::{api_key, Result};
 
+/// Resolves the models each role uses from the settings stored in SQLite.
+/// `current` re-resolves only when the relevant settings changed; a failed
+/// resolution keeps the last working model for that role and logs the error
+/// once per change.
+#[derive(Clone)]
 struct ModelFactory {
     store: Arc<SqliteStorage>,
-    default_reasoning: ReasoningLevel,
+    cache: Arc<Mutex<Cache>>,
+}
+
+#[derive(Default)]
+struct Cache {
+    fingerprint: Option<u64>,
+    main: Option<Working>,
+    summarizer: Option<Option<(Model, Option<u32>)>>,
+    compactor: Option<Model>,
+    utility: Option<Option<llm_rig::RigLlm>>,
+    main_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct Working {
+    llm: llm_rig::RigLlm,
+    context: Option<u32>,
+    selection: harness::ModelSelection,
+    provider: Provider,
+    model: storage::Model,
+}
+
+impl ModelFactory {
+    fn new(store: Arc<SqliteStorage>) -> Self {
+        Self {
+            store,
+            cache: Arc::new(Mutex::new(Cache::default())),
+        }
+    }
+
+    /// Covers every input `resolve` reads, so a change to any of them
+    /// re-resolves. Env vars referenced by key_env are fixed at process start.
+    fn fingerprint(&self) -> std::result::Result<u64, harness::HarnessError> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.store.settings()?.hash(&mut hasher);
+        self.store.utility_model()?.hash(&mut hasher);
+        for provider in self.store.providers()? {
+            provider.hash(&mut hasher);
+            self.store.models(&provider.id)?.hash(&mut hasher);
+        }
+        Ok(hasher.finish())
+    }
 }
 
 impl harness::Models for ModelFactory {
@@ -28,7 +75,7 @@ impl harness::Models for ModelFactory {
                 "default: provider={} model={} reasoning={}",
                 default.provider.0,
                 default.model,
-                self.default_reasoning.as_str()
+                settings.reasoning.as_str()
             ),
             match settings.compaction_model {
                 Some(model) => format!(
@@ -95,11 +142,53 @@ impl harness::Models for ModelFactory {
         reasoning: Option<ReasoningLevel>,
     ) -> std::result::Result<(Model, Option<u32>, harness::ModelSelection), harness::HarnessError>
     {
-        let settings = self.store.settings()?;
-        let default = settings
-            .default_model
-            .ok_or_else(|| harness::HarnessError::Compaction("no default model".into()))?;
-        let (provider_id, model_id) = choice.unwrap_or((&default.provider.0, &default.model));
+        let (provider_id, model_id, reasoning) = match choice {
+            Some((provider, model)) => (
+                provider.to_owned(),
+                model.to_owned(),
+                match reasoning {
+                    Some(reasoning) => reasoning,
+                    None => self.store.settings()?.reasoning,
+                },
+            ),
+            None => {
+                self.current()?;
+                let main = {
+                    let cache = self.cache.lock().expect("model cache poisoned");
+                    cache.main.clone().ok_or_else(|| {
+                        harness::HarnessError::Compaction(
+                            cache
+                                .main_error
+                                .clone()
+                                .unwrap_or_else(|| "no main model".into()),
+                        )
+                    })?
+                };
+                let reasoning = reasoning.unwrap_or(main.selection.reasoning);
+                if reasoning == main.selection.reasoning {
+                    return Ok((Model::Main(main.llm), main.context, main.selection));
+                }
+                let key = api_key(&main.provider).map_err(|_| {
+                    harness::HarnessError::Compaction(format!(
+                        "API key for provider {} is not set",
+                        main.provider.id.0
+                    ))
+                })?;
+                return Ok((
+                    Model::Main(llm_rig::connect(
+                        &main.provider,
+                        &key,
+                        &main.model,
+                        reasoning,
+                    )),
+                    main.context,
+                    harness::ModelSelection {
+                        reasoning,
+                        ..main.selection
+                    },
+                ));
+            }
+        };
         let unknown = || harness::HarnessError::UnknownModel(format!("{provider_id} {model_id}"));
         let provider = self
             .store
@@ -107,6 +196,7 @@ impl harness::Models for ModelFactory {
             .into_iter()
             .find(|p| p.id.0 == provider_id)
             .ok_or_else(unknown)?;
+        check_base_url(&provider).map_err(harness::HarnessError::Compaction)?;
         let model = self
             .store
             .models(&provider.id)?
@@ -119,20 +209,72 @@ impl harness::Models for ModelFactory {
             ))
         })?;
         Ok((
-            Model::Main(llm_rig::connect(
-                &provider,
-                &key,
-                &model,
-                reasoning.unwrap_or(self.default_reasoning),
-            )),
+            Model::Main(llm_rig::connect(&provider, &key, &model, reasoning)),
             model.effective_context(),
             harness::ModelSelection {
                 images: model.images,
-                provider: provider_id.to_owned(),
-                model: model_id.to_owned(),
-                reasoning: reasoning.unwrap_or(self.default_reasoning),
+                provider: provider_id,
+                model: model_id,
+                reasoning,
             },
         ))
+    }
+
+    fn current(&self) -> std::result::Result<harness::Current<Model>, harness::HarnessError> {
+        let fingerprint = self.fingerprint()?;
+        let mut cache = self.cache.lock().expect("model cache poisoned");
+        if cache.fingerprint != Some(fingerprint) {
+            cache.fingerprint = Some(fingerprint);
+            let attempt = resolve(&self.store, cache.main.as_ref());
+            // A role that fails to resolve keeps its last working model; each
+            // distinct error is logged once per settings change.
+            let mut logged: Vec<String> = Vec::new();
+            let mut log = |error: &String| {
+                if !logged.contains(error) {
+                    eprintln!("{error}");
+                    logged.push(error.clone());
+                }
+            };
+            match attempt.main {
+                Ok(working) => {
+                    cache.main = Some(working);
+                    cache.main_error = None;
+                }
+                Err(error) => {
+                    log(&error);
+                    cache.main_error = Some(error);
+                }
+            }
+            match attempt.summarizer {
+                Ok(summarizer) => cache.summarizer = Some(summarizer),
+                Err(error) => log(&error),
+            }
+            match attempt.compactor {
+                Ok(compactor) => cache.compactor = Some(compactor),
+                Err(error) => log(&error),
+            }
+            match attempt.utility {
+                Ok(utility) => cache.utility = Some(utility),
+                Err(error) => log(&error),
+            }
+        }
+        let main = cache.main.clone().ok_or_else(|| {
+            harness::HarnessError::Compaction(
+                cache
+                    .main_error
+                    .clone()
+                    .unwrap_or_else(|| "no main model".into()),
+            )
+        })?;
+        Ok(harness::Current {
+            main: Model::Main(main.llm.clone()),
+            summarizer: cache.summarizer.clone().flatten(),
+            compactor: cache
+                .compactor
+                .clone()
+                .unwrap_or_else(|| Model::Main(main.llm.clone())),
+            utility: cache.utility.clone().flatten().map(harness::Utility::new),
+        })
     }
 }
 
@@ -155,116 +297,195 @@ impl llm::Llm for Model {
     }
 }
 
-type Chat = ChatHarness<Model, LocalEnvironment, Arc<SqliteStorage>, Model, ModelFactory>;
+/// The memory compactor role: resolves the current compaction model once at
+/// the start of each compaction pass.
+#[derive(Clone)]
+struct Compactor(ModelFactory);
 
-struct Setup {
-    llm: llm_rig::RigLlm,
-    environment: LocalEnvironment,
-    summarizer: Option<(Model, Option<u32>)>,
-    utility: Option<harness::Utility>,
-    compactor: Model,
-    reasoning: ReasoningLevel,
+impl llm::Source for Compactor {
+    type Llm = Model;
+
+    fn current(&self) -> std::result::Result<Model, llm::LlmError> {
+        self.0
+            .current()
+            .map(|current| current.compactor)
+            .map_err(|error| llm::LlmError::Request(error.to_string()))
+    }
 }
 
-async fn setup(
-    store: &Arc<SqliteStorage>,
-    workspace: &Path,
-    skills_dir: Option<&Path>,
-) -> Result<Setup> {
-    let settings = store.settings()?;
-    let model = settings
-        .default_model
-        .ok_or("no default model; run `agent model set <provider>/<model>`")?;
+type Chat = ChatHarness<LocalEnvironment, Arc<SqliteStorage>, Compactor, ModelFactory>;
+
+type Resolve<T> = std::result::Result<T, String>;
+
+struct Attempt {
+    main: Resolve<Working>,
+    summarizer: Resolve<Option<(Model, Option<u32>)>>,
+    compactor: Resolve<Model>,
+    utility: Resolve<Option<llm_rig::RigLlm>>,
+}
+
+fn check_base_url(provider: &Provider) -> Resolve<()> {
+    let base_url = &provider.base_url;
+    let valid = !base_url
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control())
+        && url::Url::parse(base_url)
+            .map(|url| matches!(url.scheme(), "http" | "https"))
+            .unwrap_or(false)
+        && base_url
+            .parse::<axum::http::Uri>()
+            .is_ok_and(|uri| uri.host().is_some_and(|host| !host.is_empty()));
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "provider {} has an invalid base URL: expected an absolute http(s) URL",
+            provider.id.0
+        ))
+    }
+}
+
+fn resolve_model(
+    store: &SqliteStorage,
+    selected: &storage::ModelRef,
+) -> Resolve<(Provider, storage::Model)> {
     let provider = store
-        .providers()?
+        .providers()
+        .map_err(|error| error.to_string())?
         .into_iter()
-        .find(|provider| provider.id == model.provider)
-        .ok_or_else(|| format!("unknown provider: {}", model.provider.0))?;
-    let stored_model = store
-        .models(&model.provider)?
+        .find(|provider| provider.id == selected.provider)
+        .ok_or_else(|| format!("unknown provider: {}", selected.provider.0))?;
+    check_base_url(&provider)?;
+    let model = store
+        .models(&selected.provider)
+        .map_err(|error| error.to_string())?
         .into_iter()
-        .find(|candidate| candidate.id == model.model)
+        .find(|model| model.id == selected.model)
         .ok_or_else(|| {
             format!(
                 "unknown model {}/{}; run `agent models refresh` first",
-                model.provider.0, model.model
+                selected.provider.0, selected.model
             )
         })?;
-    let key = api_key(&provider)?;
-    let llm = llm_rig::connect(&provider, &key, &stored_model, settings.reasoning);
+    Ok((provider, model))
+}
 
-    let llm_main = llm;
-    let summarizer = if let Some(selected) = settings.compaction_model.clone() {
-        let is_main = selected == model;
-        let model = selected;
-        let provider = store
-            .providers()?
-            .into_iter()
-            .find(|provider| provider.id == model.provider)
-            .ok_or_else(|| format!("unknown provider: {}", model.provider.0))?;
-        let stored = store
-            .models(&model.provider)?
-            .into_iter()
-            .find(|candidate| candidate.id == model.model)
-            .ok_or_else(|| {
-                format!(
-                    "unknown model {}/{}; run `agent models refresh` first",
-                    model.provider.0, model.model
-                )
-            })?;
-        let llm = llm_rig::connect(
-            &provider,
-            &api_key(&provider)?,
-            &stored,
-            settings.compaction_reasoning.unwrap_or(settings.reasoning),
-        );
-        Some((
-            if is_main {
-                Model::Main(llm)
-            } else {
-                Model::Fallback(Arc::new(llm::Fallback::new(llm, llm_main.clone())))
-            },
-            if is_main {
-                stored.effective_context()
-            } else {
-                match (stored.effective_context(), stored_model.effective_context()) {
-                    (Some(compaction), Some(main)) => Some(compaction.min(main)),
-                    (compaction, main) => compaction.or(main),
-                }
-            },
-        ))
-    } else {
-        None
+fn resolve_main(store: &SqliteStorage, settings: &storage::Settings) -> Resolve<Working> {
+    let Some(selected) = &settings.default_model else {
+        return Err("no default model; run `agent model set <provider>/<model>`".into());
     };
+    let (provider, model) = resolve_model(store, selected)?;
+    let key = api_key(&provider).map_err(|error| error.to_string())?;
+    Ok(Working {
+        llm: llm_rig::connect(&provider, &key, &model, settings.reasoning),
+        context: model.effective_context(),
+        selection: harness::ModelSelection {
+            images: model.images,
+            provider: provider.id.0.clone(),
+            model: model.id.clone(),
+            reasoning: settings.reasoning,
+        },
+        provider,
+        model,
+    })
+}
 
-    let utility = if let Some((selected, reasoning)) = store.utility_model()? {
-        let provider = store
-            .providers()?
-            .into_iter()
-            .find(|provider| provider.id == selected.provider)
-            .ok_or_else(|| format!("unknown provider: {}", selected.provider.0))?;
-        let model = store
-            .models(&selected.provider)?
-            .into_iter()
-            .find(|model| model.id == selected.model)
-            .ok_or_else(|| {
-                format!(
-                    "unknown model {}/{}; run `agent models refresh` first",
-                    selected.provider.0, selected.model
-                )
-            })?;
-        Some(harness::Utility::new(llm_rig::connect(
+fn resolve_summarizer(
+    store: &SqliteStorage,
+    settings: &storage::Settings,
+    main: &Resolve<Working>,
+    cached: Option<&Working>,
+) -> Resolve<Option<(Model, Option<u32>)>> {
+    let Some(selected) = &settings.compaction_model else {
+        return Ok(None);
+    };
+    let (provider, stored) = resolve_model(store, selected)?;
+    let key = api_key(&provider).map_err(|error| error.to_string())?;
+    let llm = llm_rig::connect(
+        &provider,
+        &key,
+        &stored,
+        settings.compaction_reasoning.unwrap_or(settings.reasoning),
+    );
+    if settings.default_model.as_ref() == Some(selected) {
+        return Ok(Some((Model::Main(llm), stored.effective_context())));
+    }
+    let fallback = main.as_ref().ok().or(cached);
+    let main_window = fallback.and_then(|main| main.context);
+    let window = match (stored.effective_context(), main_window) {
+        (Some(compaction), Some(main)) => Some(compaction.min(main)),
+        (compaction, main) => compaction.or(main),
+    };
+    let model = match fallback {
+        Some(main) => Model::Fallback(Arc::new(llm::Fallback::new(llm, main.llm.clone()))),
+        None => Model::Main(llm),
+    };
+    Ok(Some((model, window)))
+}
+
+fn resolve_compactor(store: &SqliteStorage, settings: &storage::Settings) -> Resolve<Model> {
+    let Some(selected) = &settings.default_model else {
+        return Err("no default model; run `agent model set <provider>/<model>`".into());
+    };
+    let (provider, stored) = resolve_model(store, selected)?;
+    let key = api_key(&provider).map_err(|error| error.to_string())?;
+    Ok(Model::Main(llm_rig::connect(
+        &provider,
+        &key,
+        &stored,
+        settings.compaction_reasoning.unwrap_or(settings.reasoning),
+    )))
+}
+
+fn resolve(store: &SqliteStorage, cached: Option<&Working>) -> Attempt {
+    let settings = match store.settings() {
+        Ok(settings) => settings,
+        Err(error) => {
+            let error = error.to_string();
+            return Attempt {
+                main: Err(error.clone()),
+                summarizer: Err(error.clone()),
+                compactor: Err(error.clone()),
+                utility: Err(error),
+            };
+        }
+    };
+    let main = resolve_main(store, &settings);
+    let summarizer = resolve_summarizer(store, &settings, &main, cached);
+    let compactor = match &summarizer {
+        Ok(Some((model, _))) => Ok(model.clone()),
+        Ok(None) => resolve_compactor(store, &settings),
+        Err(error) => Err(error.clone()),
+    };
+    let utility = (|| -> Resolve<Option<llm_rig::RigLlm>> {
+        let Some((selected, reasoning)) =
+            store.utility_model().map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        let (provider, model) = resolve_model(store, &selected)?;
+        let key = api_key(&provider).map_err(|error| error.to_string())?;
+        Ok(Some(llm_rig::connect(
             &provider,
-            &api_key(&provider)?,
+            &key,
             &model,
             reasoning.unwrap_or(ReasoningLevel::Low),
         )))
-    } else {
-        None
-    };
+    })();
+    Attempt {
+        main,
+        summarizer,
+        compactor,
+        utility,
+    }
+}
 
-    let workspace = workspace.to_path_buf();
-    let environment = LocalEnvironment::new(&workspace, skills_dir.map(Path::to_path_buf))?;
+async fn environment(
+    store: &Arc<SqliteStorage>,
+    workspace: &Path,
+    skills_dir: Option<&Path>,
+) -> Result<LocalEnvironment> {
+    let environment = LocalEnvironment::new(workspace, skills_dir.map(Path::to_path_buf))?;
     let manifest = environment.managed_skills().await?;
     let skills = store.skills()?;
     let mut put = Vec::new();
@@ -294,51 +515,31 @@ async fn setup(
     for name in environment.apply_skills(put, remove).await? {
         eprintln!("skill {name} skipped: a user-owned skill with this name exists");
     }
-    let compactor = summarizer
-        .as_ref()
-        .map(|(model, _)| model.clone())
-        .unwrap_or_else(|| {
-            Model::Main(llm_rig::connect(
-                &provider,
-                &key,
-                &stored_model,
-                settings.compaction_reasoning.unwrap_or(settings.reasoning),
-            ))
-        });
-    Ok(Setup {
-        llm: llm_main,
-        environment,
-        summarizer,
-        utility,
-        compactor,
-        reasoning: settings.reasoning,
-    })
+    Ok(environment)
 }
 
 async fn chat_harness(
     store: Arc<SqliteStorage>,
     workspace: &Path,
     skills_dir: Option<&Path>,
+    models: ModelFactory,
 ) -> Result<Chat> {
-    let setup = setup(&store, workspace, skills_dir).await?;
+    models.current()?;
+    let environment = environment(&store, workspace, skills_dir).await?;
     let memory = memory::Memory::open(
         store.clone(),
-        setup.compactor,
+        Compactor(models.clone()),
         memory::MemoryConfig::default(),
     )?;
     Ok(ChatHarness::new(
-        Model::Main(setup.llm),
-        setup.environment,
+        environment,
         store.clone(),
         memory,
         EnvironmentPaths {
             workspace: workspace.to_path_buf(),
         },
-        ModelFactory {
-            store: store.clone(),
-            default_reasoning: setup.reasoning,
-        },
-        (setup.summarizer, setup.utility, store),
+        models,
+        store,
     ))
 }
 
@@ -350,7 +551,8 @@ pub async fn chat(
 ) -> Result<()> {
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
-    let harness = chat_harness(store, workspace, skills_dir).await?;
+    let models = ModelFactory::new(store.clone());
+    let harness = chat_harness(store, workspace, skills_dir, models).await?;
     let mut failure = None;
     let answer = tokio::select! {
         answer = harness.run(&prompt) => answer,
@@ -474,11 +676,41 @@ pub async fn serve(
     workspace: &Path,
     skills_dir: Option<&Path>,
     token: String,
+    shared_discord: Arc<std::sync::OnceLock<Arc<messenger_discord::Discord>>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    let harness = chat_harness(store.clone(), workspace, skills_dir).await?;
-    let discord: Arc<dyn messenger::Messenger> = Arc::new(messenger_discord::Discord::new(token));
+    let models = ModelFactory::new(store.clone());
+    if models.current().is_err() {
+        eprintln!("Discord waiting for a main model; set one in the web settings");
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                    if models.current().is_ok() {
+                        break;
+                    }
+                }
+                _ = shutdown.changed() => return Ok(()),
+            }
+        }
+    }
+    let harness = chat_harness(store.clone(), workspace, skills_dir, models.clone()).await?;
+    let client = Arc::new(messenger_discord::Discord::new(token));
+    let _ = shared_discord.set(client.clone());
+    let warm = client.clone();
+    tokio::spawn(async move {
+        while !warm.is_ready() {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        if let Err(error) = warm.directory().await {
+            eprintln!("discord directory: {error}");
+        }
+    });
+    let discord: Arc<dyn messenger::Messenger> = client;
     let messengers = harness::Messengers::new(vec![discord.clone()], store.clone())
-        .with_utility(harness.utility().cloned());
+        .with_utility({
+            let models = models.clone();
+            move || models.current().ok().and_then(|current| current.utility)
+        });
     let harness = harness.with_messengers(messengers.clone());
     let (tx, mut rx) = tokio::sync::mpsc::channel(128);
     let listener_discord = discord.clone();
@@ -487,9 +719,13 @@ pub async fn serve(
     let admission_store = store.clone();
     let admission_discord = discord.clone();
     let admission_messengers = messengers.clone();
-    let utility = harness.utility().cloned();
+    let admission_models = models.clone();
     let admission = tokio::spawn(async move {
         while let Some(inbound) = rx.recv().await {
+            let utility = admission_models
+                .current()
+                .ok()
+                .and_then(|current| current.utility);
             match admit(
                 &admission_store,
                 admission_discord.clone(),
@@ -512,8 +748,6 @@ pub async fn serve(
             }
         }
     });
-    let mut interrupt = signal(SignalKind::interrupt())?;
-    let mut terminate = signal(SignalKind::terminate())?;
     let mut pending = std::collections::VecDeque::<(String, storage::Meta)>::new();
     let mut backoff = false;
     tokio::select! {
@@ -533,8 +767,7 @@ pub async fn serve(
                     }
                     harness.work().await
                 } => None,
-                _ = interrupt.recv() => { listener.abort(); admission.abort(); return Ok(()); },
-                _ = terminate.recv() => { listener.abort(); admission.abort(); return Ok(()); },
+                _ = shutdown.changed() => { listener.abort(); admission.abort(); return Ok(()); },
             }
         };
         let run = async {
@@ -562,8 +795,7 @@ pub async fn serve(
                     Some(next) => { let (text, meta) = next?; harness.steer_message(text, Some(meta)); },
                     None => return match listener.await? { Err(error) => Err(error.into()), Ok(()) => Err("discord listener stopped".into()) },
                 },
-                _ = interrupt.recv() => { listener.abort(); admission.abort(); return Ok(()); },
-                _ = terminate.recv() => { listener.abort(); admission.abort(); return Ok(()); },
+                _ = shutdown.changed() => { listener.abort(); admission.abort(); return Ok(()); },
             }
         }
         messengers.quiet();

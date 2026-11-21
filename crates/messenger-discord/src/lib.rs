@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use tokio::sync::mpsc;
 use twilight_http::Client;
 use twilight_model::{
-    channel::{message::MessageType, Message},
+    channel::{message::MessageType, ChannelType, Message},
     id::{
         marker::{ChannelMarker, UserMarker},
         Id,
@@ -21,7 +21,13 @@ pub struct Discord {
     token: String,
     http: Client,
     user: tokio::sync::OnceCell<Id<UserMarker>>,
+    ready: std::sync::atomic::AtomicBool,
+    directory: tokio::sync::Mutex<Option<(std::time::Instant, Directory)>>,
 }
+
+type Directory = (Vec<(String, String, String)>, Vec<Person>);
+
+const DIRECTORY_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 fn backend(error: impl std::error::Error + Send + Sync + 'static) -> MessengerError {
     MessengerError::Backend(Box::new(error))
@@ -85,7 +91,87 @@ impl Discord {
             http: Client::new(token.clone()),
             token,
             user: tokio::sync::OnceCell::new(),
+            ready: std::sync::atomic::AtomicBool::new(false),
+            directory: tokio::sync::Mutex::new(None),
         }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub async fn directory(&self) -> Result<Directory, MessengerError> {
+        if !self.is_ready() {
+            return Ok(Default::default());
+        }
+        let mut cache = self.directory.lock().await;
+        if let Some((at, directory)) = cache.as_ref() {
+            if at.elapsed() < DIRECTORY_TTL {
+                return Ok(directory.clone());
+            }
+        }
+        match self.fetch_directory().await {
+            Ok(directory) => {
+                *cache = Some((std::time::Instant::now(), directory.clone()));
+                Ok(directory)
+            }
+            Err(error) => match cache.as_ref() {
+                Some((_, directory)) => {
+                    eprintln!("discord directory: {error}");
+                    Ok(directory.clone())
+                }
+                None => Err(error),
+            },
+        }
+    }
+
+    async fn fetch_directory(&self) -> Result<Directory, MessengerError> {
+        let guilds = self
+            .http
+            .current_user_guilds()
+            .limit(200)
+            .await
+            .map_err(backend)?
+            .models()
+            .await
+            .map_err(backend)?;
+        let mut channels = Vec::new();
+        let mut people = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for guild in guilds {
+            let members = match self.http.guild_members(guild.id).limit(1000).await {
+                Ok(response) => response.models().await.map_err(backend)?,
+                Err(error) => {
+                    eprintln!("discord directory: members of {}: {error}", guild.name);
+                    Vec::new()
+                }
+            };
+            for member in members {
+                let p = person(&member.user);
+                if !member.user.bot && seen.insert(p.id.clone()) {
+                    people.push(p);
+                }
+            }
+            for channel in self
+                .http
+                .guild_channels(guild.id)
+                .await
+                .map_err(backend)?
+                .models()
+                .await
+                .map_err(backend)?
+            {
+                if matches!(
+                    channel.kind,
+                    ChannelType::GuildText | ChannelType::GuildAnnouncement
+                ) {
+                    if let Some(name) = channel.name {
+                        channels.push((channel.id.to_string(), name, guild.name.clone()));
+                    }
+                }
+            }
+        }
+        Ok((channels, people))
     }
 
     pub async fn ping_state(
@@ -320,7 +406,10 @@ impl Messenger for Discord {
         })
     }
     async fn listen(&self, inbound: mpsc::Sender<Inbound>) -> Result<(), MessengerError> {
-        gateway::listen(self, inbound).await
+        let result = gateway::listen(self, inbound).await;
+        self.ready
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        result
     }
     async fn react(&self, place: &Place, message: &str, mark: Mark) -> Result<(), MessengerError> {
         self.http

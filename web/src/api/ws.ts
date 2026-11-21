@@ -1,0 +1,152 @@
+import { Effect, Layer, Schema, Stream, SubscriptionRef } from 'effect'
+
+import { ApiError, Transport } from './client'
+import { ReplyFrame, type RequestFrame } from './protocol'
+
+type Pending = Readonly<{
+  frame: RequestFrame
+  resume: (result: Effect.Effect<ReplyFrame, ApiError>) => void
+}>
+
+export const wsTransport: Layer.Layer<Transport> = Layer.effect(
+  Transport,
+  Effect.gen(function* () {
+    const connected = yield* SubscriptionRef.make(false)
+    const unauthorized = yield* SubscriptionRef.make(false)
+    const pending = new Map<string, Pending>()
+    let socket: WebSocket | undefined
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined
+    let attempts = 0
+    let stopped = true
+
+    const setConnected = (value: boolean) =>
+      Effect.runSync(SubscriptionRef.set(connected, value))
+    const setUnauthorized = (value: boolean) =>
+      Effect.runSync(SubscriptionRef.set(unauthorized, value))
+
+    const sendFrame = (frame: RequestFrame) => {
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify(frame))
+      }
+    }
+
+    const connect = () => {
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+      const current = new WebSocket(`${protocol}//${location.host}/ws`)
+      socket = current
+      let opened = false
+
+      current.onopen = () => {
+        if (stopped || socket !== current) {
+          current.close()
+          return
+        }
+        opened = true
+        attempts = 0
+        setUnauthorized(false)
+        setConnected(true)
+        for (const { frame } of pending.values()) {
+          sendFrame(frame)
+        }
+      }
+      current.onmessage = event => {
+        try {
+          const data: unknown = JSON.parse(String(event.data))
+          const reply = Schema.decodeUnknownSync(ReplyFrame)(data)
+          const request = pending.get(reply.id)
+          if (request !== undefined) {
+            pending.delete(reply.id)
+            request.resume(Effect.succeed(reply))
+          }
+        } catch {
+          current.close()
+        }
+      }
+      current.onclose = event => {
+        if (socket !== current) {
+          return
+        }
+        setConnected(false)
+        if (opened) {
+          for (const request of pending.values()) {
+            request.resume(
+              Effect.fail(new ApiError({ message: 'Connection lost' })),
+            )
+          }
+          pending.clear()
+        }
+        if (event.code === 4401) {
+          setUnauthorized(true)
+          return
+        }
+        void fetch('/api/session')
+          .then(response => {
+            if (!stopped && socket === current && response.status === 401) {
+              setUnauthorized(true)
+            }
+          })
+          .catch(() => {})
+        if (!stopped) {
+          const delay = Math.min(1000 * 2 ** attempts, 30000)
+          attempts = Math.min(attempts + 1, 5)
+          reconnectTimer = setTimeout(connect, delay)
+        }
+      }
+    }
+
+    const stop = () => {
+      stopped = true
+      clearTimeout(reconnectTimer)
+      const current = socket
+      socket = undefined
+      current?.close()
+      setConnected(false)
+      setUnauthorized(false)
+      for (const request of pending.values()) {
+        request.resume(
+          Effect.fail(new ApiError({ message: 'Connection closed' })),
+        )
+      }
+      pending.clear()
+    }
+
+    yield* Effect.addFinalizer(() => Effect.sync(stop))
+
+    return Transport.of({
+      send: frame =>
+        Effect.callback<ReplyFrame, ApiError>(resume => {
+          const timer = setTimeout(() => {
+            pending.delete(frame.id)
+            resume(Effect.fail(new ApiError({ message: 'Request timed out' })))
+          }, 15000)
+          pending.set(frame.id, {
+            frame,
+            resume: result => {
+              clearTimeout(timer)
+              resume(result)
+            },
+          })
+          sendFrame(frame)
+          return Effect.sync(() => {
+            clearTimeout(timer)
+            pending.delete(frame.id)
+          })
+        }),
+      status: Stream.unwrap(
+        Effect.acquireRelease(
+          Effect.sync(() => {
+            stopped = false
+            attempts = 0
+            setUnauthorized(false)
+            connect()
+            return SubscriptionRef.changes(connected)
+          }),
+          () => Effect.sync(stop),
+        ),
+      ),
+      unauthorized: SubscriptionRef.changes(unauthorized).pipe(
+        Stream.filter(Boolean),
+      ),
+    })
+  }),
+)

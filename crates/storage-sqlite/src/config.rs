@@ -186,7 +186,9 @@ impl ConfigStore for SqliteStorage {
         models: Vec<DiscoveredModel>,
     ) -> Result<(), StoreError> {
         let mut connection = self.lock();
-        let transaction = connection.transaction().map_err(backend)?;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(backend)?;
         let kept: HashSet<&str> = models.iter().map(|model| model.id.as_str()).collect();
         let existing = transaction
             .prepare("SELECT id FROM models WHERE provider = ?1")

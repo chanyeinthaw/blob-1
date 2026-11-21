@@ -190,13 +190,13 @@ impl<T: SkillStore + ?Sized> SkillStore for std::sync::Arc<T> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProviderId(pub String);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderApi {
     OpenAiResponses,
     OpenAiCompletions,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Provider {
     pub id: ProviderId,
     pub api: ProviderApi,
@@ -258,7 +258,7 @@ pub struct DiscoveredModel {
     pub context_window: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Model {
     pub images: bool,
     pub provider: ProviderId,
@@ -277,13 +277,13 @@ impl Model {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModelRef {
     pub provider: ProviderId,
     pub model: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Settings {
     pub default_model: Option<ModelRef>,
     pub reasoning: ReasoningLevel,
@@ -295,6 +295,24 @@ pub struct Settings {
 pub struct Home {
     pub messenger: String,
     pub target: String,
+}
+
+pub trait WebAuthStore: Send + Sync {
+    fn web_password(&self) -> Result<Option<String>, StoreError>;
+    fn set_web_password(&self, hash: &str) -> Result<(), StoreError>;
+    fn create_web_session(
+        &self,
+        hash: &[u8],
+        expires: i64,
+        password: &str,
+    ) -> Result<bool, StoreError>;
+    fn authenticate_web_session(
+        &self,
+        hash: &[u8],
+        now: i64,
+        expires: i64,
+    ) -> Result<bool, StoreError>;
+    fn delete_web_session(&self, hash: &[u8]) -> Result<(), StoreError>;
 }
 
 pub trait ConfigStore: Send + Sync {

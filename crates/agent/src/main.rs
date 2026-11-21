@@ -12,6 +12,7 @@ use storage_sqlite::SqliteStorage;
 
 mod import;
 mod run;
+mod web;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -29,7 +30,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Serve,
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:7878")]
+        web: std::net::SocketAddr,
+    },
+    Web {
+        #[command(subcommand)]
+        command: WebCommand,
+    },
     Watch {
         #[command(subcommand)]
         command: WatchCommand,
@@ -81,6 +89,19 @@ enum Command {
     Chat {
         message: String,
     },
+}
+
+#[derive(Subcommand)]
+enum WebCommand {
+    Password {
+        #[command(subcommand)]
+        command: WebPasswordCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum WebPasswordCommand {
+    Set,
 }
 
 #[derive(Subcommand)]
@@ -285,9 +306,12 @@ async fn main() -> Result<()> {
     let store = Arc::new(
         if matches!(
             cli.command,
-            Command::Model {
-                command: ModelCommand::Utility { .. }
-            } | Command::Messenger { .. }
+            Command::Model { .. }
+                | Command::Models { .. }
+                | Command::Provider { .. }
+                | Command::Reasoning { .. }
+                | Command::Web { .. }
+                | Command::Messenger { .. }
                 | Command::Identity { .. }
                 | Command::Timezone { .. }
                 | Command::Home { .. }
@@ -368,37 +392,67 @@ async fn main() -> Result<()> {
                     }
                 }
                 HomeCommand::Set { messenger, target } => {
-                    if messenger != "discord" {
-                        return Err("home messenger must be discord".into());
-                    }
-                    let id = target.strip_prefix("dm:").unwrap_or(&target);
-                    if !id.bytes().all(|b| b.is_ascii_digit())
-                        || id.parse::<u64>().map_or(true, |id| id == 0)
-                    {
-                        return Err(
-                            "home target must be a numeric channel id or dm:<numeric user id>"
-                                .into(),
-                        );
-                    }
-                    store.set_home(Some(&storage::Home { messenger, target }))?
+                    set_home(&store, Some(storage::Home { messenger, target }))?
                 }
-                HomeCommand::Clear => store.set_home(None)?,
+                HomeCommand::Clear => set_home(&store, None)?,
             }
             Ok(())
         }
         Command::Identity { command } => identity(&store, command),
         Command::Messenger { command } => messenger(&store, command),
-        Command::Serve => {
-            let token =
-                std::env::var("DISCORD_BOT_TOKEN").map_err(|_| "DISCORD_BOT_TOKEN is not set")?;
-            std::fs::create_dir_all(&workspace)?;
-            run::serve(
-                store,
-                &workspace.canonicalize()?,
-                skills_dir.as_deref(),
-                token,
-            )
-            .await
+        Command::Web {
+            command:
+                WebCommand::Password {
+                    command: WebPasswordCommand::Set,
+                },
+        } => web::set_password(&store),
+        Command::Serve { web: addr } => {
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            let web_store = store.clone();
+            let discord_client = Arc::new(std::sync::OnceLock::new());
+            let discord_for_run = discord_client.clone();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let shutdown_tx = Arc::new(shutdown_tx);
+            let discord_shutdown = shutdown_rx.clone();
+            let mut interrupt =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            let token = std::env::var("DISCORD_BOT_TOKEN");
+            let discord_task = match token {
+                Ok(token) => {
+                    std::fs::create_dir_all(&workspace)?;
+                    let workspace = workspace.canonicalize()?;
+                    let stop = shutdown_tx.clone();
+                    Some(tokio::spawn(async move {
+                        let result = run::serve(
+                            store,
+                            &workspace,
+                            skills_dir.as_deref(),
+                            token,
+                            discord_for_run,
+                            discord_shutdown,
+                        )
+                        .await;
+                        let _ = stop.send(true);
+                        result
+                    }))
+                }
+                Err(_) => {
+                    eprintln!("Discord disabled: DISCORD_BOT_TOKEN is not set");
+                    None
+                }
+            };
+            let signal_tx = shutdown_tx.clone();
+            tokio::spawn(async move {
+                tokio::select! { _ = interrupt.recv() => {}, _ = terminate.recv() => {} }
+                let _ = signal_tx.send(true);
+            });
+            web::serve(listener, web_store, discord_client, shutdown_rx).await?;
+            match discord_task {
+                Some(task) => task.await?,
+                None => Ok(()),
+            }
         }
         Command::Provider { command } => provider(&store, command),
         Command::Models { command } => models(&store, command).await,
@@ -420,6 +474,20 @@ async fn main() -> Result<()> {
     }
 }
 
+fn set_home(store: &SqliteStorage, home: Option<storage::Home>) -> Result<()> {
+    if let Some(home) = &home {
+        if home.messenger != "discord" {
+            return Err("home messenger must be discord".into());
+        }
+        let id = home.target.strip_prefix("dm:").unwrap_or(&home.target);
+        if !id.bytes().all(|b| b.is_ascii_digit()) || id.parse::<u64>().map_or(true, |id| id == 0) {
+            return Err("home target must be a numeric channel id or dm:<numeric user id>".into());
+        }
+    }
+    store.set_home(home.as_ref())?;
+    Ok(())
+}
+
 fn identity(store: &SqliteStorage, command: IdentityCommand) -> Result<()> {
     match command {
         IdentityCommand::Show => println!(
@@ -437,14 +505,19 @@ fn identity(store: &SqliteStorage, command: IdentityCommand) -> Result<()> {
             } else {
                 std::fs::read_to_string(file)?
             };
-            let text = text.trim_end();
-            if text.is_empty() {
-                return Err("identity cannot be empty".into());
-            }
-            store.set_identity(Some(text))?;
+            set_identity(store, &text)?;
         }
         IdentityCommand::Reset => store.set_identity(None)?,
     }
+    Ok(())
+}
+
+fn set_identity(store: &SqliteStorage, text: &str) -> Result<()> {
+    let text = text.trim_end();
+    if text.is_empty() {
+        return Err("identity cannot be empty".into());
+    }
+    store.set_identity(Some(text))?;
     Ok(())
 }
 
@@ -501,10 +574,8 @@ async fn models(store: &SqliteStorage, command: ModelsCommand) -> Result<()> {
                 None => providers.iter().collect(),
             };
             for provider in selected {
-                let key = api_key(provider)?;
-                let models = llm_rig::discover(provider, &key).await?;
-                println!("{}: {} models", provider.id.0, models.len());
-                store.replace_models(&provider.id, models)?;
+                let count = refresh_provider(store, provider).await?;
+                println!("{}: {} models", provider.id.0, count);
             }
         }
         ModelsCommand::List => {
@@ -587,6 +658,14 @@ async fn models(store: &SqliteStorage, command: ModelsCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn refresh_provider(store: &SqliteStorage, provider: &Provider) -> Result<usize> {
+    let key = api_key(provider)?;
+    let models = llm_rig::discover(provider, &key).await?;
+    let count = models.len();
+    store.replace_models(&provider.id, models)?;
+    Ok(count)
 }
 
 fn known_model(store: &SqliteStorage, model: &str) -> Result<storage::Model> {

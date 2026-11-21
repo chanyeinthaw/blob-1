@@ -1,6 +1,7 @@
 services:
   agent:
     build: .
+    command: ["serve", "--web", "100.121.80.5:7878"]
     network_mode: host
     restart: unless-stopped
     environment:

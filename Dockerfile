@@ -1,6 +1,15 @@
+FROM node:22-bookworm AS web-build
+WORKDIR /src/web
+RUN corepack enable
+COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY web/ ./
+RUN pnpm build
+
 FROM rust:1.98-bookworm AS build
 WORKDIR /src
 COPY . .
+COPY --from=web-build /src/web/dist ./web/dist
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release -p agent && cp target/release/agent /usr/local/bin/agent

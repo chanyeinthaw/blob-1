@@ -10,7 +10,9 @@ mod tasks;
 mod utility;
 pub use utility::{parse_inline, Utility};
 
-pub use chat::{ChatHarness, ModelSelection, Models, ZoomId, CHAT_PROMPT, DEFAULT_IDENTITY};
+pub use chat::{
+    ChatHarness, Current, ModelSelection, Models, ZoomId, CHAT_PROMPT, DEFAULT_IDENTITY,
+};
 pub use llm::{CompletionRequest, CompletionResponse, Llm, LlmError, ToolCallRequest, Usage};
 pub use prompt::SUB_PROMPT;
 pub use session::{

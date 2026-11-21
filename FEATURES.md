@@ -18,6 +18,16 @@ Where each feature lives: code, CLI, model tools and storage.
 | `storage` | storage traits, `Meta`, XML rendering of model input |
 | `storage-sqlite` | SQLite implementation of every store |
 
+## Web settings
+
+- Code: `crates/agent/src/web.rs`, `crates/storage-sqlite/src/web_auth.rs`, `web/src/session.ts`, `web/src/api/{client,ws,mock,protocol}.ts`, `web/src/page/settings/{identity,models,providers,discord}.ts`
+- `agent serve --web <addr>` serves the app (default `127.0.0.1:7878`); `agent web password set` sets the password.
+- HTTP endpoints: `/api/session`, `/api/login`, `/api/logout`, `/ws`.
+- Tables: `web_password`, `web_sessions`.
+- Discord starts once `DISCORD_BOT_TOKEN` is set and a main model resolves, including while `serve` is already running; otherwise `serve` runs web-only until then. A Discord failure exits the process.
+- Model and provider changes apply to the running bot without a restart: each turn, spawned task, compaction pass and utility call resolves from current settings; a run already in progress keeps its model, a task keeps the model it was spawned with for its lifetime, and a role whose settings no longer resolve keeps its last working model. The `model`, `models`, `provider` and `reasoning` commands run while `serve` holds the data directory; `serve`, `chat` and `skill` still need it exclusively.
+- The mock transport is enabled only with `VITE_MOCK=1`.
+
 ## Chat
 
 The bot is one chat that never ends. It coordinates and talks; tasks do the work.
