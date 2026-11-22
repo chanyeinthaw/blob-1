@@ -24,7 +24,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use storage::{
-    ConfigStore, McpServer, McpStore, McpTransport, MessengerStore, ReasoningLevel, WebAuthStore,
+    Checkin, CheckinStore, ConfigStore, McpServer, McpStore, McpTransport, MessengerStore,
+    ReasoningLevel, ScheduleStore, WatchStore, WebAuthStore,
 };
 use storage_sqlite::SqliteStorage;
 
@@ -419,6 +420,136 @@ fn providers_reply(store: &SqliteStorage) -> crate::Result<Value> {
     }
     Ok(json!(result))
 }
+fn describe_target(
+    store: &SqliteStorage,
+    to_dest: Option<u64>,
+    reply: Option<&str>,
+) -> Option<String> {
+    if let Some(id) = to_dest {
+        if let Ok(Some((_, place))) = store.place(id) {
+            if place.dm {
+                return Some("Direct message".to_string());
+            }
+            if let Some(thread) = place.thread {
+                return Some(format!("Thread {thread}"));
+            }
+            return Some(format!("Channel {}", place.channel));
+        }
+        return Some(format!("d{id}"));
+    }
+    reply.map(|id| format!("Reply {id}"))
+}
+
+const WEEKDAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+const OCCURRENCE_PAGE_LIMIT: usize = 500;
+
+fn occurrences_reply(
+    store: &SqliteStorage,
+    start: i64,
+    end: i64,
+    cursor: Option<(i64, &str)>,
+) -> crate::Result<Value> {
+    let effective_start = cursor.map_or(start, |(at, _)| start.max(at));
+    let mut all: Vec<(i64, String)> = Vec::new();
+    for s in store.schedules()? {
+        let id = format!("s{}", s.id);
+        // Fetch up to PAGE_LIMIT + 1 items strictly after `cursor` per schedule
+        // so the merged sort is exact even when multiple schedules fire at the
+        // same timestamp.
+        let mut count = 0usize;
+        for at in harness::schedule::occurrences(&s, effective_start, end, OCCURRENCE_PAGE_LIMIT + 2)
+        {
+            if let Some((c_at, c_id)) = cursor {
+                if at < c_at || (at == c_at && id.as_str() <= c_id) {
+                    continue;
+                }
+            }
+            all.push((at, id.clone()));
+            count += 1;
+            if count > OCCURRENCE_PAGE_LIMIT {
+                break;
+            }
+        }
+    }
+    all.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let has_more = all.len() > OCCURRENCE_PAGE_LIMIT;
+    all.truncate(OCCURRENCE_PAGE_LIMIT);
+    let next_cursor = if has_more {
+        all.last()
+            .map(|(at, id)| json!({ "at": at, "scheduleId": id }))
+    } else {
+        None
+    };
+    let occurrences = all
+        .into_iter()
+        .map(|(at, id)| json!({ "scheduleId": id, "at": at }))
+        .collect::<Vec<_>>();
+    Ok(json!({ "occurrences": occurrences, "nextCursor": next_cursor }))
+}
+
+fn schedule_reply(store: &SqliteStorage) -> crate::Result<Value> {
+    let timezone = store.timezone()?;
+    let now_s = now();
+    let schedules = store
+        .schedules()?
+        .into_iter()
+        .map(|s| {
+            let (kind, when) = match (s.at, s.cron) {
+                (Some(at), _) => ("at", at),
+                (_, Some(cron)) => ("cron", cron),
+                _ => ("at", String::new()),
+            };
+            json!({
+                "id": format!("s{}", s.id),
+                "text": s.text,
+                "kind": kind,
+                "when": when,
+                "timezone": s.timezone,
+                "nextDue": s.next_due,
+                "target": describe_target(store, s.to_dest, s.reply.as_deref()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let checkin_cfg = store.checkin()?;
+    let next_checkin = checkin_cfg
+        .as_ref()
+        .and_then(|cfg| harness::schedule::next_checkin_timestamp(cfg, &timezone));
+    let checkin = checkin_cfg.map(|c| {
+        let days = c
+            .days
+            .split(',')
+            .filter(|d| WEEKDAYS.contains(d))
+            .collect::<Vec<_>>();
+        json!({
+            "every": c.every,
+            "days": days,
+            "startHour": c.start_hour,
+            "endHour": c.end_hour,
+        })
+    });
+    let watches = store
+        .watches()?
+        .into_iter()
+        .filter(|w| w.until.is_none_or(|until| until > now_s))
+        .map(|w| {
+            json!({
+                "id": format!("w{}", w.id),
+                "text": w.text,
+                "until": w.until,
+                "target": describe_target(store, w.to_dest, w.reply.as_deref()),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "timezone": timezone,
+        "schedules": schedules,
+        "checkin": checkin,
+        "nextCheckin": next_checkin,
+        "watches": watches,
+    }))
+}
+
 fn discord_reply(ctx: &Context) -> crate::Result<Value> {
     let store = &ctx.store;
     let home = match store.home()? {
@@ -948,6 +1079,151 @@ async fn dispatch(
                 }
                 let origin = request_origin(ctx, headers).ok_or("missing Host header")?;
                 Ok(json!({"url": format!("{origin}/api/mcp/login?id={id}")}))
+            }
+            "schedule.get" => Ok(schedule_reply(store)?),
+            "schedule.occurrences" => {
+                let start = payload
+                    .get("start")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(invalid)?;
+                let end = payload
+                    .get("end")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(invalid)?;
+                if end < start || end.saturating_sub(start) > 90 * 86400 {
+                    return Err("Range must be at most 90 days".into());
+                }
+                let cursor = match payload.get("cursor") {
+                    None | Some(Value::Null) => None,
+                    Some(obj) => {
+                        let at = obj.get("at").and_then(Value::as_i64).ok_or_else(invalid)?;
+                        let id = obj
+                            .get("scheduleId")
+                            .and_then(Value::as_str)
+                            .ok_or_else(invalid)?;
+                        Some((at, id))
+                    }
+                };
+                Ok(occurrences_reply(store, start, end, cursor)?)
+            }
+            "schedule.setTimezone" => {
+                let tz = harness::schedule::validate_timezone(get("timezone")?.trim())
+                    .map_err(|_| "Invalid timezone".to_string())?;
+                store.set_timezone(&tz)?;
+                Ok(schedule_reply(store)?)
+            }
+            "schedule.add" => {
+                let text = get("text")?.trim().to_string();
+                if text.is_empty() {
+                    return Err("Task is required".into());
+                }
+                let kind = get("kind")?;
+                let when = get("when")?.trim().to_string();
+                let tz = match payload.get("timezone") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(s)) if s.trim().is_empty() => None,
+                    Some(Value::String(s)) => Some(s.trim().to_string()),
+                    Some(_) => return Err(invalid().into()),
+                };
+                let (at, cron) = match kind {
+                    "at" => (Some(when), None),
+                    "cron" => (None, Some(when)),
+                    _ => return Err(invalid().into()),
+                };
+                harness::schedule::add(
+                    store.as_ref(),
+                    store.as_ref(),
+                    harness::schedule::Add {
+                        text,
+                        at,
+                        cron,
+                        tz,
+                        to: None,
+                        reply: None,
+                    },
+                )?;
+                Ok(schedule_reply(store)?)
+            }
+            "schedule.remove" => {
+                harness::schedule::remove(store.as_ref(), get("id")?)?;
+                Ok(schedule_reply(store)?)
+            }
+            "checkin.set" => {
+                let every = payload
+                    .get("every")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(invalid)?;
+                if every < 300 {
+                    return Err("Interval must be at least 5 minutes".into());
+                }
+                let raw_days = payload
+                    .get("days")
+                    .and_then(Value::as_array)
+                    .ok_or_else(invalid)?;
+                let mut selected = std::collections::HashSet::new();
+                for value in raw_days {
+                    let day = value.as_str().ok_or_else(invalid)?;
+                    if !WEEKDAYS.contains(&day) || !selected.insert(day) {
+                        return Err("Invalid days".into());
+                    }
+                }
+                if selected.is_empty() {
+                    return Err("Choose at least one day".into());
+                }
+                let days = WEEKDAYS
+                    .iter()
+                    .copied()
+                    .filter(|day| selected.contains(day))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let start_hour = payload
+                    .get("startHour")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u8::try_from(v).ok())
+                    .ok_or_else(invalid)?;
+                let end_hour = payload
+                    .get("endHour")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u8::try_from(v).ok())
+                    .ok_or_else(invalid)?;
+                if start_hour >= end_hour || end_hour > 24 {
+                    return Err("End hour must be after start hour".into());
+                }
+                store.set_checkin(&Checkin {
+                    every,
+                    days,
+                    start_hour,
+                    end_hour,
+                })?;
+                Ok(schedule_reply(store)?)
+            }
+            "checkin.clear" => {
+                store.clear_checkin()?;
+                Ok(schedule_reply(store)?)
+            }
+            "watch.add" => {
+                let text = get("text")?.trim().to_string();
+                let until = match payload.get("until") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(s)) if s.trim().is_empty() => None,
+                    Some(Value::String(s)) => Some(s.trim().to_string()),
+                    Some(_) => return Err(invalid().into()),
+                };
+                harness::watch::add(
+                    store.as_ref(),
+                    store.as_ref(),
+                    harness::watch::Add {
+                        text,
+                        to: None,
+                        reply: None,
+                        until,
+                    },
+                )?;
+                Ok(schedule_reply(store)?)
+            }
+            "watch.remove" => {
+                harness::watch::remove(store.as_ref(), get("id")?)?;
+                Ok(schedule_reply(store)?)
             }
             _ => Err(format!("Unknown request: {request_type}").into()),
         }

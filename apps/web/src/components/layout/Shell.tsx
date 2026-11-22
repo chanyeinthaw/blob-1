@@ -2,6 +2,7 @@ import { useAtomSet, useAtomValue } from '@effect/atom-react'
 import { Link, type LinkProps, Navigate, useNavigate } from '@tanstack/react-router'
 import { AsyncResult } from 'effect/reactivity'
 import {
+  CalendarClock,
   Link as LinkIcon,
   LogOut,
   MessageCircle,
@@ -30,10 +31,11 @@ interface NavItem {
 
 const navItems: ReadonlyArray<NavItem> = [
   { label: 'Identity', mobileLabel: 'Identity', to: '/settings/identity', icon: User },
-  { label: 'Models', mobileLabel: 'Models', to: '/settings/models', icon: SlidersHorizontal },
-  { label: 'Providers', mobileLabel: 'Providers', to: '/settings/providers', icon: Server },
+  { label: 'Schedules', mobileLabel: 'Schedules', to: '/settings/schedules', icon: CalendarClock },
   { label: 'Chat platforms', mobileLabel: 'Chat', to: '/settings/chat', icon: MessageCircle },
   { label: 'MCP', mobileLabel: 'MCP', to: '/settings/mcp', icon: LinkIcon },
+  { label: 'Models', mobileLabel: 'Models', to: '/settings/models', icon: SlidersHorizontal },
+  { label: 'Providers', mobileLabel: 'Providers', to: '/settings/providers', icon: Server },
 ]
 
 interface ConnectionInfo {

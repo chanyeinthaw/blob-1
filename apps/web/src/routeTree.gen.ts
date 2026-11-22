@@ -19,6 +19,7 @@ import { Route as SettingsIdentityRouteImport } from './routes/settings.identity
 import { Route as SettingsMcpRouteImport } from './routes/settings.mcp'
 import { Route as SettingsModelsRouteImport } from './routes/settings.models'
 import { Route as SettingsProvidersRouteImport } from './routes/settings.providers'
+import { Route as SettingsSchedulesRouteImport } from './routes/settings.schedules'
 import { Route as SettingsChatIndexRouteImport } from './routes/settings.chat.index'
 import { Route as SettingsChatDiscordRouteImport } from './routes/settings.chat.discord'
 
@@ -72,6 +73,11 @@ const SettingsProvidersRoute = SettingsProvidersRouteImport.update({
   path: '/providers',
   getParentRoute: () => SettingsRoute,
 } as any)
+const SettingsSchedulesRoute = SettingsSchedulesRouteImport.update({
+  id: '/schedules',
+  path: '/schedules',
+  getParentRoute: () => SettingsRoute,
+} as any)
 const SettingsChatIndexRoute = SettingsChatIndexRouteImport.update({
   id: '/',
   path: '/',
@@ -93,6 +99,7 @@ export interface FileRoutesByFullPath {
   '/settings/mcp': typeof SettingsMcpRoute
   '/settings/models': typeof SettingsModelsRoute
   '/settings/providers': typeof SettingsProvidersRoute
+  '/settings/schedules': typeof SettingsSchedulesRoute
   '/settings/': typeof SettingsIndexRoute
   '/settings/chat/discord': typeof SettingsChatDiscordRoute
   '/settings/chat/': typeof SettingsChatIndexRoute
@@ -105,6 +112,7 @@ export interface FileRoutesByTo {
   '/settings/mcp': typeof SettingsMcpRoute
   '/settings/models': typeof SettingsModelsRoute
   '/settings/providers': typeof SettingsProvidersRoute
+  '/settings/schedules': typeof SettingsSchedulesRoute
   '/settings': typeof SettingsIndexRoute
   '/settings/chat/discord': typeof SettingsChatDiscordRoute
   '/settings/chat': typeof SettingsChatIndexRoute
@@ -120,6 +128,7 @@ export interface FileRoutesById {
   '/settings/mcp': typeof SettingsMcpRoute
   '/settings/models': typeof SettingsModelsRoute
   '/settings/providers': typeof SettingsProvidersRoute
+  '/settings/schedules': typeof SettingsSchedulesRoute
   '/settings/': typeof SettingsIndexRoute
   '/settings/chat/discord': typeof SettingsChatDiscordRoute
   '/settings/chat/': typeof SettingsChatIndexRoute
@@ -136,6 +145,7 @@ export interface FileRouteTypes {
     | '/settings/mcp'
     | '/settings/models'
     | '/settings/providers'
+    | '/settings/schedules'
     | '/settings/'
     | '/settings/chat/discord'
     | '/settings/chat/'
@@ -148,6 +158,7 @@ export interface FileRouteTypes {
     | '/settings/mcp'
     | '/settings/models'
     | '/settings/providers'
+    | '/settings/schedules'
     | '/settings'
     | '/settings/chat/discord'
     | '/settings/chat'
@@ -162,6 +173,7 @@ export interface FileRouteTypes {
     | '/settings/mcp'
     | '/settings/models'
     | '/settings/providers'
+    | '/settings/schedules'
     | '/settings/'
     | '/settings/chat/discord'
     | '/settings/chat/'
@@ -245,6 +257,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SettingsProvidersRouteImport
       parentRoute: typeof SettingsRoute
     }
+    '/settings/schedules': {
+      id: '/settings/schedules'
+      path: '/schedules'
+      fullPath: '/settings/schedules'
+      preLoaderRoute: typeof SettingsSchedulesRouteImport
+      parentRoute: typeof SettingsRoute
+    }
     '/settings/chat/': {
       id: '/settings/chat/'
       path: '/'
@@ -283,6 +302,7 @@ interface SettingsRouteChildren {
   SettingsMcpRoute: typeof SettingsMcpRoute
   SettingsModelsRoute: typeof SettingsModelsRoute
   SettingsProvidersRoute: typeof SettingsProvidersRoute
+  SettingsSchedulesRoute: typeof SettingsSchedulesRoute
   SettingsIndexRoute: typeof SettingsIndexRoute
 }
 
@@ -293,6 +313,7 @@ const SettingsRouteChildren: SettingsRouteChildren = {
   SettingsMcpRoute: SettingsMcpRoute,
   SettingsModelsRoute: SettingsModelsRoute,
   SettingsProvidersRoute: SettingsProvidersRoute,
+  SettingsSchedulesRoute: SettingsSchedulesRoute,
   SettingsIndexRoute: SettingsIndexRoute,
 }
 

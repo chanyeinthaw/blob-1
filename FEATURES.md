@@ -105,20 +105,22 @@ One-shot generation: one request, no tools, no memory, no session.
 
 ## Calendar
 
-- Code: `crates/harness/src/schedule.rs` (`run_schedules`), `crates/storage-sqlite/src/schedule.rs`
+- Code: `crates/harness/src/schedule.rs` (`run_schedules`), `crates/storage-sqlite/src/schedule.rs`, `apps/web/src/features/schedules/`
 - One-off (`at`) or recurring (`cron`) jobs with their own timezone and optional `to` or `reply`
 - Fires as `<scheduled id due [late] [to] [for] [home]>` while `serve` runs; a missed job fires once, marked late
 - Tools: `schedule`, `unschedule`, `schedules`
+- Web protocol: `schedule.get`, `schedule.occurrences`, `schedule.setTimezone`, `schedule.add`, `schedule.remove` (`/settings/schedules`)
 - CLI: `agent schedule add | list | remove`, `agent timezone show | set`, `agent home show | set | clear`
 - Tables: `schedules`, `clock`, `home`
 
 ## Watches and check-ins
 
-- Code: `crates/harness/src/watch.rs`, `crates/harness/src/schedule.rs` (`next_checkin`), `crates/storage-sqlite/src/{watch,checkin}.rs`
+- Code: `crates/harness/src/watch.rs`, `crates/harness/src/schedule.rs` (`next_checkin`), `crates/storage-sqlite/src/{watch,checkin}.rs`, `apps/web/src/features/schedules/`
 - Watches: things the bot keeps an eye on, with optional `to`, `reply` and `until`
 - Check-ins: every interval within an hour window on chosen weekdays, only when watches exist; fire as `<checkin time [home]>` with a `<watch>` per item
 - Results with no destination and no home go in the final reply, kept in memory and printed by `serve`
 - Tools: `watch`, `unwatch`, `watches`
+- Web protocol: `checkin.set`, `checkin.clear`, `watch.add`, `watch.remove` (`/settings/schedules`)
 - CLI: `agent watch list | remove`, `agent checkin show | set --every --days --hours | off`
 - Tables: `watches`, `checkin`
 

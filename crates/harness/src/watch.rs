@@ -30,11 +30,11 @@ pub const TOOLS: &[ToolSpec] = &[
 ];
 
 #[derive(Deserialize)]
-struct Add {
-    text: String,
-    to: Option<String>,
-    reply: Option<String>,
-    until: Option<String>,
+pub struct Add {
+    pub text: String,
+    pub to: Option<String>,
+    pub reply: Option<String>,
+    pub until: Option<String>,
 }
 #[derive(Deserialize)]
 struct Id {
@@ -82,6 +82,50 @@ pub fn remove<S: WatchStore>(store: &S, id: &str) -> Result<String> {
     Ok(format!("removed {id}"))
 }
 
+pub fn add<S: WatchStore + MessengerStore + MemoryStore>(
+    store: &S,
+    config: &dyn ConfigStore,
+    args: Add,
+) -> Result<String> {
+    if args.text.trim().is_empty() {
+        return Err("watch text must not be blank".into());
+    }
+    if storage::escape(&args.text).chars().count() > 1000 {
+        return Err("watch text must not exceed 1000 characters".into());
+    }
+    let now = Utc::now().timestamp();
+    if store
+        .watches()?
+        .iter()
+        .filter(|watch| watch.until.is_none_or(|until| until > now))
+        .count()
+        >= 20
+    {
+        return Err("at most 20 active watches are allowed".into());
+    }
+    let to_dest = target(store, args.to.as_deref(), args.reply.as_deref())?;
+    let until = args
+        .until
+        .as_deref()
+        .map(|value| -> Result<i64> {
+            let tz: Tz = config.timezone()?.parse()?;
+            let time = parse_time(value, tz)?;
+            if time <= Utc::now() {
+                return Err("until must be in the future".into());
+            }
+            Ok(time.timestamp() + i64::from(time.timestamp_subsec_nanos() > 0))
+        })
+        .transpose()?;
+    let id = store.add_watch(&Watch {
+        id: 0,
+        text: args.text,
+        to_dest,
+        reply: args.reply,
+        until,
+    })?;
+    Ok(format!("watching w{id}"))
+}
+
 pub fn execute<S: WatchStore + MessengerStore + MemoryStore>(
     store: &S,
     config: &dyn ConfigStore,
@@ -89,46 +133,7 @@ pub fn execute<S: WatchStore + MessengerStore + MemoryStore>(
     arguments: &str,
 ) -> Result<String> {
     match name {
-        "watch" => {
-            let args: Add = serde_json::from_str(arguments)?;
-            if args.text.trim().is_empty() {
-                return Err("watch text must not be blank".into());
-            }
-            if storage::escape(&args.text).chars().count() > 1000 {
-                return Err("watch text must not exceed 1000 characters".into());
-            }
-            let now = Utc::now().timestamp();
-            if store
-                .watches()?
-                .iter()
-                .filter(|watch| watch.until.is_none_or(|until| until > now))
-                .count()
-                >= 20
-            {
-                return Err("at most 20 active watches are allowed".into());
-            }
-            let to_dest = target(store, args.to.as_deref(), args.reply.as_deref())?;
-            let until = args
-                .until
-                .as_deref()
-                .map(|value| -> Result<i64> {
-                    let tz: Tz = config.timezone()?.parse()?;
-                    let time = parse_time(value, tz)?;
-                    if time <= Utc::now() {
-                        return Err("until must be in the future".into());
-                    }
-                    Ok(time.timestamp() + i64::from(time.timestamp_subsec_nanos() > 0))
-                })
-                .transpose()?;
-            let id = store.add_watch(&Watch {
-                id: 0,
-                text: args.text,
-                to_dest,
-                reply: args.reply,
-                until,
-            })?;
-            Ok(format!("watching w{id}"))
-        }
+        "watch" => add(store, config, serde_json::from_str(arguments)?),
         "unwatch" => remove(store, &serde_json::from_str::<Id>(arguments)?.id),
         "watches" => {
             let _: serde_json::Value = serde_json::from_str(arguments)?;

@@ -2,6 +2,7 @@ import { Array, Duration, Effect, Layer, Random, Ref, Schema, Stream, Struct } f
 
 import { Transport } from './api.ts'
 import {
+  type CheckinConfig,
   Discord,
   type DiscordAccessEntry,
   type DiscordAccessMode,
@@ -19,7 +20,10 @@ import {
   type RequestFrame,
   type RequestPayload,
   type RequestType,
+  type ScheduleItem,
+  type ScheduleState,
   Slot,
+  type WatchItem,
   isRequestType,
   requests,
 } from '@blob-1/contracts'
@@ -45,6 +49,12 @@ type State = Readonly<{
   interactionModes: ReadonlyArray<DiscordInteractionOverride>
   replyModes: ReadonlyArray<DiscordReplyOverride>
   mcpServers: ReadonlyArray<McpServer>
+  timezone: string
+  schedules: ReadonlyArray<ScheduleItem>
+  nextScheduleId: number
+  checkin: CheckinConfig | null
+  watches: ReadonlyArray<WatchItem>
+  nextWatchId: number
 }>
 
 const DEFAULT_IDENTITY = 'You are Blob-1.'
@@ -91,6 +101,34 @@ const seedState = (): State => ({
       toolCount: 11,
     },
   ],
+  timezone: 'Asia/Bangkok',
+  schedules: [
+    {
+      id: 's1',
+      text: 'Summarize unread GitHub notifications and PR reviews.',
+      kind: 'cron',
+      when: '0 9 * * 1-5',
+      timezone: 'Asia/Bangkok',
+      nextDue: Math.floor(Date.now() / 1000) + 3600,
+      target: null,
+    },
+  ],
+  nextScheduleId: 2,
+  checkin: {
+    every: 1800,
+    days: ['mon', 'tue', 'wed', 'thu', 'fri'],
+    startHour: 9,
+    endHour: 22,
+  },
+  watches: [
+    {
+      id: 'w1',
+      text: 'Check if blob-1 release workflow finished.',
+      until: Math.floor(Date.now() / 1000) + 86400,
+      target: null,
+    },
+  ],
+  nextWatchId: 2,
 })
 
 const identityReply = (state: State): Identity => ({
@@ -116,6 +154,89 @@ const providersReply = (state: State): ReadonlyArray<Provider> =>
     keyEnv: provider.keyEnv,
     modelCount: provider.models.length,
   }))
+
+const scheduleReply = (state: State): ScheduleState => ({
+  timezone: state.timezone,
+  schedules: state.schedules,
+  checkin: state.checkin,
+  nextCheckin: state.checkin === null ? null : Math.floor(Date.now() / 1000) + state.checkin.every,
+  watches: state.watches,
+})
+
+const LOCAL_DATETIME = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})$/
+
+const parseDateInTimeZone = (raw: string, timeZone: string): number | null => {
+  const trimmed = raw.trim()
+  const localMatch = LOCAL_DATETIME.exec(trimmed)
+  if (localMatch === null) {
+    const parsed = Date.parse(trimmed)
+    return Number.isNaN(parsed) ? null : Math.floor(parsed / 1000)
+  }
+  const [, y, mo, d, h, mi] = localMatch
+  const target = {
+    year: Number(y),
+    month: Number(mo),
+    day: Number(d),
+    hour: Number(h),
+    minute: Number(mi),
+  }
+  const targetUtc = Date.UTC(target.year, target.month - 1, target.day, target.hour, target.minute)
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  })
+  const partsAt = (ms: number) => {
+    const parts = formatter.formatToParts(new Date(ms))
+    const get = (type: Intl.DateTimeFormatPartTypes) =>
+      Number(parts.find(part => part.type === type)?.value ?? 0)
+    return {
+      year: get('year'),
+      month: get('month'),
+      day: get('day'),
+      hour: get('hour') % 24,
+      minute: get('minute'),
+    }
+  }
+  const matchesTarget = (ms: number) => {
+    const p = partsAt(ms)
+    return (
+      p.year === target.year &&
+      p.month === target.month &&
+      p.day === target.day &&
+      p.hour === target.hour &&
+      p.minute === target.minute
+    )
+  }
+  const offsetAt = (ms: number): number => {
+    const p = partsAt(ms)
+    const rendered = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute)
+    return ms - rendered
+  }
+  // Probe the zone's actual offsets before and after the target day (handles
+  // arbitrary DST shifts, including 2-hour transitions like Antarctica/Troll).
+  const candidateOffsets = new Set<number>([
+    offsetAt(targetUtc - 86_400_000),
+    offsetAt(targetUtc),
+    offsetAt(targetUtc + 86_400_000),
+  ])
+  const matches = new Set<number>()
+  for (const offset of candidateOffsets) {
+    const candidate = targetUtc + offset
+    if (matchesTarget(candidate)) {
+      matches.add(candidate)
+    }
+  }
+  // Require exactly one matching UTC instant (rejects both spring-forward gaps
+  // and fall-back ambiguous times, matching Rust `LocalResult::Single`).
+  if (matches.size !== 1) return null
+  const [resolved] = matches
+  return resolved === undefined ? null : Math.floor(resolved / 1000)
+}
 
 const discordReply = (state: State): Discord => ({
   allowed: state.accessEntries
@@ -747,6 +868,117 @@ const handlers: { readonly [K in RequestType]: Handler<K> } = {
           : Effect.fail(`MCP server '${id}' is not an HTTP server`),
       ),
     ),
+
+  'schedule.get': (_payload, state) => Ref.get(state).pipe(Effect.map(scheduleReply)),
+
+  'schedule.occurrences': ({ start, end, cursor }, state) =>
+    Ref.get(state).pipe(
+      Effect.map(current => {
+        const items = current.schedules
+          .filter(item => item.nextDue >= start && item.nextDue <= end)
+          .map(item => ({ scheduleId: item.id, at: item.nextDue }))
+          .toSorted((a, b) => a.at - b.at || a.scheduleId.localeCompare(b.scheduleId))
+          .filter(
+            item =>
+              cursor === undefined ||
+              cursor === null ||
+              item.at > cursor.at ||
+              (item.at === cursor.at && item.scheduleId > cursor.scheduleId),
+          )
+        return { occurrences: items, nextCursor: null }
+      }),
+    ),
+
+  'schedule.setTimezone': ({ timezone }, state) =>
+    transition(state, current =>
+      timezone.trim() === ''
+        ? Effect.fail('Invalid timezone')
+        : Effect.succeed(Struct.evolve(current, { timezone: () => timezone.trim() })),
+    ).pipe(Effect.map(scheduleReply)),
+
+  'schedule.add': (payload, state) =>
+    transition(state, current =>
+      Effect.gen(function* () {
+        if (payload.text.trim() === '') return yield* Effect.fail('Task is required')
+        if (payload.when.trim() === '') return yield* Effect.fail('Schedule time is required')
+        const tz = payload.timezone ?? current.timezone
+        const now = Math.floor(Date.now() / 1000)
+        const nextDue = payload.kind === 'at' ? parseDateInTimeZone(payload.when, tz) : now + 3600
+        if (nextDue === null) return yield* Effect.fail('Invalid schedule time')
+        if (payload.kind === 'at' && nextDue <= now) {
+          return yield* Effect.fail('at must be in the future')
+        }
+        const id = `s${current.nextScheduleId}`
+        const item: ScheduleItem = {
+          id,
+          text: payload.text.trim(),
+          kind: payload.kind,
+          when: payload.when.trim(),
+          timezone: tz,
+          nextDue,
+          target: null,
+        }
+        return Struct.evolve(current, {
+          schedules: list => [...list, item],
+          nextScheduleId: n => n + 1,
+        })
+      }),
+    ).pipe(Effect.map(scheduleReply)),
+
+  'schedule.remove': ({ id }, state) =>
+    transition(state, current =>
+      Effect.succeed(
+        Struct.evolve(current, {
+          schedules: list => list.filter(item => item.id !== id),
+        }),
+      ),
+    ).pipe(Effect.map(scheduleReply)),
+
+  'checkin.set': (payload, state) =>
+    transition(state, current =>
+      Effect.gen(function* () {
+        if (payload.every < 300) return yield* Effect.fail('Interval must be at least 5 minutes')
+        if (payload.days.length === 0) return yield* Effect.fail('Choose at least one day')
+        if (payload.startHour >= payload.endHour || payload.endHour > 24) {
+          return yield* Effect.fail('End hour must be after start hour')
+        }
+        return Struct.evolve(current, { checkin: () => payload })
+      }),
+    ).pipe(Effect.map(scheduleReply)),
+
+  'checkin.clear': (_payload, state) =>
+    transition(state, current =>
+      Effect.succeed(Struct.evolve(current, { checkin: () => null })),
+    ).pipe(Effect.map(scheduleReply)),
+
+  'watch.add': (payload, state) =>
+    transition(state, current =>
+      Effect.gen(function* () {
+        if (payload.text.trim() === '') return yield* Effect.fail('Watch text is required')
+        const now = Math.floor(Date.now() / 1000)
+        let until: number | null = null
+        if (payload.until !== null && payload.until.trim() !== '') {
+          until = parseDateInTimeZone(payload.until, current.timezone)
+          if (until === null) return yield* Effect.fail('Invalid watch expiration')
+          if (until <= now) return yield* Effect.fail('until must be in the future')
+        }
+        const id = `w${current.nextWatchId}`
+        const item: WatchItem = { id, text: payload.text.trim(), until, target: null }
+        return Struct.evolve(current, {
+          watches: list => [...list, item],
+          nextWatchId: n => n + 1,
+        })
+      }),
+    ).pipe(Effect.map(scheduleReply)),
+
+  'watch.remove': ({ id }, state) =>
+    transition(state, current =>
+      Effect.succeed(
+        Struct.evolve(current, {
+          watches: list => list.filter(item => item.id !== id),
+        }),
+      ),
+    ).pipe(Effect.map(scheduleReply)),
 }
 
 const replyOk = (id: string, payload: ReplyPayload<RequestType>): ReplyFrame => ({

@@ -130,12 +130,70 @@ pub(crate) fn target<S: MessengerStore + MemoryStore>(
 pub(crate) fn parse_time(value: &str, tz: Tz) -> Result<DateTime<Utc>> {
     Ok(match DateTime::parse_from_rfc3339(value) {
         Ok(value) => value.with_timezone(&Utc),
-        Err(_) => tz
-            .from_local_datetime(&NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M")?)
-            .single()
-            .ok_or("local time is ambiguous or does not exist")?
-            .with_timezone(&Utc),
+        Err(_) => {
+            let local = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M")
+                .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M"))?;
+            tz.from_local_datetime(&local)
+                .single()
+                .ok_or("local time is ambiguous or does not exist")?
+                .with_timezone(&Utc)
+        }
     })
+}
+
+/// Validates an IANA timezone name (e.g. `Asia/Bangkok`, `UTC`).
+pub fn validate_timezone(value: &str) -> Result<String> {
+    let tz: Tz = value.parse()?;
+    Ok(tz.name().to_string())
+}
+
+/// Computes the next check-in unix timestamp (seconds) from now, if valid.
+pub fn next_checkin_timestamp(config: &Checkin, timezone: &str) -> Option<i64> {
+    let tz: Tz = timezone.parse().ok()?;
+    next_checkin(config, tz, Utc::now()).map(|dt| dt.timestamp())
+}
+
+/// Expands a schedule's firing timestamps (unix seconds) within `[start, end]`,
+/// capped at `limit` occurrences so high-frequency crons stay bounded.
+pub fn occurrences(schedule: &Schedule, start: i64, end: i64, limit: usize) -> Vec<i64> {
+    if end < start || limit == 0 {
+        return Vec::new();
+    }
+    if schedule.at.is_some() {
+        return if schedule.next_due >= start && schedule.next_due <= end {
+            vec![schedule.next_due]
+        } else {
+            Vec::new()
+        };
+    }
+    let Some(cron_expr) = schedule.cron.as_deref() else {
+        return Vec::new();
+    };
+    let Ok(tz) = schedule.timezone.parse::<Tz>() else {
+        return Vec::new();
+    };
+    let Ok(cron) = cron_expr.parse::<croner::Cron>() else {
+        return Vec::new();
+    };
+    let Some(mut cursor) = DateTime::from_timestamp(start.saturating_sub(1), 0) else {
+        return Vec::new();
+    };
+    let Some(end_dt) = DateTime::from_timestamp(end, 0) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    while out.len() < limit {
+        let Ok(next) = cron.find_next_occurrence(&cursor.with_timezone(&tz), false) else {
+            break;
+        };
+        let next_utc = next.with_timezone(&Utc);
+        if next_utc > end_dt {
+            break;
+        }
+        out.push(next_utc.timestamp());
+        cursor = next_utc;
+    }
+    out
 }
 
 pub fn add<S: ScheduleStore + MessengerStore + MemoryStore>(

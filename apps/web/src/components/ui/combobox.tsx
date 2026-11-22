@@ -11,7 +11,7 @@ import {
   InputGroupButton,
   InputGroupInput,
 } from '~/components/ui/input-group'
-import { ChevronDownIcon, XIcon, CheckIcon } from 'lucide-react'
+import { CheckIcon, ChevronDownIcon, SearchIcon, XIcon } from 'lucide-react'
 
 const Combobox = ComboboxPrimitive.Root
 
@@ -74,6 +74,26 @@ function ComboboxInput({
       </InputGroupAddon>
       {children}
     </InputGroup>
+  )
+}
+
+function ComboboxSearch({
+  className,
+  placeholder = 'Search…',
+  ...props
+}: ComboboxPrimitive.Input.Props) {
+  return (
+    <div
+      data-slot="combobox-search"
+      className={cn('flex h-9 items-center gap-2 border-b border-border/70 px-2.5', className)}
+    >
+      <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
+      <ComboboxPrimitive.Input
+        placeholder={placeholder}
+        className="w-full min-w-0 bg-transparent text-sm text-foreground outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-50"
+        {...props}
+      />
+    </div>
   )
 }
 
@@ -254,6 +274,7 @@ function useComboboxAnchor() {
 export {
   Combobox,
   ComboboxInput,
+  ComboboxSearch,
   ComboboxContent,
   ComboboxList,
   ComboboxItem,

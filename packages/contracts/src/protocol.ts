@@ -187,6 +187,66 @@ export const McpAddPayload = Schema.Union([
 
 const NoPayload = Schema.Struct({})
 
+export const Weekday = Schema.Literals(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'])
+export type Weekday = typeof Weekday.Type
+
+export const ScheduleKind = Schema.Literals(['at', 'cron'])
+export type ScheduleKind = typeof ScheduleKind.Type
+
+export const ScheduleItem = Schema.Struct({
+  id: Schema.String,
+  text: Schema.String,
+  kind: ScheduleKind,
+  when: Schema.String,
+  timezone: Schema.String,
+  nextDue: Schema.Finite,
+  target: Schema.NullOr(Schema.String),
+})
+export type ScheduleItem = typeof ScheduleItem.Type
+
+export const CheckinConfig = Schema.Struct({
+  every: Schema.Finite,
+  days: Schema.Array(Weekday),
+  startHour: Schema.Finite,
+  endHour: Schema.Finite,
+})
+export type CheckinConfig = typeof CheckinConfig.Type
+
+export const WatchItem = Schema.Struct({
+  id: Schema.String,
+  text: Schema.String,
+  until: Schema.NullOr(Schema.Finite),
+  target: Schema.NullOr(Schema.String),
+})
+export type WatchItem = typeof WatchItem.Type
+
+export const ScheduleOccurrence = Schema.Struct({
+  scheduleId: Schema.String,
+  at: Schema.Finite,
+})
+export type ScheduleOccurrence = typeof ScheduleOccurrence.Type
+
+export const ScheduleOccurrenceCursor = Schema.Struct({
+  at: Schema.Finite,
+  scheduleId: Schema.String,
+})
+export type ScheduleOccurrenceCursor = typeof ScheduleOccurrenceCursor.Type
+
+export const ScheduleOccurrencesPage = Schema.Struct({
+  occurrences: Schema.Array(ScheduleOccurrence),
+  nextCursor: Schema.NullOr(ScheduleOccurrenceCursor),
+})
+export type ScheduleOccurrencesPage = typeof ScheduleOccurrencesPage.Type
+
+export const ScheduleState = Schema.Struct({
+  timezone: Schema.String,
+  schedules: Schema.Array(ScheduleItem),
+  checkin: Schema.NullOr(CheckinConfig),
+  nextCheckin: Schema.NullOr(Schema.Finite),
+  watches: Schema.Array(WatchItem),
+})
+export type ScheduleState = typeof ScheduleState.Type
+
 export const requests = {
   'identity.get': { payload: NoPayload, reply: Identity },
   'identity.set': {
@@ -331,6 +391,48 @@ export const requests = {
   'mcp.login': {
     payload: Schema.Struct({ id: Schema.String }),
     reply: Schema.Struct({ url: Schema.String }),
+  },
+  'schedule.get': { payload: NoPayload, reply: ScheduleState },
+  'schedule.occurrences': {
+    payload: Schema.Struct({
+      start: Schema.Finite,
+      end: Schema.Finite,
+      cursor: Schema.optional(Schema.NullOr(ScheduleOccurrenceCursor)),
+    }),
+    reply: ScheduleOccurrencesPage,
+  },
+  'schedule.setTimezone': {
+    payload: Schema.Struct({ timezone: Schema.String }),
+    reply: ScheduleState,
+  },
+  'schedule.add': {
+    payload: Schema.Struct({
+      text: Schema.String,
+      kind: ScheduleKind,
+      when: Schema.String,
+      timezone: Schema.NullOr(Schema.String),
+    }),
+    reply: ScheduleState,
+  },
+  'schedule.remove': {
+    payload: Schema.Struct({ id: Schema.String }),
+    reply: ScheduleState,
+  },
+  'checkin.set': {
+    payload: CheckinConfig,
+    reply: ScheduleState,
+  },
+  'checkin.clear': { payload: NoPayload, reply: ScheduleState },
+  'watch.add': {
+    payload: Schema.Struct({
+      text: Schema.String,
+      until: Schema.NullOr(Schema.String),
+    }),
+    reply: ScheduleState,
+  },
+  'watch.remove': {
+    payload: Schema.Struct({ id: Schema.String }),
+    reply: ScheduleState,
   },
 }
 
