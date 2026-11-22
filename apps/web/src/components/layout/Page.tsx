@@ -53,6 +53,7 @@ export function Page(props: PageProps) {
 
 interface SectionProps {
   readonly title: string
+  readonly action?: ReactNode
   readonly className?: string
   readonly children: ReactNode
 }
@@ -60,7 +61,10 @@ interface SectionProps {
 export function Section(props: SectionProps) {
   return (
     <section className={cn('mt-8 first:mt-0', props.className)}>
-      <h2 className="mb-2.5 text-sm font-semibold text-foreground">{props.title}</h2>
+      <div className="mb-2.5 flex items-center justify-between gap-2">
+        <h2 className="text-sm font-semibold text-foreground">{props.title}</h2>
+        {props.action}
+      </div>
       {props.children}
     </section>
   )

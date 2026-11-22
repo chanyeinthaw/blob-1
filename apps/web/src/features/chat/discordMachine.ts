@@ -149,16 +149,19 @@ export const DiscordStates = Machine.state({
     tokenGeneration: Schema.Finite,
     /** Transient home type chosen before picking a destination; null follows `discord.home.kind`. */
     pendingHomeKind: Schema.NullOr(HomeKind),
-    /** Access add-entry form draft. */
+    /** Access add-entry dialog + form draft. */
+    accessDialogOpen: Schema.Boolean,
     accessScope: DiscordAccessScope,
     accessScopeId: Schema.String,
     accessUser: Schema.String,
-    /** Add-override form draft; root fields so busy states can't lose it. */
+    /** Interaction mode dialog + form draft; root fields so busy states can't lose it. */
+    modeDialogOpen: Schema.Boolean,
     modeScope: DiscordInteractionScope,
     modeGuild: Schema.String,
     modeTarget: Schema.String,
     modeSetting: DiscordInteractionMode,
-    /** Reply-mode add form draft. */
+    /** Reply-mode dialog + form draft. */
+    replyDialogOpen: Schema.Boolean,
     replyChannel: Schema.String,
     replySetting: DiscordReplyMode,
   },
@@ -259,6 +262,8 @@ export const DiscordEvents = Machine.events({
   ClearTokenError: {},
   SubmitToken: { token: Schema.String },
   RemoveToken: {},
+  OpenAccessDialog: {},
+  CloseAccessDialog: {},
   SelectAccessScope: { scope: DiscordAccessScope },
   SelectAccessScopeId: { scopeId: Schema.String },
   SelectAccessUser: { userId: Schema.String },
@@ -277,6 +282,8 @@ export const DiscordEvents = Machine.events({
   },
   SelectHomeKind: { kind: HomeKind },
   SetHome: { home: Home },
+  OpenModeDialog: {},
+  CloseModeDialog: {},
   SelectModeScope: { scope: DiscordInteractionScope },
   SelectModeGuild: { guildId: Schema.String },
   SelectModeTarget: { targetId: Schema.String },
@@ -292,6 +299,8 @@ export const DiscordEvents = Machine.events({
     guildId: Schema.NullOr(Schema.String),
     targetId: Schema.String,
   },
+  OpenReplyDialog: {},
+  CloseReplyDialog: {},
   SelectReplyChannel: { channelId: Schema.String },
   SelectReplySetting: { mode: DiscordReplyMode },
   SetReplyMode: { channelId: Schema.String, mode: DiscordReplyMode },
@@ -322,13 +331,16 @@ export const DiscordMachine = Machine.make({
     ...input,
     tokenGeneration: 0,
     pendingHomeKind: null,
+    accessDialogOpen: false,
     accessScope: 'global',
     accessScopeId: '',
     accessUser: '',
+    modeDialogOpen: false,
     modeScope: 'channel',
     modeGuild: input.directory.guilds.length === 1 ? (input.directory.guilds[0]?.id ?? '') : '',
     modeTarget: '',
-    modeSetting: 'mention-only',
+    modeSetting: 'always',
+    replyDialogOpen: false,
     replyChannel: '',
     replySetting: 'direct',
   }),
@@ -472,6 +484,28 @@ export const DiscordMachine = Machine.make({
       states: {
         Idle: {
           on: {
+            OpenAccessDialog: {
+              target: 'Access.Idle',
+              update: 'root',
+              data: ({ root }) => ({
+                target: { error: null },
+                update: {
+                  ...root,
+                  accessDialogOpen: true,
+                  accessScope: 'global',
+                  accessScopeId: '',
+                  accessUser: '',
+                },
+              }),
+            },
+            CloseAccessDialog: {
+              target: 'Access.Idle',
+              update: 'root',
+              data: ({ root }) => ({
+                target: { error: null },
+                update: { ...root, accessDialogOpen: false, accessUser: '' },
+              }),
+            },
             SelectAccessScope: {
               target: 'Access.Idle',
               update: 'root',
@@ -587,13 +621,8 @@ export const DiscordMachine = Machine.make({
                     state.tokenGeneration === root.tokenGeneration
                       ? mergeDirectoryChannels(root.directory, output.directory)
                       : root.directory,
-                  accessUser:
-                    state.list === root.discord.accessMode &&
-                    state.scope === root.accessScope &&
-                    (state.scope === 'global' || state.scopeId === root.accessScopeId) &&
-                    state.userId === root.accessUser
-                      ? ''
-                      : root.accessUser,
+                  accessDialogOpen: false,
+                  accessUser: '',
                 },
               }),
             },
@@ -713,6 +742,30 @@ export const DiscordMachine = Machine.make({
       states: {
         Idle: {
           on: {
+            OpenModeDialog: {
+              target: 'Interaction.Idle',
+              update: 'root',
+              data: ({ root }) => ({
+                target: { error: null },
+                update: {
+                  ...root,
+                  modeDialogOpen: true,
+                  modeScope: 'channel',
+                  modeGuild:
+                    root.directory.guilds.length === 1 ? (root.directory.guilds[0]?.id ?? '') : '',
+                  modeTarget: '',
+                  modeSetting: 'always',
+                },
+              }),
+            },
+            CloseModeDialog: {
+              target: 'Interaction.Idle',
+              update: 'root',
+              data: ({ root }) => ({
+                target: { error: null },
+                update: { ...root, modeDialogOpen: false, modeTarget: '' },
+              }),
+            },
             SelectModeScope: {
               target: 'Interaction.Idle',
               update: 'root',
@@ -791,6 +844,7 @@ export const DiscordMachine = Machine.make({
                 update: {
                   ...root,
                   discord: { ...root.discord, interactionModes: output.interactionModes },
+                  modeDialogOpen: false,
                   // Drop the draft only when the saved row was the draft.
                   modeTarget:
                     state.scope === root.modeScope &&
@@ -845,6 +899,27 @@ export const DiscordMachine = Machine.make({
       states: {
         Idle: {
           on: {
+            OpenReplyDialog: {
+              target: 'ReplyMode.Idle',
+              update: 'root',
+              data: ({ root }) => ({
+                target: { error: null },
+                update: {
+                  ...root,
+                  replyDialogOpen: true,
+                  replyChannel: '',
+                  replySetting: 'direct',
+                },
+              }),
+            },
+            CloseReplyDialog: {
+              target: 'ReplyMode.Idle',
+              update: 'root',
+              data: ({ root }) => ({
+                target: { error: null },
+                update: { ...root, replyDialogOpen: false, replyChannel: '' },
+              }),
+            },
             SelectReplyChannel: {
               target: 'ReplyMode.Idle',
               update: 'root',
@@ -889,6 +964,7 @@ export const DiscordMachine = Machine.make({
                 update: {
                   ...root,
                   discord: { ...root.discord, replyModes: output.replyModes },
+                  replyDialogOpen: false,
                   replyChannel: state.channelId === root.replyChannel ? '' : root.replyChannel,
                 },
               }),

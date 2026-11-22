@@ -7,6 +7,7 @@ import {
   ComboboxInput,
   ComboboxItem,
   ComboboxList,
+  useComboboxAnchor,
 } from '~/components/ui/combobox'
 
 export interface PickerOption {
@@ -57,6 +58,7 @@ const resolveOptions = (
 /** A searchable single choice, e.g. a Discord channel or person. */
 export function Picker(props: PickerProps) {
   const inputRef = useRef<HTMLInputElement>(null)
+  const anchorRef = useComboboxAnchor()
   const initialLabel = resolveOptions(props.options, props.value, null).selected?.label ?? ''
   const [inputValue, setInputValue] = useState(initialLabel)
   const syncedRef = useRef({ value: props.value, label: initialLabel })
@@ -112,14 +114,16 @@ export function Picker(props: PickerProps) {
         }
       }}
     >
-      <ComboboxInput
-        ref={inputRef}
-        id={props.id}
-        placeholder={props.placeholder}
-        disabled={props.disabled}
-        className="w-full"
-      />
-      <ComboboxContent>
+      <div ref={anchorRef} className="w-full">
+        <ComboboxInput
+          ref={inputRef}
+          id={props.id}
+          placeholder={props.placeholder}
+          disabled={props.disabled}
+          className="w-full"
+        />
+      </div>
+      <ComboboxContent anchor={anchorRef}>
         <ComboboxEmpty>{emptyText}</ComboboxEmpty>
         <ComboboxList>
           {(option: PickerOption) => (
