@@ -90,8 +90,11 @@ function AutoRespondSection() {
         <div className="flex items-center justify-between gap-4 rounded-2xl border border-border bg-card px-4 py-3.5 shadow-xs">
           <div className="min-w-0">
             <p className="text-sm font-medium text-foreground">Auto-respond</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              Reply in channels and threads without an @mention when spoken to.
+            </p>
             {value.hasUtilityModel ? null : (
-              <p className="mt-0.5 text-xs text-muted-foreground">
+              <p className="mt-1 text-xs text-muted-foreground">
                 Requires a utility model.{' '}
                 <Link
                   to="/settings/models"
