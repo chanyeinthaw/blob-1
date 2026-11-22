@@ -518,6 +518,7 @@ async fn environment(
 async fn chat_harness(
     store: Arc<SqliteStorage>,
     workspace: &Path,
+    pinned_workspace: harness::PinnedWorkspace,
     skills_dir: Option<&Path>,
     models: ModelFactory,
     mcp: mcp::Mcp,
@@ -536,8 +537,13 @@ async fn chat_harness(
             workspace: workspace.to_path_buf(),
         },
         models,
-        store,
+        store.clone(),
     )
+    .with_share(harness::ShareTools::new(
+        store.clone(),
+        store,
+        pinned_workspace,
+    ))
     .with_mcp(mcp))
 }
 
@@ -556,7 +562,9 @@ pub async fn chat(
     store.mcp_servers()?;
     let mcp = mcp::Mcp::new(store.clone());
     let mcp_shutdown = mcp.clone();
-    let harness = chat_harness(store, workspace, skills_dir, models, mcp).await?;
+    std::fs::create_dir_all(workspace)?;
+    let pinned_workspace = harness::PinnedWorkspace::open(workspace)?;
+    let harness = chat_harness(store, workspace, pinned_workspace, skills_dir, models, mcp).await?;
     let mut failure = None;
     let signal_text = tokio::select! {
         answer = harness.run(&prompt) => {
@@ -1207,6 +1215,7 @@ async fn admit_batch(
 pub async fn serve(
     store: Arc<SqliteStorage>,
     workspace: &Path,
+    pinned_workspace: harness::PinnedWorkspace,
     skills_dir: Option<&Path>,
     discord: Arc<messenger_discord::Discord>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -1216,6 +1225,7 @@ pub async fn serve(
     let harness = chat_harness(
         store.clone(),
         workspace,
+        pinned_workspace,
         skills_dir,
         models.clone(),
         mcp.clone(),

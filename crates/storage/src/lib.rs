@@ -1375,3 +1375,28 @@ impl<T: McpStore + ?Sized> McpStore for Arc<T> {
         (**self).delete_mcp_oauth_state(csrf)
     }
 }
+
+/// A workspace file published under an unguessable public capability URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicFile {
+    pub id: String,
+    pub workspace: String,
+    pub path: String,
+    pub content_type: String,
+    pub created_at: i64,
+}
+
+pub trait PublicFileStore: Send + Sync {
+    fn create_public_file(&self, file: &PublicFile) -> Result<(), StoreError>;
+    fn public_file(&self, id: &str) -> Result<Option<PublicFile>, StoreError>;
+}
+
+impl<T: PublicFileStore + ?Sized> PublicFileStore for Arc<T> {
+    fn create_public_file(&self, file: &PublicFile) -> Result<(), StoreError> {
+        (**self).create_public_file(file)
+    }
+
+    fn public_file(&self, id: &str) -> Result<Option<PublicFile>, StoreError> {
+        (**self).public_file(id)
+    }
+}

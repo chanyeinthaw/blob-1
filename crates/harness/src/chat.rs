@@ -77,7 +77,7 @@ Always answer DMs, mentions and replies to you with at least one send. For group
 
 For a message you are answering that has no text or refers to something you have not seen, read recent messages with history first, then answer what was asked, or ask what they need if it is still unclear.
 
-Write plain, unescaped text in send. Send with reply to answer the message; send with to to post plainly in that conversation. You may send any number of messages per turn. Several people and conversations can be active, so pick the right token. Talk like a human teammate. Keep each send at most 300 characters. For longer answers, issue multiple send calls together. Mention people by user id with mention; find ids with participants.
+Write plain, unescaped text in send. Send with reply to answer the message; send with to to post plainly in that conversation. You may send any number of messages per turn. Several people and conversations can be active, so pick the right token. Talk like a human teammate. Keep each send at most 300 characters. For a short multi-line answer, a few sends are fine. For long responses (reports, tables, multi-section writeups, large code blocks), call share with content (or path for a file a task already wrote in the workspace), defaulting to Markdown unless the user asks for HTML or another format, then send a concise summary with the link instead of spamming many sends. If share is unavailable (for example, no public URL is configured), fall back to splitting the reply across a few send calls. Mention people by user id with mention; find ids with participants.
 
 When you answer a message marked mode="inline", answer inline with reply. If an inline exchange turns into real work, send with thread: true to continue in a thread.
 
@@ -215,6 +215,7 @@ pub(crate) struct Inner<E, S, M, F: Models> {
     pub state: Mutex<State>,
     pub notify: Notify,
     pub messengers: Option<crate::Messengers>,
+    pub share: Option<crate::ShareTools>,
     pub mcp: Option<mcp::Mcp>,
     pub mcp_session: Option<Arc<mcp::SessionTools>>,
     pub mcp_view_generation: Mutex<u64>,
@@ -317,6 +318,7 @@ where
                 }),
                 notify: Notify::new(),
                 messengers: None,
+                share: None,
                 mcp: None,
                 mcp_session: None,
                 mcp_view_generation: Mutex::new(0),
@@ -332,6 +334,11 @@ where
         Arc::get_mut(&mut self.inner)
             .expect("unshared chat")
             .messengers = Some(messengers);
+        self
+    }
+
+    pub fn with_share(mut self, share: crate::ShareTools) -> Self {
+        Arc::get_mut(&mut self.inner).expect("unshared chat").share = Some(share);
         self
     }
 
@@ -567,6 +574,9 @@ where
             tools.push(crate::messenger::SEND);
             tools.extend_from_slice(crate::messenger::LOOKUP);
         }
+        if self.inner.share.is_some() {
+            tools.push(crate::share::TOOL);
+        }
         loop {
             loop {
                 let next = self
@@ -753,6 +763,12 @@ where
                     .lookup(&call.name, &call.arguments)
                     .await?
             }
+            "share" => self
+                .inner
+                .share
+                .as_ref()
+                .ok_or("share tool not configured")?
+                .execute(&call.arguments)?,
             _ => return Err(format!("unknown tool: {}", call.name).into()),
         };
         Ok((content, Vec::new()))

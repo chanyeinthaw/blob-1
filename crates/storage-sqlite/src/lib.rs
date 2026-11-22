@@ -12,6 +12,7 @@ mod crypto;
 mod mcp;
 mod memory;
 mod messenger;
+mod public_file;
 mod schedule;
 mod session;
 mod skill;
@@ -70,6 +71,13 @@ CREATE TABLE IF NOT EXISTS seen_threads (messenger TEXT NOT NULL, channel TEXT N
 
 CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK (id = 1), text TEXT NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS public_url (id INTEGER PRIMARY KEY CHECK (id = 1), url TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS public_files (
+    id TEXT PRIMARY KEY,
+    workspace TEXT NOT NULL,
+    path TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+) STRICT;
 
 CREATE TABLE IF NOT EXISTS providers (
     id TEXT PRIMARY KEY,

@@ -81,6 +81,7 @@ pub struct SessionHarness<L, E, S> {
     llm: L,
     memory_tools: Option<Arc<dyn MemoryTools>>,
     lookup_tools: Option<crate::Messengers>,
+    share_tools: Option<crate::ShareTools>,
     mcp_tools: Option<Arc<SessionTools>>,
     observer: Option<Arc<dyn Fn(Step) + Send + Sync>>,
     summarizer: Option<Arc<Summarizer<L>>>,
@@ -102,6 +103,7 @@ where
             llm,
             memory_tools: None,
             lookup_tools: None,
+            share_tools: None,
             mcp_tools: None,
             observer: None,
             summarizer: None,
@@ -120,6 +122,11 @@ where
 
     pub fn with_lookup_tools(mut self, tools: crate::Messengers) -> Self {
         self.lookup_tools = Some(tools);
+        self
+    }
+
+    pub fn with_share_tools(mut self, tools: crate::ShareTools) -> Self {
+        self.share_tools = Some(tools);
         self
     }
 
@@ -195,6 +202,9 @@ where
 
         if self.lookup_tools.is_some() {
             tools.extend_from_slice(crate::messenger::LOOKUP);
+        }
+        if self.share_tools.is_some() {
+            tools.push(crate::share::TOOL);
         }
 
         if let Some(user_message) = user_message {
@@ -340,6 +350,12 @@ where
                             }
                         })
                         .map_err(|e| e.to_string())
+                } else if let Some(share) = self
+                    .share_tools
+                    .as_ref()
+                    .filter(|_| call.name == "share")
+                {
+                    share.execute(&call.arguments).map_err(|e| e.to_string())
                 } else if let Some(result) = match &self.mcp_tools {
                     Some(mcp) => mcp.execute(&call.name, &call.arguments).await,
                     None => None,

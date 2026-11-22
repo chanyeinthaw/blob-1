@@ -818,10 +818,14 @@ async fn main() -> Result<()> {
             let mut terminate =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
             let stop = shutdown_tx.clone();
+            std::fs::create_dir_all(&workspace)?;
+            let pinned_workspace = harness::PinnedWorkspace::open(&workspace)?;
+            let harness_workspace = pinned_workspace.clone();
             let harness_task = tokio::spawn(async move {
                 let result = run::serve(
                     store,
                     &workspace,
+                    harness_workspace,
                     skills_dir.as_deref(),
                     discord,
                     harness_shutdown,
@@ -843,6 +847,7 @@ async fn main() -> Result<()> {
                 mcp_for_web,
                 shutdown_rx,
                 public_url,
+                pinned_workspace,
             )
             .await?;
             let result = match harness_task.await {

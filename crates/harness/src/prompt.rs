@@ -32,7 +32,14 @@ messages it was made from; zoom(id, 1) gives message id in full. Zoom
 whenever a summary only mentions something you need, such as a
 decision, a past attempt or where a file is, before you act, guess or
 ask. date(id) gives the date and time of message id. zoom("id") gives
-a task's chat."#;
+a task's chat.
+
+Sharing long outputs: when your task produces a long report, document,
+or generated file meant for the user, write it to the workspace (prefer
+Markdown unless another format was asked for), call share to get a
+public link, and include that link in your report. If share is
+unavailable (for example, no public URL is configured), include the key
+findings directly in your report instead."#;
 
 /// `mcp` holds `(id, one-line description)` for each enabled MCP server;
 /// empty when no server is configured.

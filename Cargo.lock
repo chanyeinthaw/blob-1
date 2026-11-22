@@ -1009,6 +1009,7 @@ dependencies = [
  "chrono-tz",
  "croner",
  "environment",
+ "libc",
  "llm",
  "mcp",
  "memory",

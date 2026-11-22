@@ -27,8 +27,8 @@ Where each feature lives: code, CLI, model tools and storage.
 - `agent serve --web <addr>` serves the app (default `127.0.0.1:7878`); `agent web password set` sets the password.
 - `agent serve --public-url <url>` sets the absolute http(s) URL the app is publicly reached at (e.g. `https://silicon.tailcd7ccb.ts.net:7878` via Tailscale Serve proxying to `--web 127.0.0.1:7878`): the OAuth redirect URI and `mcp.login` URL use it instead of the Host header, the WebSocket Origin check accepts exactly that origin, and the session cookie gets `Secure` when it is https. `serve` persists it so `agent mcp login` prints the same URL; running `serve` without it clears the stored value.
 - The session cookie is `HttpOnly; SameSite=Lax` so the cross-site OAuth callback's top-level GET still carries it.
-- HTTP endpoints: `/api/session`, `/api/login`, `/api/logout`, `/api/mcp/login`, `/api/mcp/callback`, `/ws`.
-- Tables: `web_password`, `web_sessions`, `public_url`.
+- HTTP endpoints: `/api/session`, `/api/login`, `/api/logout`, `/api/mcp/login`, `/api/mcp/callback`, `/ws`, `/p/{id}`, `/p/{id}/{name}` (public shared workspace files, unauthenticated capability URLs, served with `Content-Security-Policy: sandbox allow-scripts` and `X-Content-Type-Options: nosniff`; Markdown served inline as `text/plain; charset=utf-8`).
+- Tables: `web_password`, `web_sessions`, `public_url`, `public_files`.
 - The Discord settings live on the **Chat platforms** page at `/settings/chat/discord`: token Replace/Remove, connection status (`off` / `connecting` / `online` with the bot name / `error` with a short message), the user allowlist, Discord-wide interaction and reply defaults, per-channel, per-person and per-server interaction-mode overrides and the home channel or DM. Discord is the only chat platform today.
 - Model and provider changes apply to the running bot without a restart: each turn, spawned task, compaction pass and utility call resolves from current settings; a run already in progress keeps its model, a task keeps the model it was spawned with for its lifetime, and a role whose settings no longer resolve keeps its last working model. The `model`, `models`, `provider` and `reasoning` commands run while `serve` holds the data directory; `serve`, `chat` and `skill` still need it exclusively.
 - The mock transport is enabled only with `VITE_MOCK=1`.
@@ -41,7 +41,7 @@ The bot is one chat that never ends. It coordinates and talks; tasks do the work
 - Runs: a run ends when the agent is done. Task reports and reminders steer a live run or wake an idle agent (`resume`).
 - Input: every outside input is one XML element with escaped text: `<message>`, `<report>`, `<reminder>`, `<scheduled>`, `<checkin>`
 - Final reply `NO_UPDATES` ends a messenger turn silently.
-- Tools: `zoom`, `date`, `spawn`, `models`, `tasks`, `tell`, `stop`, plus messenger, calendar, watch and MCP tools
+- Tools: `zoom`, `date`, `spawn`, `models`, `tasks`, `tell`, `stop`, `share` (creates public capability links in `public_files` for workspace files or inline Markdown/HTML under `workspace/shares/`; also available to background tasks), plus messenger, calendar, watch and MCP tools
 - MCP tool results carrying png, jpg, gif or webp images reach the model as images when the main model accepts image input; the memory echo keeps the `[N image(s) omitted]` note
 - CLI: `agent chat <message>` (one message, then waits for its tasks to report)
 

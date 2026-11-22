@@ -1,8 +1,10 @@
 pub mod chat;
 pub mod messenger;
 pub mod schedule;
+pub mod share;
 pub mod watch;
 pub use messenger::Messengers;
+pub use share::{PinnedWorkspace, ShareTools};
 mod compaction;
 pub mod prompt;
 pub mod session;

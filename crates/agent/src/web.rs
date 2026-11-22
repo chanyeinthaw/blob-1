@@ -3,11 +3,12 @@ use argon2::{
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
 };
 use axum::{
+    body::Body,
     extract::{
         ws::{CloseFrame, Message, WebSocket},
-        Query, State, WebSocketUpgrade,
+        Path as AxumPath, Query, State, WebSocketUpgrade,
     },
-    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
@@ -25,7 +26,7 @@ use std::{
 };
 use storage::{
     Checkin, CheckinStore, ConfigStore, McpServer, McpStore, McpTransport, MessengerStore,
-    ReasoningLevel, ScheduleStore, WatchStore, WebAuthStore,
+    PublicFileStore, ReasoningLevel, ScheduleStore, WatchStore, WebAuthStore,
 };
 use storage_sqlite::SqliteStorage;
 
@@ -37,6 +38,7 @@ struct WebContext {
     settings_lock: tokio::sync::Mutex<()>,
     mcp: mcp::Mcp,
     public_url: Option<url::Url>,
+    workspace: harness::PinnedWorkspace,
 }
 impl WebContext {
     fn secure_cookie(&self) -> bool {
@@ -105,6 +107,7 @@ pub async fn serve(
     mcp: mcp::Mcp,
     shutdown: tokio::sync::watch::Receiver<bool>,
     public_url: Option<url::Url>,
+    workspace: harness::PinnedWorkspace,
 ) -> crate::Result<()> {
     let store = Arc::new(WebContext {
         store,
@@ -112,6 +115,7 @@ pub async fn serve(
         settings_lock: tokio::sync::Mutex::new(()),
         mcp,
         public_url,
+        workspace,
     });
     let app = Router::new()
         .route("/api/session", get(session))
@@ -120,6 +124,8 @@ pub async fn serve(
         .route("/api/mcp/login", get(mcp_login))
         .route("/api/mcp/callback", get(mcp_callback))
         .route("/ws", get(ws))
+        .route("/p/{id}", get(public_file))
+        .route("/p/{id}/{name}", get(public_file_named))
         .fallback(assets)
         .with_state(store);
     axum::serve(listener, app)
@@ -1397,9 +1403,110 @@ async fn socket_loop(socket: WebSocket, ctx: Context, headers: HeaderMap) {
     drop(tx);
     writer.abort();
 }
+const PUBLIC_FILE_CHUNK_BYTES: usize = 64 * 1024;
+
+async fn public_file(
+    method: Method,
+    State(ctx): State<Context>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    serve_public_file(&ctx, &id, method == Method::HEAD).await
+}
+
+async fn public_file_named(
+    method: Method,
+    State(ctx): State<Context>,
+    AxumPath((id, _name)): AxumPath<(String, String)>,
+) -> Response {
+    serve_public_file(&ctx, &id, method == Method::HEAD).await
+}
+
+async fn serve_public_file(ctx: &WebContext, id: &str, head_only: bool) -> Response {
+    let record = match ctx.store.public_file(id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    // Reject links recorded under a different --workspace.
+    if ctx.workspace.canonical_path() != record.workspace {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let workspace = ctx.workspace.clone();
+    let rel_path = record.path.clone();
+    let opened =
+        tokio::task::spawn_blocking(move || -> Result<(std::fs::File, u64), StatusCode> {
+            let file = workspace
+                .open_file_nofollow(&rel_path)
+                .map_err(|_| StatusCode::NOT_FOUND)?;
+            let meta = file.metadata().map_err(|_| StatusCode::NOT_FOUND)?;
+            let limit = harness::share::MAX_PUBLIC_FILE_BYTES;
+            if meta.len() > limit {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+            Ok((file, meta.len()))
+        })
+        .await;
+    let (file, len) = match opened {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(status)) => return status.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let body = if head_only {
+        Body::empty()
+    } else {
+        // Stream directly from the pinned file handle in 64 KiB chunks, capped
+        // strictly at `len` (<= MAX_PUBLIC_FILE_BYTES) so concurrent growth
+        // cannot buffer or exceed the cap.
+        let reader = tokio::io::AsyncReadExt::take(tokio::fs::File::from_std(file), len);
+        let stream = futures_util::stream::try_unfold(reader, |mut reader| async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; PUBLIC_FILE_CHUNK_BYTES];
+            let n = reader.read(&mut buf).await?;
+            if n == 0 {
+                Ok::<_, std::io::Error>(None)
+            } else {
+                buf.truncate(n);
+                Ok(Some((buf, reader)))
+            }
+        });
+        Body::from_stream(stream)
+    };
+    let content_type = HeaderValue::from_str(&record.content_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    let mut response = Response::new(body);
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, content_type);
+    // Set Content-Length only on HEAD; streaming GET omits it so a concurrent
+    // file truncation does not abort the HTTP transfer.
+    if head_only {
+        if let Ok(len_header) = HeaderValue::from_str(&len.to_string()) {
+            headers.insert(header::CONTENT_LENGTH, len_header);
+        }
+    }
+    // Isolate generated HTML/SVG in an opaque null origin so scripts can render
+    // freely without any access to same-origin cookies, /api, or /ws.
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox allow-scripts"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=60"),
+    );
+    response
+}
+
 async fn assets(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
-    if path == "api" || path.starts_with("api/") {
+    if path == "api" || path.starts_with("api/") || path == "p" || path.starts_with("p/") {
         return StatusCode::NOT_FOUND.into_response();
     }
     let (path, file) = match Assets::get(path) {
@@ -1426,4 +1533,142 @@ async fn assets(uri: Uri) -> Response {
         );
     }
     response
+}
+
+#[cfg(test)]
+mod public_file_tests {
+    use super::*;
+    use storage::PublicFile;
+
+    #[tokio::test]
+    async fn serves_shared_files_with_sandbox_csp_and_blocks_escapes() {
+        let dir = std::env::temp_dir().join(format!("blob-1-web-share-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let workspace = dir.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let store = Arc::new(SqliteStorage::open(dir.join("agent.db"), None).unwrap());
+        store
+            .set_public_url(Some("https://blob-1.example.com"))
+            .unwrap();
+
+        let pinned = harness::PinnedWorkspace::open(&workspace).unwrap();
+        let tools = harness::ShareTools::new(store.clone(), store.clone(), pinned.clone());
+        let md_url = tools
+            .execute(r##"{"content":"# Hello\nworld","filename":"report"}"##)
+            .unwrap();
+        assert!(md_url.ends_with("/report.md"));
+        let md_id = md_url
+            .strip_prefix("https://blob-1.example.com/p/")
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        std::fs::write(workspace.join("page.html"), "<script>1+1</script>").unwrap();
+        let html_url = tools.execute(r#"{"path":"page.html"}"#).unwrap();
+        let html_id = html_url
+            .strip_prefix("https://blob-1.example.com/p/")
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        // Store an entry pointing outside the workspace to verify serve-time containment.
+        let outside = dir.join("secret.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        store
+            .create_public_file(&PublicFile {
+                id: "escape".into(),
+                workspace: pinned.canonical_path().to_owned(),
+                path: "../secret.txt".into(),
+                content_type: "text/plain; charset=utf-8".into(),
+                created_at: 0,
+            })
+            .unwrap();
+
+        // Store an entry recorded under a different workspace to verify workspace binding.
+        let other_ws = dir.join("other-ws");
+        std::fs::create_dir_all(&other_ws).unwrap();
+        std::fs::write(other_ws.join("page.html"), "other").unwrap();
+        let other_pinned = harness::PinnedWorkspace::open(&other_ws).unwrap();
+        store
+            .create_public_file(&PublicFile {
+                id: "other-ws-link".into(),
+                workspace: other_pinned.canonical_path().to_owned(),
+                path: "page.html".into(),
+                content_type: "text/html; charset=utf-8".into(),
+                created_at: 0,
+            })
+            .unwrap();
+
+        let ctx = WebContext {
+            store: store.clone(),
+            discord: Arc::new(messenger_discord::Discord::new()),
+            settings_lock: tokio::sync::Mutex::new(()),
+            mcp: mcp::Mcp::new(store.clone()),
+            public_url: Some(public_url("https://blob-1.example.com").unwrap()),
+            workspace: pinned,
+        };
+
+        let md_resp = serve_public_file(&ctx, &md_id, false).await;
+        assert_eq!(md_resp.status(), StatusCode::OK);
+        assert_eq!(
+            md_resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            md_resp.headers().get(header::CONTENT_SECURITY_POLICY).unwrap(),
+            "sandbox allow-scripts"
+        );
+        assert_eq!(
+            md_resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
+        assert!(md_resp.headers().get(header::CONTENT_LENGTH).is_none());
+        let md_body = axum::body::to_bytes(md_resp.into_body(), 1024).await.unwrap();
+        assert_eq!(md_body.as_ref(), b"# Hello\nworld");
+
+        let head_resp = serve_public_file(&ctx, &md_id, true).await;
+        assert_eq!(head_resp.status(), StatusCode::OK);
+        assert_eq!(
+            head_resp.headers().get(header::CONTENT_LENGTH).unwrap(),
+            "13"
+        );
+        let head_body = axum::body::to_bytes(head_resp.into_body(), 1024)
+            .await
+            .unwrap();
+        assert!(head_body.is_empty());
+
+        let html_resp = serve_public_file(&ctx, &html_id, false).await;
+        assert_eq!(html_resp.status(), StatusCode::OK);
+        assert_eq!(
+            html_resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let csp = html_resp
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("sandbox"));
+        assert!(!csp.contains("allow-same-origin"));
+
+        assert_eq!(
+            serve_public_file(&ctx, "missing", false).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            serve_public_file(&ctx, "escape", false).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            serve_public_file(&ctx, "other-ws-link", false).await.status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
