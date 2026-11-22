@@ -6,7 +6,7 @@ Where each feature lives: code, CLI, model tools and storage.
 
 | crate | role |
 |---|---|
-| `agent` | CLI and composition root: `serve`, `chat`, configuration commands |
+| `agent` | CLI and composition root: `serve`, `chat`, `update`, `launcher`, configuration commands |
 | `harness` | chat harness, tasks, sessions, prompts, messenger tools, calendar, watches, utility model |
 | `memory` | chat memory: append-only messages, summary tree, views, zoom |
 | `llm` | `Llm` trait and request types, quota fallback |
@@ -64,6 +64,7 @@ Background workers spawned by the chat.
 
 - Code: `crates/harness/src/tasks.rs`, `crates/harness/src/session.rs`, `crates/harness/src/compaction.rs`
 - Tools: `read`, `write`, `edit`, `bash`, read-only `zoom` and `date`, read-only `history`, `search`, `participants`, `message`; never `send`; plus MCP tools
+- `read`, `write` and `edit` resolve paths against the task's workspace root but are not restricted to it: `..` and absolute paths reach anywhere the process can
 - Reports: `<report task status [for]>`; a 15-minute watch per run sends `<reminder task running last_activity [for]>`
 - `spawn` with `for: "m…"` links a task to a messenger message
 - Images: `read` returns png, jpg, gif and webp files as images on models with image input
@@ -151,6 +152,15 @@ Blob-1 is an MCP client: chat and background tasks can call tools, read resource
 - Values are XChaCha20-Poly1305 with a random 24-byte nonce, stored as `enc:v1:<base64(nonce‖ciphertext)>`; encryption stays inside the storage layer so callers keep plain types. Plaintext rows seal idempotently on the first keyed open; key rotation is not supported yet
 - Encrypted columns: `mcp_servers.env`, `mcp_servers.headers`, `mcp_tokens.credentials`, `mcp_tokens.registration`, `mcp_oauth_states.state`, `messenger_tokens.token` (empty JSON maps stay plaintext). Web password/session hashes and provider `api_key_env` names are not encrypted
 - Tables: `app_key`, `secret_scrub` (set while freed plaintext may still sit in the WAL; every keyed open retries a truncating checkpoint until it succeeds)
+
+## Releases and self-update
+
+- Code: `crates/agent/src/runtime.rs`, `scripts/install.sh`, `.github/workflows/release.yml`
+- The workspace version is `0.0.0`; release builds stamp `BLOB_1_VERSION` so `blob-1 --version` reports the tag. Channels: `latest` ships `X.Y.Z-latest.YYYYMMDD.HHMM` (tag `vX.Y.Z-latest.YYYYMMDD.HHMM`, published with `--prerelease --latest=false`), `stable` ships plain `X.Y.Z` (published `--latest`). The release workflow builds linux-x64 and darwin-arm64 on tag pushes (`v*`) or `workflow_dispatch` (channel `latest`/`stable`, optional explicit `version`)
+- `scripts/install.sh` (`curl | sh`) installs into `$BLOB_1_HOME/runtime` (default `~/.blob-1/runtime`): `versions/<version>/blob-1` + `.install-complete`, a `~/.local/bin/blob-1` symlink, and the `runtime/launchers` list. Env: `BLOB_1_CHANNEL` (`latest` default, `stable`), `BLOB_1_VERSION`, `BLOB_1_HOME`, `BLOB_1_INSTALL_BIN_DIR`, `BLOB_1_RELEASE_BASE_URL`
+- `blob-1 update [VERSION] [--channel latest|stable] [--allow-downgrade] [--no-restart]` downloads `SHA256SUMS` + `blob-1-<version>-<platform>.tar.gz` into `versions/.staging-*`, verifies the checksum, smoke-tests `--version` and renames into place. With a launcher on `runtime/launcher.sock` it sends `{"type":"apply-update","targetVersion","allowDowngrade"}` and reports the outcome; otherwise it repoints launcher symlinks and prunes old versions. `GH_TOKEN`/`GITHUB_TOKEN` authenticate the releases API
+- `blob-1 launcher [--web --public-url]` (inherits `--data-dir`, `--workspace`, `skills-dir`) supervises `serve`: it runs `versions/<activeVersion>/blob-1 serve` (falling back to the current exe) with `BLOB_1_READY_FILE`; `serve` writes `ready\n` there once the database and web listener are up. On `apply-update` it persists a `pending` update in `runtime/service-state.json`, stops the child, snapshots `agent.db` (+ `-wal`/`-shm`) into `runtime/db-backup/<id>/`, trials the target, then commits (new `activeVersion`, repoint launchers, prune) or rolls back (restore db, restart the old version). A `pending` record at startup is recovered the same way. SIGTERM/SIGINT stop the child and remove `launcher.sock`
+- Upgrades must move forward; a dev `0.0.0` build may adopt its first release without `--allow-downgrade`
 
 ## Dev server
 

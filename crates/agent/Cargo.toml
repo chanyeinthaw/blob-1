@@ -31,3 +31,5 @@ futures-util = "0.3"
 memory.workspace = true
 messenger = { path = "../messenger" }
 messenger-discord = { path = "../messenger-discord" }
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "json"] }
+libc = "0.2"

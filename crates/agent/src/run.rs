@@ -727,6 +727,7 @@ pub async fn serve(
     let (tx, mut rx) = tokio::sync::mpsc::channel(128);
     let listener_discord = discord.clone();
     let listener = tokio::spawn(async move { listener_discord.listen(tx).await });
+    crate::runtime::mark_ready();
     let supervisor = {
         let store = store.clone();
         let models = models.clone();

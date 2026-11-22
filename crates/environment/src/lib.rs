@@ -179,8 +179,6 @@ pub const CATALOG: &[ToolSpec] = &[
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
-    #[error("Path escapes workspace: {0}")]
-    PathEscape(String),
     #[error("File not found: {0}")]
     NotFound(String),
     #[error("{0}")]

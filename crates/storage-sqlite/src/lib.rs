@@ -143,6 +143,7 @@ pub struct SqliteStorage {
     connection: Mutex<Connection>,
     pub(crate) key: Option<XChaCha20Poly1305>,
     _owner: Option<File>,
+    _maint: File,
 }
 
 impl SqliteStorage {
@@ -178,6 +179,25 @@ impl SqliteStorage {
         owner: Option<File>,
         app_key: Option<AppKey>,
     ) -> Result<Self, StoreError> {
+        let maint = File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(maint_lock_path(path))
+            .map_err(|error| StoreError::Backend(Box::new(error)))?;
+        match maint.try_lock_shared() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(StoreError::Backend(
+                    format!(
+                        "{} is locked for update maintenance; retry shortly",
+                        path.display()
+                    )
+                    .into(),
+                ));
+            }
+            Err(TryLockError::Error(error)) => return Err(StoreError::Backend(Box::new(error))),
+        }
         let connection = Connection::open(path).map_err(backend)?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
@@ -221,6 +241,7 @@ impl SqliteStorage {
             connection: Mutex::new(connection),
             key,
             _owner: owner,
+            _maint: maint,
         })
     }
 
@@ -234,6 +255,12 @@ impl SqliteStorage {
 fn lock_path(path: &Path) -> std::path::PathBuf {
     let mut lock = path.as_os_str().to_owned();
     lock.push(".lock");
+    lock.into()
+}
+
+fn maint_lock_path(path: &Path) -> std::path::PathBuf {
+    let mut lock = path.as_os_str().to_owned();
+    lock.push(".maint.lock");
     lock.into()
 }
 

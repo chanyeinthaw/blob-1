@@ -5,7 +5,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/chanyeinthaw/blob-1/main/scripts/install.sh | sh
 #
 # Environment:
-#   BLOB_1_VERSION           exact version to install (e.g. 0.0.0 or v0.0.0; default: latest)
+#   BLOB_1_VERSION           exact version to install (e.g. 0.0.0 or v0.0.0; default: newest on the channel)
+#   BLOB_1_CHANNEL           release channel: latest (default) or stable
 #   BLOB_1_HOME              Blob-1 home directory (default: ~/.blob-1)
 #   BLOB_1_INSTALL_BIN_DIR   where the `blob-1` symlink goes (default: ~/.local/bin)
 #   BLOB_1_RELEASE_BASE_URL  mirror for releases/download (default: GitHub)
@@ -138,26 +139,77 @@ else
   fail "sha256sum or shasum is required"
 fi
 
+channel="${BLOB_1_CHANNEL:-latest}"
+case "$channel" in
+  latest | stable) ;;
+  *) fail "BLOB_1_CHANNEL must be latest or stable" ;;
+esac
+
+# Print the tag names of every non-draft release (up to 10 pages of 100).
+release_tags() {
+  if command -v gh >/dev/null 2>&1; then
+    gh api "repos/${repo}/releases?per_page=100" --paginate \
+      --jq '.[] | select(.draft | not) | .tag_name' 2>/dev/null && return
+  fi
+  page=1
+  while [ "$page" -le 10 ]; do
+    tmp_page="$(mktemp)"
+    if ! fetch "https://api.github.com/repos/${repo}/releases?per_page=100&page=${page}" "$tmp_page" application/json; then
+      rm -f "$tmp_page"
+      return
+    fi
+    # draft comes after tag_name in each release object; pair them up.
+    grep -oE '"tag_name": *"[^"]+"|"draft": *(true|false)' "$tmp_page" | awk '
+      /"tag_name"/ { tag = $0; sub(/.*"tag_name": *"/, "", tag); sub(/".*/, "", tag); pending = tag }
+      /"draft"/ { if (pending != "" && $0 ~ /false/) print pending; pending = "" }
+    '
+    count="$(grep -oE '"tag_name": *"[^"]+"' "$tmp_page" | wc -l | tr -d ' ')"
+    rm -f "$tmp_page"
+    [ "$count" -ge 100 ] || return
+    page=$((page + 1))
+  done
+}
+
+# Sort key for vX.Y.Z-latest.YYYYMMDD.HHMM style tags: zero-padded numeric
+# core plus the prerelease suffix (fixed-width digits compare lexically).
+semver_key() {
+  while IFS= read -r tag; do
+    v="${tag#v}"
+    core="${v%%-*}"
+    pre=""
+    case "$v" in *-*) pre="${v#*-}" ;; esac
+    IFS=. read -r maj min patch <<EOF
+$core
+EOF
+    printf '%012d%012d%012d%s %s\n' "$maj" "$min" "$patch" "$pre" "$v"
+  done
+}
+
 version="${BLOB_1_VERSION:-}"
 version="${version#v}"
 if [ -z "$version" ]; then
-  tmp_index="$(mktemp)"
-  fetch_status=0
-  fetch "https://github.com/${repo}/releases/latest" "$tmp_index" application/json || fetch_status=$?
-  if [ "$fetch_status" -eq 0 ]; then
-    version="$(sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p' "$tmp_index" | head -n 1)"
-  elif [ "$fetch_status" -eq 44 ] && command -v gh >/dev/null 2>&1; then
-    tag="$(gh release view --repo "$repo" --json tagName --jq .tagName 2>/dev/null || true)"
-    version="${tag#v}"
+  if [ "$channel" = stable ]; then
+    version="$(release_tags \
+      | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+      | semver_key | sort -r | head -n 1 | cut -d' ' -f2)"
+    [ -n "$version" ] || fail "could not find a stable release; set BLOB_1_VERSION or authenticate with gh"
+  else
+    version="$(release_tags \
+      | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-latest\.[0-9]{8}\.[0-9]{4}$' \
+      | semver_key | sort -r | head -n 1 | cut -d' ' -f2)"
+    [ -n "$version" ] || fail "could not find a latest-channel release; set BLOB_1_VERSION or authenticate with gh"
   fi
-  rm -f "$tmp_index"
-  [ -n "$version" ] || fail "could not find the latest release; set BLOB_1_VERSION or authenticate with gh"
 fi
+
+case "$version" in
+  '' | *[!0-9A-Za-z.-]* | .* | */* | *..*) fail "invalid version '${version}'" ;;
+esac
 
 archive="blob-1-${version}-${platform}-${arch}.tar.gz"
 versions_dir="${blob_home}/runtime/versions"
 target_dir="${versions_dir}/${version}"
 
+staging=
 if [ -f "${target_dir}/.install-complete" ] && [ "$(cat "${target_dir}/.install-complete")" = "$version" ]; then
   step "Version ${version} is already downloaded."
 else
@@ -197,18 +249,44 @@ else
   chmod +x "${staging}/blob-1"
   "${staging}/blob-1" --help >/dev/null || fail "the downloaded executable does not run"
   printf '%s\n' "$version" > "${staging}/.install-complete"
-
-  rm -rf "$target_dir"
-  mv "$staging" "$target_dir"
-  trap - EXIT
 fi
 
 step "Setting up the blob-1 command..."
-mkdir -p "$bin_dir"
-ln -sfn "${target_dir}/blob-1" "${bin_dir}/blob-1"
-launcher="$(CDPATH='' cd -P -- "$bin_dir" && pwd)/blob-1"
+mkdir -p "$bin_dir" "$versions_dir"
+lock_file="${versions_dir}/.lock"
+# Publish staged version and register/repoint launcher under one exclusive
+# kernel flock shared with the Rust updater/launcher (works on Linux & macOS).
+publish_and_activate_cmd='
+set -eu
+if [ -n "$1" ]; then
+  if [ -f "$2/.install-complete" ] && [ "$(cat "$2/.install-complete")" = "$3" ]; then
+    rm -rf "$1"
+  else
+    rm -rf "$2"
+    mv "$1" "$2"
+  fi
+fi
+ln -sfn "$2/blob-1" "$4/blob-1"
+launcher="$(CDPATH="" cd -P -- "$4" && pwd)/blob-1"
+grep -qxF "$launcher" "$5" 2>/dev/null || printf "%s\n" "$launcher" >> "$5"
+'
 launchers="${blob_home}/runtime/launchers"
-grep -qxF "$launcher" "$launchers" 2>/dev/null || printf '%s\n' "$launcher" >> "$launchers"
+if command -v flock >/dev/null 2>&1; then
+  (
+    flock -x 9
+    sh -c "$publish_and_activate_cmd" -- "$staging" "$target_dir" "$version" "$bin_dir" "$launchers"
+  ) 9>"$lock_file"
+elif command -v python3 >/dev/null 2>&1; then
+  python3 -c '
+import fcntl, subprocess, sys
+with open(sys.argv[1], "a+") as f:
+    fcntl.flock(f, fcntl.LOCK_EX)
+    sys.exit(subprocess.call(["sh", "-c", sys.argv[2], "--", *sys.argv[3:]]))
+' "$lock_file" "$publish_and_activate_cmd" "$staging" "$target_dir" "$version" "$bin_dir" "$launchers"
+else
+  fail "flock or python3 is required to safely publish and activate Blob-1"
+fi
+trap - EXIT
 if "$interactive"; then printf '\r\033[2K' >&2; fi
 printf '  %sInstalled Blob-1 %s%s\n\n' "$green" "$version" "$reset" >&2
 case ":${PATH}:" in

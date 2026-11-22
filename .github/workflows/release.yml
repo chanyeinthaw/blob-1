@@ -4,11 +4,85 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel
+        type: choice
+        options:
+          - latest
+          - stable
+        default: latest
+      version:
+        description: Explicit version (required for stable; latest defaults to 0.0.0-latest.<UTC timestamp>)
+        required: false
+        type: string
 
 permissions:
   contents: write
 
 jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - id: v
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_CHANNEL: ${{ inputs.channel }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            channel="$INPUT_CHANNEL"
+            version="$INPUT_VERSION"
+            if [ -z "$version" ]; then
+              if [ "$channel" != latest ]; then
+                echo "::error::the version input is required for a stable release" >&2
+                exit 1
+              fi
+              version="0.0.0-latest.$(date -u +%Y%m%d.%H%M)"
+            fi
+            if [[ "$version" == *$'\n'* || "$version" == *$'\r'* ]]; then
+              echo "::error::version must be a single line" >&2
+              exit 1
+            fi
+            case "$channel" in
+              latest)
+                [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-latest\.[0-9]{8}\.[0-9]{4}$ ]] \
+                  || { echo "::error::latest versions must be X.Y.Z-latest.YYYYMMDD.HHMM" >&2; exit 1; }
+                ;;
+              stable)
+                [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+                  || { echo "::error::stable versions must be X.Y.Z" >&2; exit 1; }
+                ;;
+              *)
+                echo "::error::invalid channel" >&2
+                exit 1
+                ;;
+            esac
+            tag="v${version}"
+            if gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}" >/dev/null 2>&1; then
+              echo "::error::tag $tag already exists" >&2
+              exit 1
+            fi
+          else
+            version="${GITHUB_REF_NAME#v}"
+            if [[ "$version" == *$'\n'* || "$version" == *$'\r'* ]]; then
+              echo "::error::tag must be a single line" >&2
+              exit 1
+            fi
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-latest\.[0-9]{8}\.[0-9]{4})?$ ]] \
+              || { echo "::error::tag must be vX.Y.Z or vX.Y.Z-latest.YYYYMMDD.HHMM" >&2; exit 1; }
+            tag="v${version}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
   web:
     name: Build web UI
     runs-on: ubuntu-24.04
@@ -34,7 +108,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.platform }}
-    needs: web
+    needs: [version, web]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -46,6 +120,8 @@ jobs:
           - target: aarch64-apple-darwin
             platform: darwin-arm64
             os: macos-15
+    env:
+      BLOB_1_VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -67,8 +143,7 @@ jobs:
 
       - name: Package binary
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          archive="blob-1-${version}-${{ matrix.platform }}.tar.gz"
+          archive="blob-1-${BLOB_1_VERSION}-${{ matrix.platform }}.tar.gz"
           stage="$(mktemp -d)"
           cp "target/${{ matrix.target }}/release/agent" "${stage}/blob-1"
           tar -C "${stage}" -czf "${archive}" blob-1
@@ -82,7 +157,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
@@ -98,8 +173,19 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/* \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "${GITHUB_REF_NAME}" \
-            --generate-notes
+          case "$TAG" in
+            v*-latest.*) flags=(--prerelease --latest=false) ;;
+            *) flags=(--latest) ;;
+          esac
+          target=()
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            target=(--target "$COMMIT_SHA")
+          fi
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --generate-notes "${flags[@]}" "${target[@]}"

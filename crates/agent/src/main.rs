@@ -3,7 +3,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use storage::{
     Checkin, CheckinStore, ConfigStore, McpStore, MessengerStore, ModelRef, Provider, ProviderApi,
     ProviderId, ReasoningLevel, SkillStore,
@@ -12,11 +12,19 @@ use storage_sqlite::{AppKey, SqliteStorage};
 
 mod import;
 mod run;
+mod runtime;
 mod web;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Release builds stamp BLOB_1_VERSION; workspace builds report 0.0.0.
+const VERSION: &str = match option_env!("BLOB_1_VERSION") {
+    Some(v) if !v.is_empty() => v,
+    _ => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
+#[command(name = "blob-1")]
 struct Cli {
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
@@ -97,6 +105,30 @@ enum Command {
     },
     Chat {
         message: String,
+    },
+    /// Download a release and switch to it.
+    Update {
+        /// Version to install (default: newest on --channel).
+        version: Option<String>,
+        /// Channel to resolve the newest version from.
+        #[arg(long, value_enum, default_value_t = runtime::Channel::Latest)]
+        channel: runtime::Channel,
+        /// Allow switching to an older version.
+        #[arg(long)]
+        allow_downgrade: bool,
+        /// Repoint launcher symlinks without asking a running launcher to restart.
+        #[arg(long)]
+        no_restart: bool,
+    },
+    /// Supervise `serve`, applying updates with database rollback.
+    Launcher {
+        #[arg(long, default_value = "127.0.0.1:7878")]
+        web: std::net::SocketAddr,
+        /// Absolute http(s) URL the web app is publicly reached at (e.g. via
+        /// Tailscale Serve); OAuth callbacks and WebSocket origins use it
+        /// instead of the Host header.
+        #[arg(long)]
+        public_url: Option<String>,
     },
 }
 
@@ -359,7 +391,8 @@ enum SkillCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().version(VERSION).get_matches();
+    let cli = Cli::from_arg_matches(&matches)?;
     let data_dir = match cli.data_dir {
         Some(dir) => dir,
         None => default_data_dir()?,
@@ -371,6 +404,38 @@ async fn main() -> Result<()> {
         Some(dir) if !dir.is_absolute() => Some(std::env::current_dir()?.join(dir)),
         dir => dir,
     };
+    match &cli.command {
+        Command::Update {
+            version,
+            channel,
+            allow_downgrade,
+            no_restart,
+        } => {
+            return runtime::update(runtime::UpdateOpts {
+                current: VERSION,
+                channel: *channel,
+                version: version.clone(),
+                allow_downgrade: *allow_downgrade,
+                no_restart: *no_restart,
+            })
+            .await;
+        }
+        Command::Launcher { web, public_url } => {
+            if let Some(url) = public_url {
+                web::public_url(url)?;
+            }
+            return runtime::launch(runtime::LauncherOpts {
+                current: VERSION,
+                data_dir,
+                workspace,
+                skills_dir,
+                web: *web,
+                public_url: public_url.clone(),
+            })
+            .await;
+        }
+        _ => {}
+    }
     let path = data_dir.join("agent.db");
     let app_key = std::env::var("BLOB_1_APP_KEY")
         .ok()
@@ -497,6 +562,8 @@ async fn main() -> Result<()> {
                     .map(|url| url.as_str().trim_end_matches('/')),
             )?;
             let listener = tokio::net::TcpListener::bind(addr).await?;
+            std::fs::create_dir_all(&workspace)?;
+            let workspace = workspace.canonicalize()?;
             let web_store = store.clone();
             let discord = Arc::new(messenger_discord::Discord::new());
             let discord_for_web = discord.clone();
@@ -510,8 +577,6 @@ async fn main() -> Result<()> {
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
             let mut terminate =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-            std::fs::create_dir_all(&workspace)?;
-            let workspace = workspace.canonicalize()?;
             let stop = shutdown_tx.clone();
             let harness_task = tokio::spawn(async move {
                 let result = run::serve(
@@ -564,6 +629,7 @@ async fn main() -> Result<()> {
             let workspace = workspace.canonicalize()?;
             run::chat(store, &workspace, skills_dir.as_deref(), message).await
         }
+        Command::Update { .. } | Command::Launcher { .. } => unreachable!(),
     }
 }
 

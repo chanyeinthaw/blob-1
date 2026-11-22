@@ -72,66 +72,18 @@ impl LocalEnvironment {
             .map_err(io_error)
     }
 
-    fn resolve_readable(&self, path: &Path) -> Result<PathBuf, ToolError> {
-        let joined = self.root.join(path);
-        let lexical_skill = joined.is_absolute()
-            && !joined
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            && joined.starts_with(&self.skills_dir);
-        let resolved = joined
-            .canonicalize()
-            .map_err(|_| ToolError::NotFound(path.display().to_string()))?;
-        if lexical_skill || resolved.starts_with(&self.skills_dir) {
-            return Ok(resolved);
-        }
-        self.ensure_inside_root(&resolved)?;
-        Ok(resolved)
-    }
-
     fn resolve_existing(&self, path: &Path) -> Result<PathBuf, ToolError> {
-        let resolved = self
-            .root
+        self.root
             .join(path)
             .canonicalize()
-            .map_err(|_| ToolError::NotFound(path.display().to_string()))?;
-        self.ensure_inside_root(&resolved)?;
-        Ok(resolved)
+            .map_err(|_| ToolError::NotFound(path.display().to_string()))
     }
 
     fn resolve_for_write(&self, path: &Path) -> Result<PathBuf, ToolError> {
-        let joined: PathBuf = self.root.join(path).components().collect();
-        match joined.symlink_metadata() {
-            Ok(_) => return self.resolve_existing(&joined),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error(error)),
+        if path.as_os_str().is_empty() {
+            return Err(ToolError::Invalid("Path cannot be empty".into()));
         }
-        let escape = || ToolError::PathEscape(path.display().to_string());
-        let file_name = joined.file_name().ok_or_else(escape)?;
-        let mut existing = joined.parent().ok_or_else(escape)?;
-        let mut missing = Vec::new();
-        while !existing.exists() {
-            missing.push(existing.file_name().ok_or_else(escape)?);
-            existing = existing.parent().ok_or_else(escape)?;
-        }
-        let mut resolved = existing.canonicalize().map_err(io_error)?;
-        self.ensure_inside_root(&resolved)?;
-        for component in missing.into_iter().rev() {
-            if component == ".." {
-                return Err(escape());
-            }
-            resolved.push(component);
-        }
-        resolved.push(file_name);
-        Ok(resolved)
-    }
-
-    fn ensure_inside_root(&self, path: &Path) -> Result<(), ToolError> {
-        if path.starts_with(&self.root) {
-            Ok(())
-        } else {
-            Err(ToolError::PathEscape(path.display().to_string()))
-        }
+        Ok(self.root.join(path))
     }
 
     async fn read(
@@ -140,7 +92,7 @@ impl LocalEnvironment {
         offset: Option<usize>,
         limit: Option<usize>,
     ) -> Result<String, ToolError> {
-        let resolved = self.resolve_readable(path)?;
+        let resolved = self.resolve_existing(path)?;
         let content = tokio::fs::read_to_string(resolved)
             .await
             .map_err(io_error)?;
@@ -767,7 +719,7 @@ impl Environment for LocalEnvironment {
                 _ => None,
             };
             if let Some(mime) = mime {
-                let resolved = self.resolve_readable(path)?;
+                let resolved = self.resolve_existing(path)?;
                 if tokio::fs::metadata(&resolved)
                     .await
                     .map_err(io_error)?
