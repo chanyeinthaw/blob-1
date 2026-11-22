@@ -18,12 +18,34 @@ use twilight_model::{
     user::User,
 };
 
+/// Decision returned by the gateway pre-filter before any REST call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreFilterDecision {
+    /// Admit the message and proceed with REST lookups as needed.
+    Allow,
+    /// Drop the message immediately with no further REST calls.
+    Reject,
+    /// Channel parent is unknown and an inherited channel override could apply;
+    /// resolve the channel once, then re-check with the resolved parent.
+    NeedParent,
+}
+
+/// Cheap gate consulted per incoming gateway message before any REST call:
+/// `(author_id, channel_id, thread_id, addressed, channel_known)`. When
+/// `thread_id` is `Some`, `channel_id` is the resolved parent channel; when
+/// `None` and `channel_known` is `true`, `channel_id` is a known top-level
+/// channel (or DM); when `channel_known` is `false`, `channel_id` is uncached
+/// and may be a thread. Without a pre-filter, only addressed messages run.
+type PreFilter =
+    Arc<dyn Fn(&str, &str, Option<&str>, bool, bool) -> PreFilterDecision + Send + Sync>;
+
 /// The Discord messenger. It starts disconnected and swaps its HTTP client
 /// and gateway live when `connect` is called with a new token. Operations
 /// while disconnected fail with "Discord is not connected".
 pub struct Discord {
     inner: watch::Sender<Option<Arc<Inner>>>,
     connection: watch::Sender<Connection>,
+    pre_filter: std::sync::RwLock<Option<PreFilter>>,
 }
 
 /// One bot connection: its HTTP client plus the state the gateway fills in.
@@ -119,7 +141,24 @@ impl Discord {
         Self {
             inner: watch::channel(None).0,
             connection: watch::channel(Connection::Off).0,
+            pre_filter: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Installs the per-message pre-filter the gateway runs before any REST
+    /// call, so busy servers can't rate-limit the bot on skipped messages.
+    pub fn set_pre_filter(&self, filter: PreFilter) {
+        *self
+            .pre_filter
+            .write()
+            .expect("pre_filter lock poisoned") = Some(filter);
+    }
+
+    pub(crate) fn pre_filter(&self) -> Option<PreFilter> {
+        self.pre_filter
+            .read()
+            .expect("pre_filter lock poisoned")
+            .clone()
     }
 
     /// Connects with a bot token, replacing any current connection.

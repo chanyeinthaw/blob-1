@@ -23,6 +23,7 @@ interface PickerProps {
   readonly focusOnMount?: boolean
   readonly disabled?: boolean
   readonly clearOnSelect?: boolean
+  readonly clearOnEdit?: boolean
   readonly customOption?: (query: string) => PickerOption | null
   readonly emptyMessage?: (query: string) => string
   readonly onChange: (value: string) => void
@@ -92,6 +93,15 @@ export function Picker(props: PickerProps) {
           return
         }
         setInputValue(next)
+        if (
+          props.clearOnEdit === true &&
+          (details.reason === 'input-change' || details.reason === 'input-clear') &&
+          props.value !== '' &&
+          next !== resolvedLabel
+        ) {
+          syncedRef.current = { value: '', label: '' }
+          props.onChange('')
+        }
       }}
       itemToStringLabel={(option: PickerOption) => option.label}
       isItemEqualToValue={(item: PickerOption, value: PickerOption) => item.value === value.value}

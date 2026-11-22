@@ -3,6 +3,7 @@ import { Array, Duration, Effect, Layer, Random, Ref, Schema, Stream, Struct } f
 import { Transport } from './api.ts'
 import {
   Discord,
+  type DiscordInteractionOverride,
   Home,
   Identity,
   McpServer,
@@ -37,6 +38,7 @@ type State = Readonly<{
   allowed: ReadonlyArray<string>
   home: Home
   hasToken: boolean
+  interactionModes: ReadonlyArray<DiscordInteractionOverride>
   mcpServers: ReadonlyArray<McpServer>
 }>
 
@@ -67,6 +69,7 @@ const seedState = (): State => ({
   allowed: ['435482941515104257'],
   home: { kind: 'none' },
   hasToken: true,
+  interactionModes: [],
   mcpServers: [
     {
       id: 'filesystem',
@@ -110,6 +113,7 @@ const discordReply = (state: State): Discord => ({
   home: state.home,
   token: state.hasToken ? 'set' : 'missing',
   connection: state.hasToken ? { state: 'online', bot: 'Blob-1' } : { state: 'off' },
+  interactionModes: state.interactionModes,
 })
 
 const setToken = (state: State, token: string): Effect.Effect<State, string> =>
@@ -228,6 +232,50 @@ const setHome = (state: State, home: Home): Effect.Effect<State, string> =>
     }
 
     return Struct.evolve(state, { home: () => home })
+  })
+
+const SNOWFLAKE = /^\d{17,20}$/
+
+const sortedModes = (
+  modes: ReadonlyArray<DiscordInteractionOverride>,
+): ReadonlyArray<DiscordInteractionOverride> =>
+  modes.toSorted((a, b) => a.scope.localeCompare(b.scope) || a.targetId.localeCompare(b.targetId))
+
+const setInteractionMode = (
+  state: State,
+  payload: RequestPayload<'discord.setInteractionMode'>,
+): Effect.Effect<State, string> =>
+  Effect.gen(function* () {
+    if (!SNOWFLAKE.test(payload.targetId)) {
+      return yield* Effect.fail('Ids must be 17–20 digits')
+    }
+
+    return Struct.evolve(state, {
+      interactionModes: modes =>
+        sortedModes([
+          ...modes.filter(
+            entry => !(entry.scope === payload.scope && entry.targetId === payload.targetId),
+          ),
+          payload,
+        ]),
+    })
+  })
+
+const clearInteractionMode = (
+  state: State,
+  payload: RequestPayload<'discord.clearInteractionMode'>,
+): Effect.Effect<State, string> =>
+  Effect.gen(function* () {
+    if (payload.targetId === '') {
+      return yield* Effect.fail('Invalid target id')
+    }
+
+    return Struct.evolve(state, {
+      interactionModes: modes =>
+        modes.filter(
+          entry => !(entry.scope === payload.scope && entry.targetId === payload.targetId),
+        ),
+    })
   })
 
 const MCP_ID = /^[a-z0-9-]+$/
@@ -427,6 +475,16 @@ const handlers: { readonly [K in RequestType]: Handler<K> } = {
     transition(state, current =>
       Effect.succeed(Struct.evolve(current, { hasToken: () => false })),
     ).pipe(Effect.map(discordReply)),
+
+  'discord.setInteractionMode': (payload, state) =>
+    transition(state, current => setInteractionMode(current, payload)).pipe(
+      Effect.map(discordReply),
+    ),
+
+  'discord.clearInteractionMode': (payload, state) =>
+    transition(state, current => clearInteractionMode(current, payload)).pipe(
+      Effect.map(discordReply),
+    ),
 
   'mcp.list': (_payload, state) => Ref.get(state).pipe(Effect.map(current => current.mcpServers)),
 

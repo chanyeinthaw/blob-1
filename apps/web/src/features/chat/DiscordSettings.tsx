@@ -1,5 +1,10 @@
 import type { ApiError } from '@blob-1/client/api'
-import type { DiscordConnection, DiscordDirectory, Home } from '@blob-1/contracts'
+import type {
+  DiscordConnection,
+  DiscordDirectory,
+  DiscordInteractionOverride,
+  Home,
+} from '@blob-1/contracts'
 import { useAtomRefresh, useAtomSet, useAtomValue } from '@effect/atom-react'
 import { AtomMachine } from '@typeonce/effect-machine/reactivity'
 import {
@@ -9,7 +14,7 @@ import {
 } from '@typeonce/effect-machine-react'
 import { type Cause, Option } from 'effect'
 import { AsyncResult } from 'effect/reactivity'
-import { KeyRound, Trash2, User } from 'lucide-react'
+import { Hash, KeyRound, Trash2, User } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 
 import { ConfirmDialog } from '~/components/ConfirmDialog'
@@ -131,6 +136,7 @@ export function DiscordSettings() {
     <div>
       <TokenSection />
       <AllowlistSection />
+      <InteractionModeSection />
       <HomeSection />
     </div>
   )
@@ -309,7 +315,7 @@ function TokenForm(props: TokenFormProps) {
   )
 }
 
-const USER_ID = /^\d{17,20}$/
+const SNOWFLAKE = /^\d{17,20}$/
 
 function personName(directory: DiscordDirectory, user: string) {
   return directory.people.find(person => person.id === user)?.name
@@ -444,14 +450,14 @@ function AllowForm() {
               }))}
               customOption={raw => {
                 const user = raw.trim()
-                if (!USER_ID.test(user) || value.discord.allowed.includes(user)) return null
+                if (!SNOWFLAKE.test(user) || value.discord.allowed.includes(user)) return null
                 return { value: user, label: `Allow ID ${user}`, hint: null }
               }}
               emptyMessage={raw => {
                 const trimmed = raw.trim()
                 if (trimmed === '') return 'No matches'
                 if (value.discord.allowed.includes(trimmed)) return 'Already allowed'
-                if (/^\d+$/.test(trimmed) && !USER_ID.test(trimmed)) {
+                if (/^\d+$/.test(trimmed) && !SNOWFLAKE.test(trimmed)) {
                   return 'Discord user IDs have 17–20 digits'
                 }
                 return 'No matches'
@@ -475,7 +481,7 @@ function AllowForm() {
             onSubmit={event => {
               event.preventDefault()
               const user = draft.trim()
-              if (!USER_ID.test(user)) {
+              if (!SNOWFLAKE.test(user)) {
                 setLocalError('Enter a Discord user ID with 17–20 digits.')
               } else if (value.discord.allowed.includes(user)) {
                 setLocalError('This user is already allowed.')
@@ -515,6 +521,255 @@ function AllowForm() {
               </Button>
             </div>
           </form>
+        )
+      }}
+    </MachineState>
+  )
+}
+
+const modeToggleItemClassName =
+  'h-full rounded-full px-3 text-muted-foreground hover:bg-transparent hover:text-foreground aria-pressed:bg-background aria-pressed:text-foreground aria-pressed:shadow-sm'
+
+/** Per-channel and per-person overrides of the default mention-only gate. */
+function InteractionModeSection() {
+  const machine = DiscordOwner.useMachine()
+  const isIdle = AsyncResult.getOrElse(
+    useMachineResult(AtomMachine.matches(machine, 'Interaction.Idle')),
+    () => false,
+  )
+  return (
+    <Section title="Interaction mode">
+      <MachineState machine={machine} path="">
+        {({ value }) =>
+          value.discord.interactionModes.length === 0 ? (
+            <EmptyLine>No interaction mode overrides.</EmptyLine>
+          ) : (
+            <ul className="flex flex-col divide-y">
+              {value.discord.interactionModes.map(override => (
+                <OverrideRow
+                  key={`${override.scope}:${override.targetId}`}
+                  override={override}
+                  directory={value.directory}
+                  disabled={!isIdle}
+                />
+              ))}
+            </ul>
+          )
+        }
+      </MachineState>
+      <ModeForm isIdle={isIdle} />
+    </Section>
+  )
+}
+
+interface OverrideRowProps {
+  readonly override: DiscordInteractionOverride
+  readonly directory: DiscordDirectory
+  readonly disabled: boolean
+}
+
+function OverrideRow(props: OverrideRowProps) {
+  const machine = DiscordOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  const { scope, targetId, mode } = props.override
+  const name =
+    scope === 'channel'
+      ? props.directory.channels.find(channel => channel.id === targetId)?.name
+      : props.directory.people.find(person => person.id === targetId)?.name
+  const label =
+    scope === 'channel' ? (name === undefined ? targetId : `#${name}`) : (name ?? targetId)
+  return (
+    <li className="flex min-h-12 flex-wrap items-center gap-x-3 gap-y-2 py-2">
+      <span
+        aria-hidden="true"
+        className="grid size-7 shrink-0 place-items-center rounded-full bg-muted text-[11px] font-semibold text-muted-foreground"
+      >
+        {scope === 'channel' ? (
+          <Hash className="size-3.5" />
+        ) : name === undefined ? (
+          <User className="size-3.5" />
+        ) : (
+          initials(name)
+        )}
+      </span>
+      <div className="flex min-w-0 flex-1 basis-40 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span className="break-words text-sm [overflow-wrap:anywhere]">{label}</span>
+        {name === undefined ? null : (
+          <span className="font-mono text-xs text-muted-foreground">{targetId}</span>
+        )}
+      </div>
+      <div className="ml-auto flex items-center gap-2">
+        <ToggleGroup
+          aria-label={`Interaction mode for ${label}`}
+          spacing={1}
+          disabled={props.disabled}
+          value={[mode]}
+          onValueChange={values => {
+            const next = values[0]
+            if ((next === 'mention-only' || next === 'always') && next !== mode) {
+              send(DiscordEvents.SetInteractionMode({ scope, targetId, mode: next }))
+            }
+          }}
+          className="h-10 rounded-full bg-muted p-[3px] md:h-8"
+        >
+          <ToggleGroupItem value="mention-only" className={modeToggleItemClassName}>
+            Mention only
+          </ToggleGroupItem>
+          <ToggleGroupItem value="always" className={modeToggleItemClassName}>
+            Always
+          </ToggleGroupItem>
+        </ToggleGroup>
+        <ConfirmDialog
+          tooltip="Remove override"
+          trigger={
+            <Button
+              variant="outline"
+              size="icon"
+              aria-label={`Remove override for ${label}`}
+              disabled={props.disabled}
+              className="text-destructive"
+            >
+              <Trash2 />
+            </Button>
+          }
+          title="Remove interaction override?"
+          detail={name === undefined ? targetId : `${label} (${targetId})`}
+          confirmLabel="Remove"
+          onConfirm={() => send(DiscordEvents.ClearInteractionMode({ scope, targetId }))}
+        />
+      </div>
+    </li>
+  )
+}
+
+interface ModeFormProps {
+  readonly isIdle: boolean
+}
+
+/** The add-override form: scope toggle, target picker and mode toggle. */
+function ModeForm(props: ModeFormProps) {
+  const machine = DiscordOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  return (
+    <MachineState machine={machine} path="">
+      {({ value, states }) => {
+        const interaction = states.Interaction.state
+        const error = interaction.path === 'Interaction.Idle' ? interaction.value.error : null
+        const scope = value.modeScope
+        const overridden = (targetId: string) =>
+          value.discord.interactionModes.some(
+            entry => entry.scope === scope && entry.targetId === targetId,
+          )
+        const multipleServers =
+          new Set(value.directory.channels.map(channel => channel.server)).size > 1
+        const options =
+          scope === 'channel'
+            ? value.directory.channels
+                .filter(channel => !overridden(channel.id))
+                .map(channel => ({
+                  value: channel.id,
+                  label: `#${channel.name}`,
+                  hint: multipleServers ? channel.server : null,
+                }))
+            : value.directory.people
+                .filter(
+                  person => value.discord.allowed.includes(person.id) && !overridden(person.id),
+                )
+                .map(person => ({ value: person.id, label: person.name, hint: person.id }))
+        const targetValid = SNOWFLAKE.test(value.modeTarget) && !overridden(value.modeTarget)
+        return (
+          <div className="mt-2.5">
+            <FieldRow labelId="discord-mode-scope-label" label="For">
+              <ToggleGroup
+                aria-labelledby="discord-mode-scope-label"
+                spacing={1}
+                disabled={!props.isIdle}
+                value={[scope]}
+                onValueChange={values => {
+                  const next = values[0]
+                  if ((next === 'channel' || next === 'user') && next !== scope) {
+                    send(DiscordEvents.SelectModeScope({ scope: next }))
+                  }
+                }}
+                className="h-10 rounded-full bg-muted p-[3px] md:h-8"
+              >
+                <ToggleGroupItem value="channel" className={modeToggleItemClassName}>
+                  Channel
+                </ToggleGroupItem>
+                <ToggleGroupItem value="user" className={modeToggleItemClassName}>
+                  Person
+                </ToggleGroupItem>
+              </ToggleGroup>
+            </FieldRow>
+            <FieldRow id="discord-mode-target" label={scope === 'channel' ? 'Channel' : 'Person'}>
+              <Picker
+                id="discord-mode-target"
+                placeholder={scope === 'channel' ? 'Choose a channel' : 'Choose a person'}
+                value={value.modeTarget}
+                disabled={!props.isIdle}
+                clearOnEdit
+                options={options}
+                customOption={raw => {
+                  const id = raw.trim()
+                  if (!SNOWFLAKE.test(id) || overridden(id)) return null
+                  return { value: id, label: `Use ID ${id}`, hint: null }
+                }}
+                emptyMessage={raw => {
+                  const trimmed = raw.trim()
+                  if (trimmed === '') return 'No matches'
+                  if (overridden(trimmed)) return 'Already has an override'
+                  if (/^\d+$/.test(trimmed) && !SNOWFLAKE.test(trimmed)) {
+                    return 'Discord IDs have 17–20 digits'
+                  }
+                  return 'No matches'
+                }}
+                onChange={targetId => send(DiscordEvents.SelectModeTarget({ targetId }))}
+              />
+            </FieldRow>
+            <FieldRow labelId="discord-mode-setting-label" label="Mode">
+              <div className="flex flex-wrap items-center gap-2">
+                <ToggleGroup
+                  aria-labelledby="discord-mode-setting-label"
+                  spacing={1}
+                  disabled={!props.isIdle}
+                  value={[value.modeSetting]}
+                  onValueChange={values => {
+                    const next = values[0]
+                    if (
+                      (next === 'mention-only' || next === 'always') &&
+                      next !== value.modeSetting
+                    ) {
+                      send(DiscordEvents.SelectModeSetting({ mode: next }))
+                    }
+                  }}
+                  className="h-10 rounded-full bg-muted p-[3px] md:h-8"
+                >
+                  <ToggleGroupItem value="mention-only" className={modeToggleItemClassName}>
+                    Mention only
+                  </ToggleGroupItem>
+                  <ToggleGroupItem value="always" className={modeToggleItemClassName}>
+                    Always
+                  </ToggleGroupItem>
+                </ToggleGroup>
+                <Button
+                  className="ml-auto"
+                  disabled={!props.isIdle || !targetValid}
+                  onClick={() =>
+                    send(
+                      DiscordEvents.SetInteractionMode({
+                        scope,
+                        targetId: value.modeTarget,
+                        mode: value.modeSetting,
+                      }),
+                    )
+                  }
+                >
+                  Add override
+                </Button>
+              </div>
+            </FieldRow>
+            {error === null ? null : <FieldError id="discord-mode-error">{error}</FieldError>}
+          </div>
         )
       }}
     </MachineState>

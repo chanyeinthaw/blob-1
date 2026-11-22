@@ -1,5 +1,11 @@
 import { Api } from '@blob-1/client/api'
-import { Discord, DiscordDirectory, Home } from '@blob-1/contracts'
+import {
+  Discord,
+  DiscordDirectory,
+  DiscordInteractionMode,
+  DiscordInteractionScope,
+  Home,
+} from '@blob-1/contracts'
 import { Machine } from '@typeonce/effect-machine'
 import { Effect, Schedule, Schema } from 'effect'
 
@@ -25,6 +31,23 @@ const disallow = Effect.fn('DiscordSettings.disallow')(function* (user: string) 
 const setHome = Effect.fn('DiscordSettings.setHome')(function* (home: Home) {
   const api = yield* Api
   return yield* api.request('discord.setHome', { home })
+})
+
+const setInteractionMode = Effect.fn('DiscordSettings.setInteractionMode')(function* (input: {
+  readonly scope: DiscordInteractionScope
+  readonly targetId: string
+  readonly mode: DiscordInteractionMode
+}) {
+  const api = yield* Api
+  return yield* api.request('discord.setInteractionMode', input)
+})
+
+const clearInteractionMode = Effect.fn('DiscordSettings.clearInteractionMode')(function* (input: {
+  readonly scope: DiscordInteractionScope
+  readonly targetId: string
+}) {
+  const api = yield* Api
+  return yield* api.request('discord.clearInteractionMode', input)
 })
 
 /** Polls every 2 seconds until the bot leaves "connecting", then loads the new bot's directory. */
@@ -64,6 +87,10 @@ export const DiscordStates = Machine.state({
     tokenGeneration: Schema.Finite,
     /** Transient home type chosen before picking a destination; null follows `discord.home.kind`. */
     pendingHomeKind: Schema.NullOr(HomeKind),
+    /** Add-override form draft; root fields so busy states can't lose it. */
+    modeScope: DiscordInteractionScope,
+    modeTarget: Schema.String,
+    modeSetting: DiscordInteractionMode,
   },
   states: {
     Token: {
@@ -100,6 +127,21 @@ export const DiscordStates = Machine.state({
         Saving: { fields: { home: Home, queued: Schema.NullOr(Home) } },
       },
     },
+    Interaction: {
+      states: {
+        Idle: { fields: { error: ErrorMessage } },
+        Saving: {
+          fields: {
+            scope: DiscordInteractionScope,
+            targetId: Schema.String,
+            mode: DiscordInteractionMode,
+          },
+        },
+        Removing: {
+          fields: { scope: DiscordInteractionScope, targetId: Schema.String },
+        },
+      },
+    },
   },
 })
 
@@ -114,6 +156,15 @@ export const DiscordEvents = Machine.events({
   Disallow: { user: Schema.String },
   SelectHomeKind: { kind: HomeKind },
   SetHome: { home: Home },
+  SelectModeScope: { scope: DiscordInteractionScope },
+  SelectModeTarget: { targetId: Schema.String },
+  SelectModeSetting: { mode: DiscordInteractionMode },
+  SetInteractionMode: {
+    scope: DiscordInteractionScope,
+    targetId: Schema.String,
+    mode: DiscordInteractionMode,
+  },
+  ClearInteractionMode: { scope: DiscordInteractionScope, targetId: Schema.String },
 })
 
 /** The Discord settings page: token, live connection status, allowlist and home channel. */
@@ -122,9 +173,25 @@ export const DiscordMachine = Machine.make({
   root: DiscordStates,
   events: DiscordEvents,
   input: DiscordInput,
-  effects: { saveToken, removeToken, watchConnection, allow, disallow, setHome },
+  effects: {
+    saveToken,
+    removeToken,
+    watchConnection,
+    allow,
+    disallow,
+    setHome,
+    setInteractionMode,
+    clearInteractionMode,
+  },
 }).handle({
-  root: ({ input }) => ({ ...input, tokenGeneration: 0, pendingHomeKind: null }),
+  root: ({ input }) => ({
+    ...input,
+    tokenGeneration: 0,
+    pendingHomeKind: null,
+    modeScope: 'channel',
+    modeTarget: '',
+    modeSetting: 'mention-only',
+  }),
   states: {
     Token: {
       initial: { target: 'Token.Saved' },
@@ -364,6 +431,106 @@ export const DiscordMachine = Machine.make({
                   pendingHomeKind: state.home.kind === 'none' ? null : root.pendingHomeKind,
                 },
               }),
+            },
+          },
+        },
+      },
+    },
+    Interaction: {
+      initial: { target: 'Interaction.Idle', data: { error: null } },
+      states: {
+        Idle: {
+          on: {
+            SelectModeScope: {
+              target: 'Interaction.Idle',
+              update: 'root',
+              data: ({ event, root, state }) => ({
+                target: { ...state, error: null },
+                update: { ...root, modeScope: event.scope, modeTarget: '' },
+              }),
+            },
+            SelectModeTarget: {
+              target: 'Interaction.Idle',
+              update: 'root',
+              data: ({ event, root, state }) => ({
+                target: { ...state, error: null },
+                update: { ...root, modeTarget: event.targetId },
+              }),
+            },
+            SelectModeSetting: {
+              target: 'Interaction.Idle',
+              update: 'root',
+              data: ({ event, root, state }) => ({
+                target: { ...state, error: null },
+                update: { ...root, modeSetting: event.mode },
+              }),
+            },
+            SetInteractionMode: {
+              target: 'Interaction.Saving',
+              data: ({ event }) => ({
+                scope: event.scope,
+                targetId: event.targetId,
+                mode: event.mode,
+              }),
+            },
+            ClearInteractionMode: {
+              target: 'Interaction.Removing',
+              data: ({ event }) => ({ scope: event.scope, targetId: event.targetId }),
+            },
+          },
+        },
+        Saving: {
+          invoke: {
+            src: 'setInteractionMode',
+            input: ({ state }) => ({
+              scope: state.scope,
+              targetId: state.targetId,
+              mode: state.mode,
+            }),
+            onDone: {
+              target: 'Interaction.Idle',
+              update: 'root',
+              data: ({ root, state, output }) => ({
+                target: { error: null },
+                update: {
+                  ...root,
+                  discord: { ...root.discord, interactionModes: output.interactionModes },
+                  // Drop the draft only when the saved row was the draft.
+                  modeTarget:
+                    state.scope === root.modeScope && state.targetId === root.modeTarget
+                      ? ''
+                      : root.modeTarget,
+                },
+              }),
+            },
+            onFailure: {
+              target: 'Interaction.Idle',
+              data: ({ error }) => ({ error: error.message }),
+            },
+          },
+        },
+        Removing: {
+          invoke: {
+            src: 'clearInteractionMode',
+            input: ({ state }) => ({ scope: state.scope, targetId: state.targetId }),
+            onDone: {
+              target: 'Interaction.Idle',
+              update: 'root',
+              data: ({ root, state, output }) => ({
+                target: { error: null },
+                update: {
+                  ...root,
+                  discord: { ...root.discord, interactionModes: output.interactionModes },
+                  modeTarget:
+                    state.scope === root.modeScope && state.targetId === root.modeTarget
+                      ? ''
+                      : root.modeTarget,
+                },
+              }),
+            },
+            onFailure: {
+              target: 'Interaction.Idle',
+              data: ({ error }) => ({ error: error.message }),
             },
           },
         },

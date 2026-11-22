@@ -11,6 +11,9 @@ pub struct Inbound {
     pub attachments: Vec<Attachment>,
     pub location: String,
     pub earlier: Option<u32>,
+    /// `true` for DMs, mentions of the bot and replies to the bot; `false`
+    /// for plain channel or thread messages the bot was not addressed by.
+    pub addressed: bool,
 }
 
 #[derive(Debug, Clone)]

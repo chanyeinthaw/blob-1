@@ -28,7 +28,7 @@ Where each feature lives: code, CLI, model tools and storage.
 - The session cookie is `HttpOnly; SameSite=Lax` so the cross-site OAuth callback's top-level GET still carries it.
 - HTTP endpoints: `/api/session`, `/api/login`, `/api/logout`, `/api/mcp/login`, `/api/mcp/callback`, `/ws`.
 - Tables: `web_password`, `web_sessions`, `public_url`.
-- The Discord settings live on the **Chat platforms** page at `/settings/chat/discord`: token Replace/Remove, connection status (`off` / `connecting` / `online` with the bot name / `error` with a short message), the user allowlist and the home channel or DM. Discord is the only chat platform today.
+- The Discord settings live on the **Chat platforms** page at `/settings/chat/discord`: token Replace/Remove, connection status (`off` / `connecting` / `online` with the bot name / `error` with a short message), the user allowlist, per-channel and per-person interaction-mode overrides and the home channel or DM. Discord is the only chat platform today.
 - Model and provider changes apply to the running bot without a restart: each turn, spawned task, compaction pass and utility call resolves from current settings; a run already in progress keeps its model, a task keeps the model it was spawned with for its lifetime, and a role whose settings no longer resolve keeps its last working model. The `model`, `models`, `provider` and `reasoning` commands run while `serve` holds the data directory; `serve`, `chat` and `skill` still need it exclusively.
 - The mock transport is enabled only with `VITE_MOCK=1`.
 
@@ -90,7 +90,7 @@ One-shot generation: one request, no tools, no memory, no session.
 ## Messengers (Discord)
 
 - Code: `crates/messenger/src/lib.rs`, `crates/messenger-discord/src/{lib,gateway,render}.rs`, `crates/harness/src/messenger.rs`, `crates/agent/src/run.rs` (`serve`, `admit`)
-- Gate: DMs, mentions of the bot and replies to the bot, from allowlisted users
+- Gate: DMs, mentions of the bot and replies to the bot, from allowlisted users. Interaction-mode overrides relax or tighten this per message — a thread-level `channel` override wins, then the channel's, then the author's `user` override, default `mention-only`; `always` admits unaddressed messages. Changes apply live, and a store-backed pre-filter drops non-allowlisted or never-admissible messages before any Discord REST call
 - Reply-mode gate: with a utility model, a plain-channel message is answered inline or in a thread (5-second budget, fallback thread)
 - Threads: replies to a plain-channel message start a thread from it; bot-created threads get a generated title
 - Pings: one ping per message per turn; follow-ups in a bot run post plainly
@@ -99,9 +99,9 @@ One-shot generation: one request, no tools, no memory, no session.
 - References: replied-to message as `<quote>`; attachments as `<attachment>`
 - Tools: `send` (chat only), `history`, `search`, `participants`, `message` (chat and tasks)
 - The bot token lives in `messenger_tokens`, not the environment: `agent messenger token set discord` reads it from stdin and validates it against `GET /users/@me` before storing; `agent messenger token clear discord` removes it; the **Chat platforms** page does the same over `discord.setToken` / `discord.clearToken`. `serve` polls the row and connects, swaps or drops the gateway live — no restart; with no token sends fail with `Discord is not connected`; a token with no main model reports `Waiting for a main model`; a fatal gateway close (e.g. rejected token, missing intents) reports an error state and stays there until the token changes or is saved again from the web, instead of exiting the process; schedules and check-ins pause whenever there is no main model or the bot is offline (jobs due meanwhile fire late once it is back); shell commands and stdio MCP servers never inherit `BLOB_1_APP_KEY`
-- Web protocol: `discord.get`, `discord.allow`, `discord.disallow`, `discord.setHome`, `discord.directory` (empty lists while disconnected), `discord.setToken`, `discord.clearToken`; `Discord` replies carry `token: "set"|"missing"` and `connection` (`off`, `connecting`, `online` + bot name, `error` + message) alongside `allowed` and `home`
-- CLI: `agent serve` (needs `BLOB_1_APP_KEY`), `agent messenger allow | disallow | list`, `agent messenger token set | clear <messenger>`
-- Tables: `destinations`, `allowed_users`, `messenger_tokens`
+- Web protocol: `discord.get`, `discord.allow`, `discord.disallow`, `discord.setHome`, `discord.directory` (empty lists while disconnected), `discord.setToken`, `discord.clearToken`, `discord.setInteractionMode`, `discord.clearInteractionMode`; `Discord` replies carry `token: "set"|"missing"` and `connection` (`off`, `connecting`, `online` + bot name, `error` + message) alongside `allowed`, `home` and `interactionModes`
+- CLI: `agent serve` (needs `BLOB_1_APP_KEY`), `agent messenger allow | disallow | list`, `agent messenger token set | clear <messenger>`, `agent messenger mode list <messenger>`, `agent messenger mode set <messenger> <channel|user> <id> <mention-only|always>`, `agent messenger mode clear <messenger> <channel|user> <id>`
+- Tables: `destinations`, `allowed_users`, `messenger_tokens`, `interaction_modes`
 
 ## Calendar
 

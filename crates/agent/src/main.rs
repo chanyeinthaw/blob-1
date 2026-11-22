@@ -263,6 +263,56 @@ enum MessengerCommand {
         #[command(subcommand)]
         command: MessengerTokenCommand,
     },
+    Mode {
+        #[command(subcommand)]
+        command: MessengerModeCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum MessengerModeCommand {
+    List { messenger: String },
+    Set {
+        messenger: String,
+        scope: ModeScope,
+        id: String,
+        mode: ModeSetting,
+    },
+    Clear {
+        messenger: String,
+        scope: ModeScope,
+        id: String,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ModeScope {
+    Channel,
+    User,
+}
+
+impl From<ModeScope> for storage::InteractionScope {
+    fn from(scope: ModeScope) -> Self {
+        match scope {
+            ModeScope::Channel => Self::Channel,
+            ModeScope::User => Self::User,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ModeSetting {
+    MentionOnly,
+    Always,
+}
+
+impl From<ModeSetting> for storage::InteractionMode {
+    fn from(mode: ModeSetting) -> Self {
+        match mode {
+            ModeSetting::MentionOnly => Self::MentionOnly,
+            ModeSetting::Always => Self::Always,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -946,6 +996,10 @@ fn skill(store: &SqliteStorage, command: SkillCommand) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn valid_discord_id(id: &str) -> bool {
+    (17..=20).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit())
+}
+
 async fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<()> {
     match command {
         MessengerCommand::Allow { messenger, user_id } => store.allow_user(&messenger, &user_id)?,
@@ -980,6 +1034,45 @@ async fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<(
                 }
             }
         }
+        MessengerCommand::Mode { command } => match command {
+            MessengerModeCommand::List { messenger } => {
+                if messenger != "discord" {
+                    return Err(format!("unknown messenger: {messenger}").into());
+                }
+                for item in store.interaction_modes(&messenger)? {
+                    println!(
+                        "{} {} {}",
+                        item.scope.as_str(),
+                        item.target_id,
+                        item.mode.as_str()
+                    );
+                }
+            }
+            MessengerModeCommand::Set {
+                messenger,
+                scope,
+                id,
+                mode,
+            } => {
+                if messenger != "discord" {
+                    return Err(format!("unknown messenger: {messenger}").into());
+                }
+                if !valid_discord_id(&id) {
+                    return Err("Discord IDs must be 17–20 digits".into());
+                }
+                store.set_interaction_mode(&messenger, scope.into(), &id, mode.into())?;
+            }
+            MessengerModeCommand::Clear {
+                messenger,
+                scope,
+                id,
+            } => {
+                if messenger != "discord" {
+                    return Err(format!("unknown messenger: {messenger}").into());
+                }
+                store.clear_interaction_mode(&messenger, scope.into(), &id)?;
+            }
+        },
     }
     Ok(())
 }

@@ -719,6 +719,61 @@ impl<T: ScheduleStore + ?Sized> ScheduleStore for std::sync::Arc<T> {
     }
 }
 
+/// What an interaction override applies to: a Discord channel or thread id,
+/// or a user id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractionScope {
+    Channel,
+    User,
+}
+
+impl InteractionScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Channel => "channel",
+            Self::User => "user",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|scope| scope.as_str() == s)
+    }
+
+    const ALL: [Self; 2] = [Self::Channel, Self::User];
+}
+
+/// How eagerly the bot engages: `MentionOnly` answers DMs, mentions and
+/// replies; `Always` answers every message in scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractionMode {
+    MentionOnly,
+    Always,
+}
+
+impl InteractionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MentionOnly => "mention-only",
+            Self::Always => "always",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == s)
+    }
+
+    const ALL: [Self; 2] = [Self::MentionOnly, Self::Always];
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteractionOverride {
+    pub scope: InteractionScope,
+    pub target_id: String,
+    pub mode: InteractionMode,
+}
+
 pub trait MessengerStore: Send + Sync {
     fn destination(&self, messenger: &str, place: &Place) -> Result<u64, StoreError>;
     fn place(&self, id: u64) -> Result<Option<(String, Place)>, StoreError>;
@@ -728,6 +783,22 @@ pub trait MessengerStore: Send + Sync {
     /// The bot token for a chat platform (e.g. `discord`); stored encrypted.
     fn messenger_token(&self, messenger: &str) -> Result<Option<String>, StoreError>;
     fn set_messenger_token(&self, messenger: &str, token: Option<&str>) -> Result<(), StoreError>;
+    /// Per-channel and per-user interaction overrides, ordered by scope then
+    /// target id.
+    fn interaction_modes(&self, messenger: &str) -> Result<Vec<InteractionOverride>, StoreError>;
+    fn set_interaction_mode(
+        &self,
+        messenger: &str,
+        scope: InteractionScope,
+        target_id: &str,
+        mode: InteractionMode,
+    ) -> Result<(), StoreError>;
+    fn clear_interaction_mode(
+        &self,
+        messenger: &str,
+        scope: InteractionScope,
+        target_id: &str,
+    ) -> Result<bool, StoreError>;
 }
 
 impl<T: MessengerStore + ?Sized> MessengerStore for std::sync::Arc<T> {
@@ -751,6 +822,26 @@ impl<T: MessengerStore + ?Sized> MessengerStore for std::sync::Arc<T> {
     }
     fn set_messenger_token(&self, messenger: &str, token: Option<&str>) -> Result<(), StoreError> {
         (**self).set_messenger_token(messenger, token)
+    }
+    fn interaction_modes(&self, messenger: &str) -> Result<Vec<InteractionOverride>, StoreError> {
+        (**self).interaction_modes(messenger)
+    }
+    fn set_interaction_mode(
+        &self,
+        messenger: &str,
+        scope: InteractionScope,
+        target_id: &str,
+        mode: InteractionMode,
+    ) -> Result<(), StoreError> {
+        (**self).set_interaction_mode(messenger, scope, target_id, mode)
+    }
+    fn clear_interaction_mode(
+        &self,
+        messenger: &str,
+        scope: InteractionScope,
+        target_id: &str,
+    ) -> Result<bool, StoreError> {
+        (**self).clear_interaction_mode(messenger, scope, target_id)
     }
 }
 

@@ -441,6 +441,7 @@ fn discord_reply(ctx: &Context) -> crate::Result<Value> {
         "home": home,
         "token": if store.messenger_token("discord")?.is_some() { "set" } else { "missing" },
         "connection": connection,
+        "interactionModes": store.interaction_modes("discord")?.into_iter().map(|o| json!({"scope":o.scope.as_str(),"targetId":o.target_id,"mode":o.mode.as_str()})).collect::<Vec<_>>(),
     }))
 }
 fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -700,6 +701,31 @@ async fn dispatch(
                         )?;
                     }
                     _ => return Err(invalid().into()),
+                }
+                discord_reply(ctx)
+            }
+            "discord.setInteractionMode" | "discord.clearInteractionMode" => {
+                let scope = match get("scope")? {
+                    "channel" => storage::InteractionScope::Channel,
+                    "user" => storage::InteractionScope::User,
+                    _ => return Err(invalid().into()),
+                };
+                let target = get("targetId")?;
+                if request_type == "discord.setInteractionMode" {
+                    if !crate::valid_discord_id(target) {
+                        return Err("Ids must be 17–20 digits".into());
+                    }
+                    let mode = match get("mode")? {
+                        "always" => storage::InteractionMode::Always,
+                        "mention-only" => storage::InteractionMode::MentionOnly,
+                        _ => return Err(invalid().into()),
+                    };
+                    store.set_interaction_mode("discord", scope, target, mode)?;
+                } else {
+                    if target.is_empty() {
+                        return Err(invalid().into());
+                    }
+                    store.clear_interaction_mode("discord", scope, target)?;
                 }
                 discord_reply(ctx)
             }

@@ -1,9 +1,32 @@
-use crate::{attachments, backend, person, Connection, Discord, Inner};
+use crate::{attachments, backend, person, Connection, Discord, Inner, PreFilterDecision};
 use messenger::{Inbound, MessengerError, Place, Quote};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, ShardState, StreamExt};
-use twilight_model::channel::{ChannelType, Message};
+use twilight_model::{
+    channel::{message::MessageType, Message},
+    id::{marker::ChannelMarker, Id},
+};
+
+#[derive(Clone)]
+struct CachedChannel {
+    name: String,
+    parent: Option<Id<ChannelMarker>>,
+}
+
+fn cache_channel(
+    known: &mut HashMap<Id<ChannelMarker>, CachedChannel>,
+    ch: &twilight_model::channel::Channel,
+) {
+    known.insert(
+        ch.id,
+        CachedChannel {
+            name: ch.name.clone().unwrap_or_default(),
+            parent: ch.kind.is_thread().then_some(ch.parent_id).flatten(),
+        },
+    );
+}
 
 async fn quote(inner: &Inner, message: &Message) -> Option<Quote> {
     if let Some(quoted) = &message.referenced_message {
@@ -74,6 +97,7 @@ async fn run(
 ) -> Outcome {
     let mut shard = Shard::new(ShardId::ONE, inner.token.clone(), intents);
     let mut bot = None;
+    let mut known_channels: HashMap<Id<ChannelMarker>, CachedChannel> = HashMap::new();
     loop {
         let event = tokio::select! {
             _ = tx.closed() => return Outcome::Exit,
@@ -101,20 +125,115 @@ async fn run(
                     }
                 });
             }
+            Some(Ok(Event::GuildCreate(guild))) => {
+                if let twilight_model::gateway::payload::incoming::GuildCreate::Available(guild) =
+                    *guild
+                {
+                    for ch in guild.channels.iter().chain(guild.threads.iter()) {
+                        cache_channel(&mut known_channels, ch);
+                    }
+                }
+            }
+            Some(Ok(Event::ChannelCreate(ch))) => cache_channel(&mut known_channels, &ch),
+            Some(Ok(Event::ChannelUpdate(ch))) => cache_channel(&mut known_channels, &ch),
+            Some(Ok(Event::ThreadCreate(ch))) => cache_channel(&mut known_channels, &ch),
+            Some(Ok(Event::ThreadUpdate(ch))) => cache_channel(&mut known_channels, &ch),
+            Some(Ok(Event::ThreadListSync(sync))) => {
+                for ch in &sync.threads {
+                    cache_channel(&mut known_channels, ch);
+                }
+            }
             Some(Ok(Event::MessageCreate(message))) => {
                 let Some(bot) = bot else { continue };
                 if message.author.bot || message.author.id == bot {
                     continue;
                 }
                 let dm = message.guild_id.is_none();
-                if !dm
-                    && !message.mentions.iter().any(|u| u.id == bot)
-                    && !message
+                let addressed = dm
+                    || message.mentions.iter().any(|u| u.id == bot)
+                    || message
                         .referenced_message
                         .as_ref()
-                        .is_some_and(|m| m.author.id == bot)
+                        .is_some_and(|m| m.author.id == bot);
+                // Unaddressed `always` mode only admits real conversation
+                // turns (regular messages and replies), never system notices
+                // such as pin or thread-created events.
+                if !addressed
+                    && !matches!(message.kind, MessageType::Regular | MessageType::Reply)
                 {
                     continue;
+                }
+                let author_id = message.author.id.to_string();
+                let channel_id = message.channel_id.to_string();
+                let pre_filter = discord.pre_filter();
+                let cached = (!dm)
+                    .then(|| known_channels.get(&message.channel_id).cloned())
+                    .flatten();
+                let mut resolved_channel = None;
+                let decision = match &pre_filter {
+                    Some(filter) => {
+                        if dm {
+                            filter(&author_id, &channel_id, None, true, true)
+                        } else if let Some(cached) = &cached {
+                            match cached.parent {
+                                Some(parent) => filter(
+                                    &author_id,
+                                    &parent.to_string(),
+                                    Some(&channel_id),
+                                    addressed,
+                                    true,
+                                ),
+                                None => filter(&author_id, &channel_id, None, addressed, true),
+                            }
+                        } else {
+                            filter(&author_id, &channel_id, None, addressed, false)
+                        }
+                    }
+                    None => {
+                        if addressed {
+                            PreFilterDecision::Allow
+                        } else {
+                            PreFilterDecision::Reject
+                        }
+                    }
+                };
+                match decision {
+                    PreFilterDecision::Reject => continue,
+                    PreFilterDecision::NeedParent => {
+                        // Channel was uncached and might be a thread whose
+                        // parent has an `always` override: resolve it once,
+                        // cache it, and re-check before any parent/quote REST.
+                        let fetched = match inner.http.channel(message.channel_id).await {
+                            Ok(resp) => resp.model().await.map_err(backend),
+                            Err(error) => Err(backend(error)),
+                        };
+                        let ch = match fetched {
+                            Ok(ch) => ch,
+                            Err(error) => {
+                                eprintln!("discord message: {error}");
+                                continue;
+                            }
+                        };
+                        let parent = ch.kind.is_thread().then_some(ch.parent_id).flatten();
+                        cache_channel(&mut known_channels, &ch);
+                        if let Some(filter) = &pre_filter {
+                            let recheck = match parent {
+                                Some(parent) => filter(
+                                    &author_id,
+                                    &parent.to_string(),
+                                    Some(&channel_id),
+                                    addressed,
+                                    true,
+                                ),
+                                None => filter(&author_id, &channel_id, None, addressed, true),
+                            };
+                            if recheck != PreFilterDecision::Allow {
+                                continue;
+                            }
+                        }
+                        resolved_channel = Some(ch);
+                    }
+                    PreFilterDecision::Allow => {}
                 }
                 let text = message
                     .content
@@ -126,7 +245,7 @@ async fn run(
                     Ok(if dm {
                         (
                             Place {
-                                channel: message.channel_id.to_string(),
+                                channel: channel_id.clone(),
                                 thread: None,
                                 dm: true,
                             },
@@ -134,34 +253,50 @@ async fn run(
                             None,
                         )
                     } else {
-                        let channel = inner
-                            .http
-                            .channel(message.channel_id)
-                            .await
-                            .map_err(backend)?
-                            .model()
-                            .await
-                            .map_err(backend)?;
-                        if matches!(
-                            channel.kind,
-                            ChannelType::PublicThread
-                                | ChannelType::PrivateThread
-                                | ChannelType::AnnouncementThread
-                        ) {
+                        let channel = match resolved_channel {
+                            Some(ch) => ch,
+                            None => {
+                                let ch = inner
+                                    .http
+                                    .channel(message.channel_id)
+                                    .await
+                                    .map_err(backend)?
+                                    .model()
+                                    .await
+                                    .map_err(backend)?;
+                                cache_channel(&mut known_channels, &ch);
+                                ch
+                            }
+                        };
+                        if channel.kind.is_thread() {
                             let parent = channel.parent_id.ok_or_else(|| {
                                 backend(std::io::Error::other("thread has no parent"))
                             })?;
-                            let parent_channel = inner
-                                .http
-                                .channel(parent)
-                                .await
-                                .map_err(backend)?
-                                .model()
-                                .await
-                                .map_err(backend)?;
+                            let parent_name = match known_channels.get(&parent) {
+                                Some(cached_parent) => cached_parent.name.clone(),
+                                None => {
+                                    let parent_channel = inner
+                                        .http
+                                        .channel(parent)
+                                        .await
+                                        .map_err(backend)?
+                                        .model()
+                                        .await
+                                        .map_err(backend)?;
+                                    let name = parent_channel.name.unwrap_or_default();
+                                    known_channels.insert(
+                                        parent,
+                                        CachedChannel {
+                                            name: name.clone(),
+                                            parent: None,
+                                        },
+                                    );
+                                    name
+                                }
+                            };
                             let location = format!(
                                 "#{} › {}",
-                                parent_channel.name.unwrap_or_default(),
+                                parent_name,
                                 channel.name.unwrap_or_default()
                             );
                             (
@@ -203,6 +338,7 @@ async fn run(
                     attachments: attachments(&message.attachments),
                     location,
                     earlier,
+                    addressed,
                 };
                 if tx.send(inbound).await.is_err() {
                     return Outcome::Exit;

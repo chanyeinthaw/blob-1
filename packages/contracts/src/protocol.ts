@@ -65,11 +65,25 @@ export const DiscordConnection = Schema.Union([
 ])
 export type DiscordConnection = typeof DiscordConnection.Type
 
+export const DiscordInteractionScope = Schema.Literals(['channel', 'user'])
+export type DiscordInteractionScope = typeof DiscordInteractionScope.Type
+
+export const DiscordInteractionMode = Schema.Literals(['mention-only', 'always'])
+export type DiscordInteractionMode = typeof DiscordInteractionMode.Type
+
+export const DiscordInteractionOverride = Schema.Struct({
+  scope: DiscordInteractionScope,
+  targetId: Schema.String,
+  mode: DiscordInteractionMode,
+})
+export type DiscordInteractionOverride = typeof DiscordInteractionOverride.Type
+
 export const Discord = Schema.Struct({
   allowed: Schema.Array(Schema.String),
   home: Home,
   token: Schema.Literals(['set', 'missing']),
   connection: DiscordConnection,
+  interactionModes: Schema.Array(DiscordInteractionOverride),
 })
 export type Discord = typeof Discord.Type
 
@@ -210,6 +224,21 @@ export const requests = {
     reply: Discord,
   },
   'discord.clearToken': { payload: NoPayload, reply: Discord },
+  'discord.setInteractionMode': {
+    payload: Schema.Struct({
+      scope: DiscordInteractionScope,
+      targetId: Schema.String,
+      mode: DiscordInteractionMode,
+    }),
+    reply: Discord,
+  },
+  'discord.clearInteractionMode': {
+    payload: Schema.Struct({
+      scope: DiscordInteractionScope,
+      targetId: Schema.String,
+    }),
+    reply: Discord,
+  },
   'mcp.list': { payload: NoPayload, reply: Schema.Array(McpServer) },
   'mcp.add': { payload: McpAddPayload, reply: Schema.Array(McpServer) },
   'mcp.remove': {

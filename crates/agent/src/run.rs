@@ -625,6 +625,101 @@ async fn decide_inline(
     utility.generate("Decide how a team chat bot should answer this message. Reply 'inline' for a quick question, greeting or short answer; reply 'thread' if it will need work, several messages, files or a longer discussion. Reply with one word.", &prompt).await.is_ok_and(|answer| harness::parse_inline(&answer))
 }
 
+/// The effective interaction mode for an inbound message: a thread-level
+/// channel override, then the channel, then the author, default
+/// mention-only.
+fn effective_mode(
+    overrides: &[storage::InteractionOverride],
+    inbound: &messenger::Inbound,
+) -> storage::InteractionMode {
+    use storage::{InteractionMode, InteractionScope};
+    let find = |scope: InteractionScope, target: &str| {
+        overrides
+            .iter()
+            .find(|o| o.scope == scope && o.target_id == target)
+            .map(|o| o.mode)
+    };
+    if let Some(thread) = inbound.place.thread.as_deref() {
+        if let Some(mode) = find(InteractionScope::Channel, thread) {
+            return mode;
+        }
+    }
+    find(InteractionScope::Channel, &inbound.place.channel)
+        .or_else(|| find(InteractionScope::User, &inbound.author.id))
+        .unwrap_or(InteractionMode::MentionOnly)
+}
+
+/// Evaluates the gateway pre-filter decision for a message given its known
+/// channel/thread identity (`thread == Some(t)` when `channel` is the resolved
+/// parent channel; `thread == None` when `channel` is a known top-level channel
+/// or an uncached channel/thread).
+fn pre_filter_decision(
+    overrides: &[storage::InteractionOverride],
+    author: &str,
+    channel: &str,
+    thread: Option<&str>,
+    addressed: bool,
+    channel_known: bool,
+) -> messenger_discord::PreFilterDecision {
+    use messenger_discord::PreFilterDecision;
+    use storage::{InteractionMode, InteractionScope};
+    if addressed {
+        return PreFilterDecision::Allow;
+    }
+    let find = |scope: InteractionScope, target: &str| {
+        overrides
+            .iter()
+            .find(|o| o.scope == scope && o.target_id == target)
+            .map(|o| o.mode)
+    };
+    if let Some(thread) = thread {
+        if let Some(mode) = find(InteractionScope::Channel, thread) {
+            return match mode {
+                InteractionMode::Always => PreFilterDecision::Allow,
+                InteractionMode::MentionOnly => PreFilterDecision::Reject,
+            };
+        }
+    }
+    if let Some(mode) = find(InteractionScope::Channel, channel) {
+        return match mode {
+            InteractionMode::Always => PreFilterDecision::Allow,
+            InteractionMode::MentionOnly => PreFilterDecision::Reject,
+        };
+    }
+    let user_mode = find(InteractionScope::User, author).unwrap_or(InteractionMode::MentionOnly);
+    // If `channel` is an uncached ID (not yet known to be a top-level channel
+    // or thread), ask to resolve its parent only when a parent channel override
+    // could flip the user's default/override decision.
+    if !channel_known {
+        let could_flip = match user_mode {
+            InteractionMode::MentionOnly => overrides
+                .iter()
+                .any(|o| o.scope == InteractionScope::Channel && o.mode == InteractionMode::Always),
+            InteractionMode::Always => overrides.iter().any(|o| {
+                o.scope == InteractionScope::Channel && o.mode == InteractionMode::MentionOnly
+            }),
+        };
+        if could_flip {
+            return PreFilterDecision::NeedParent;
+        }
+    }
+    match user_mode {
+        InteractionMode::Always => PreFilterDecision::Allow,
+        InteractionMode::MentionOnly => PreFilterDecision::Reject,
+    }
+}
+fn admitted(store: &SqliteStorage, inbound: &messenger::Inbound) -> Result<bool> {
+    if !store.allowed_users("discord")?.contains(&inbound.author.id) {
+        return Ok(false);
+    }
+    Ok(
+        match effective_mode(&store.interaction_modes("discord")?, inbound) {
+            storage::InteractionMode::Always => true,
+            storage::InteractionMode::MentionOnly => inbound.addressed,
+        },
+    )
+}
+
 async fn admit(
     store: &Arc<SqliteStorage>,
     discord: Arc<dyn messenger::Messenger>,
@@ -632,7 +727,7 @@ async fn admit(
     inbound: messenger::Inbound,
     utility: Option<&harness::Utility>,
 ) -> Result<Option<(String, storage::Meta)>> {
-    if !store.allowed_users("discord")?.contains(&inbound.author.id) {
+    if !admitted(store, &inbound)? {
         return Ok(None);
     }
     let inline = if inbound.place.thread.is_none() && !inbound.place.dm {
@@ -724,6 +819,47 @@ pub async fn serve(
                     )
             }
         });
+    // The cheap per-message gate the gateway runs before any Discord REST
+    // call: check the allowlist, then evaluate exact channel/thread/user
+    // overrides and only ask for parent resolution when an uncached ID could
+    // inherit an `always` channel override.
+    {
+        let filter_store = store.clone();
+        discord.set_pre_filter(Arc::new(
+            move |author: &str,
+                  channel: &str,
+                  thread: Option<&str>,
+                  addressed: bool,
+                  channel_known: bool| {
+                use messenger_discord::PreFilterDecision;
+                match filter_store.allowed_users("discord") {
+                    Ok(users) if users.iter().any(|u| u == author) => {}
+                    Ok(_) => return PreFilterDecision::Reject,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        return PreFilterDecision::Reject;
+                    }
+                }
+                if addressed {
+                    return PreFilterDecision::Allow;
+                }
+                match filter_store.interaction_modes("discord") {
+                    Ok(overrides) => pre_filter_decision(
+                        &overrides,
+                        author,
+                        channel,
+                        thread,
+                        addressed,
+                        channel_known,
+                    ),
+                    Err(error) => {
+                        eprintln!("{error}");
+                        PreFilterDecision::Reject
+                    }
+                }
+            },
+        ));
+    }
     let (tx, mut rx) = tokio::sync::mpsc::channel(128);
     let listener_discord = discord.clone();
     let listener = tokio::spawn(async move { listener_discord.listen(tx).await });
@@ -873,5 +1009,179 @@ pub async fn serve(
     }
         } => result,
         _ = harness.run_schedules() => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storage::{InteractionMode, InteractionOverride, InteractionScope, Person, Place};
+
+    fn override_at(
+        scope: InteractionScope,
+        target: &str,
+        mode: InteractionMode,
+    ) -> InteractionOverride {
+        InteractionOverride {
+            scope,
+            target_id: target.into(),
+            mode,
+        }
+    }
+
+    fn inbound(place: Place, author: &str, addressed: bool) -> messenger::Inbound {
+        messenger::Inbound {
+            place,
+            message: "m1".into(),
+            author: Person {
+                id: author.into(),
+                name: author.into(),
+            },
+            text: "hi".into(),
+            quote: None,
+            attachments: Vec::new(),
+            location: "#c".into(),
+            earlier: None,
+            addressed,
+        }
+    }
+
+    fn channel(channel: &str, thread: Option<&str>) -> Place {
+        Place {
+            channel: channel.into(),
+            thread: thread.map(Into::into),
+            dm: false,
+        }
+    }
+
+    #[test]
+    fn mode_precedence() {
+        // Channel overrides beat user overrides; the default is mention-only.
+        let overrides = vec![
+            override_at(InteractionScope::Channel, "c1", InteractionMode::Always),
+            override_at(InteractionScope::User, "u1", InteractionMode::MentionOnly),
+        ];
+        assert_eq!(
+            effective_mode(
+                &overrides,
+                &inbound(channel("c1", None), "u1", false)
+            ),
+            InteractionMode::Always
+        );
+        assert_eq!(
+            effective_mode(
+                &overrides,
+                &inbound(channel("c2", None), "u1", false)
+            ),
+            InteractionMode::MentionOnly
+        );
+        assert_eq!(
+            effective_mode(&[], &inbound(channel("c2", None), "u2", false)),
+            InteractionMode::MentionOnly
+        );
+
+        // A thread-level override wins over its parent channel and the user;
+        // a thread without one inherits the parent channel's.
+        let overrides = vec![
+            override_at(InteractionScope::Channel, "c1", InteractionMode::Always),
+            override_at(InteractionScope::Channel, "t1", InteractionMode::MentionOnly),
+            override_at(InteractionScope::User, "u1", InteractionMode::Always),
+        ];
+        assert_eq!(
+            effective_mode(
+                &overrides,
+                &inbound(channel("c1", Some("t1")), "u1", false)
+            ),
+            InteractionMode::MentionOnly
+        );
+        assert_eq!(
+            effective_mode(
+                &overrides,
+                &inbound(channel("c1", Some("t2")), "u2", false)
+            ),
+            InteractionMode::Always
+        );
+    }
+
+    #[test]
+    fn pre_filter_avoids_rest_for_unrelated_channels() {
+        use messenger_discord::PreFilterDecision;
+        let overrides = vec![
+            override_at(InteractionScope::Channel, "c1", InteractionMode::Always),
+            override_at(InteractionScope::Channel, "t1", InteractionMode::MentionOnly),
+        ];
+        // Known unrelated top-level channel rejects without REST.
+        assert_eq!(
+            pre_filter_decision(&overrides, "u1", "c2", None, false, true),
+            PreFilterDecision::Reject
+        );
+        // Thread explicitly set to mention-only rejects even before parent lookup.
+        assert_eq!(
+            pre_filter_decision(&overrides, "u1", "t1", None, false, false),
+            PreFilterDecision::Reject
+        );
+        // Known thread under c1 allows directly.
+        assert_eq!(
+            pre_filter_decision(&overrides, "u1", "c1", Some("t2"), false, true),
+            PreFilterDecision::Allow
+        );
+        // Unknown channel id asks to resolve parent once because c1 is always.
+        assert_eq!(
+            pre_filter_decision(&overrides, "u1", "t2", None, false, false),
+            PreFilterDecision::NeedParent
+        );
+    }
+
+    #[test]
+    fn admission() {
+        let dir = std::env::temp_dir().join(format!(
+            "blob-1-run-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SqliteStorage::open(dir.join("agent.db"), None).unwrap();
+        store.allow_user("discord", "u1").unwrap();
+
+        // With no overrides, only addressed messages are admitted.
+        assert!(admitted(&store, &inbound(channel("c1", None), "u1", true)).unwrap());
+        assert!(!admitted(&store, &inbound(channel("c1", None), "u1", false)).unwrap());
+        // DMs count as addressed.
+        let dm = Place {
+            channel: "dm1".into(),
+            thread: None,
+            dm: true,
+        };
+        assert!(admitted(&store, &inbound(dm, "u1", true)).unwrap());
+
+        // An `always` channel override admits unaddressed messages, but the
+        // allowlist still gates unallowlisted authors.
+        store
+            .set_interaction_mode("discord", InteractionScope::Channel, "c1", InteractionMode::Always)
+            .unwrap();
+        assert!(admitted(&store, &inbound(channel("c1", None), "u1", false)).unwrap());
+        assert!(!admitted(&store, &inbound(channel("c1", None), "u9", false)).unwrap());
+
+        // A mention-only thread override wins over the channel's `always`.
+        store
+            .set_interaction_mode(
+                "discord",
+                InteractionScope::Channel,
+                "t1",
+                InteractionMode::MentionOnly,
+            )
+            .unwrap();
+        assert!(
+            !admitted(&store, &inbound(channel("c1", Some("t1")), "u1", false)).unwrap()
+        );
+
+        // An `always` user override admits the user anywhere without a
+        // channel override.
+        store
+            .set_interaction_mode("discord", InteractionScope::User, "u1", InteractionMode::Always)
+            .unwrap();
+        assert!(admitted(&store, &inbound(channel("c9", None), "u1", false)).unwrap());
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
