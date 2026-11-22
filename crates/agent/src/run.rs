@@ -621,52 +621,52 @@ async fn decide_inline(
     utility.generate("Decide how a team chat bot should answer this message. Reply 'inline' for a quick question, greeting or short answer; reply 'thread' if it will need work, several messages, files or a longer discussion. Reply with one word.", &prompt).await.is_ok_and(|answer| harness::parse_inline(&answer))
 }
 
-/// Returns any explicit interaction mode override matching `inbound`
-/// (thread override -> parent channel override -> guild-scoped author override),
-/// or `None` when the bot-wide default applies.
+/// Returns any explicit interaction override matching the message location and
+/// author: thread override -> parent channel override -> guild-scoped author
+/// override -> server override. `None` means the messenger default applies.
+/// Shared by `admission_policy` and `pre_filter_decision` so they cannot drift.
 fn explicit_interaction_mode(
     overrides: &[storage::InteractionOverride],
-    inbound: &messenger::Inbound,
+    channel: &str,
+    thread: Option<&str>,
+    guild: Option<&str>,
+    author: &str,
 ) -> Option<storage::InteractionMode> {
     use storage::InteractionScope;
-    let find_channel = |target: &str| {
-        overrides
-            .iter()
-            .find(|o| o.scope == InteractionScope::Channel && o.target_id == target)
-            .map(|o| o.mode)
-    };
-    let find_user = |guild: &str, user: &str| {
+    let find = |scope: InteractionScope, guild_id: Option<&str>, target: &str| {
         overrides
             .iter()
             .find(|o| {
-                o.scope == InteractionScope::User
-                    && o.guild_id.as_deref() == Some(guild)
-                    && o.target_id == user
+                o.scope == scope && o.guild_id.as_deref() == guild_id && o.target_id == target
             })
             .map(|o| o.mode)
     };
-    if let Some(thread) = inbound.place.thread.as_deref() {
-        if let Some(mode) = find_channel(thread) {
+    if let Some(thread) = thread {
+        if let Some(mode) = find(InteractionScope::Channel, None, thread) {
             return Some(mode);
         }
     }
-    find_channel(&inbound.place.channel).or_else(|| {
-        inbound
-            .guild
-            .as_deref()
-            .and_then(|guild| find_user(guild, &inbound.author.id))
-    })
+    find(InteractionScope::Channel, None, channel)
+        .or_else(|| guild.and_then(|g| find(InteractionScope::User, Some(g), author)))
+        .or_else(|| guild.and_then(|g| find(InteractionScope::Server, None, g)))
 }
 
-/// The effective interaction mode for an inbound message: a thread-level
-/// channel override, then the channel, then the guild-scoped author override,
-/// default mention-only.
+/// The effective interaction mode for an inbound message: the matching
+/// override, else the Discord-wide `default`.
 #[cfg(test)]
 fn effective_mode(
     overrides: &[storage::InteractionOverride],
+    default: storage::InteractionMode,
     inbound: &messenger::Inbound,
 ) -> storage::InteractionMode {
-    explicit_interaction_mode(overrides, inbound).unwrap_or(storage::InteractionMode::MentionOnly)
+    explicit_interaction_mode(
+        overrides,
+        &inbound.place.channel,
+        inbound.place.thread.as_deref(),
+        inbound.guild.as_deref(),
+        &inbound.author.id,
+    )
+    .unwrap_or(default)
 }
 
 /// Evaluates whether `author` is permitted to talk to the bot under the active
@@ -704,10 +704,10 @@ fn access_allowed(
 }
 
 /// Evaluates the gateway pre-filter decision for a message given its access
-/// policy, interaction overrides, and known guild/channel/thread identity
-/// (`thread == Some(t)` when `channel` is the resolved parent channel;
-/// `thread == None` when `channel` is a known top-level channel or an uncached
-/// channel/thread).
+/// policy, interaction overrides, Discord-wide `default_mode`, and known
+/// guild/channel/thread identity (`thread == Some(t)` when `channel` is the
+/// resolved parent channel; `thread == None` when `channel` is a known
+/// top-level channel or an uncached channel/thread).
 #[allow(clippy::too_many_arguments)]
 fn pre_filter_decision(
     access_mode: storage::AccessMode,
@@ -719,6 +719,7 @@ fn pre_filter_decision(
     thread: Option<&str>,
     addressed: bool,
     channel_known: bool,
+    default_mode: storage::InteractionMode,
     auto_respond: bool,
 ) -> messenger_discord::PreFilterDecision {
     use messenger_discord::PreFilterDecision;
@@ -727,7 +728,15 @@ fn pre_filter_decision(
     let access_decision = match access_mode {
         AccessMode::AllowAll => PreFilterDecision::Allow,
         AccessMode::Whitelist => {
-            if access_allowed(access_mode, access_entries, author, guild, channel, thread, dm) {
+            if access_allowed(
+                access_mode,
+                access_entries,
+                author,
+                guild,
+                channel,
+                thread,
+                dm,
+            ) {
                 PreFilterDecision::Allow
             } else if !channel_known
                 && !dm
@@ -743,7 +752,15 @@ fn pre_filter_decision(
             }
         }
         AccessMode::Blacklist => {
-            if !access_allowed(access_mode, access_entries, author, guild, channel, thread, dm) {
+            if !access_allowed(
+                access_mode,
+                access_entries,
+                author,
+                guild,
+                channel,
+                thread,
+                dm,
+            ) {
                 PreFilterDecision::Reject
             } else if !channel_known
                 && !dm
@@ -765,58 +782,36 @@ fn pre_filter_decision(
     let interaction_decision = if addressed {
         PreFilterDecision::Allow
     } else {
-        let find_channel = |target: &str| {
-            overrides
-                .iter()
-                .find(|o| o.scope == InteractionScope::Channel && o.target_id == target)
-                .map(|o| o.mode)
+        let mode_allows = |mode: InteractionMode| match mode {
+            // `auto_respond` is only true when a utility model exists and
+            // Auto-respond is enabled; inert `auto` behaves like mention-only.
+            InteractionMode::Always => true,
+            InteractionMode::MentionOnly => false,
+            InteractionMode::Auto => auto_respond,
         };
-        if let Some(mode) = thread.and_then(find_channel).or_else(|| find_channel(channel)) {
-            match mode {
-                InteractionMode::Always => PreFilterDecision::Allow,
-                InteractionMode::MentionOnly => PreFilterDecision::Reject,
-            }
+        let mode = explicit_interaction_mode(overrides, channel, thread, guild, author)
+            .unwrap_or(default_mode);
+        let allows = mode_allows(mode);
+        let decided = if allows {
+            PreFilterDecision::Allow
         } else {
-            let user_override = guild.and_then(|g| {
-                overrides
-                    .iter()
-                    .find(|o| {
-                        o.scope == InteractionScope::User
-                            && o.guild_id.as_deref() == Some(g)
-                            && o.target_id == author
-                    })
-                    .map(|o| o.mode)
-            });
-            // Without an explicit user override, `auto_respond` lets unaddressed
-            // messages reach the shared utility-model response gate in `admit`.
-            let default_allow = match user_override {
-                Some(InteractionMode::Always) => true,
-                Some(InteractionMode::MentionOnly) => false,
-                None => auto_respond,
-            };
-            if !channel_known {
-                let could_flip = if default_allow {
-                    overrides.iter().any(|o| {
-                        o.scope == InteractionScope::Channel
-                            && o.mode == InteractionMode::MentionOnly
-                    })
-                } else {
-                    overrides.iter().any(|o| {
-                        o.scope == InteractionScope::Channel && o.mode == InteractionMode::Always
-                    })
-                };
-                if could_flip {
-                    PreFilterDecision::NeedParent
-                } else if default_allow {
-                    PreFilterDecision::Allow
-                } else {
-                    PreFilterDecision::Reject
-                }
-            } else if default_allow {
-                PreFilterDecision::Allow
-            } else {
-                PreFilterDecision::Reject
-            }
+            PreFilterDecision::Reject
+        };
+        if channel_known
+            || overrides
+                .iter()
+                .any(|o| o.scope == InteractionScope::Channel && o.target_id == channel)
+        {
+            decided
+        } else if overrides
+            .iter()
+            .any(|o| o.scope == InteractionScope::Channel && mode_allows(o.mode) != allows)
+        {
+            // An uncached id may be a thread inheriting a parent channel
+            // override that would change the outcome; ask for the parent.
+            PreFilterDecision::NeedParent
+        } else {
+            decided
         }
     };
     if interaction_decision == PreFilterDecision::Reject {
@@ -860,23 +855,20 @@ fn admission_policy(
     if inbound.addressed {
         return Ok(AdmissionPolicy::AdmitDirect);
     }
-    match explicit_interaction_mode(&store.interaction_modes("discord")?, inbound) {
-        Some(storage::InteractionMode::Always) => Ok(AdmissionPolicy::AdmitDirect),
-        Some(storage::InteractionMode::MentionOnly) => Ok(AdmissionPolicy::Deny),
-        None => Ok(AdmissionPolicy::AutoRespondCheck),
+    let defaults = store.messenger_defaults("discord")?;
+    match explicit_interaction_mode(
+        &store.interaction_modes("discord")?,
+        &inbound.place.channel,
+        inbound.place.thread.as_deref(),
+        inbound.guild.as_deref(),
+        &inbound.author.id,
+    )
+    .unwrap_or(defaults.interaction_mode)
+    {
+        storage::InteractionMode::Always => Ok(AdmissionPolicy::AdmitDirect),
+        storage::InteractionMode::MentionOnly => Ok(AdmissionPolicy::Deny),
+        storage::InteractionMode::Auto => Ok(AdmissionPolicy::AutoRespondCheck),
     }
-}
-
-/// The effective reply mode for a plain-channel message: a channel override
-/// if configured, otherwise `Decision`.
-fn effective_reply_mode(
-    overrides: &[storage::ReplyOverride],
-    channel_id: &str,
-) -> storage::ReplyMode {
-    overrides
-        .iter()
-        .find(|o| o.channel_id == channel_id)
-        .map_or(storage::ReplyMode::Decision, |o| o.mode)
 }
 
 /// RAII guard that releases a per-caller warming hold on drop (covering timeouts,
@@ -939,10 +931,16 @@ async fn admit_approved(
     auto_responded: bool,
 ) -> Result<Option<(String, storage::Meta)>> {
     let inline = if inbound.place.thread.is_none() && !inbound.place.dm {
-        match effective_reply_mode(&store.reply_modes("discord")?, &inbound.place.channel) {
+        let default = store.messenger_defaults("discord")?.reply_mode;
+        match storage::effective_reply_mode(
+            &store.reply_modes("discord")?,
+            &inbound.place.channel,
+            inbound.guild.as_deref(),
+            default,
+        ) {
             storage::ReplyMode::Direct => true,
             storage::ReplyMode::Thread => false,
-            storage::ReplyMode::Decision => {
+            storage::ReplyMode::Auto => {
                 if let Some(utility) = utility {
                     tokio::time::timeout(std::time::Duration::from_secs(5), async {
                         let fetched;
@@ -959,9 +957,12 @@ async fn admit_approved(
                                     // Start warming before a live latest-20 REST fetch (no `before`
                                     // cursor) so all messages up to now—including edits, deletes,
                                     // and intervening bot messages—are covered with zero gap.
-                                    let hold =
-                                        WarmingHold::acquire(discord.clone(), inbound.place.clone());
-                                    let latest = discord.history(&inbound.place, None, 20).await.ok()?;
+                                    let hold = WarmingHold::acquire(
+                                        discord.clone(),
+                                        inbound.place.clone(),
+                                    );
+                                    let latest =
+                                        discord.history(&inbound.place, None, 20).await.ok()?;
                                     let complete_from_start = latest.len() < 20;
                                     discord.seed_history(
                                         &inbound.place,
@@ -969,7 +970,8 @@ async fn admit_approved(
                                         complete_from_start,
                                         hold.token,
                                     );
-                                    let before = filter_history_before(&latest, &inbound.message, 5);
+                                    let before =
+                                        filter_history_before(&latest, &inbound.message, 5);
                                     fetched = if !complete_from_start && before.len() < 5 {
                                         discord
                                             .history(&inbound.place, Some(&inbound.message), 5)
@@ -1029,8 +1031,11 @@ async fn admit_approved(
         store.clear_pending_thread(to)?;
     }
     if inbound.addressed {
-        let (discord_react, place, message) =
-            (discord.clone(), inbound.place.clone(), inbound.message.clone());
+        let (discord_react, place, message) = (
+            discord.clone(),
+            inbound.place.clone(),
+            inbound.message.clone(),
+        );
         tokio::spawn(async move {
             if let Err(error) = discord_react
                 .react(&place, &message, messenger::Mark::Seen)
@@ -1174,16 +1179,9 @@ async fn admit_batch(
     for (inbound, policy) in ordered {
         match policy {
             AdmissionPolicy::AdmitDirect => {
-                if let Some(item) = admit_approved(
-                    store,
-                    &discord,
-                    messengers,
-                    inbound,
-                    utility,
-                    None,
-                    false,
-                )
-                .await?
+                if let Some(item) =
+                    admit_approved(store, &discord, messengers, inbound, utility, None, false)
+                        .await?
                 {
                     let _ = tx.send(Ok(item)).await;
                 }
@@ -1193,13 +1191,7 @@ async fn admit_batch(
                     .as_ref()
                     .and_then(|(id, h)| (*id == inbound.message).then_some(h.as_slice()));
                 if let Some(item) = admit_approved(
-                    store,
-                    &discord,
-                    messengers,
-                    inbound,
-                    utility,
-                    prefetched,
-                    true,
+                    store, &discord, messengers, inbound, utility, prefetched, true,
                 )
                 .await?
                 {
@@ -1297,6 +1289,13 @@ pub async fn serve(
                         false
                     }
                 };
+                let default_mode = match filter_store.messenger_defaults("discord") {
+                    Ok(defaults) => defaults.interaction_mode,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        return PreFilterDecision::Reject;
+                    }
+                };
                 let auto_respond = auto_respond_enabled && has_utility;
                 pre_filter_decision(
                     access_mode,
@@ -1308,13 +1307,15 @@ pub async fn serve(
                     thread,
                     addressed,
                     channel_known,
+                    default_mode,
                     auto_respond,
                 )
             },
         ));
         let thread_store = store.clone();
         discord.set_on_thread_seen(Arc::new(move |parent: &str, thread: &str| {
-            if let Err(error) = thread_store.clear_pending_thread_by_place("discord", parent, thread)
+            if let Err(error) =
+                thread_store.clear_pending_thread_by_place("discord", parent, thread)
             {
                 eprintln!("{error}");
             }
@@ -1408,7 +1409,10 @@ pub async fn serve(
             // simultaneous inbound + timer readiness never stretches past `flush_at`.
             if debounce.get(&place).is_some_and(|b| now >= b.flush_at) {
                 if let Some(expired) = debounce.remove(&place) {
-                    ready.entry(place.clone()).or_default().push_back(expired.messages);
+                    ready
+                        .entry(place.clone())
+                        .or_default()
+                        .push_back(expired.messages);
                 }
             }
             let sealed = if let Some(batch) = debounce.get_mut(&place) {
@@ -1437,8 +1441,7 @@ pub async fn serve(
         // Separate fast-lane for DMs, @mentions, replies, and explicit `always`
         // overrides: never stalled by unaddressed triage traffic.
         let direct_limit = Arc::new(tokio::sync::Semaphore::new(8));
-        let mut direct_inflight: tokio::task::JoinSet<storage::Place> =
-            tokio::task::JoinSet::new();
+        let mut direct_inflight: tokio::task::JoinSet<storage::Place> = tokio::task::JoinSet::new();
         let mut direct_active: std::collections::HashSet<storage::Place> =
             std::collections::HashSet::new();
         let mut direct_debounce: std::collections::HashMap<storage::Place, DebounceBatch> =
@@ -1452,8 +1455,7 @@ pub async fn serve(
         // runs 1 utility decision per sealed burst and admits each approved message
         // individually with its own destination and reply/to tokens.
         let triage_limit = Arc::new(tokio::sync::Semaphore::new(8));
-        let mut triage_inflight: tokio::task::JoinSet<storage::Place> =
-            tokio::task::JoinSet::new();
+        let mut triage_inflight: tokio::task::JoinSet<storage::Place> = tokio::task::JoinSet::new();
         let mut triage_active: std::collections::HashSet<storage::Place> =
             std::collections::HashSet::new();
         let mut triage_debounce: std::collections::HashMap<storage::Place, DebounceBatch> =
@@ -1494,9 +1496,9 @@ pub async fn serve(
         let dispatch_ready = |inflight: &mut tokio::task::JoinSet<storage::Place>,
                               active: &mut std::collections::HashSet<storage::Place>,
                               ready: &mut std::collections::HashMap<
-                                  storage::Place,
-                                  std::collections::VecDeque<Vec<messenger::Inbound>>,
-                              >,
+            storage::Place,
+            std::collections::VecDeque<Vec<messenger::Inbound>>,
+        >,
                               limit: &Arc<tokio::sync::Semaphore>| {
             let places: Vec<storage::Place> = ready
                 .keys()
@@ -1515,29 +1517,30 @@ pub async fn serve(
             }
         };
 
-        let queued_count =
-            |inflight: &tokio::task::JoinSet<storage::Place>,
-             debounce: &std::collections::HashMap<storage::Place, DebounceBatch>,
-             ready: &std::collections::HashMap<
-                 storage::Place,
-                 std::collections::VecDeque<Vec<messenger::Inbound>>,
-             >| {
-                inflight.len()
-                    + debounce.len()
-                    + ready.values().map(std::collections::VecDeque::len).sum::<usize>()
-            };
+        let queued_count = |inflight: &tokio::task::JoinSet<storage::Place>,
+                            debounce: &std::collections::HashMap<storage::Place, DebounceBatch>,
+                            ready: &std::collections::HashMap<
+            storage::Place,
+            std::collections::VecDeque<Vec<messenger::Inbound>>,
+        >| {
+            inflight.len()
+                + debounce.len()
+                + ready
+                    .values()
+                    .map(std::collections::VecDeque::len)
+                    .sum::<usize>()
+        };
 
-        let next_flush_at =
-            |direct: &std::collections::HashMap<storage::Place, DebounceBatch>,
-             triage: &std::collections::HashMap<storage::Place, DebounceBatch>|
-             -> Option<tokio::time::Instant> {
-                let d = direct.values().map(|b| b.flush_at).min();
-                let t = triage.values().map(|b| b.flush_at).min();
-                match (d, t) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
-                }
-            };
+        let next_flush_at = |direct: &std::collections::HashMap<storage::Place, DebounceBatch>,
+                             triage: &std::collections::HashMap<storage::Place, DebounceBatch>|
+         -> Option<tokio::time::Instant> {
+            let d = direct.values().map(|b| b.flush_at).min();
+            let t = triage.values().map(|b| b.flush_at).min();
+            match (d, t) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            }
+        };
 
         loop {
             let wake_at = next_flush_at(&direct_debounce, &triage_debounce);
@@ -1828,6 +1831,15 @@ mod tests {
         }
     }
 
+    fn server_override(guild: &str, mode: InteractionMode) -> InteractionOverride {
+        InteractionOverride {
+            scope: InteractionScope::Server,
+            guild_id: None,
+            target_id: guild.into(),
+            mode,
+        }
+    }
+
     fn inbound(
         place: Place,
         guild: Option<&str>,
@@ -1861,32 +1873,93 @@ mod tests {
 
     #[test]
     fn mode_precedence() {
-        // Channel overrides beat guild-scoped user overrides; default is mention-only.
+        // Channel overrides beat guild-scoped user overrides, which beat
+        // server overrides; with no override the messenger default applies.
         let overrides = vec![
             channel_override("c1", InteractionMode::Always),
             user_override("g1", "u1", InteractionMode::MentionOnly),
             user_override("g2", "u1", InteractionMode::Always),
+            server_override("g3", InteractionMode::Always),
         ];
         assert_eq!(
-            effective_mode(&overrides, &inbound(channel("c1", None), Some("g1"), "u1", false)),
+            effective_mode(
+                &overrides,
+                InteractionMode::Auto,
+                &inbound(channel("c1", None), Some("g1"), "u1", false)
+            ),
             InteractionMode::Always
         );
         assert_eq!(
-            effective_mode(&overrides, &inbound(channel("c2", None), Some("g1"), "u1", false)),
+            effective_mode(
+                &overrides,
+                InteractionMode::Auto,
+                &inbound(channel("c2", None), Some("g1"), "u1", false)
+            ),
             InteractionMode::MentionOnly
         );
-        // Same user in guild g2 gets g2's always override, but not in g3.
+        // Same user in guild g2 gets g2's always override, and in g3 the server
+        // override kicks in below the missing user override.
         assert_eq!(
-            effective_mode(&overrides, &inbound(channel("c2", None), Some("g2"), "u1", false)),
+            effective_mode(
+                &overrides,
+                InteractionMode::Auto,
+                &inbound(channel("c2", None), Some("g2"), "u1", false)
+            ),
             InteractionMode::Always
         );
         assert_eq!(
-            effective_mode(&overrides, &inbound(channel("c2", None), Some("g3"), "u1", false)),
+            effective_mode(
+                &overrides,
+                InteractionMode::MentionOnly,
+                &inbound(channel("c2", None), Some("g3"), "u1", false)
+            ),
+            InteractionMode::Always
+        );
+        assert_eq!(
+            effective_mode(
+                &overrides,
+                InteractionMode::MentionOnly,
+                &inbound(channel("c2", None), Some("g3"), "u2", false)
+            ),
+            InteractionMode::Always
+        );
+        // A user override still wins over the server override in g3.
+        let overrides = vec![
+            user_override("g3", "u1", InteractionMode::MentionOnly),
+            server_override("g3", InteractionMode::Always),
+        ];
+        assert_eq!(
+            effective_mode(
+                &overrides,
+                InteractionMode::Always,
+                &inbound(channel("c2", None), Some("g3"), "u1", false)
+            ),
+            InteractionMode::MentionOnly
+        );
+        // No override anywhere falls back to the messenger default, whatever it is.
+        assert_eq!(
+            effective_mode(
+                &[],
+                InteractionMode::MentionOnly,
+                &inbound(channel("c2", None), Some("g1"), "u2", false)
+            ),
             InteractionMode::MentionOnly
         );
         assert_eq!(
-            effective_mode(&[], &inbound(channel("c2", None), Some("g1"), "u2", false)),
-            InteractionMode::MentionOnly
+            effective_mode(
+                &[],
+                InteractionMode::Always,
+                &inbound(channel("c2", None), Some("g1"), "u2", false)
+            ),
+            InteractionMode::Always
+        );
+        assert_eq!(
+            effective_mode(
+                &[],
+                InteractionMode::Auto,
+                &inbound(channel("c2", None), Some("g1"), "u2", false)
+            ),
+            InteractionMode::Auto
         );
 
         // A thread-level override wins over its parent channel and the guild user;
@@ -1899,6 +1972,7 @@ mod tests {
         assert_eq!(
             effective_mode(
                 &overrides,
+                InteractionMode::Auto,
                 &inbound(channel("c1", Some("t1")), Some("g1"), "u1", false)
             ),
             InteractionMode::MentionOnly
@@ -1906,6 +1980,7 @@ mod tests {
         assert_eq!(
             effective_mode(
                 &overrides,
+                InteractionMode::Auto,
                 &inbound(channel("c1", Some("t2")), Some("g1"), "u2", false)
             ),
             InteractionMode::Always
@@ -1953,6 +2028,7 @@ mod tests {
                 None,
                 false,
                 true,
+                InteractionMode::Auto,
                 false
             ),
             PreFilterDecision::Allow
@@ -1968,6 +2044,7 @@ mod tests {
                 None,
                 false,
                 true,
+                InteractionMode::Auto,
                 false
             ),
             PreFilterDecision::Reject
@@ -1984,6 +2061,7 @@ mod tests {
                 None,
                 false,
                 true,
+                InteractionMode::Auto,
                 true
             ),
             PreFilterDecision::Allow
@@ -2000,6 +2078,7 @@ mod tests {
                 None,
                 false,
                 false,
+                InteractionMode::Auto,
                 true
             ),
             PreFilterDecision::Reject
@@ -2016,6 +2095,7 @@ mod tests {
                 None,
                 false,
                 false,
+                InteractionMode::Auto,
                 true
             ),
             PreFilterDecision::NeedParent
@@ -2032,6 +2112,7 @@ mod tests {
                 None,
                 false,
                 false,
+                InteractionMode::Auto,
                 false
             ),
             PreFilterDecision::Reject
@@ -2048,6 +2129,7 @@ mod tests {
                 Some("t2"),
                 false,
                 true,
+                InteractionMode::Auto,
                 false
             ),
             PreFilterDecision::Allow
@@ -2064,6 +2146,7 @@ mod tests {
                 None,
                 false,
                 false,
+                InteractionMode::Auto,
                 false
             ),
             PreFilterDecision::NeedParent
@@ -2080,6 +2163,7 @@ mod tests {
                 None,
                 true,
                 false,
+                InteractionMode::Auto,
                 false
             ),
             PreFilterDecision::NeedParent
@@ -2096,6 +2180,7 @@ mod tests {
                 None,
                 true,
                 false,
+                InteractionMode::Auto,
                 true
             ),
             PreFilterDecision::Reject
@@ -2118,6 +2203,7 @@ mod tests {
                 None,
                 true,
                 false,
+                InteractionMode::Auto,
                 false
             ),
             PreFilterDecision::NeedParent
@@ -2133,7 +2219,96 @@ mod tests {
                 Some("t2"),
                 true,
                 true,
+                InteractionMode::Auto,
                 false
+            ),
+            PreFilterDecision::Reject
+        );
+
+        // A server override covers known channels in its guild without REST.
+        let with_server = vec![server_override("g1", InteractionMode::Always)];
+        assert_eq!(
+            pre_filter_decision(
+                AccessMode::Whitelist,
+                &access,
+                &with_server,
+                "u1",
+                Some("g1"),
+                "c9",
+                None,
+                false,
+                true,
+                InteractionMode::Auto,
+                false
+            ),
+            PreFilterDecision::Allow
+        );
+        // Server mention-only rejects even when Auto-respond is available.
+        let with_server = vec![server_override("g1", InteractionMode::MentionOnly)];
+        assert_eq!(
+            pre_filter_decision(
+                AccessMode::Whitelist,
+                &access,
+                &with_server,
+                "u1",
+                Some("g1"),
+                "c9",
+                None,
+                false,
+                true,
+                InteractionMode::Auto,
+                true
+            ),
+            PreFilterDecision::Reject
+        );
+        // An `always` default admits unaddressed messages with no overrides.
+        assert_eq!(
+            pre_filter_decision(
+                AccessMode::Whitelist,
+                &access,
+                &[],
+                "u1",
+                Some("g2"),
+                "c9",
+                None,
+                false,
+                true,
+                InteractionMode::Always,
+                false
+            ),
+            PreFilterDecision::Allow
+        );
+        // An `auto` default without a utility gate behaves like mention-only.
+        assert_eq!(
+            pre_filter_decision(
+                AccessMode::Whitelist,
+                &access,
+                &[],
+                "u1",
+                Some("g2"),
+                "c9",
+                None,
+                false,
+                true,
+                InteractionMode::Auto,
+                false
+            ),
+            PreFilterDecision::Reject
+        );
+        // A mention-only default rejects even when Auto-respond is available.
+        assert_eq!(
+            pre_filter_decision(
+                AccessMode::Whitelist,
+                &access,
+                &[],
+                "u1",
+                Some("g2"),
+                "c9",
+                None,
+                false,
+                true,
+                InteractionMode::MentionOnly,
+                true
             ),
             PreFilterDecision::Reject
         );
@@ -2181,33 +2356,150 @@ mod tests {
             },
         ];
         // AllowAll admits anyone everywhere.
-        assert!(access_allowed(AccessMode::AllowAll, &entries, "anyone", Some("g9"), "c9", None, false));
-        assert!(access_allowed(AccessMode::AllowAll, &entries, "b_global", None, "dm1", None, true));
+        assert!(access_allowed(
+            AccessMode::AllowAll,
+            &entries,
+            "anyone",
+            Some("g9"),
+            "c9",
+            None,
+            false
+        ));
+        assert!(access_allowed(
+            AccessMode::AllowAll,
+            &entries,
+            "b_global",
+            None,
+            "dm1",
+            None,
+            true
+        ));
 
         // Whitelist: global works everywhere + DM; guild only in g1 (not DM); channel only in c1/threads (not DM).
-        assert!(access_allowed(AccessMode::Whitelist, &entries, "u_global", None, "dm1", None, true));
-        assert!(access_allowed(AccessMode::Whitelist, &entries, "u_guild", Some("g1"), "c9", None, false));
-        assert!(!access_allowed(AccessMode::Whitelist, &entries, "u_guild", Some("g2"), "c9", None, false));
-        assert!(!access_allowed(AccessMode::Whitelist, &entries, "u_guild", None, "dm1", None, true));
-        assert!(access_allowed(AccessMode::Whitelist, &entries, "u_chan", Some("g1"), "c1", Some("t1"), false));
-        assert!(!access_allowed(AccessMode::Whitelist, &entries, "u_chan", Some("g1"), "c2", None, false));
+        assert!(access_allowed(
+            AccessMode::Whitelist,
+            &entries,
+            "u_global",
+            None,
+            "dm1",
+            None,
+            true
+        ));
+        assert!(access_allowed(
+            AccessMode::Whitelist,
+            &entries,
+            "u_guild",
+            Some("g1"),
+            "c9",
+            None,
+            false
+        ));
+        assert!(!access_allowed(
+            AccessMode::Whitelist,
+            &entries,
+            "u_guild",
+            Some("g2"),
+            "c9",
+            None,
+            false
+        ));
+        assert!(!access_allowed(
+            AccessMode::Whitelist,
+            &entries,
+            "u_guild",
+            None,
+            "dm1",
+            None,
+            true
+        ));
+        assert!(access_allowed(
+            AccessMode::Whitelist,
+            &entries,
+            "u_chan",
+            Some("g1"),
+            "c1",
+            Some("t1"),
+            false
+        ));
+        assert!(!access_allowed(
+            AccessMode::Whitelist,
+            &entries,
+            "u_chan",
+            Some("g1"),
+            "c2",
+            None,
+            false
+        ));
 
         // Blacklist: everyone allowed except matched blacklist entries.
-        assert!(access_allowed(AccessMode::Blacklist, &entries, "anyone", Some("g1"), "c1", None, false));
-        assert!(!access_allowed(AccessMode::Blacklist, &entries, "b_global", None, "dm1", None, true));
-        assert!(!access_allowed(AccessMode::Blacklist, &entries, "b_guild", Some("g1"), "c2", None, false));
-        assert!(access_allowed(AccessMode::Blacklist, &entries, "b_guild", Some("g2"), "c2", None, false));
-        assert!(access_allowed(AccessMode::Blacklist, &entries, "b_guild", None, "dm1", None, true));
-        assert!(!access_allowed(AccessMode::Blacklist, &entries, "b_chan", Some("g1"), "c1", Some("t1"), false));
-        assert!(access_allowed(AccessMode::Blacklist, &entries, "b_chan", Some("g1"), "c2", None, false));
+        assert!(access_allowed(
+            AccessMode::Blacklist,
+            &entries,
+            "anyone",
+            Some("g1"),
+            "c1",
+            None,
+            false
+        ));
+        assert!(!access_allowed(
+            AccessMode::Blacklist,
+            &entries,
+            "b_global",
+            None,
+            "dm1",
+            None,
+            true
+        ));
+        assert!(!access_allowed(
+            AccessMode::Blacklist,
+            &entries,
+            "b_guild",
+            Some("g1"),
+            "c2",
+            None,
+            false
+        ));
+        assert!(access_allowed(
+            AccessMode::Blacklist,
+            &entries,
+            "b_guild",
+            Some("g2"),
+            "c2",
+            None,
+            false
+        ));
+        assert!(access_allowed(
+            AccessMode::Blacklist,
+            &entries,
+            "b_guild",
+            None,
+            "dm1",
+            None,
+            true
+        ));
+        assert!(!access_allowed(
+            AccessMode::Blacklist,
+            &entries,
+            "b_chan",
+            Some("g1"),
+            "c1",
+            Some("t1"),
+            false
+        ));
+        assert!(access_allowed(
+            AccessMode::Blacklist,
+            &entries,
+            "b_chan",
+            Some("g1"),
+            "c2",
+            None,
+            false
+        ));
     }
 
     #[test]
     fn admission() {
-        let dir = std::env::temp_dir().join(format!(
-            "blob-1-run-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("blob-1-run-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = SqliteStorage::open(dir.join("agent.db"), None).unwrap();
@@ -2215,13 +2507,19 @@ mod tests {
 
         // With no overrides, addressed messages admit directly and unaddressed go to AutoRespondCheck.
         assert_eq!(
-            admission_policy(&store, &inbound(channel("c1", None), Some("g1"), "u1", true))
-                .unwrap(),
+            admission_policy(
+                &store,
+                &inbound(channel("c1", None), Some("g1"), "u1", true)
+            )
+            .unwrap(),
             AdmissionPolicy::AdmitDirect
         );
         assert_eq!(
-            admission_policy(&store, &inbound(channel("c1", None), Some("g1"), "u1", false))
-                .unwrap(),
+            admission_policy(
+                &store,
+                &inbound(channel("c1", None), Some("g1"), "u1", false)
+            )
+            .unwrap(),
             AdmissionPolicy::AutoRespondCheck
         );
         // DMs count as addressed.
@@ -2247,13 +2545,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            admission_policy(&store, &inbound(channel("c1", None), Some("g1"), "u1", false))
-                .unwrap(),
+            admission_policy(
+                &store,
+                &inbound(channel("c1", None), Some("g1"), "u1", false)
+            )
+            .unwrap(),
             AdmissionPolicy::AdmitDirect
         );
         assert_eq!(
-            admission_policy(&store, &inbound(channel("c1", None), Some("g1"), "u9", false))
-                .unwrap(),
+            admission_policy(
+                &store,
+                &inbound(channel("c1", None), Some("g1"), "u9", false)
+            )
+            .unwrap(),
             AdmissionPolicy::Deny
         );
 
@@ -2288,14 +2592,82 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            admission_policy(&store, &inbound(channel("c9", None), Some("g1"), "u1", false))
-                .unwrap(),
+            admission_policy(
+                &store,
+                &inbound(channel("c9", None), Some("g1"), "u1", false)
+            )
+            .unwrap(),
             AdmissionPolicy::AdmitDirect
         );
         assert_eq!(
-            admission_policy(&store, &inbound(channel("c9", None), Some("g2"), "u1", false))
-                .unwrap(),
+            admission_policy(
+                &store,
+                &inbound(channel("c9", None), Some("g2"), "u1", false)
+            )
+            .unwrap(),
             AdmissionPolicy::AutoRespondCheck
+        );
+
+        // A server override covers every channel and user in that guild, below
+        // channel/user overrides but above the Discord-wide default.
+        store
+            .set_interaction_mode(
+                "discord",
+                InteractionScope::Server,
+                None,
+                "g2",
+                InteractionMode::Always,
+            )
+            .unwrap();
+        store
+            .set_interaction_mode(
+                "discord",
+                InteractionScope::Server,
+                None,
+                "g3",
+                InteractionMode::MentionOnly,
+            )
+            .unwrap();
+        assert_eq!(
+            admission_policy(
+                &store,
+                &inbound(channel("c9", None), Some("g2"), "u1", false)
+            )
+            .unwrap(),
+            AdmissionPolicy::AdmitDirect
+        );
+        assert_eq!(
+            admission_policy(
+                &store,
+                &inbound(channel("c9", None), Some("g3"), "u1", false)
+            )
+            .unwrap(),
+            AdmissionPolicy::Deny
+        );
+
+        // With no override matching, the Discord-wide default decides: auto
+        // runs triage, mention-only denies, always admits directly.
+        store
+            .set_default_interaction_mode("discord", InteractionMode::MentionOnly)
+            .unwrap();
+        assert_eq!(
+            admission_policy(
+                &store,
+                &inbound(channel("c2", None), Some("g9"), "u1", false)
+            )
+            .unwrap(),
+            AdmissionPolicy::Deny
+        );
+        store
+            .set_default_interaction_mode("discord", InteractionMode::Always)
+            .unwrap();
+        assert_eq!(
+            admission_policy(
+                &store,
+                &inbound(channel("c2", None), Some("g9"), "u1", false)
+            )
+            .unwrap(),
+            AdmissionPolicy::AdmitDirect
         );
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2303,25 +2675,60 @@ mod tests {
 
     #[test]
     fn reply_mode_resolution() {
-        use storage::{ReplyMode, ReplyOverride};
+        use storage::{effective_reply_mode, ReplyMode, ReplyOverride, ReplyScope};
         let overrides = vec![
             ReplyOverride {
-                channel_id: "c1".into(),
+                scope: ReplyScope::Channel,
+                target_id: "c1".into(),
                 mode: ReplyMode::Direct,
             },
             ReplyOverride {
-                channel_id: "c2".into(),
+                scope: ReplyScope::Channel,
+                target_id: "c2".into(),
                 mode: ReplyMode::Thread,
             },
             ReplyOverride {
-                channel_id: "c3".into(),
-                mode: ReplyMode::Decision,
+                scope: ReplyScope::Channel,
+                target_id: "c3".into(),
+                mode: ReplyMode::Auto,
+            },
+            ReplyOverride {
+                scope: ReplyScope::Server,
+                target_id: "g1".into(),
+                mode: ReplyMode::Direct,
             },
         ];
-        assert_eq!(effective_reply_mode(&overrides, "c1"), ReplyMode::Direct);
-        assert_eq!(effective_reply_mode(&overrides, "c2"), ReplyMode::Thread);
-        assert_eq!(effective_reply_mode(&overrides, "c3"), ReplyMode::Decision);
-        assert_eq!(effective_reply_mode(&overrides, "c9"), ReplyMode::Decision);
+        // Channel overrides win over server overrides and the default; a
+        // server override applies only to messages in that guild, and
+        // everything else falls back to the messenger default.
+        assert_eq!(
+            effective_reply_mode(&overrides, "c1", Some("g1"), ReplyMode::Auto),
+            ReplyMode::Direct
+        );
+        assert_eq!(
+            effective_reply_mode(&overrides, "c2", Some("g1"), ReplyMode::Auto),
+            ReplyMode::Thread
+        );
+        assert_eq!(
+            effective_reply_mode(&overrides, "c3", Some("g9"), ReplyMode::Thread),
+            ReplyMode::Auto
+        );
+        assert_eq!(
+            effective_reply_mode(&overrides, "c9", Some("g1"), ReplyMode::Thread),
+            ReplyMode::Direct
+        );
+        assert_eq!(
+            effective_reply_mode(&overrides, "c9", Some("g9"), ReplyMode::Thread),
+            ReplyMode::Thread
+        );
+        assert_eq!(
+            effective_reply_mode(&overrides, "c9", None, ReplyMode::Direct),
+            ReplyMode::Direct
+        );
+        assert_eq!(
+            effective_reply_mode(&overrides, "c9", None, ReplyMode::Auto),
+            ReplyMode::Auto
+        );
     }
 
     #[tokio::test]
@@ -2378,9 +2785,12 @@ mod tests {
                 _place: &Place,
                 _before: Option<&str>,
                 _limit: u32,
-            ) -> std::result::Result<Vec<messenger::Fetched>, messenger::MessengerError> {
+            ) -> std::result::Result<Vec<messenger::Fetched>, messenger::MessengerError>
+            {
                 if self.fail_history {
-                    return Err(messenger::MessengerError::Unsupported("history failed".into()));
+                    return Err(messenger::MessengerError::Unsupported(
+                        "history failed".into(),
+                    ));
                 }
                 Ok(vec![messenger::Fetched {
                     message: "m0".into(),
@@ -2398,7 +2808,8 @@ mod tests {
                 _scope: &messenger::Scope,
                 _query: &str,
                 _limit: u32,
-            ) -> std::result::Result<Vec<messenger::Fetched>, messenger::MessengerError> {
+            ) -> std::result::Result<Vec<messenger::Fetched>, messenger::MessengerError>
+            {
                 Ok(Vec::new())
             }
             async fn participants(
@@ -2463,15 +2874,15 @@ mod tests {
             }
         }
 
-        let dir = std::env::temp_dir().join(format!(
-            "blob-1-admit-auto-respond-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("blob-1-admit-auto-respond-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = Arc::new(SqliteStorage::open(dir.join("agent.db"), None).unwrap());
         store.allow_user("discord", "u1").unwrap();
-        let stub: Arc<dyn messenger::Messenger> = Arc::new(StubMessenger { fail_history: false });
+        let stub: Arc<dyn messenger::Messenger> = Arc::new(StubMessenger {
+            fail_history: false,
+        });
         let failing_stub: Arc<dyn messenger::Messenger> =
             Arc::new(StubMessenger { fail_history: true });
         let messengers = harness::Messengers::new(vec![stub.clone()], store.clone());

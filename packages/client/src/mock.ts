@@ -6,7 +6,9 @@ import {
   Discord,
   type DiscordAccessEntry,
   type DiscordAccessMode,
+  type DiscordInteractionMode,
   type DiscordInteractionOverride,
+  type DiscordReplyMode,
   type DiscordReplyOverride,
   type GeneralSettings,
   Home,
@@ -49,7 +51,9 @@ type State = Readonly<{
   home: Home
   hasToken: boolean
   interactionModes: ReadonlyArray<DiscordInteractionOverride>
+  defaultInteractionMode: DiscordInteractionMode
   replyModes: ReadonlyArray<DiscordReplyOverride>
+  defaultReplyMode: DiscordReplyMode
   mcpServers: ReadonlyArray<McpServer>
   timezone: string
   schedules: ReadonlyArray<ScheduleItem>
@@ -91,7 +95,9 @@ const seedState = (): State => ({
   home: { kind: 'none' },
   hasToken: true,
   interactionModes: [],
+  defaultInteractionMode: 'auto',
   replyModes: [],
+  defaultReplyMode: 'auto',
   mcpServers: [
     {
       id: 'filesystem',
@@ -256,7 +262,9 @@ const discordReply = (state: State): Discord => ({
   token: state.hasToken ? 'set' : 'missing',
   connection: state.hasToken ? { state: 'online', bot: 'Blob-1' } : { state: 'off' },
   interactionModes: state.interactionModes,
+  defaultInteractionMode: state.defaultInteractionMode,
   replyModes: state.replyModes,
+  defaultReplyMode: state.defaultReplyMode,
 })
 
 const setToken = (state: State, token: string): Effect.Effect<State, string> =>
@@ -443,8 +451,8 @@ const setInteractionMode = (
     if (!SNOWFLAKE.test(payload.targetId)) {
       return yield* Effect.fail('Ids must be 17–20 digits')
     }
-    if (payload.scope === 'channel' && payload.guildId !== null) {
-      return yield* Effect.fail('Channel overrides cannot specify a server')
+    if (payload.scope !== 'user' && payload.guildId !== null) {
+      return yield* Effect.fail('A server id applies only to user overrides')
     }
     if (
       payload.scope === 'user' &&
@@ -467,7 +475,7 @@ const clearInteractionMode = (
     if (payload.targetId === '') {
       return yield* Effect.fail('Invalid target id')
     }
-    if (payload.scope === 'channel' && payload.guildId !== null) {
+    if (payload.scope !== 'user' && payload.guildId !== null) {
       return yield* Effect.fail('Invalid payload')
     }
 
@@ -479,23 +487,28 @@ const clearInteractionMode = (
 const sortedReplyModes = (
   modes: ReadonlyArray<DiscordReplyOverride>,
 ): ReadonlyArray<DiscordReplyOverride> =>
-  modes.toSorted((a, b) => a.channelId.localeCompare(b.channelId))
+  modes.toSorted((a, b) => a.scope.localeCompare(b.scope) || a.targetId.localeCompare(b.targetId))
+
+const sameReplyKey = (
+  entry: DiscordReplyOverride,
+  key: {
+    readonly scope: DiscordReplyOverride['scope']
+    readonly targetId: string
+  },
+): boolean => entry.scope === key.scope && entry.targetId === key.targetId
 
 const setReplyMode = (
   state: State,
   payload: RequestPayload<'discord.setReplyMode'>,
 ): Effect.Effect<State, string> =>
   Effect.gen(function* () {
-    if (!SNOWFLAKE.test(payload.channelId)) {
-      return yield* Effect.fail('Channel IDs must be 17–20 digits')
+    if (!SNOWFLAKE.test(payload.targetId)) {
+      return yield* Effect.fail('Ids must be 17–20 digits')
     }
 
     return Struct.evolve(state, {
       replyModes: modes =>
-        sortedReplyModes([
-          ...modes.filter(entry => entry.channelId !== payload.channelId),
-          payload,
-        ]),
+        sortedReplyModes([...modes.filter(entry => !sameReplyKey(entry, payload)), payload]),
     })
   })
 
@@ -504,12 +517,12 @@ const clearReplyMode = (
   payload: RequestPayload<'discord.clearReplyMode'>,
 ): Effect.Effect<State, string> =>
   Effect.gen(function* () {
-    if (payload.channelId === '') {
-      return yield* Effect.fail('Invalid channel id')
+    if (!SNOWFLAKE.test(payload.targetId)) {
+      return yield* Effect.fail('Ids must be 17–20 digits')
     }
 
     return Struct.evolve(state, {
-      replyModes: modes => modes.filter(entry => entry.channelId !== payload.channelId),
+      replyModes: modes => modes.filter(entry => !sameReplyKey(entry, payload)),
     })
   })
 
@@ -846,11 +859,21 @@ const handlers: { readonly [K in RequestType]: Handler<K> } = {
       Effect.map(discordReply),
     ),
 
+  'discord.setDefaultInteractionMode': ({ mode }, state) =>
+    transition(state, current =>
+      Effect.succeed(Struct.evolve(current, { defaultInteractionMode: () => mode })),
+    ).pipe(Effect.map(discordReply)),
+
   'discord.setReplyMode': (payload, state) =>
     transition(state, current => setReplyMode(current, payload)).pipe(Effect.map(discordReply)),
 
   'discord.clearReplyMode': (payload, state) =>
     transition(state, current => clearReplyMode(current, payload)).pipe(Effect.map(discordReply)),
+
+  'discord.setDefaultReplyMode': ({ mode }, state) =>
+    transition(state, current =>
+      Effect.succeed(Struct.evolve(current, { defaultReplyMode: () => mode })),
+    ).pipe(Effect.map(discordReply)),
 
   'discord.setAccessMode': ({ mode }, state) =>
     transition(state, current =>

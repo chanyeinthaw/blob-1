@@ -75,13 +75,15 @@ pub trait MemoryTools: Send + Sync {
     fn date(&self, id: u64) -> Result<String, HarnessError>;
 }
 
+type Summarizer<L> = dyn Fn() -> Option<(L, Option<u32>)> + Send + Sync;
+
 pub struct SessionHarness<L, E, S> {
     llm: L,
     memory_tools: Option<Arc<dyn MemoryTools>>,
     lookup_tools: Option<crate::Messengers>,
     mcp_tools: Option<Arc<SessionTools>>,
     observer: Option<Arc<dyn Fn(Step) + Send + Sync>>,
-    summarizer: Option<Arc<dyn Fn() -> Option<(L, Option<u32>)> + Send + Sync>>,
+    summarizer: Option<Arc<Summarizer<L>>>,
     environment: E,
     store: S,
     paths: EnvironmentPaths,

@@ -291,9 +291,7 @@ enum MessengerCommand {
 #[derive(Subcommand)]
 enum MessengerAccessCommand {
     /// Show the access mode and all whitelist/blacklist entries.
-    Show {
-        messenger: String,
-    },
+    Show { messenger: String },
     /// Set the access mode (`allow-all`, `whitelist`, or `blacklist`).
     Mode {
         messenger: String,
@@ -358,20 +356,42 @@ enum MessengerReplyCommand {
     List {
         messenger: String,
     },
+    /// Show or set the Discord-wide default reply mode.
+    Default {
+        messenger: String,
+        mode: Option<ReplyModeSetting>,
+    },
     Set {
         messenger: String,
-        channel_id: String,
+        scope: ReplyScopeSetting,
+        id: String,
         mode: ReplyModeSetting,
     },
     Clear {
         messenger: String,
-        channel_id: String,
+        scope: ReplyScopeSetting,
+        id: String,
     },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
+enum ReplyScopeSetting {
+    Channel,
+    Server,
+}
+
+impl From<ReplyScopeSetting> for storage::ReplyScope {
+    fn from(scope: ReplyScopeSetting) -> Self {
+        match scope {
+            ReplyScopeSetting::Channel => Self::Channel,
+            ReplyScopeSetting::Server => Self::Server,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 enum ReplyModeSetting {
-    Decision,
+    Auto,
     Thread,
     Direct,
 }
@@ -379,7 +399,7 @@ enum ReplyModeSetting {
 impl From<ReplyModeSetting> for storage::ReplyMode {
     fn from(mode: ReplyModeSetting) -> Self {
         match mode {
-            ReplyModeSetting::Decision => Self::Decision,
+            ReplyModeSetting::Auto => Self::Auto,
             ReplyModeSetting::Thread => Self::Thread,
             ReplyModeSetting::Direct => Self::Direct,
         }
@@ -390,6 +410,11 @@ impl From<ReplyModeSetting> for storage::ReplyMode {
 enum MessengerModeCommand {
     List {
         messenger: String,
+    },
+    /// Show or set the Discord-wide default interaction mode.
+    Default {
+        messenger: String,
+        mode: Option<ModeSetting>,
     },
     Set {
         messenger: String,
@@ -414,6 +439,7 @@ enum MessengerModeCommand {
 enum ModeScope {
     Channel,
     User,
+    Server,
 }
 
 impl From<ModeScope> for storage::InteractionScope {
@@ -421,6 +447,7 @@ impl From<ModeScope> for storage::InteractionScope {
         match scope {
             ModeScope::Channel => Self::Channel,
             ModeScope::User => Self::User,
+            ModeScope::Server => Self::Server,
         }
     }
 }
@@ -429,6 +456,7 @@ impl From<ModeScope> for storage::InteractionScope {
 enum ModeSetting {
     MentionOnly,
     Always,
+    Auto,
 }
 
 impl From<ModeSetting> for storage::InteractionMode {
@@ -436,6 +464,7 @@ impl From<ModeSetting> for storage::InteractionMode {
         match mode {
             ModeSetting::MentionOnly => Self::MentionOnly,
             ModeSetting::Always => Self::Always,
+            ModeSetting::Auto => Self::Auto,
         }
     }
 }
@@ -514,8 +543,12 @@ enum ProviderCommand {
 #[derive(Subcommand)]
 enum ProviderKeyCommand {
     /// Reads the provider API key from stdin, never from argv.
-    Set { id: String },
-    Clear { id: String },
+    Set {
+        id: String,
+    },
+    Clear {
+        id: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -954,7 +987,10 @@ fn provider(store: &SqliteStorage, command: ProviderCommand) -> Result<()> {
                 } else {
                     "no key"
                 };
-                println!("{}\t{api}\t{}\t{key_status}", provider.id.0, provider.base_url);
+                println!(
+                    "{}\t{api}\t{}\t{key_status}",
+                    provider.id.0, provider.base_url
+                );
             }
         }
         ProviderCommand::Remove { id } => store.remove_provider(&ProviderId(id))?,
@@ -1230,6 +1266,13 @@ async fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<(
                 if messenger != "discord" {
                     return Err(format!("unknown messenger: {messenger}").into());
                 }
+                println!(
+                    "default {}",
+                    store
+                        .messenger_defaults(&messenger)?
+                        .interaction_mode
+                        .as_str()
+                );
                 for item in store.interaction_modes(&messenger)? {
                     match item.guild_id {
                         Some(guild) => println!(
@@ -1262,7 +1305,10 @@ async fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<(
                 }
                 let scope: storage::InteractionScope = scope.into();
                 match (scope, guild.as_deref()) {
-                    (storage::InteractionScope::Channel, Some(_)) => {
+                    (
+                        storage::InteractionScope::Channel | storage::InteractionScope::Server,
+                        Some(_),
+                    ) => {
                         return Err("--guild applies only to user overrides".into());
                     }
                     (storage::InteractionScope::User, None) => {
@@ -1294,11 +1340,26 @@ async fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<(
                     return Err("target ID cannot be empty".into());
                 }
                 let scope: storage::InteractionScope = scope.into();
-                if scope == storage::InteractionScope::Channel && guild.is_some() {
+                if scope != storage::InteractionScope::User && guild.is_some() {
                     return Err("--guild applies only to user overrides".into());
                 }
                 let guild_ref = guild.as_deref().filter(|g| !g.is_empty());
                 store.clear_interaction_mode(&messenger, scope, guild_ref, &id)?;
+            }
+            MessengerModeCommand::Default { messenger, mode } => {
+                if messenger != "discord" {
+                    return Err(format!("unknown messenger: {messenger}").into());
+                }
+                match mode {
+                    Some(mode) => store.set_default_interaction_mode(&messenger, mode.into())?,
+                    None => println!(
+                        "{}",
+                        store
+                            .messenger_defaults(&messenger)?
+                            .interaction_mode
+                            .as_str()
+                    ),
+                }
             }
         },
         MessengerCommand::Reply { command } => match command {
@@ -1306,34 +1367,57 @@ async fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<(
                 if messenger != "discord" {
                     return Err(format!("unknown messenger: {messenger}").into());
                 }
+                println!(
+                    "default {}",
+                    store.messenger_defaults(&messenger)?.reply_mode.as_str()
+                );
                 for item in store.reply_modes(&messenger)? {
-                    println!("{} {}", item.channel_id, item.mode.as_str());
+                    println!(
+                        "{} {} {}",
+                        item.scope.as_str(),
+                        item.target_id,
+                        item.mode.as_str()
+                    );
                 }
             }
             MessengerReplyCommand::Set {
                 messenger,
-                channel_id,
+                scope,
+                id,
                 mode,
             } => {
                 if messenger != "discord" {
                     return Err(format!("unknown messenger: {messenger}").into());
                 }
-                if !valid_discord_id(&channel_id) {
-                    return Err("Discord channel IDs must be 17–20 digits".into());
+                if !valid_discord_id(&id) {
+                    return Err("Discord IDs must be 17–20 digits".into());
                 }
-                store.set_reply_mode(&messenger, &channel_id, mode.into())?;
+                store.set_reply_mode(&messenger, scope.into(), &id, mode.into())?;
             }
             MessengerReplyCommand::Clear {
                 messenger,
-                channel_id,
+                scope,
+                id,
             } => {
                 if messenger != "discord" {
                     return Err(format!("unknown messenger: {messenger}").into());
                 }
-                if channel_id.is_empty() {
-                    return Err("channel ID cannot be empty".into());
+                if id.is_empty() {
+                    return Err("target ID cannot be empty".into());
                 }
-                store.clear_reply_mode(&messenger, &channel_id)?;
+                store.clear_reply_mode(&messenger, scope.into(), &id)?;
+            }
+            MessengerReplyCommand::Default { messenger, mode } => {
+                if messenger != "discord" {
+                    return Err(format!("unknown messenger: {messenger}").into());
+                }
+                match mode {
+                    Some(mode) => store.set_default_reply_mode(&messenger, mode.into())?,
+                    None => println!(
+                        "{}",
+                        store.messenger_defaults(&messenger)?.reply_mode.as_str()
+                    ),
+                }
             }
         },
         MessengerCommand::Access { command } => match command {

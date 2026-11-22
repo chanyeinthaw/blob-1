@@ -738,11 +738,12 @@ impl<T: ScheduleStore + ?Sized> ScheduleStore for std::sync::Arc<T> {
 }
 
 /// What an interaction override applies to: a Discord channel or thread id,
-/// or a user id.
+/// a user id, or a whole server (guild) id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InteractionScope {
     Channel,
     User,
+    Server,
 }
 
 impl InteractionScope {
@@ -750,24 +751,26 @@ impl InteractionScope {
         match self {
             Self::Channel => "channel",
             Self::User => "user",
+            Self::Server => "server",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|scope| scope.as_str() == s)
+        Self::ALL.into_iter().find(|scope| scope.as_str() == s)
     }
 
-    const ALL: [Self; 2] = [Self::Channel, Self::User];
+    const ALL: [Self; 3] = [Self::Channel, Self::User, Self::Server];
 }
 
 /// How eagerly the bot engages: `MentionOnly` answers DMs, mentions and
-/// replies; `Always` answers every message in scope.
+/// replies; `Always` answers every message in scope; `Auto` routes
+/// unaddressed messages through the Auto-respond check (acting like
+/// `MentionOnly` when no utility model is configured or Auto-respond is off).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InteractionMode {
     MentionOnly,
     Always,
+    Auto,
 }
 
 impl InteractionMode {
@@ -775,6 +778,7 @@ impl InteractionMode {
         match self {
             Self::MentionOnly => "mention-only",
             Self::Always => "always",
+            Self::Auto => "auto",
         }
     }
 
@@ -782,24 +786,25 @@ impl InteractionMode {
         Self::ALL.into_iter().find(|mode| mode.as_str() == s)
     }
 
-    const ALL: [Self; 2] = [Self::MentionOnly, Self::Always];
+    const ALL: [Self; 3] = [Self::MentionOnly, Self::Always, Self::Auto];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InteractionOverride {
     pub scope: InteractionScope,
-    /// Discord guild id for `User` overrides; `None` for `Channel` overrides.
+    /// Discord guild id for `User` overrides; `None` for `Channel` and
+    /// `Server` overrides (a `Server` override's `target_id` is the guild id).
     pub guild_id: Option<String>,
     pub target_id: String,
     pub mode: InteractionMode,
 }
 
 /// How the bot replies to plain-channel messages (outside DMs and threads):
-/// `decision` asks the utility model (falling back to a thread), `thread`
+/// `auto` asks the utility model (falling back to a thread), `thread`
 /// always starts a thread, and `direct` always replies inline in the channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplyMode {
-    Decision,
+    Auto,
     Thread,
     Direct,
 }
@@ -807,7 +812,7 @@ pub enum ReplyMode {
 impl ReplyMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Decision => "decision",
+            Self::Auto => "auto",
             Self::Thread => "thread",
             Self::Direct => "direct",
         }
@@ -817,13 +822,75 @@ impl ReplyMode {
         Self::ALL.into_iter().find(|mode| mode.as_str() == s)
     }
 
-    const ALL: [Self; 3] = [Self::Decision, Self::Thread, Self::Direct];
+    const ALL: [Self; 3] = [Self::Auto, Self::Thread, Self::Direct];
+}
+
+/// What a reply-mode override applies to: a Discord channel id or a whole
+/// server (guild) id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyScope {
+    Channel,
+    Server,
+}
+
+impl ReplyScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Channel => "channel",
+            Self::Server => "server",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|scope| scope.as_str() == s)
+    }
+
+    const ALL: [Self; 2] = [Self::Channel, Self::Server];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplyOverride {
-    pub channel_id: String,
+    pub scope: ReplyScope,
+    /// Channel id for `Channel` overrides, guild id for `Server` overrides.
+    pub target_id: String,
     pub mode: ReplyMode,
+}
+
+/// The effective reply mode for a plain-channel message: a `channel`
+/// override wins, then the `server` override for the message's guild,
+/// then `default`.
+pub fn effective_reply_mode(
+    overrides: &[ReplyOverride],
+    channel: &str,
+    guild: Option<&str>,
+    default: ReplyMode,
+) -> ReplyMode {
+    overrides
+        .iter()
+        .find(|o| o.scope == ReplyScope::Channel && o.target_id == channel)
+        .or_else(|| {
+            overrides
+                .iter()
+                .find(|o| o.scope == ReplyScope::Server && Some(o.target_id.as_str()) == guild)
+        })
+        .map_or(default, |o| o.mode)
+}
+
+/// Per-messenger fallbacks applied when no override matches: unaddressed
+/// messages go to the Auto-respond check and replies are decided per message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessengerDefaults {
+    pub interaction_mode: InteractionMode,
+    pub reply_mode: ReplyMode,
+}
+
+impl Default for MessengerDefaults {
+    fn default() -> Self {
+        Self {
+            interaction_mode: InteractionMode::Auto,
+            reply_mode: ReplyMode::Auto,
+        }
+    }
 }
 
 /// Who can talk to the bot on a messenger: everyone (`allow-all`), only listed
@@ -956,15 +1023,31 @@ pub trait MessengerStore: Send + Sync {
         guild_id: Option<&str>,
         target_id: &str,
     ) -> Result<bool, StoreError>;
-    /// Per-channel reply mode overrides, ordered by channel id.
+    /// Per-channel and per-server reply mode overrides, ordered by scope,
+    /// then target id.
     fn reply_modes(&self, messenger: &str) -> Result<Vec<ReplyOverride>, StoreError>;
     fn set_reply_mode(
         &self,
         messenger: &str,
-        channel_id: &str,
+        scope: ReplyScope,
+        target_id: &str,
         mode: ReplyMode,
     ) -> Result<(), StoreError>;
-    fn clear_reply_mode(&self, messenger: &str, channel_id: &str) -> Result<bool, StoreError>;
+    fn clear_reply_mode(
+        &self,
+        messenger: &str,
+        scope: ReplyScope,
+        target_id: &str,
+    ) -> Result<bool, StoreError>;
+    /// Messenger-wide fallbacks used when no override matches; an absent row
+    /// resolves to the built-in defaults (`auto` interaction, `auto` reply).
+    fn messenger_defaults(&self, messenger: &str) -> Result<MessengerDefaults, StoreError>;
+    fn set_default_interaction_mode(
+        &self,
+        messenger: &str,
+        mode: InteractionMode,
+    ) -> Result<(), StoreError>;
+    fn set_default_reply_mode(&self, messenger: &str, mode: ReplyMode) -> Result<(), StoreError>;
     /// Persisted markers for synthesized thread destinations that have not yet
     /// been created on the messenger.
     fn mark_pending_thread(&self, destination: u64) -> Result<(), StoreError>;
@@ -1057,13 +1140,32 @@ impl<T: MessengerStore + ?Sized> MessengerStore for std::sync::Arc<T> {
     fn set_reply_mode(
         &self,
         messenger: &str,
-        channel_id: &str,
+        scope: ReplyScope,
+        target_id: &str,
         mode: ReplyMode,
     ) -> Result<(), StoreError> {
-        (**self).set_reply_mode(messenger, channel_id, mode)
+        (**self).set_reply_mode(messenger, scope, target_id, mode)
     }
-    fn clear_reply_mode(&self, messenger: &str, channel_id: &str) -> Result<bool, StoreError> {
-        (**self).clear_reply_mode(messenger, channel_id)
+    fn clear_reply_mode(
+        &self,
+        messenger: &str,
+        scope: ReplyScope,
+        target_id: &str,
+    ) -> Result<bool, StoreError> {
+        (**self).clear_reply_mode(messenger, scope, target_id)
+    }
+    fn messenger_defaults(&self, messenger: &str) -> Result<MessengerDefaults, StoreError> {
+        (**self).messenger_defaults(messenger)
+    }
+    fn set_default_interaction_mode(
+        &self,
+        messenger: &str,
+        mode: InteractionMode,
+    ) -> Result<(), StoreError> {
+        (**self).set_default_interaction_mode(messenger, mode)
+    }
+    fn set_default_reply_mode(&self, messenger: &str, mode: ReplyMode) -> Result<(), StoreError> {
+        (**self).set_default_reply_mode(messenger, mode)
     }
     fn mark_pending_thread(&self, destination: u64) -> Result<(), StoreError> {
         (**self).mark_pending_thread(destination)

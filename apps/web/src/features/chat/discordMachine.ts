@@ -8,6 +8,8 @@ import {
   DiscordInteractionMode,
   DiscordInteractionScope,
   DiscordReplyMode,
+  DiscordReplyScope,
+  GeneralSettings,
   Home,
 } from '@blob-1/contracts'
 import { Machine } from '@typeonce/effect-machine'
@@ -21,6 +23,7 @@ const fetchDiscordAll = Effect.gen(function* () {
     {
       discord: api.request('discord.get', {}),
       directory: api.request('discord.directory', {}),
+      general: api.request('general.get', {}),
     },
     { concurrency: 'unbounded' },
   ).pipe(Effect.orElseSucceed(() => null))
@@ -95,8 +98,23 @@ const clearInteractionMode = Effect.fn('DiscordSettings.clearInteractionMode')(f
   return yield* api.request('discord.clearInteractionMode', input)
 })
 
+const setDefaultInteractionMode = Effect.fn('DiscordSettings.setDefaultInteractionMode')(function* (
+  mode: DiscordInteractionMode,
+) {
+  const api = yield* Api
+  return yield* api.request('discord.setDefaultInteractionMode', { mode })
+})
+
+const setDefaultReplyMode = Effect.fn('DiscordSettings.setDefaultReplyMode')(function* (
+  mode: DiscordReplyMode,
+) {
+  const api = yield* Api
+  return yield* api.request('discord.setDefaultReplyMode', { mode })
+})
+
 const setReplyMode = Effect.fn('DiscordSettings.setReplyMode')(function* (input: {
-  readonly channelId: string
+  readonly scope: DiscordReplyScope
+  readonly targetId: string
   readonly mode: DiscordReplyMode
 }) {
   const api = yield* Api
@@ -104,7 +122,8 @@ const setReplyMode = Effect.fn('DiscordSettings.setReplyMode')(function* (input:
 })
 
 const clearReplyMode = Effect.fn('DiscordSettings.clearReplyMode')(function* (input: {
-  readonly channelId: string
+  readonly scope: DiscordReplyScope
+  readonly targetId: string
 }) {
   const api = yield* Api
   return yield* api.request('discord.clearReplyMode', input)
@@ -145,7 +164,11 @@ const mergeDirectoryChannels = (
   return extra.length === 0 ? current : { ...current, channels: [...current.channels, ...extra] }
 }
 
-export const DiscordInput = Schema.Struct({ discord: Discord, directory: DiscordDirectory })
+export const DiscordInput = Schema.Struct({
+  discord: Discord,
+  directory: DiscordDirectory,
+  general: GeneralSettings,
+})
 export type DiscordInput = typeof DiscordInput.Type
 
 const ErrorMessage = Schema.NullOr(Schema.String)
@@ -156,6 +179,7 @@ export const DiscordStates = Machine.state({
   fields: {
     discord: Discord,
     directory: DiscordDirectory,
+    general: GeneralSettings,
     serverAccessMode: DiscordAccessMode,
     pendingAccessMode: Schema.NullOr(DiscordAccessMode),
     inFlightAccessMode: Schema.NullOr(DiscordAccessMode),
@@ -178,7 +202,8 @@ export const DiscordStates = Machine.state({
     modeSetting: DiscordInteractionMode,
     /** Reply-mode dialog + form draft. */
     replyDialogOpen: Schema.Boolean,
-    replyChannel: Schema.String,
+    replyScope: DiscordReplyScope,
+    replyTarget: Schema.String,
     replySetting: DiscordReplyMode,
   },
   states: {
@@ -250,6 +275,9 @@ export const DiscordStates = Machine.state({
             mode: DiscordInteractionMode,
           },
         },
+        SettingDefault: {
+          fields: { mode: DiscordInteractionMode, previous: DiscordInteractionMode },
+        },
         Removing: {
           fields: {
             scope: DiscordInteractionScope,
@@ -264,13 +292,18 @@ export const DiscordStates = Machine.state({
         Idle: { fields: { error: ErrorMessage } },
         Saving: {
           fields: {
-            channelId: Schema.String,
+            scope: DiscordReplyScope,
+            targetId: Schema.String,
             mode: DiscordReplyMode,
           },
         },
+        SettingDefault: {
+          fields: { mode: DiscordReplyMode, previous: DiscordReplyMode },
+        },
         Removing: {
           fields: {
-            channelId: Schema.String,
+            scope: DiscordReplyScope,
+            targetId: Schema.String,
           },
         },
       },
@@ -317,6 +350,7 @@ export const DiscordEvents = Machine.events({
     targetId: Schema.String,
     mode: DiscordInteractionMode,
   },
+  SetDefaultInteractionMode: { mode: DiscordInteractionMode },
   ClearInteractionMode: {
     scope: DiscordInteractionScope,
     guildId: Schema.NullOr(Schema.String),
@@ -324,10 +358,16 @@ export const DiscordEvents = Machine.events({
   },
   OpenReplyDialog: {},
   CloseReplyDialog: {},
-  SelectReplyChannel: { channelId: Schema.String },
+  SelectReplyScope: { scope: DiscordReplyScope },
+  SelectReplyTarget: { targetId: Schema.String },
   SelectReplySetting: { mode: DiscordReplyMode },
-  SetReplyMode: { channelId: Schema.String, mode: DiscordReplyMode },
-  ClearReplyMode: { channelId: Schema.String },
+  SetReplyMode: {
+    scope: DiscordReplyScope,
+    targetId: Schema.String,
+    mode: DiscordReplyMode,
+  },
+  SetDefaultReplyMode: { mode: DiscordReplyMode },
+  ClearReplyMode: { scope: DiscordReplyScope, targetId: Schema.String },
 })
 
 /** The Discord settings page: token, live connection status, allowlist, overrides and home channel. */
@@ -347,8 +387,10 @@ export const DiscordMachine = Machine.make({
     setHome,
     setInteractionMode,
     clearInteractionMode,
+    setDefaultInteractionMode,
     setReplyMode,
     clearReplyMode,
+    setDefaultReplyMode,
   },
 }).handle({
   root: ({ input }) => ({
@@ -370,7 +412,8 @@ export const DiscordMachine = Machine.make({
     modeTarget: '',
     modeSetting: 'always',
     replyDialogOpen: false,
-    replyChannel: '',
+    replyScope: 'channel',
+    replyTarget: '',
     replySetting: 'direct',
   }),
   on: {
@@ -421,6 +464,7 @@ export const DiscordMachine = Machine.make({
                     ...root,
                     serverAccessMode: output.discord.accessMode,
                     discord: output.discord,
+                    general: output.general,
                     directory:
                       output.directory.guilds.length > 0 ||
                       output.directory.channels.length > 0 ||
@@ -512,7 +556,7 @@ export const DiscordMachine = Machine.make({
                         accessUser: '',
                         modeGuild: '',
                         modeTarget: '',
-                        replyChannel: '',
+                        replyTarget: '',
                         tokenGeneration: root.tokenGeneration + 1,
                       },
               }),
@@ -549,7 +593,7 @@ export const DiscordMachine = Machine.make({
                   accessUser: '',
                   modeGuild: '',
                   modeTarget: '',
-                  replyChannel: '',
+                  replyTarget: '',
                   tokenGeneration: root.tokenGeneration + 1,
                 },
               }),
@@ -1068,6 +1112,19 @@ export const DiscordMachine = Machine.make({
                 },
               }),
             },
+            SetDefaultInteractionMode: {
+              target: 'Interaction.SettingDefault',
+              update: 'root',
+              data: ({ event, root }) => ({
+                target: { mode: event.mode, previous: root.discord.defaultInteractionMode },
+                update: {
+                  ...root,
+                  inFlightWrites: root.inFlightWrites + 1,
+                  mutationSeq: root.mutationSeq + 1,
+                  discord: { ...root.discord, defaultInteractionMode: event.mode },
+                },
+              }),
+            },
             ClearInteractionMode: {
               target: 'Interaction.Removing',
               update: 'root',
@@ -1109,7 +1166,7 @@ export const DiscordMachine = Machine.make({
                   // Drop the draft only when the saved row was the draft.
                   modeTarget:
                     state.scope === root.modeScope &&
-                    (state.scope === 'channel' || state.guildId === root.modeGuild) &&
+                    (state.scope !== 'user' || state.guildId === root.modeGuild) &&
                     state.targetId === root.modeTarget
                       ? ''
                       : root.modeTarget,
@@ -1125,6 +1182,41 @@ export const DiscordMachine = Machine.make({
                   ...root,
                   inFlightWrites: Math.max(0, root.inFlightWrites - 1),
                   mutationSeq: root.mutationSeq + 1,
+                },
+              }),
+            },
+          },
+        },
+        SettingDefault: {
+          invoke: {
+            src: 'setDefaultInteractionMode',
+            input: ({ state }) => state.mode,
+            onDone: {
+              target: 'Interaction.Idle',
+              update: 'root',
+              data: ({ root, output }) => ({
+                target: { error: null },
+                update: {
+                  ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
+                  discord: {
+                    ...root.discord,
+                    defaultInteractionMode: output.defaultInteractionMode,
+                  },
+                },
+              }),
+            },
+            onFailure: {
+              target: 'Interaction.Idle',
+              update: 'root',
+              data: ({ root, state, error }) => ({
+                target: { error: error.message },
+                update: {
+                  ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
+                  discord: { ...root.discord, defaultInteractionMode: state.previous },
                 },
               }),
             },
@@ -1150,7 +1242,7 @@ export const DiscordMachine = Machine.make({
                   discord: { ...root.discord, interactionModes: output.interactionModes },
                   modeTarget:
                     state.scope === root.modeScope &&
-                    (state.scope === 'channel' || state.guildId === root.modeGuild) &&
+                    (state.scope !== 'user' || state.guildId === root.modeGuild) &&
                     state.targetId === root.modeTarget
                       ? ''
                       : root.modeTarget,
@@ -1186,7 +1278,8 @@ export const DiscordMachine = Machine.make({
                 update: {
                   ...root,
                   replyDialogOpen: true,
-                  replyChannel: '',
+                  replyScope: 'channel',
+                  replyTarget: '',
                   replySetting: 'direct',
                 },
               }),
@@ -1196,15 +1289,23 @@ export const DiscordMachine = Machine.make({
               update: 'root',
               data: ({ root }) => ({
                 target: { error: null },
-                update: { ...root, replyDialogOpen: false, replyChannel: '' },
+                update: { ...root, replyDialogOpen: false, replyTarget: '' },
               }),
             },
-            SelectReplyChannel: {
+            SelectReplyScope: {
               target: 'ReplyMode.Idle',
               update: 'root',
               data: ({ event, root, state }) => ({
                 target: { ...state, error: null },
-                update: { ...root, replyChannel: event.channelId },
+                update: { ...root, replyScope: event.scope, replyTarget: '' },
+              }),
+            },
+            SelectReplyTarget: {
+              target: 'ReplyMode.Idle',
+              update: 'root',
+              data: ({ event, root, state }) => ({
+                target: { ...state, error: null },
+                update: { ...root, replyTarget: event.targetId },
               }),
             },
             SelectReplySetting: {
@@ -1220,7 +1321,8 @@ export const DiscordMachine = Machine.make({
               update: 'root',
               data: ({ event, root }) => ({
                 target: {
-                  channelId: event.channelId,
+                  scope: event.scope,
+                  targetId: event.targetId,
                   mode: event.mode,
                 },
                 update: {
@@ -1230,11 +1332,24 @@ export const DiscordMachine = Machine.make({
                 },
               }),
             },
+            SetDefaultReplyMode: {
+              target: 'ReplyMode.SettingDefault',
+              update: 'root',
+              data: ({ event, root }) => ({
+                target: { mode: event.mode, previous: root.discord.defaultReplyMode },
+                update: {
+                  ...root,
+                  inFlightWrites: root.inFlightWrites + 1,
+                  mutationSeq: root.mutationSeq + 1,
+                  discord: { ...root.discord, defaultReplyMode: event.mode },
+                },
+              }),
+            },
             ClearReplyMode: {
               target: 'ReplyMode.Removing',
               update: 'root',
               data: ({ event, root }) => ({
-                target: { channelId: event.channelId },
+                target: { scope: event.scope, targetId: event.targetId },
                 update: {
                   ...root,
                   inFlightWrites: root.inFlightWrites + 1,
@@ -1248,7 +1363,8 @@ export const DiscordMachine = Machine.make({
           invoke: {
             src: 'setReplyMode',
             input: ({ state }) => ({
-              channelId: state.channelId,
+              scope: state.scope,
+              targetId: state.targetId,
               mode: state.mode,
             }),
             onDone: {
@@ -1262,7 +1378,11 @@ export const DiscordMachine = Machine.make({
                   mutationSeq: root.mutationSeq + 1,
                   discord: { ...root.discord, replyModes: output.replyModes },
                   replyDialogOpen: false,
-                  replyChannel: state.channelId === root.replyChannel ? '' : root.replyChannel,
+                  // Drop the draft only when the saved row was the draft.
+                  replyTarget:
+                    state.scope === root.replyScope && state.targetId === root.replyTarget
+                      ? ''
+                      : root.replyTarget,
                 },
               }),
             },
@@ -1280,10 +1400,42 @@ export const DiscordMachine = Machine.make({
             },
           },
         },
+        SettingDefault: {
+          invoke: {
+            src: 'setDefaultReplyMode',
+            input: ({ state }) => state.mode,
+            onDone: {
+              target: 'ReplyMode.Idle',
+              update: 'root',
+              data: ({ root, output }) => ({
+                target: { error: null },
+                update: {
+                  ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
+                  discord: { ...root.discord, defaultReplyMode: output.defaultReplyMode },
+                },
+              }),
+            },
+            onFailure: {
+              target: 'ReplyMode.Idle',
+              update: 'root',
+              data: ({ root, state, error }) => ({
+                target: { error: error.message },
+                update: {
+                  ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
+                  discord: { ...root.discord, defaultReplyMode: state.previous },
+                },
+              }),
+            },
+          },
+        },
         Removing: {
           invoke: {
             src: 'clearReplyMode',
-            input: ({ state }) => ({ channelId: state.channelId }),
+            input: ({ state }) => ({ scope: state.scope, targetId: state.targetId }),
             onDone: {
               target: 'ReplyMode.Idle',
               update: 'root',
@@ -1294,7 +1446,10 @@ export const DiscordMachine = Machine.make({
                   inFlightWrites: Math.max(0, root.inFlightWrites - 1),
                   mutationSeq: root.mutationSeq + 1,
                   discord: { ...root.discord, replyModes: output.replyModes },
-                  replyChannel: state.channelId === root.replyChannel ? '' : root.replyChannel,
+                  replyTarget:
+                    state.scope === root.replyScope && state.targetId === root.replyTarget
+                      ? ''
+                      : root.replyTarget,
                 },
               }),
             },

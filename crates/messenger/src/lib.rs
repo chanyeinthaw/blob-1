@@ -109,6 +109,11 @@ pub trait Lookup: Send + Sync {
     }
     /// Refreshes TTL on an already-participating channel without overwriting entries.
     fn touch_history(&self, _place: &Place) {}
+    /// Guild (server) id `channel_id` belongs to; `Ok(None)` for DMs and
+    /// guild-less messengers, `Err` when the lookup itself fails.
+    async fn channel_guild(&self, _channel_id: &str) -> Result<Option<String>, MessengerError> {
+        Ok(None)
+    }
     async fn message(&self, place: &Place, id: &str) -> Result<Fetched, MessengerError>;
     fn parse_link(&self, link: &str) -> Option<(Place, String)>;
     async fn history(

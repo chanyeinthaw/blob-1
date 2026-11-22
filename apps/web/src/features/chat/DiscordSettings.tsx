@@ -6,9 +6,12 @@ import type {
   DiscordAccessScope,
   DiscordConnection,
   DiscordDirectory,
+  DiscordInteractionMode,
   DiscordInteractionOverride,
+  DiscordInteractionScope,
   DiscordReplyMode,
   DiscordReplyOverride,
+  DiscordReplyScope,
   Home,
 } from '@blob-1/contracts'
 import { useAtomRefresh, useAtomSet, useAtomValue } from '@effect/atom-react'
@@ -16,7 +19,7 @@ import { AtomMachine } from '@typeonce/effect-machine/reactivity'
 import { MachineState, useMachineResult } from '@typeonce/effect-machine-react'
 import { type Cause, Option } from 'effect'
 import { AsyncResult } from 'effect/reactivity'
-import { Hash, KeyRound, Pencil, Plus, Trash2, User } from 'lucide-react'
+import { CircleHelp, Hash, KeyRound, Pencil, Plus, Server, Trash2, User } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 
 import { ConfirmDialog } from '~/components/ConfirmDialog'
@@ -575,11 +578,14 @@ function AccessScopePicker(props: {
         label: guild.name,
         hint: guild.id,
       }))
-    : props.directory.channels.map(channel => ({
-        value: channel.id,
-        label: `#${channel.name}`,
-        hint: channel.server,
-      }))
+    : props.directory.channels
+        .toSorted((a, b) => a.server.localeCompare(b.server) || a.name.localeCompare(b.name))
+        .map(channel => ({
+          value: channel.id,
+          label: `#${channel.name}`,
+          hint: null,
+          group: channel.server,
+        }))
   return (
     <FieldRow id="discord-access-scope-target" label={isGuild ? 'Server' : 'Channel'}>
       <Picker
@@ -755,7 +761,97 @@ function AccessAddDialog(props: AccessAddDialogProps) {
 const modeToggleItemClassName =
   'h-full rounded-full px-3 text-muted-foreground hover:bg-transparent hover:text-foreground aria-pressed:bg-background aria-pressed:text-foreground aria-pressed:shadow-sm'
 
-/** Per-channel and per-person overrides of the default mention-only gate. */
+interface ModeHelpItem {
+  readonly term: string
+  readonly description: string
+}
+
+const interactionModeHelp: ReadonlyArray<ModeHelpItem> = [
+  { term: 'Mention only', description: 'replies only when mentioned, replied to, or in DMs.' },
+  {
+    term: 'Always',
+    description: 'every message goes to the main model, which may stay silent.',
+  },
+  {
+    term: 'Auto',
+    description:
+      'the utility model decides whether to reply; needs a utility model and Auto-respond on, otherwise acts like Mention only.',
+  },
+]
+
+const replyModeHelp: ReadonlyArray<ModeHelpItem> = [
+  {
+    term: 'Auto',
+    description:
+      "the utility model picks an inline reply or a thread (thread if it can't decide or there is no utility model).",
+  },
+  { term: 'Thread', description: 'always replies in a new thread.' },
+  { term: 'Direct', description: 'always replies inline, never starts threads.' },
+]
+
+interface ModeHelpProps {
+  /** Accessible name of the trigger, e.g. "About interaction modes". */
+  readonly label: string
+  readonly items: ReadonlyArray<ModeHelpItem>
+}
+
+/** A circled-? button whose tooltip explains each mode option in one line. */
+function ModeHelp(props: ModeHelpProps) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label={props.label}
+            className="text-muted-foreground"
+          >
+            <CircleHelp className="size-3.5" />
+          </Button>
+        }
+      />
+      <TooltipContent className="flex-col items-start">
+        {props.items.map(item => (
+          <p key={item.term}>
+            <span className="font-semibold">{item.term}</span>
+            {' – '}
+            {item.description}
+          </p>
+        ))}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+const interactionModes: ReadonlyArray<{
+  readonly mode: DiscordInteractionMode
+  readonly label: string
+}> = [
+  { mode: 'mention-only', label: 'Mention only' },
+  { mode: 'always', label: 'Always' },
+  { mode: 'auto', label: 'Auto' },
+]
+
+const modeScopes: ReadonlyArray<{
+  readonly scope: DiscordInteractionScope
+  readonly label: string
+}> = [
+  { scope: 'channel', label: 'Channel' },
+  { scope: 'user', label: 'Person' },
+  { scope: 'server', label: 'Server' },
+]
+
+function isInteractionMode(value: string | undefined): value is DiscordInteractionMode {
+  return value === 'mention-only' || value === 'always' || value === 'auto'
+}
+
+function isInteractionScope(value: string | undefined): value is DiscordInteractionScope {
+  return value === 'channel' || value === 'user' || value === 'server'
+}
+
+/** Per-channel, per-person and per-server overrides of the default interaction gate. */
 function InteractionModeSection() {
   const machine = DiscordOwner.useMachine()
   const send = useAtomSet(machine.send)
@@ -766,6 +862,7 @@ function InteractionModeSection() {
   return (
     <Section
       title="Interaction mode"
+      titleExtra={<ModeHelp label="About interaction modes" items={interactionModeHelp} />}
       action={
         <Button
           size="sm"
@@ -782,10 +879,56 @@ function InteractionModeSection() {
         {({ value, states }) => {
           const interaction = states.Interaction.state
           const error = interaction.path === 'Interaction.Idle' ? interaction.value.error : null
+          const autoInactive =
+            value.discord.defaultInteractionMode === 'auto' &&
+            (!value.general.autoRespond || !value.general.hasUtilityModel)
           return (
             <>
+              <FieldRow
+                labelId="discord-default-mode-label"
+                label="Default"
+                labelExtra={
+                  <ModeHelp label="About interaction modes" items={interactionModeHelp} />
+                }
+              >
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                  <ToggleGroup
+                    aria-labelledby="discord-default-mode-label"
+                    spacing={1}
+                    disabled={!isIdle}
+                    value={[value.discord.defaultInteractionMode]}
+                    onValueChange={values => {
+                      const next = values[0]
+                      if (
+                        isInteractionMode(next) &&
+                        next !== value.discord.defaultInteractionMode
+                      ) {
+                        send(DiscordEvents.SetDefaultInteractionMode({ mode: next }))
+                      }
+                    }}
+                    className="h-10 rounded-full bg-muted p-[3px] md:h-8"
+                  >
+                    {interactionModes.map(item => (
+                      <ToggleGroupItem
+                        key={item.mode}
+                        value={item.mode}
+                        className={modeToggleItemClassName}
+                      >
+                        {item.label}
+                      </ToggleGroupItem>
+                    ))}
+                  </ToggleGroup>
+                  {autoInactive ? (
+                    <span className="text-xs text-muted-foreground">
+                      {value.general.autoRespond
+                        ? 'Inactive: no utility model'
+                        : 'Inactive: Auto-respond is off'}
+                    </span>
+                  ) : null}
+                </div>
+              </FieldRow>
               {value.discord.interactionModes.length === 0 ? (
-                <EmptyLine>Using General default everywhere.</EmptyLine>
+                <EmptyLine>No overrides.</EmptyLine>
               ) : (
                 <ul className="flex flex-col divide-y">
                   {value.discord.interactionModes.map(override => (
@@ -816,16 +959,13 @@ interface OverrideRowProps {
   readonly disabled: boolean
 }
 
-function resolveOverrideTarget(override: DiscordInteractionOverride, directory: DiscordDirectory) {
-  if (override.scope === 'channel') {
-    const channel = directory.channels.find(entry => entry.id === override.targetId)
-    const name = channel?.name
-    return {
-      name,
-      label: name === undefined ? override.targetId : `#${name}`,
-      guildLabel: channel?.server ?? null,
-    }
-  }
+interface OverrideTargetKey {
+  readonly scope: DiscordInteractionScope
+  readonly guildId: string | null
+  readonly targetId: string
+}
+
+function resolveUserOverrideTarget(override: OverrideTargetKey, directory: DiscordDirectory) {
   const name = directory.people.find(person => person.id === override.targetId)?.name
   const guildLabel =
     override.guildId === null
@@ -835,14 +975,36 @@ function resolveOverrideTarget(override: DiscordInteractionOverride, directory: 
   return { name, label: name ?? override.targetId, guildLabel }
 }
 
-function describeOverride(override: DiscordInteractionOverride, directory: DiscordDirectory) {
+function resolveOverrideTarget(override: OverrideTargetKey, directory: DiscordDirectory) {
+  if (override.scope === 'channel') {
+    const channel = directory.channels.find(entry => entry.id === override.targetId)
+    const name = channel?.name
+    return {
+      name,
+      label: name === undefined ? override.targetId : `#${name}`,
+      guildLabel: channel?.server ?? null,
+    }
+  }
+  if (override.scope === 'server') {
+    const name = directory.guilds.find(guild => guild.id === override.targetId)?.name
+    return { name, label: name ?? `server ${override.targetId}`, guildLabel: 'Server' }
+  }
+  return resolveUserOverrideTarget(override, directory)
+}
+
+function describeOverride(override: OverrideTargetKey, directory: DiscordDirectory) {
   const { name, label, guildLabel } = resolveOverrideTarget(override, directory)
   const detail = [label, guildLabel].filter(Boolean).join(' · ')
   return {
     name,
     label,
     guildLabel,
-    accessibleTarget: guildLabel === null ? label : `${label} in ${guildLabel}`,
+    accessibleTarget:
+      override.scope === 'server'
+        ? `server ${name ?? override.targetId}`
+        : guildLabel === null
+          ? label
+          : `${label} in ${guildLabel}`,
     confirmDetail: name === undefined ? detail : `${detail} (${override.targetId})`,
   }
 }
@@ -863,6 +1025,8 @@ function OverrideRow(props: OverrideRowProps) {
       >
         {scope === 'channel' ? (
           <Hash className="size-3.5" />
+        ) : scope === 'server' ? (
+          <Server className="size-3.5" />
         ) : name === undefined ? (
           <User className="size-3.5" />
         ) : (
@@ -885,18 +1049,17 @@ function OverrideRow(props: OverrideRowProps) {
           value={[mode]}
           onValueChange={values => {
             const next = values[0]
-            if ((next === 'mention-only' || next === 'always') && next !== mode) {
+            if (isInteractionMode(next) && next !== mode) {
               send(DiscordEvents.SetInteractionMode({ scope, guildId, targetId, mode: next }))
             }
           }}
           className="h-10 rounded-full bg-muted p-[3px] md:h-8"
         >
-          <ToggleGroupItem value="mention-only" className={modeToggleItemClassName}>
-            Mention only
-          </ToggleGroupItem>
-          <ToggleGroupItem value="always" className={modeToggleItemClassName}>
-            Always
-          </ToggleGroupItem>
+          {interactionModes.map(item => (
+            <ToggleGroupItem key={item.mode} value={item.mode} className={modeToggleItemClassName}>
+              {item.label}
+            </ToggleGroupItem>
+          ))}
         </ToggleGroup>
         <ConfirmDialog
           tooltip="Remove override"
@@ -927,7 +1090,44 @@ interface ModeAddDialogProps {
   readonly error: string | null
 }
 
-/** Dialog to add a channel or server-scoped person interaction mode override. */
+const modeTargetField = {
+  channel: { label: 'Channel', placeholder: 'Choose a channel' },
+  user: { label: 'Person', placeholder: 'Choose a person' },
+  server: { label: 'Server', placeholder: 'Choose a server' },
+} satisfies Record<DiscordInteractionScope, { label: string; placeholder: string }>
+
+const modeTargetOptions = (
+  scope: DiscordInteractionScope,
+  selectedGuild: string | null,
+  directory: DiscordDirectory,
+  overridden: (targetId: string) => boolean,
+) => {
+  if (scope === 'channel') {
+    return directory.channels
+      .filter(channel => !overridden(channel.id))
+      .toSorted((a, b) => a.server.localeCompare(b.server) || a.name.localeCompare(b.name))
+      .map(channel => ({
+        value: channel.id,
+        label: `#${channel.name}`,
+        hint: null,
+        group: channel.server,
+      }))
+  }
+  if (scope === 'server') {
+    return directory.guilds
+      .filter(guild => !overridden(guild.id))
+      .map(guild => ({ value: guild.id, label: guild.name, hint: guild.id }))
+  }
+  return directory.people
+    .filter(
+      person =>
+        !overridden(person.id) &&
+        (selectedGuild === null || selectedGuild === '' || person.guilds.includes(selectedGuild)),
+    )
+    .map(person => ({ value: person.id, label: person.name, hint: person.id }))
+}
+
+/** Dialog to add a channel, person, or whole-server interaction mode override. */
 function ModeAddDialog(props: ModeAddDialogProps) {
   const machine = DiscordOwner.useMachine()
   const send = useAtomSet(machine.send)
@@ -950,7 +1150,7 @@ function ModeAddDialog(props: ModeAddDialogProps) {
               value.discord.interactionModes.some(
                 entry =>
                   entry.scope === scope &&
-                  (scope === 'channel' || entry.guildId === selectedGuild) &&
+                  entry.guildId === selectedGuild &&
                   entry.targetId === targetId,
               )
             const guildOptions = value.directory.guilds.map(guild => ({
@@ -958,25 +1158,8 @@ function ModeAddDialog(props: ModeAddDialogProps) {
               label: guild.name,
               hint: guild.id,
             }))
-            const options =
-              scope === 'channel'
-                ? value.directory.channels
-                    .filter(channel => !overridden(channel.id))
-                    .map(channel => ({
-                      value: channel.id,
-                      label: `#${channel.name}`,
-                      hint: channel.server,
-                    }))
-                : value.directory.people
-                    .filter(
-                      person =>
-                        !overridden(person.id) &&
-                        (selectedGuild === null ||
-                          selectedGuild === '' ||
-                          person.guilds.includes(selectedGuild)),
-                    )
-                    .map(person => ({ value: person.id, label: person.name, hint: person.id }))
-            const guildValid = scope === 'channel' || SNOWFLAKE.test(value.modeGuild)
+            const options = modeTargetOptions(scope, selectedGuild, value.directory, overridden)
+            const guildValid = scope !== 'user' || SNOWFLAKE.test(value.modeGuild)
             const targetValid =
               guildValid && SNOWFLAKE.test(value.modeTarget) && !overridden(value.modeTarget)
             return (
@@ -989,18 +1172,21 @@ function ModeAddDialog(props: ModeAddDialogProps) {
                     value={[scope]}
                     onValueChange={values => {
                       const next = values[0]
-                      if ((next === 'channel' || next === 'user') && next !== scope) {
+                      if (isInteractionScope(next) && next !== scope) {
                         send(DiscordEvents.SelectModeScope({ scope: next }))
                       }
                     }}
                     className="h-10 rounded-full bg-muted p-[3px] md:h-8"
                   >
-                    <ToggleGroupItem value="channel" className={modeToggleItemClassName}>
-                      Channel
-                    </ToggleGroupItem>
-                    <ToggleGroupItem value="user" className={modeToggleItemClassName}>
-                      Person
-                    </ToggleGroupItem>
+                    {modeScopes.map(item => (
+                      <ToggleGroupItem
+                        key={item.scope}
+                        value={item.scope}
+                        className={modeToggleItemClassName}
+                      >
+                        {item.label}
+                      </ToggleGroupItem>
+                    ))}
                   </ToggleGroup>
                 </FieldRow>
                 {scope === 'user' ? (
@@ -1028,13 +1214,10 @@ function ModeAddDialog(props: ModeAddDialogProps) {
                     />
                   </FieldRow>
                 ) : null}
-                <FieldRow
-                  id="discord-mode-target"
-                  label={scope === 'channel' ? 'Channel' : 'Person'}
-                >
+                <FieldRow id="discord-mode-target" label={modeTargetField[scope].label}>
                   <Picker
                     id="discord-mode-target"
-                    placeholder={scope === 'channel' ? 'Choose a channel' : 'Choose a person'}
+                    placeholder={modeTargetField[scope].placeholder}
                     value={value.modeTarget}
                     disabled={!props.isIdle}
                     clearOnEdit
@@ -1056,7 +1239,13 @@ function ModeAddDialog(props: ModeAddDialogProps) {
                     onChange={targetId => send(DiscordEvents.SelectModeTarget({ targetId }))}
                   />
                 </FieldRow>
-                <FieldRow labelId="discord-mode-setting-label" label="Mode">
+                <FieldRow
+                  labelId="discord-mode-setting-label"
+                  label="Mode"
+                  labelExtra={
+                    <ModeHelp label="About interaction modes" items={interactionModeHelp} />
+                  }
+                >
                   <ToggleGroup
                     aria-labelledby="discord-mode-setting-label"
                     spacing={1}
@@ -1064,21 +1253,21 @@ function ModeAddDialog(props: ModeAddDialogProps) {
                     value={[value.modeSetting]}
                     onValueChange={values => {
                       const next = values[0]
-                      if (
-                        (next === 'mention-only' || next === 'always') &&
-                        next !== value.modeSetting
-                      ) {
+                      if (isInteractionMode(next) && next !== value.modeSetting) {
                         send(DiscordEvents.SelectModeSetting({ mode: next }))
                       }
                     }}
                     className="h-10 rounded-full bg-muted p-[3px] md:h-8"
                   >
-                    <ToggleGroupItem value="mention-only" className={modeToggleItemClassName}>
-                      Mention only
-                    </ToggleGroupItem>
-                    <ToggleGroupItem value="always" className={modeToggleItemClassName}>
-                      Always
-                    </ToggleGroupItem>
+                    {interactionModes.map(item => (
+                      <ToggleGroupItem
+                        key={item.mode}
+                        value={item.mode}
+                        className={modeToggleItemClassName}
+                      >
+                        {item.label}
+                      </ToggleGroupItem>
+                    ))}
                   </ToggleGroup>
                 </FieldRow>
                 {props.error === null ? null : (
@@ -1120,13 +1309,27 @@ function ModeAddDialog(props: ModeAddDialogProps) {
 }
 
 const replyModes: ReadonlyArray<{ readonly mode: DiscordReplyMode; readonly label: string }> = [
-  { mode: 'decision', label: 'Decision' },
+  { mode: 'auto', label: 'Auto' },
   { mode: 'thread', label: 'Thread' },
   { mode: 'direct', label: 'Direct' },
 ]
 
+const replyScopes: ReadonlyArray<{ readonly scope: DiscordReplyScope; readonly label: string }> = [
+  { scope: 'channel', label: 'Channel' },
+  { scope: 'server', label: 'Server' },
+]
+
+const replyTargetField = {
+  channel: { label: 'Channel', placeholder: 'Choose a channel' },
+  server: { label: 'Server', placeholder: 'Choose a server' },
+} satisfies Record<DiscordReplyScope, { label: string; placeholder: string }>
+
 function isReplyMode(value: string | undefined): value is DiscordReplyMode {
-  return value === 'decision' || value === 'thread' || value === 'direct'
+  return value === 'auto' || value === 'thread' || value === 'direct'
+}
+
+function isReplyScope(value: string | undefined): value is DiscordReplyScope {
+  return value === 'channel' || value === 'server'
 }
 
 function ReplyModeSection() {
@@ -1139,6 +1342,7 @@ function ReplyModeSection() {
   return (
     <Section
       title="Reply mode"
+      titleExtra={<ModeHelp label="About reply modes" items={replyModeHelp} />}
       action={
         <Button
           size="sm"
@@ -1157,13 +1361,42 @@ function ReplyModeSection() {
           const error = reply.path === 'ReplyMode.Idle' ? reply.value.error : null
           return (
             <>
+              <FieldRow
+                labelId="discord-default-reply-label"
+                label="Default"
+                labelExtra={<ModeHelp label="About reply modes" items={replyModeHelp} />}
+              >
+                <ToggleGroup
+                  aria-labelledby="discord-default-reply-label"
+                  spacing={1}
+                  disabled={!isIdle}
+                  value={[value.discord.defaultReplyMode]}
+                  onValueChange={values => {
+                    const next = values[0]
+                    if (isReplyMode(next) && next !== value.discord.defaultReplyMode) {
+                      send(DiscordEvents.SetDefaultReplyMode({ mode: next }))
+                    }
+                  }}
+                  className="h-10 rounded-full bg-muted p-[3px] md:h-8"
+                >
+                  {replyModes.map(item => (
+                    <ToggleGroupItem
+                      key={item.mode}
+                      value={item.mode}
+                      className={modeToggleItemClassName}
+                    >
+                      {item.label}
+                    </ToggleGroupItem>
+                  ))}
+                </ToggleGroup>
+              </FieldRow>
               {value.discord.replyModes.length === 0 ? (
-                <EmptyLine>Decides automatically per message.</EmptyLine>
+                <EmptyLine>No overrides.</EmptyLine>
               ) : (
                 <ul className="flex flex-col divide-y">
                   {value.discord.replyModes.map(override => (
                     <ReplyOverrideRow
-                      key={override.channelId}
+                      key={`${override.scope}:${override.targetId}`}
                       override={override}
                       directory={value.directory}
                       disabled={!isIdle}
@@ -1190,24 +1423,16 @@ interface ReplyOverrideRowProps {
 }
 
 function describeReplyOverride(override: DiscordReplyOverride, directory: DiscordDirectory) {
-  const channel = directory.channels.find(entry => entry.id === override.channelId)
-  const name = channel?.name
-  const label = name === undefined ? override.channelId : `#${name}`
-  const guildLabel = channel?.server ?? null
-  const detail = [label, guildLabel].filter(Boolean).join(' · ')
-  return {
-    name,
-    label,
-    guildLabel,
-    accessibleTarget: guildLabel === null ? label : `${label} in ${guildLabel}`,
-    confirmDetail: name === undefined ? detail : `${detail} (${override.channelId})`,
-  }
+  return describeOverride(
+    { scope: override.scope, guildId: null, targetId: override.targetId },
+    directory,
+  )
 }
 
 function ReplyOverrideRow(props: ReplyOverrideRowProps) {
   const machine = DiscordOwner.useMachine()
   const send = useAtomSet(machine.send)
-  const { channelId, mode } = props.override
+  const { scope, targetId, mode } = props.override
   const { label, guildLabel, accessibleTarget, confirmDetail } = describeReplyOverride(
     props.override,
     props.directory,
@@ -1218,7 +1443,7 @@ function ReplyOverrideRow(props: ReplyOverrideRowProps) {
         aria-hidden="true"
         className="grid size-7 shrink-0 place-items-center rounded-full bg-muted text-[11px] font-semibold text-muted-foreground"
       >
-        <Hash className="size-3.5" />
+        {scope === 'server' ? <Server className="size-3.5" /> : <Hash className="size-3.5" />}
       </span>
       <div className="flex min-w-0 flex-1 basis-40 flex-wrap items-baseline gap-x-2 gap-y-0.5">
         <span className="break-words text-sm [overflow-wrap:anywhere]">{label}</span>
@@ -1237,7 +1462,7 @@ function ReplyOverrideRow(props: ReplyOverrideRowProps) {
           onValueChange={values => {
             const next = values[0]
             if (isReplyMode(next) && next !== mode) {
-              send(DiscordEvents.SetReplyMode({ channelId, mode: next }))
+              send(DiscordEvents.SetReplyMode({ scope, targetId, mode: next }))
             }
           }}
           className="h-10 rounded-full bg-muted p-[3px] md:h-8"
@@ -1268,7 +1493,7 @@ function ReplyOverrideRow(props: ReplyOverrideRowProps) {
           title="Remove reply mode override?"
           detail={confirmDetail}
           confirmLabel="Remove"
-          onConfirm={() => send(DiscordEvents.ClearReplyMode({ channelId }))}
+          onConfirm={() => send(DiscordEvents.ClearReplyMode({ scope, targetId }))}
         />
       </div>
     </li>
@@ -1281,7 +1506,7 @@ interface ReplyAddDialogProps {
   readonly error: string | null
 }
 
-/** Dialog to add a channel reply mode override (`decision`, `thread`, or `direct`). */
+/** Dialog to add a channel or whole-server reply mode override (`auto`, `thread`, or `direct`). */
 function ReplyAddDialog(props: ReplyAddDialogProps) {
   const machine = DiscordOwner.useMachine()
   const send = useAtomSet(machine.send)
@@ -1298,43 +1523,86 @@ function ReplyAddDialog(props: ReplyAddDialogProps) {
         </DialogHeader>
         <MachineState machine={machine} path="">
           {({ value }) => {
-            const overridden = (channelId: string) =>
-              value.discord.replyModes.some(entry => entry.channelId === channelId)
-            const isKnownThread = (channelId: string) =>
-              value.directory.channels.some(
-                channel => channel.id === channelId && channel.kind === 'thread',
+            const scope = value.replyScope
+            const overridden = (targetId: string) =>
+              value.discord.replyModes.some(
+                entry => entry.scope === scope && entry.targetId === targetId,
               )
-            const options = value.directory.channels
-              .filter(channel => channel.kind === 'channel' && !overridden(channel.id))
-              .map(channel => ({
-                value: channel.id,
-                label: `#${channel.name}`,
-                hint: channel.server,
-              }))
-            const channelValid =
-              SNOWFLAKE.test(value.replyChannel) &&
-              !overridden(value.replyChannel) &&
-              !isKnownThread(value.replyChannel)
+            const isKnownThread = (targetId: string) =>
+              value.directory.channels.some(
+                channel => channel.id === targetId && channel.kind === 'thread',
+              )
+            const options =
+              scope === 'server'
+                ? value.directory.guilds
+                    .filter(guild => !overridden(guild.id))
+                    .map(guild => ({ value: guild.id, label: guild.name, hint: guild.id }))
+                : value.directory.channels
+                    .filter(channel => channel.kind === 'channel' && !overridden(channel.id))
+                    .toSorted(
+                      (a, b) => a.server.localeCompare(b.server) || a.name.localeCompare(b.name),
+                    )
+                    .map(channel => ({
+                      value: channel.id,
+                      label: `#${channel.name}`,
+                      hint: null,
+                      group: channel.server,
+                    }))
+            const targetValid =
+              SNOWFLAKE.test(value.replyTarget) &&
+              !overridden(value.replyTarget) &&
+              (scope === 'server' || !isKnownThread(value.replyTarget))
             return (
               <div className="space-y-1">
-                <FieldRow id="discord-reply-channel" label="Channel">
+                <FieldRow labelId="discord-reply-scope-label" label="For">
+                  <ToggleGroup
+                    aria-labelledby="discord-reply-scope-label"
+                    spacing={1}
+                    disabled={!props.isIdle}
+                    value={[scope]}
+                    onValueChange={values => {
+                      const next = values[0]
+                      if (isReplyScope(next) && next !== scope) {
+                        send(DiscordEvents.SelectReplyScope({ scope: next }))
+                      }
+                    }}
+                    className="h-10 rounded-full bg-muted p-[3px] md:h-8"
+                  >
+                    {replyScopes.map(item => (
+                      <ToggleGroupItem
+                        key={item.scope}
+                        value={item.scope}
+                        className={modeToggleItemClassName}
+                      >
+                        {item.label}
+                      </ToggleGroupItem>
+                    ))}
+                  </ToggleGroup>
+                </FieldRow>
+                <FieldRow id="discord-reply-target" label={replyTargetField[scope].label}>
                   <Picker
-                    id="discord-reply-channel"
-                    placeholder="Choose a channel"
-                    value={value.replyChannel}
+                    id="discord-reply-target"
+                    placeholder={replyTargetField[scope].placeholder}
+                    value={value.replyTarget}
                     disabled={!props.isIdle}
                     clearOnEdit
                     options={options}
                     customOption={raw => {
                       const id = raw.trim()
-                      if (!SNOWFLAKE.test(id) || overridden(id) || isKnownThread(id)) return null
+                      if (
+                        !SNOWFLAKE.test(id) ||
+                        overridden(id) ||
+                        (scope === 'channel' && isKnownThread(id))
+                      ) {
+                        return null
+                      }
                       return { value: id, label: `Use ID ${id}`, hint: null }
                     }}
                     emptyMessage={raw => {
                       const trimmed = raw.trim()
                       if (trimmed === '') return 'No matches'
                       if (overridden(trimmed)) return 'Already has an override'
-                      if (isKnownThread(trimmed)) {
+                      if (scope === 'channel' && isKnownThread(trimmed)) {
                         return 'Reply mode applies to channels, not threads'
                       }
                       if (/^\d+$/.test(trimmed) && !SNOWFLAKE.test(trimmed)) {
@@ -1342,10 +1610,14 @@ function ReplyAddDialog(props: ReplyAddDialogProps) {
                       }
                       return 'No matches'
                     }}
-                    onChange={channelId => send(DiscordEvents.SelectReplyChannel({ channelId }))}
+                    onChange={targetId => send(DiscordEvents.SelectReplyTarget({ targetId }))}
                   />
                 </FieldRow>
-                <FieldRow labelId="discord-reply-setting-label" label="Mode">
+                <FieldRow
+                  labelId="discord-reply-setting-label"
+                  label="Mode"
+                  labelExtra={<ModeHelp label="About reply modes" items={replyModeHelp} />}
+                >
                   <ToggleGroup
                     aria-labelledby="discord-reply-setting-label"
                     spacing={1}
@@ -1384,11 +1656,12 @@ function ReplyAddDialog(props: ReplyAddDialogProps) {
                   </Button>
                   <Button
                     type="button"
-                    disabled={!props.isIdle || !channelValid}
+                    disabled={!props.isIdle || !targetValid}
                     onClick={() =>
                       send(
                         DiscordEvents.SetReplyMode({
-                          channelId: value.replyChannel,
+                          scope,
+                          targetId: value.replyTarget,
                           mode: value.replySetting,
                         }),
                       )
@@ -1448,7 +1721,6 @@ function HomeForm(props: HomeFormProps) {
   const machine = DiscordOwner.useMachine()
   const send = useAtomSet(machine.send)
   const kind = props.pendingKind ?? props.home.kind
-  const multipleServers = new Set(props.directory.channels.map(channel => channel.server)).size > 1
   return (
     <>
       <FieldRow labelId="discord-home-kind-label" label="Type">
@@ -1484,36 +1756,45 @@ function HomeForm(props: HomeFormProps) {
       </FieldRow>
       {kind === 'channel' ? (
         <FieldRow id="discord-home-channel" label="Destination">
-          <Picker
-            id="discord-home-channel"
-            placeholder="Choose a channel"
-            focusOnMount={props.pendingKind === 'channel'}
-            disabled={props.isSaving}
-            value={props.home.kind === 'channel' ? props.home.id : ''}
-            options={props.directory.channels.map(channel => ({
-              value: channel.id,
-              label: `#${channel.name}`,
-              hint: multipleServers ? channel.server : null,
-            }))}
-            onChange={id => send(DiscordEvents.SetHome({ home: { kind: 'channel', id } }))}
-          />
+          <div className="max-w-80">
+            <Picker
+              id="discord-home-channel"
+              placeholder="Choose a channel"
+              focusOnMount={props.pendingKind === 'channel'}
+              disabled={props.isSaving}
+              value={props.home.kind === 'channel' ? props.home.id : ''}
+              options={props.directory.channels
+                .toSorted(
+                  (a, b) => a.server.localeCompare(b.server) || a.name.localeCompare(b.name),
+                )
+                .map(channel => ({
+                  value: channel.id,
+                  label: `#${channel.name}`,
+                  hint: null,
+                  group: channel.server,
+                }))}
+              onChange={id => send(DiscordEvents.SetHome({ home: { kind: 'channel', id } }))}
+            />
+          </div>
         </FieldRow>
       ) : null}
       {kind === 'dm' ? (
         <FieldRow id="discord-home-person" label="Destination">
-          <Picker
-            id="discord-home-person"
-            placeholder="Choose a person"
-            focusOnMount={props.pendingKind === 'dm'}
-            disabled={props.isSaving}
-            value={props.home.kind === 'dm' ? props.home.user : ''}
-            options={props.directory.people.map(person => ({
-              value: person.id,
-              label: person.name,
-              hint: person.id,
-            }))}
-            onChange={user => send(DiscordEvents.SetHome({ home: { kind: 'dm', user } }))}
-          />
+          <div className="max-w-80">
+            <Picker
+              id="discord-home-person"
+              placeholder="Choose a person"
+              focusOnMount={props.pendingKind === 'dm'}
+              disabled={props.isSaving}
+              value={props.home.kind === 'dm' ? props.home.user : ''}
+              options={props.directory.people.map(person => ({
+                value: person.id,
+                label: person.name,
+                hint: person.id,
+              }))}
+              onChange={user => send(DiscordEvents.SetHome({ home: { kind: 'dm', user } }))}
+            />
+          </div>
         </FieldRow>
       ) : null}
     </>

@@ -71,10 +71,10 @@ export const DiscordConnection = Schema.Union([
 ])
 export type DiscordConnection = typeof DiscordConnection.Type
 
-export const DiscordInteractionScope = Schema.Literals(['channel', 'user'])
+export const DiscordInteractionScope = Schema.Literals(['channel', 'user', 'server'])
 export type DiscordInteractionScope = typeof DiscordInteractionScope.Type
 
-export const DiscordInteractionMode = Schema.Literals(['mention-only', 'always'])
+export const DiscordInteractionMode = Schema.Literals(['mention-only', 'always', 'auto'])
 export type DiscordInteractionMode = typeof DiscordInteractionMode.Type
 
 export const DiscordInteractionOverride = Schema.Struct({
@@ -85,11 +85,15 @@ export const DiscordInteractionOverride = Schema.Struct({
 })
 export type DiscordInteractionOverride = typeof DiscordInteractionOverride.Type
 
-export const DiscordReplyMode = Schema.Literals(['decision', 'thread', 'direct'])
+export const DiscordReplyScope = Schema.Literals(['channel', 'server'])
+export type DiscordReplyScope = typeof DiscordReplyScope.Type
+
+export const DiscordReplyMode = Schema.Literals(['auto', 'thread', 'direct'])
 export type DiscordReplyMode = typeof DiscordReplyMode.Type
 
 export const DiscordReplyOverride = Schema.Struct({
-  channelId: Schema.String,
+  scope: DiscordReplyScope,
+  targetId: Schema.String,
   mode: DiscordReplyMode,
 })
 export type DiscordReplyOverride = typeof DiscordReplyOverride.Type
@@ -119,7 +123,9 @@ export const Discord = Schema.Struct({
   token: Schema.Literals(['set', 'missing']),
   connection: DiscordConnection,
   interactionModes: Schema.Array(DiscordInteractionOverride),
+  defaultInteractionMode: DiscordInteractionMode,
   replyModes: Schema.Array(DiscordReplyOverride),
+  defaultReplyMode: DiscordReplyMode,
 })
 export type Discord = typeof Discord.Type
 
@@ -359,16 +365,30 @@ export const requests = {
     }),
     reply: Discord,
   },
+  'discord.setDefaultInteractionMode': {
+    payload: Schema.Struct({
+      mode: DiscordInteractionMode,
+    }),
+    reply: Discord,
+  },
   'discord.setReplyMode': {
     payload: Schema.Struct({
-      channelId: Schema.String,
+      scope: DiscordReplyScope,
+      targetId: Schema.String,
       mode: DiscordReplyMode,
     }),
     reply: Discord,
   },
   'discord.clearReplyMode': {
     payload: Schema.Struct({
-      channelId: Schema.String,
+      scope: DiscordReplyScope,
+      targetId: Schema.String,
+    }),
+    reply: Discord,
+  },
+  'discord.setDefaultReplyMode': {
+    payload: Schema.Struct({
+      mode: DiscordReplyMode,
     }),
     reply: Discord,
   },

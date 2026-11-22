@@ -63,8 +63,9 @@ CREATE TABLE IF NOT EXISTS skill_files (skill TEXT NOT NULL REFERENCES skills (n
 CREATE TABLE IF NOT EXISTS destinations (id INTEGER PRIMARY KEY, messenger TEXT NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, dm INTEGER NOT NULL CHECK (dm IN (0,1)), UNIQUE (messenger, channel, thread)) STRICT;
 CREATE TABLE IF NOT EXISTS allowed_users (messenger TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (messenger, user_id)) STRICT;
 CREATE TABLE IF NOT EXISTS access_modes (messenger TEXT PRIMARY KEY, mode TEXT NOT NULL CHECK (mode IN ('allow-all', 'whitelist', 'blacklist'))) STRICT;
-CREATE TABLE IF NOT EXISTS interaction_modes (messenger TEXT NOT NULL, scope TEXT NOT NULL CHECK (scope IN ('channel', 'user')), guild_id TEXT NOT NULL DEFAULT '', target_id TEXT NOT NULL, mode TEXT NOT NULL CHECK (mode IN ('mention-only', 'always')), CHECK ((scope = 'channel' AND guild_id = '') OR scope = 'user'), PRIMARY KEY (messenger, scope, guild_id, target_id)) STRICT;
-CREATE TABLE IF NOT EXISTS reply_modes (messenger TEXT NOT NULL, channel_id TEXT NOT NULL, mode TEXT NOT NULL CHECK (mode IN ('decision', 'thread', 'direct')), PRIMARY KEY (messenger, channel_id)) STRICT;
+CREATE TABLE IF NOT EXISTS interaction_modes (messenger TEXT NOT NULL, scope TEXT NOT NULL CHECK (scope IN ('channel', 'user', 'server')), guild_id TEXT NOT NULL DEFAULT '', target_id TEXT NOT NULL, mode TEXT NOT NULL CHECK (mode IN ('mention-only', 'always', 'auto')), CHECK ((scope IN ('channel', 'server') AND guild_id = '') OR scope = 'user'), PRIMARY KEY (messenger, scope, guild_id, target_id)) STRICT;
+CREATE TABLE IF NOT EXISTS reply_modes (messenger TEXT NOT NULL, scope TEXT NOT NULL CHECK (scope IN ('channel', 'server')), target_id TEXT NOT NULL, mode TEXT NOT NULL CHECK (mode IN ('auto', 'thread', 'direct')), PRIMARY KEY (messenger, scope, target_id)) STRICT;
+CREATE TABLE IF NOT EXISTS messenger_defaults (messenger TEXT PRIMARY KEY, interaction_mode TEXT NOT NULL CHECK (interaction_mode IN ('mention-only', 'always', 'auto')), reply_mode TEXT NOT NULL CHECK (reply_mode IN ('auto', 'thread', 'direct'))) STRICT;
 CREATE TABLE IF NOT EXISTS seen_threads (messenger TEXT NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, PRIMARY KEY (messenger, channel, thread)) STRICT;
 
 CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK (id = 1), text TEXT NOT NULL) STRICT;
@@ -275,23 +276,25 @@ impl SqliteStorage {
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(backend)?;
             tx.execute_batch(
-                "CREATE TABLE interaction_modes_v2 (
+                "CREATE TABLE interaction_modes_v3 (
                      messenger TEXT NOT NULL,
-                     scope TEXT NOT NULL CHECK (scope IN ('channel', 'user')),
+                     scope TEXT NOT NULL CHECK (scope IN ('channel', 'user', 'server')),
                      guild_id TEXT NOT NULL DEFAULT '',
                      target_id TEXT NOT NULL,
-                     mode TEXT NOT NULL CHECK (mode IN ('mention-only', 'always')),
-                     CHECK ((scope = 'channel' AND guild_id = '') OR scope = 'user'),
+                     mode TEXT NOT NULL CHECK (mode IN ('mention-only', 'always', 'auto')),
+                     CHECK ((scope IN ('channel', 'server') AND guild_id = '') OR scope = 'user'),
                      PRIMARY KEY (messenger, scope, guild_id, target_id)
                  ) STRICT;
-                 INSERT INTO interaction_modes_v2 (messenger, scope, guild_id, target_id, mode)
+                 INSERT INTO interaction_modes_v3 (messenger, scope, guild_id, target_id, mode)
                  SELECT messenger, scope, '', target_id, mode FROM interaction_modes;
                  DROP TABLE interaction_modes;
-                 ALTER TABLE interaction_modes_v2 RENAME TO interaction_modes;",
+                 ALTER TABLE interaction_modes_v3 RENAME TO interaction_modes;",
             )
             .map_err(backend)?;
             tx.commit().map_err(backend)?;
         }
+        ensure_interaction_modes_v3(&mut connection, &mut require_exclusive)?;
+        ensure_reply_modes_v2(&mut connection, &mut require_exclusive)?;
         ensure_access_entries(&mut connection, &mut require_exclusive)?;
         ensure_settings_auto_respond(&mut connection, &mut require_exclusive)?;
         drop(upgrade_owner);
@@ -427,7 +430,9 @@ fn init_schema_and_pending_threads(
     let mut sent_tos: HashSet<u64> = HashSet::new();
     {
         let mut stmt = tx
-            .prepare("SELECT i, kind, text, meta FROM memory_messages WHERE kind IN ('user', 'tool')")
+            .prepare(
+                "SELECT i, kind, text, meta FROM memory_messages WHERE kind IN ('user', 'tool')",
+            )
             .map_err(backend)?;
         let rows = stmt
             .query_map([], |row| {
@@ -501,6 +506,139 @@ fn init_schema_and_pending_threads(
         tx.execute(
             "INSERT OR IGNORE INTO pending_threads (destination_id) VALUES (?1)",
             [dest_id as i64],
+        )
+        .map_err(backend)?;
+    }
+    tx.commit().map_err(backend)?;
+    Ok(())
+}
+
+/// Rebuilds `interaction_modes` when the stored schema predates the `server`
+/// scope and `auto` mode, copying every existing row inside one atomic
+/// immediate transaction. Requires the exclusive owner lock so an older
+/// running server cannot write rows that miss migration.
+fn ensure_interaction_modes_v3(
+    connection: &mut Connection,
+    require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'interaction_modes'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(backend)?;
+    if sql.contains("'server'") && sql.contains("'auto'") {
+        return Ok(());
+    }
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    let sql: String = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'interaction_modes'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(backend)?;
+    if sql.contains("'server'") && sql.contains("'auto'") {
+        tx.commit().map_err(backend)?;
+        return Ok(());
+    }
+    require_exclusive(
+        "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
+    )?;
+    tx.execute_batch(
+        "CREATE TABLE interaction_modes_v3 (
+             messenger TEXT NOT NULL,
+             scope TEXT NOT NULL CHECK (scope IN ('channel', 'user', 'server')),
+             guild_id TEXT NOT NULL DEFAULT '',
+             target_id TEXT NOT NULL,
+             mode TEXT NOT NULL CHECK (mode IN ('mention-only', 'always', 'auto')),
+             CHECK ((scope IN ('channel', 'server') AND guild_id = '') OR scope = 'user'),
+             PRIMARY KEY (messenger, scope, guild_id, target_id)
+         ) STRICT;
+         INSERT INTO interaction_modes_v3 (messenger, scope, guild_id, target_id, mode)
+         SELECT messenger, scope, guild_id, target_id, mode FROM interaction_modes;
+         DROP TABLE interaction_modes;
+         ALTER TABLE interaction_modes_v3 RENAME TO interaction_modes;",
+    )
+    .map_err(backend)?;
+    tx.commit().map_err(backend)?;
+    Ok(())
+}
+
+/// Rebuilds `reply_modes` and `messenger_defaults` when the stored schema
+/// predates the `server` reply scope and the `auto` reply mode (legacy
+/// `reply_modes` keyed by `channel_id`, `decision` mode values). Copies every
+/// existing row, mapping channel rows to `scope = 'channel'` and rewriting
+/// `decision` to `auto`, inside one atomic immediate transaction. Requires the
+/// exclusive owner lock so an older running server cannot write rows that miss
+/// migration.
+fn ensure_reply_modes_v2(
+    connection: &mut Connection,
+    require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let table_sql = |conn: &Connection, name: &str| -> Result<String, StoreError> {
+        conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .map_err(backend)
+    };
+    let legacy = |conn: &Connection| -> Result<(bool, bool), StoreError> {
+        Ok((
+            table_sql(conn, "reply_modes")?.contains("channel_id"),
+            table_sql(conn, "messenger_defaults")?.contains("'decision'"),
+        ))
+    };
+    let (migrate_reply, migrate_defaults) = legacy(connection)?;
+    if !migrate_reply && !migrate_defaults {
+        return Ok(());
+    }
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    let (migrate_reply, migrate_defaults) = legacy(&tx)?;
+    if !migrate_reply && !migrate_defaults {
+        tx.commit().map_err(backend)?;
+        return Ok(());
+    }
+    require_exclusive(
+        "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
+    )?;
+    if migrate_reply {
+        tx.execute_batch(
+            "CREATE TABLE reply_modes_v2 (
+                 messenger TEXT NOT NULL,
+                 scope TEXT NOT NULL CHECK (scope IN ('channel', 'server')),
+                 target_id TEXT NOT NULL,
+                 mode TEXT NOT NULL CHECK (mode IN ('auto', 'thread', 'direct')),
+                 PRIMARY KEY (messenger, scope, target_id)
+             ) STRICT;
+             INSERT INTO reply_modes_v2 (messenger, scope, target_id, mode)
+             SELECT messenger, 'channel', channel_id,
+                 CASE WHEN mode = 'decision' THEN 'auto' ELSE mode END
+             FROM reply_modes;
+             DROP TABLE reply_modes;
+             ALTER TABLE reply_modes_v2 RENAME TO reply_modes;",
+        )
+        .map_err(backend)?;
+    }
+    if migrate_defaults {
+        tx.execute_batch(
+            "CREATE TABLE messenger_defaults_v2 (
+                 messenger TEXT PRIMARY KEY,
+                 interaction_mode TEXT NOT NULL CHECK (interaction_mode IN ('mention-only', 'always', 'auto')),
+                 reply_mode TEXT NOT NULL CHECK (reply_mode IN ('auto', 'thread', 'direct'))
+             ) STRICT;
+             INSERT INTO messenger_defaults_v2 (messenger, interaction_mode, reply_mode)
+             SELECT messenger, interaction_mode,
+                 CASE WHEN reply_mode = 'decision' THEN 'auto' ELSE reply_mode END
+             FROM messenger_defaults;
+             DROP TABLE messenger_defaults;
+             ALTER TABLE messenger_defaults_v2 RENAME TO messenger_defaults;",
         )
         .map_err(backend)?;
     }
@@ -687,10 +825,8 @@ mod provider_key_tests {
     use storage::{ConfigStore, Provider, ProviderApi, ProviderId};
 
     fn temp_db(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "blob-1-provider-key-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("blob-1-provider-key-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("agent.db")
@@ -714,9 +850,11 @@ mod provider_key_tests {
             .unwrap();
         let raw: Option<String> = store
             .lock()
-            .query_row("SELECT api_key FROM providers WHERE id = 'openai'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT api_key FROM providers WHERE id = 'openai'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let raw = raw.expect("api_key stored");
         assert!(raw.starts_with("enc:v1:"));

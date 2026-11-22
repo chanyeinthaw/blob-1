@@ -210,10 +210,7 @@ impl Discord {
     /// Installs the per-message pre-filter the gateway runs before any REST
     /// call, so busy servers can't rate-limit the bot on skipped messages.
     pub fn set_pre_filter(&self, filter: PreFilter) {
-        *self
-            .pre_filter
-            .write()
-            .expect("pre_filter lock poisoned") = Some(filter);
+        *self.pre_filter.write().expect("pre_filter lock poisoned") = Some(filter);
     }
 
     pub(crate) fn pre_filter(&self) -> Option<PreFilter> {
@@ -319,15 +316,15 @@ impl Discord {
             Err(_) => return Ok(None),
         };
         let guild_id = channel.guild_id.map(|g| g.to_string()).unwrap_or_default();
-        let server = (!guild_id.is_empty())
-            .then(|| {
-                guilds
-                    .iter()
-                    .find(|(id, _)| id == &guild_id)
-                    .map(|(_, n)| n.clone())
-                    .unwrap_or_else(|| guild_id.clone())
-            })
-            .unwrap_or_default();
+        let server = if guild_id.is_empty() {
+            String::new()
+        } else {
+            guilds
+                .iter()
+                .find(|(id, _)| id == &guild_id)
+                .map(|(_, n)| n.clone())
+                .unwrap_or_else(|| guild_id.clone())
+        };
         let name = channel.name.unwrap_or_else(|| channel_id.to_owned());
         Ok(Some((
             channel.id.to_string(),
@@ -760,6 +757,19 @@ impl Lookup for Discord {
         }
     }
 
+    async fn channel_guild(&self, channel_id: &str) -> Result<Option<String>, MessengerError> {
+        let channel = self
+            .current()?
+            .http
+            .channel(id::<ChannelMarker>(channel_id)?)
+            .await
+            .map_err(backend)?
+            .model()
+            .await
+            .map_err(backend)?;
+        Ok(channel.guild_id.map(|g| g.to_string()))
+    }
+
     async fn message(&self, place: &Place, message: &str) -> Result<Fetched, MessengerError> {
         let message = self
             .current()?
@@ -1093,11 +1103,18 @@ mod recent_history_tests {
             dm: false,
         };
         let p_token = inner.begin_warming(&partial_place);
-        let partial: Vec<Fetched> = (10u64..15).map(|n| mk_fetched(&n.to_string(), "p")).collect();
+        let partial: Vec<Fetched> = (10u64..15)
+            .map(|n| mk_fetched(&n.to_string(), "p"))
+            .collect();
         inner.seed_history(&partial_place, &partial, false, p_token);
-        assert!(inner.recent_history(&partial_place, Some("20"), 10).is_none());
+        assert!(inner
+            .recent_history(&partial_place, Some("20"), 10)
+            .is_none());
         assert_eq!(
-            inner.recent_history(&partial_place, Some("20"), 5).unwrap().len(),
+            inner
+                .recent_history(&partial_place, Some("20"), 5)
+                .unwrap()
+                .len(),
             5
         );
 

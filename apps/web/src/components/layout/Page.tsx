@@ -53,6 +53,8 @@ export function Page(props: PageProps) {
 
 interface SectionProps {
   readonly title: string
+  /** Rendered right after the title, e.g. a help tooltip. */
+  readonly titleExtra?: ReactNode
   readonly action?: ReactNode
   readonly className?: string
   readonly children: ReactNode
@@ -62,7 +64,10 @@ export function Section(props: SectionProps) {
   return (
     <section className={cn('mt-8 first:mt-0', props.className)}>
       <div className="mb-2.5 flex items-center justify-between gap-2">
-        <h2 className="text-sm font-semibold text-foreground">{props.title}</h2>
+        <h2 className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
+          {props.title}
+          {props.titleExtra}
+        </h2>
         {props.action}
       </div>
       {props.children}
@@ -75,6 +80,9 @@ type FieldRowProps = (
   | { readonly id?: undefined; readonly labelId: string }
 ) & {
   readonly label: string
+  /** Rendered right after the label, e.g. a help tooltip. Kept out of the
+   *  labelled element so `aria-labelledby` stays clean. */
+  readonly labelExtra?: ReactNode
   readonly children: ReactNode
 }
 
@@ -82,15 +90,18 @@ type FieldRowProps = (
 export function FieldRow(props: FieldRowProps) {
   return (
     <div className="grid gap-1.5 py-2 md:grid-cols-[104px_minmax(0,1fr)] md:items-start md:gap-4 md:py-1.5">
-      {props.id !== undefined ? (
-        <label htmlFor={props.id} className="text-sm font-medium text-muted-foreground md:pt-1.5">
-          {props.label}
-        </label>
-      ) : (
-        <span id={props.labelId} className="text-sm font-medium text-muted-foreground md:pt-1.5">
-          {props.label}
-        </span>
-      )}
+      <div className="flex min-w-0 items-center gap-1.5 md:pt-1.5">
+        {props.id !== undefined ? (
+          <label htmlFor={props.id} className="text-sm font-medium text-muted-foreground">
+            {props.label}
+          </label>
+        ) : (
+          <span id={props.labelId} className="text-sm font-medium text-muted-foreground">
+            {props.label}
+          </span>
+        )}
+        {props.labelExtra}
+      </div>
       <div className="min-w-0">{props.children}</div>
     </div>
   )

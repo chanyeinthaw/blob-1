@@ -478,7 +478,8 @@ fn occurrences_reply(
         // so the merged sort is exact even when multiple schedules fire at the
         // same timestamp.
         let mut count = 0usize;
-        for at in harness::schedule::occurrences(&s, effective_start, end, OCCURRENCE_PAGE_LIMIT + 2)
+        for at in
+            harness::schedule::occurrences(&s, effective_start, end, OCCURRENCE_PAGE_LIMIT + 2)
         {
             if let Some((c_at, c_id)) = cursor {
                 if at < c_at || (at == c_at && id.as_str() <= c_id) {
@@ -587,6 +588,7 @@ fn discord_reply(ctx: &Context) -> crate::Result<Value> {
             json!({"state":"error","message":message})
         }
     };
+    let defaults = store.messenger_defaults("discord")?;
     Ok(json!({
         "allowed": store.allowed_users("discord")?,
         "accessMode": store.access_mode("discord")?.as_str(),
@@ -595,7 +597,9 @@ fn discord_reply(ctx: &Context) -> crate::Result<Value> {
         "token": if store.messenger_token("discord")?.is_some() { "set" } else { "missing" },
         "connection": connection,
         "interactionModes": store.interaction_modes("discord")?.into_iter().map(|o| json!({"scope":o.scope.as_str(),"guildId":o.guild_id,"targetId":o.target_id,"mode":o.mode.as_str()})).collect::<Vec<_>>(),
-        "replyModes": store.reply_modes("discord")?.into_iter().map(|o| json!({"channelId":o.channel_id,"mode":o.mode.as_str()})).collect::<Vec<_>>(),
+        "defaultInteractionMode": defaults.interaction_mode.as_str(),
+        "replyModes": store.reply_modes("discord")?.into_iter().map(|o| json!({"scope":o.scope.as_str(),"targetId":o.target_id,"mode":o.mode.as_str()})).collect::<Vec<_>>(),
+        "defaultReplyMode": defaults.reply_mode.as_str(),
     }))
 }
 fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -902,6 +906,7 @@ async fn dispatch(
                 let scope = match get("scope")? {
                     "channel" => storage::InteractionScope::Channel,
                     "user" => storage::InteractionScope::User,
+                    "server" => storage::InteractionScope::Server,
                     _ => return Err(invalid().into()),
                 };
                 let target = get("targetId")?;
@@ -915,18 +920,26 @@ async fn dispatch(
                         return Err("Ids must be 17–20 digits".into());
                     }
                     match (scope, guild_id) {
-                        (storage::InteractionScope::Channel, None) => {}
-                        (storage::InteractionScope::User, Some(g)) if crate::valid_discord_id(g) => {}
+                        (
+                            storage::InteractionScope::Channel | storage::InteractionScope::Server,
+                            None,
+                        ) => {}
+                        (storage::InteractionScope::User, Some(g))
+                            if crate::valid_discord_id(g) => {}
                         (storage::InteractionScope::User, _) => {
                             return Err("Server IDs must be 17–20 digits".into());
                         }
-                        (storage::InteractionScope::Channel, Some(_)) => {
+                        (
+                            storage::InteractionScope::Channel | storage::InteractionScope::Server,
+                            Some(_),
+                        ) => {
                             return Err(invalid().into());
                         }
                     }
                     let mode = match get("mode")? {
                         "always" => storage::InteractionMode::Always,
                         "mention-only" => storage::InteractionMode::MentionOnly,
+                        "auto" => storage::InteractionMode::Auto,
                         _ => return Err(invalid().into()),
                     };
                     store.set_interaction_mode("discord", scope, guild_id, target, mode)?;
@@ -934,7 +947,7 @@ async fn dispatch(
                     if target.is_empty() {
                         return Err(invalid().into());
                     }
-                    if scope == storage::InteractionScope::Channel && guild_id.is_some() {
+                    if scope != storage::InteractionScope::User && guild_id.is_some() {
                         return Err(invalid().into());
                     }
                     let guild_ref = guild_id.filter(|g| !g.is_empty());
@@ -942,25 +955,50 @@ async fn dispatch(
                 }
                 discord_reply(ctx)
             }
+            "discord.setDefaultInteractionMode" => {
+                let mode = match get("mode")? {
+                    "mention-only" => storage::InteractionMode::MentionOnly,
+                    "always" => storage::InteractionMode::Always,
+                    "auto" => storage::InteractionMode::Auto,
+                    _ => return Err(invalid().into()),
+                };
+                store.set_default_interaction_mode("discord", mode)?;
+                discord_reply(ctx)
+            }
             "discord.setReplyMode" | "discord.clearReplyMode" => {
-                let channel_id = get("channelId")?;
+                let scope = match get("scope")? {
+                    "channel" => storage::ReplyScope::Channel,
+                    "server" => storage::ReplyScope::Server,
+                    _ => return Err(invalid().into()),
+                };
+                let target = get("targetId")?;
                 if request_type == "discord.setReplyMode" {
-                    if !crate::valid_discord_id(channel_id) {
-                        return Err("Channel IDs must be 17–20 digits".into());
+                    if !crate::valid_discord_id(target) {
+                        return Err("Ids must be 17–20 digits".into());
                     }
                     let mode = match get("mode")? {
-                        "decision" => storage::ReplyMode::Decision,
+                        "auto" => storage::ReplyMode::Auto,
                         "thread" => storage::ReplyMode::Thread,
                         "direct" => storage::ReplyMode::Direct,
                         _ => return Err(invalid().into()),
                     };
-                    store.set_reply_mode("discord", channel_id, mode)?;
+                    store.set_reply_mode("discord", scope, target, mode)?;
                 } else {
-                    if channel_id.is_empty() {
-                        return Err(invalid().into());
+                    if !crate::valid_discord_id(target) {
+                        return Err("Ids must be 17–20 digits".into());
                     }
-                    store.clear_reply_mode("discord", channel_id)?;
+                    store.clear_reply_mode("discord", scope, target)?;
                 }
+                discord_reply(ctx)
+            }
+            "discord.setDefaultReplyMode" => {
+                let mode = match get("mode")? {
+                    "auto" => storage::ReplyMode::Auto,
+                    "thread" => storage::ReplyMode::Thread,
+                    "direct" => storage::ReplyMode::Direct,
+                    _ => return Err(invalid().into()),
+                };
+                store.set_default_reply_mode("discord", mode)?;
                 discord_reply(ctx)
             }
             "discord.setAccessMode" => {
@@ -998,7 +1036,8 @@ async fn dispatch(
                     match (scope, scope_id) {
                         (storage::AccessScope::Global, None) => {}
                         (storage::AccessScope::Guild, Some(id)) if crate::valid_discord_id(id) => {}
-                        (storage::AccessScope::Channel, Some(id)) if crate::valid_discord_id(id) => {}
+                        (storage::AccessScope::Channel, Some(id))
+                            if crate::valid_discord_id(id) => {}
                         (storage::AccessScope::Global, Some(_)) => return Err(invalid().into()),
                         (storage::AccessScope::Guild, _) => {
                             return Err("Server IDs must be 17–20 digits".into());
@@ -1043,7 +1082,12 @@ async fn dispatch(
                     );
                 }
                 if let Ok(overrides) = store.reply_modes("discord") {
-                    extra_ids.extend(overrides.into_iter().map(|o| o.channel_id));
+                    extra_ids.extend(
+                        overrides
+                            .into_iter()
+                            .filter(|o| o.scope == storage::ReplyScope::Channel)
+                            .map(|o| o.target_id),
+                    );
                 }
                 if let Ok(entries) = store.access_entries("discord") {
                     extra_ids.extend(
@@ -1055,8 +1099,7 @@ async fn dispatch(
                 }
                 for cid in extra_ids {
                     if !channels.iter().any(|(id, _, _, _, _)| id == &cid) {
-                        if let Ok(Some(resolved)) =
-                            ctx.discord.resolve_channel(&cid, &guilds).await
+                        if let Ok(Some(resolved)) = ctx.discord.resolve_channel(&cid, &guilds).await
                         {
                             channels.push(resolved);
                         }

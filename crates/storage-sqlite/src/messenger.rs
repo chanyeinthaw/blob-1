@@ -1,7 +1,8 @@
 use rusqlite::{params, OptionalExtension};
 use storage::{
     AccessEntry, AccessList, AccessMode, AccessScope, InteractionMode, InteractionOverride,
-    InteractionScope, MessengerStore, Place, ReplyMode, ReplyOverride, StoreError,
+    InteractionScope, MessengerDefaults, MessengerStore, Place, ReplyMode, ReplyOverride,
+    ReplyScope, StoreError,
 };
 
 use crate::{backend, SqliteStorage};
@@ -235,8 +236,7 @@ impl MessengerStore for SqliteStorage {
                 StoreError::Backend(format!("invalid {kind} in interaction_modes: {value}").into())
             };
             Ok(InteractionOverride {
-                scope: InteractionScope::parse(&scope)
-                    .ok_or_else(|| invalid("scope", &scope))?,
+                scope: InteractionScope::parse(&scope).ok_or_else(|| invalid("scope", &scope))?,
                 guild_id: (!guild_id.is_empty()).then_some(guild_id),
                 target_id,
                 mode: InteractionMode::parse(&mode).ok_or_else(|| invalid("mode", &mode))?,
@@ -284,20 +284,28 @@ impl MessengerStore for SqliteStorage {
         let connection = self.lock();
         let mut statement = connection
             .prepare(
-                "SELECT channel_id, mode FROM reply_modes WHERE messenger = ?1 ORDER BY channel_id",
+                "SELECT scope, target_id, mode FROM reply_modes WHERE messenger = ?1 ORDER BY scope, target_id",
             )
             .map_err(backend)?;
         let rows = statement
             .query_map([messenger], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .map_err(backend)?;
         rows.map(|row| {
-            let (channel_id, mode) = row.map_err(backend)?;
-            let mode = ReplyMode::parse(&mode).ok_or_else(|| {
-                StoreError::Backend(format!("invalid mode in reply_modes: {mode}").into())
-            })?;
-            Ok(ReplyOverride { channel_id, mode })
+            let (scope, target_id, mode) = row.map_err(backend)?;
+            let invalid = |kind: &str, value: &str| {
+                StoreError::Backend(format!("invalid {kind} in reply_modes: {value}").into())
+            };
+            Ok(ReplyOverride {
+                scope: ReplyScope::parse(&scope).ok_or_else(|| invalid("scope", &scope))?,
+                target_id,
+                mode: ReplyMode::parse(&mode).ok_or_else(|| invalid("mode", &mode))?,
+            })
         })
         .collect()
     }
@@ -305,26 +313,84 @@ impl MessengerStore for SqliteStorage {
     fn set_reply_mode(
         &self,
         messenger: &str,
-        channel_id: &str,
+        scope: ReplyScope,
+        target_id: &str,
         mode: ReplyMode,
     ) -> Result<(), StoreError> {
         self.lock()
             .execute(
-                "INSERT INTO reply_modes (messenger, channel_id, mode) VALUES (?1, ?2, ?3) ON CONFLICT (messenger, channel_id) DO UPDATE SET mode = excluded.mode",
-                params![messenger, channel_id, mode.as_str()],
+                "INSERT INTO reply_modes (messenger, scope, target_id, mode) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (messenger, scope, target_id) DO UPDATE SET mode = excluded.mode",
+                params![messenger, scope.as_str(), target_id, mode.as_str()],
             )
             .map_err(backend)?;
         Ok(())
     }
 
-    fn clear_reply_mode(&self, messenger: &str, channel_id: &str) -> Result<bool, StoreError> {
+    fn clear_reply_mode(
+        &self,
+        messenger: &str,
+        scope: ReplyScope,
+        target_id: &str,
+    ) -> Result<bool, StoreError> {
         self.lock()
             .execute(
-                "DELETE FROM reply_modes WHERE messenger = ?1 AND channel_id = ?2",
-                params![messenger, channel_id],
+                "DELETE FROM reply_modes WHERE messenger = ?1 AND scope = ?2 AND target_id = ?3",
+                params![messenger, scope.as_str(), target_id],
             )
             .map(|n| n > 0)
             .map_err(backend)
+    }
+
+    fn messenger_defaults(&self, messenger: &str) -> Result<MessengerDefaults, StoreError> {
+        let row = self
+            .lock()
+            .query_row(
+                "SELECT interaction_mode, reply_mode FROM messenger_defaults WHERE messenger = ?1",
+                [messenger],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(backend)?;
+        match row {
+            None => Ok(MessengerDefaults::default()),
+            Some((interaction_mode, reply_mode)) => {
+                let invalid = |kind: &str, value: &str| {
+                    StoreError::Backend(
+                        format!("invalid {kind} in messenger_defaults: {value}").into(),
+                    )
+                };
+                Ok(MessengerDefaults {
+                    interaction_mode: InteractionMode::parse(&interaction_mode)
+                        .ok_or_else(|| invalid("interaction_mode", &interaction_mode))?,
+                    reply_mode: ReplyMode::parse(&reply_mode)
+                        .ok_or_else(|| invalid("reply_mode", &reply_mode))?,
+                })
+            }
+        }
+    }
+
+    fn set_default_interaction_mode(
+        &self,
+        messenger: &str,
+        mode: InteractionMode,
+    ) -> Result<(), StoreError> {
+        self.lock()
+            .execute(
+                "INSERT INTO messenger_defaults (messenger, interaction_mode, reply_mode) VALUES (?1, ?2, 'auto') ON CONFLICT (messenger) DO UPDATE SET interaction_mode = excluded.interaction_mode",
+                params![messenger, mode.as_str()],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn set_default_reply_mode(&self, messenger: &str, mode: ReplyMode) -> Result<(), StoreError> {
+        self.lock()
+            .execute(
+                "INSERT INTO messenger_defaults (messenger, interaction_mode, reply_mode) VALUES (?1, 'auto', ?2) ON CONFLICT (messenger) DO UPDATE SET reply_mode = excluded.reply_mode",
+                params![messenger, mode.as_str()],
+            )
+            .map_err(backend)?;
+        Ok(())
     }
 
     fn mark_pending_thread(&self, destination: u64) -> Result<(), StoreError> {
@@ -404,10 +470,7 @@ impl MessengerStore for SqliteStorage {
     }
 }
 
-fn normalize_access_scope<'a>(
-    scope: AccessScope,
-    scope_id: Option<&'a str>,
-) -> Result<&'a str, StoreError> {
+fn normalize_access_scope(scope: AccessScope, scope_id: Option<&str>) -> Result<&str, StoreError> {
     match (scope, scope_id) {
         (AccessScope::Global, None | Some("")) => Ok(""),
         (AccessScope::Global, Some(_)) => Err(StoreError::Backend(
@@ -423,15 +486,12 @@ fn normalize_access_scope<'a>(
     }
 }
 
-fn normalize_guild<'a>(
-    scope: InteractionScope,
-    guild_id: Option<&'a str>,
-) -> Result<&'a str, StoreError> {
+fn normalize_guild(scope: InteractionScope, guild_id: Option<&str>) -> Result<&str, StoreError> {
     match (scope, guild_id) {
-        (InteractionScope::Channel, None | Some("")) => Ok(""),
-        (InteractionScope::Channel, Some(_)) => Err(StoreError::Backend(
-            "channel interaction overrides cannot specify a guild id".into(),
-        )),
+        (InteractionScope::Channel | InteractionScope::Server, None | Some("")) => Ok(""),
+        (InteractionScope::Channel | InteractionScope::Server, Some(_)) => Err(
+            StoreError::Backend("a guild id applies only to user interaction overrides".into()),
+        ),
         (InteractionScope::User, Some(g)) if !g.is_empty() => Ok(g),
         (InteractionScope::User, _) => Err(StoreError::Backend(
             "user interaction overrides require a guild id".into(),
@@ -441,15 +501,15 @@ fn normalize_guild<'a>(
 
 /// Clearing allows `None` on `User` so legacy unassigned migrated rows (`guild_id = ''`)
 /// can be removed cleanly.
-fn normalize_clear_guild<'a>(
+fn normalize_clear_guild(
     scope: InteractionScope,
-    guild_id: Option<&'a str>,
-) -> Result<&'a str, StoreError> {
+    guild_id: Option<&str>,
+) -> Result<&str, StoreError> {
     match (scope, guild_id) {
-        (InteractionScope::Channel, None | Some("")) => Ok(""),
-        (InteractionScope::Channel, Some(_)) => Err(StoreError::Backend(
-            "channel interaction overrides cannot specify a guild id".into(),
-        )),
+        (InteractionScope::Channel | InteractionScope::Server, None | Some("")) => Ok(""),
+        (InteractionScope::Channel | InteractionScope::Server, Some(_)) => Err(
+            StoreError::Backend("a guild id applies only to user interaction overrides".into()),
+        ),
         (InteractionScope::User, None | Some("")) => Ok(""),
         (InteractionScope::User, Some(g)) => Ok(g),
     }
@@ -461,38 +521,42 @@ mod tests {
 
     #[test]
     fn interaction_modes_round_trip() {
-        let dir = std::env::temp_dir().join(format!(
-            "blob-1-messenger-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("blob-1-messenger-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = SqliteStorage::open(dir.join("agent.db"), None).unwrap();
 
         assert!(store.interaction_modes("discord").unwrap().is_empty());
         // User overrides require a guild id; channel overrides forbid one.
-        assert!(
-            store
-                .set_interaction_mode(
-                    "discord",
-                    InteractionScope::User,
-                    None,
-                    "u1",
-                    InteractionMode::Always,
-                )
-                .is_err()
-        );
-        assert!(
-            store
-                .set_interaction_mode(
-                    "discord",
-                    InteractionScope::Channel,
-                    Some("g1"),
-                    "c1",
-                    InteractionMode::Always,
-                )
-                .is_err()
-        );
+        assert!(store
+            .set_interaction_mode(
+                "discord",
+                InteractionScope::User,
+                None,
+                "u1",
+                InteractionMode::Always,
+            )
+            .is_err());
+        assert!(store
+            .set_interaction_mode(
+                "discord",
+                InteractionScope::Channel,
+                Some("g1"),
+                "c1",
+                InteractionMode::Always,
+            )
+            .is_err());
+        // Server overrides forbid a guild id too: the target id IS the guild.
+        assert!(store
+            .set_interaction_mode(
+                "discord",
+                InteractionScope::Server,
+                Some("g1"),
+                "g1",
+                InteractionMode::Always,
+            )
+            .is_err());
 
         store
             .set_interaction_mode(
@@ -540,6 +604,16 @@ mod tests {
                 InteractionMode::MentionOnly,
             )
             .unwrap();
+        // A server override covers a whole guild; `auto` is a storable mode.
+        store
+            .set_interaction_mode(
+                "discord",
+                InteractionScope::Server,
+                None,
+                "g9",
+                InteractionMode::Auto,
+            )
+            .unwrap();
         // Rows are scoped per messenger.
         store
             .set_interaction_mode(
@@ -567,6 +641,12 @@ mod tests {
                     mode: InteractionMode::MentionOnly,
                 },
                 InteractionOverride {
+                    scope: InteractionScope::Server,
+                    guild_id: None,
+                    target_id: "g9".into(),
+                    mode: InteractionMode::Auto,
+                },
+                InteractionOverride {
                     scope: InteractionScope::User,
                     guild_id: Some("g1".into()),
                     target_id: "u1".into(),
@@ -580,16 +660,18 @@ mod tests {
                 },
             ]
         );
-        assert!(
-            store
-                .clear_interaction_mode("discord", InteractionScope::User, Some("g1"), "u1")
-                .unwrap()
-        );
-        assert!(
-            !store
-                .clear_interaction_mode("discord", InteractionScope::User, Some("g1"), "u1")
-                .unwrap()
-        );
+        assert!(store
+            .clear_interaction_mode("discord", InteractionScope::Server, None, "g9")
+            .unwrap());
+        assert!(store
+            .clear_interaction_mode("discord", InteractionScope::Server, Some("g9"), "g9")
+            .is_err());
+        assert!(store
+            .clear_interaction_mode("discord", InteractionScope::User, Some("g1"), "u1")
+            .unwrap());
+        assert!(!store
+            .clear_interaction_mode("discord", InteractionScope::User, Some("g1"), "u1")
+            .unwrap());
         // Clearing g1 leaves g2 intact.
         assert_eq!(store.interaction_modes("discord").unwrap().len(), 3);
         drop(store);
@@ -597,11 +679,65 @@ mod tests {
     }
 
     #[test]
+    fn messenger_defaults_round_trip() {
+        let dir = std::env::temp_dir().join(format!("blob-1-defaults-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SqliteStorage::open(dir.join("agent.db"), None).unwrap();
+
+        // Fresh database: no row, so the built-in defaults apply.
+        assert_eq!(
+            store.messenger_defaults("discord").unwrap(),
+            MessengerDefaults {
+                interaction_mode: InteractionMode::Auto,
+                reply_mode: ReplyMode::Auto,
+            }
+        );
+        // Each setter writes its own column without clobbering the other.
+        store
+            .set_default_interaction_mode("discord", InteractionMode::MentionOnly)
+            .unwrap();
+        assert_eq!(
+            store.messenger_defaults("discord").unwrap(),
+            MessengerDefaults {
+                interaction_mode: InteractionMode::MentionOnly,
+                reply_mode: ReplyMode::Auto,
+            }
+        );
+        store
+            .set_default_reply_mode("discord", ReplyMode::Direct)
+            .unwrap();
+        assert_eq!(
+            store.messenger_defaults("discord").unwrap(),
+            MessengerDefaults {
+                interaction_mode: InteractionMode::MentionOnly,
+                reply_mode: ReplyMode::Direct,
+            }
+        );
+        // Rows are scoped per messenger.
+        assert_eq!(
+            store.messenger_defaults("slack").unwrap(),
+            MessengerDefaults::default()
+        );
+        drop(store);
+
+        // Defaults persist across reopens.
+        let store = SqliteStorage::open(dir.join("agent.db"), None).unwrap();
+        assert_eq!(
+            store.messenger_defaults("discord").unwrap(),
+            MessengerDefaults {
+                interaction_mode: InteractionMode::MentionOnly,
+                reply_mode: ReplyMode::Direct,
+            }
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn migrates_legacy_interaction_modes_table() {
-        let dir = std::env::temp_dir().join(format!(
-            "blob-1-messenger-migrate-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("blob-1-messenger-migrate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("agent.db");
@@ -641,55 +777,126 @@ mod tests {
             ]
         );
         // Legacy inactive user row can be cleared with `guild_id: None`.
-        assert!(
-            store
-                .clear_interaction_mode("discord", InteractionScope::User, None, "u1")
-                .unwrap()
-        );
+        assert!(store
+            .clear_interaction_mode("discord", InteractionScope::User, None, "u1")
+            .unwrap());
         assert_eq!(store.interaction_modes("discord").unwrap().len(), 1);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
+    fn migrates_legacy_reply_modes_and_defaults() {
+        let dir =
+            std::env::temp_dir().join(format!("blob-1-reply-modes-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("agent.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE reply_modes (
+                    messenger TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    mode TEXT NOT NULL CHECK (mode IN ('decision', 'thread', 'direct')),
+                    PRIMARY KEY (messenger, channel_id)
+                ) STRICT;
+                INSERT INTO reply_modes VALUES ('discord', 'c1', 'decision');
+                INSERT INTO reply_modes VALUES ('discord', 'c2', 'direct');
+                CREATE TABLE messenger_defaults (
+                    messenger TEXT PRIMARY KEY,
+                    interaction_mode TEXT NOT NULL CHECK (interaction_mode IN ('mention-only', 'always', 'auto')),
+                    reply_mode TEXT NOT NULL CHECK (reply_mode IN ('decision', 'thread', 'direct'))
+                ) STRICT;
+                INSERT INTO messenger_defaults VALUES ('discord', 'always', 'decision');",
+            )
+            .unwrap();
+        }
+        let store = SqliteStorage::open(&db, None).unwrap();
+        // Channel rows keep their target and mode; `decision` rewrites to `auto`.
+        assert_eq!(
+            store.reply_modes("discord").unwrap(),
+            vec![
+                ReplyOverride {
+                    scope: ReplyScope::Channel,
+                    target_id: "c1".into(),
+                    mode: ReplyMode::Auto,
+                },
+                ReplyOverride {
+                    scope: ReplyScope::Channel,
+                    target_id: "c2".into(),
+                    mode: ReplyMode::Direct,
+                },
+            ]
+        );
+        assert_eq!(
+            store.messenger_defaults("discord").unwrap(),
+            MessengerDefaults {
+                interaction_mode: InteractionMode::Always,
+                reply_mode: ReplyMode::Auto,
+            }
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn reply_modes_round_trip() {
-        let dir = std::env::temp_dir().join(format!(
-            "blob-1-reply-modes-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("blob-1-reply-modes-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = SqliteStorage::open(dir.join("agent.db"), None).unwrap();
 
         assert!(store.reply_modes("discord").unwrap().is_empty());
         store
-            .set_reply_mode("discord", "c2", ReplyMode::Direct)
+            .set_reply_mode("discord", ReplyScope::Channel, "c2", ReplyMode::Direct)
             .unwrap();
         store
-            .set_reply_mode("discord", "c1", ReplyMode::Thread)
+            .set_reply_mode("discord", ReplyScope::Channel, "c1", ReplyMode::Thread)
             .unwrap();
         store
-            .set_reply_mode("discord", "c2", ReplyMode::Decision)
+            .set_reply_mode("discord", ReplyScope::Channel, "c2", ReplyMode::Auto)
             .unwrap();
         store
-            .set_reply_mode("slack", "c9", ReplyMode::Direct)
+            .set_reply_mode("discord", ReplyScope::Server, "g1", ReplyMode::Thread)
+            .unwrap();
+        store
+            .set_reply_mode("slack", ReplyScope::Channel, "c9", ReplyMode::Direct)
             .unwrap();
 
+        // Channel and server rows are independent keys; scope sorts channels first.
         assert_eq!(
             store.reply_modes("discord").unwrap(),
             vec![
                 ReplyOverride {
-                    channel_id: "c1".into(),
+                    scope: ReplyScope::Channel,
+                    target_id: "c1".into(),
                     mode: ReplyMode::Thread,
                 },
                 ReplyOverride {
-                    channel_id: "c2".into(),
-                    mode: ReplyMode::Decision,
+                    scope: ReplyScope::Channel,
+                    target_id: "c2".into(),
+                    mode: ReplyMode::Auto,
+                },
+                ReplyOverride {
+                    scope: ReplyScope::Server,
+                    target_id: "g1".into(),
+                    mode: ReplyMode::Thread,
                 },
             ]
         );
-        assert!(store.clear_reply_mode("discord", "c1").unwrap());
-        assert!(!store.clear_reply_mode("discord", "c1").unwrap());
+        assert!(store
+            .clear_reply_mode("discord", ReplyScope::Channel, "c1")
+            .unwrap());
+        assert!(!store
+            .clear_reply_mode("discord", ReplyScope::Channel, "c1")
+            .unwrap());
+        // Clearing a channel row leaves the server row intact.
+        assert_eq!(store.reply_modes("discord").unwrap().len(), 2);
+        assert!(store
+            .clear_reply_mode("discord", ReplyScope::Server, "g1")
+            .unwrap());
         assert_eq!(store.reply_modes("discord").unwrap().len(), 1);
 
         // Pending thread state persists across reopens and clears cleanly.
@@ -743,10 +950,8 @@ mod tests {
 
     #[test]
     fn backfills_pending_threads_for_legacy_db() {
-        let dir = std::env::temp_dir().join(format!(
-            "blob-1-pending-backfill-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("blob-1-pending-backfill-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("agent.db");
@@ -825,10 +1030,7 @@ mod tests {
 
     #[test]
     fn access_modes_and_legacy_migration() {
-        let dir = std::env::temp_dir().join(format!(
-            "blob-1-access-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("blob-1-access-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("agent.db");
@@ -854,52 +1056,82 @@ mod tests {
             }]
         );
         // Scope validation
-        assert!(
-            store
-                .add_access_entry("discord", AccessList::Whitelist, AccessScope::Global, Some("g1"), "u1")
-                .is_err()
-        );
-        assert!(
-            store
-                .add_access_entry("discord", AccessList::Whitelist, AccessScope::Guild, None, "u1")
-                .is_err()
-        );
-        assert!(
-            store
-                .add_access_entry("discord", AccessList::Blacklist, AccessScope::Channel, None, "u1")
-                .is_err()
-        );
+        assert!(store
+            .add_access_entry(
+                "discord",
+                AccessList::Whitelist,
+                AccessScope::Global,
+                Some("g1"),
+                "u1"
+            )
+            .is_err());
+        assert!(store
+            .add_access_entry(
+                "discord",
+                AccessList::Whitelist,
+                AccessScope::Guild,
+                None,
+                "u1"
+            )
+            .is_err());
+        assert!(store
+            .add_access_entry(
+                "discord",
+                AccessList::Blacklist,
+                AccessScope::Channel,
+                None,
+                "u1"
+            )
+            .is_err());
         // Separate whitelist and blacklist entries coexist safely across mode changes.
         store
-            .add_access_entry("discord", AccessList::Whitelist, AccessScope::Guild, Some("g1"), "u2")
+            .add_access_entry(
+                "discord",
+                AccessList::Whitelist,
+                AccessScope::Guild,
+                Some("g1"),
+                "u2",
+            )
             .unwrap();
         store
-            .add_access_entry("discord", AccessList::Blacklist, AccessScope::Channel, Some("c1"), "u3")
+            .add_access_entry(
+                "discord",
+                AccessList::Blacklist,
+                AccessScope::Channel,
+                Some("c1"),
+                "u3",
+            )
             .unwrap();
         store
             .set_access_mode("discord", AccessMode::Blacklist)
             .unwrap();
         assert_eq!(store.access_mode("discord").unwrap(), AccessMode::Blacklist);
         assert_eq!(store.access_entries("discord").unwrap().len(), 3);
-        assert!(
-            store
-                .remove_access_entry("discord", AccessList::Whitelist, AccessScope::Guild, Some("g1"), "u2")
-                .unwrap()
-        );
-        assert!(
-            !store
-                .remove_access_entry("discord", AccessList::Whitelist, AccessScope::Guild, Some("g1"), "u2")
-                .unwrap()
-        );
+        assert!(store
+            .remove_access_entry(
+                "discord",
+                AccessList::Whitelist,
+                AccessScope::Guild,
+                Some("g1"),
+                "u2"
+            )
+            .unwrap());
+        assert!(!store
+            .remove_access_entry(
+                "discord",
+                AccessList::Whitelist,
+                AccessScope::Guild,
+                Some("g1"),
+                "u2"
+            )
+            .unwrap());
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
 
         // An empty legacy `allowed_users` table still requires the owner lock
         // when upgrading, so an older running server cannot race with migration.
-        let dir2 = std::env::temp_dir().join(format!(
-            "blob-1-access-lock-test-{}",
-            std::process::id()
-        ));
+        let dir2 =
+            std::env::temp_dir().join(format!("blob-1-access-lock-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir2);
         std::fs::create_dir_all(&dir2).unwrap();
         let db2 = dir2.join("agent.db");

@@ -345,15 +345,31 @@ impl Messengers {
             _ => Err("exactly one of to or messenger is required".into()),
         }
     }
-    fn is_direct_channel(&self, messenger: &str, channel_id: &str) -> bool {
-        self.store
-            .reply_modes(messenger)
-            .map(|modes| {
-                modes
-                    .iter()
-                    .any(|o| o.channel_id == channel_id && o.mode == storage::ReplyMode::Direct)
-            })
-            .unwrap_or(false)
+    /// Whether the place resolves to `direct` reply mode: channel override,
+    /// then the channel's server override (guild resolved over REST only when a
+    /// `server` override exists), then the messenger default.
+    async fn is_direct_channel(&self, messenger: &str, channel_id: &str) -> Result<bool, Error> {
+        let overrides = self.store.reply_modes(messenger)?;
+        let default = self.store.messenger_defaults(messenger)?.reply_mode;
+        // A channel override decides alone; the guild is looked up only when a
+        // server override could apply, and a failed lookup fails the send
+        // rather than silently ignoring a `direct` server.
+        let channel_override = overrides
+            .iter()
+            .any(|o| o.scope == storage::ReplyScope::Channel && o.target_id == channel_id);
+        let guild = if !channel_override
+            && overrides
+                .iter()
+                .any(|o| o.scope == storage::ReplyScope::Server)
+        {
+            self.find(messenger)?.channel_guild(channel_id).await?
+        } else {
+            None
+        };
+        Ok(
+            storage::effective_reply_mode(&overrides, channel_id, guild.as_deref(), default)
+                == storage::ReplyMode::Direct,
+        )
     }
 
     pub async fn send(&self, arguments: &str) -> Result<String, Error> {
@@ -398,7 +414,7 @@ impl Messengers {
                             .contains(&id);
                         let forced_direct = !place.dm
                             && place.thread.is_none()
-                            && self.is_direct_channel(&messenger, &place.channel);
+                            && self.is_direct_channel(&messenger, &place.channel).await?;
                         let thread = if forced_direct {
                             false
                         } else {
@@ -452,7 +468,8 @@ impl Messengers {
             (None, Some(to)) => {
                 let to_id = token(&to, 'd')?;
                 let (name, place) = self.place(&to, false)?;
-                let forced_direct = !place.dm && self.is_direct_channel(&name, &place.channel);
+                let forced_direct =
+                    !place.dm && self.is_direct_channel(&name, &place.channel).await?;
                 let is_pending = place.thread.is_some() && self.store.is_pending_thread(to_id)?;
                 let create_thread = !forced_direct;
                 let fallback_parent = forced_direct && is_pending;

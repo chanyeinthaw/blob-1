@@ -148,7 +148,7 @@ function ModelsLoaded() {
   const [filters, setFilters] = useState<Filters>({
     query: '',
     providerFilter: '',
-    inUseOnly: false,
+    inUseOnly: true,
     visibleCount: PAGE_SIZE,
   })
   const apply = (change: Partial<Filters>) =>
