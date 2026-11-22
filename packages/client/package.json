@@ -1,0 +1,33 @@
+{
+  "name": "@blob-1/client",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./api": {
+      "types": "./src/api.ts",
+      "default": "./src/api.ts"
+    },
+    "./ws": {
+      "types": "./src/ws.ts",
+      "default": "./src/ws.ts"
+    },
+    "./mock": {
+      "types": "./src/mock.ts",
+      "default": "./src/mock.ts"
+    },
+    "./session": {
+      "types": "./src/session.ts",
+      "default": "./src/session.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "effect-tsgo tsrs --noEmit"
+  },
+  "dependencies": {
+    "@blob-1/contracts": "workspace:*",
+    "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@effect/tsgo": "catalog:"
+  }
+}

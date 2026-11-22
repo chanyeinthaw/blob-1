@@ -1,0 +1,40 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "Preserve",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "useDefineForClassFields": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "plugins": [
+      {
+        "name": "@effect/language-service",
+        "namespaceImportPackages": ["effect"],
+        "diagnosticSeverity": {
+          "anyUnknownInErrorContext": "error",
+          "deterministicKeys": "error",
+          "floatingEffect": "error",
+          "globalErrorInEffectCatch": "error",
+          "globalErrorInEffectFailure": "error",
+          "instanceOfSchema": "error",
+          "leakingRequirements": "error",
+          "missingEffectServiceDependency": "error",
+          "globalJsonInEffect": "error",
+          "schemaSyncInEffect": "error",
+          "unknownInEffectCatch": "error",
+          "unsafeEffectTypeAssertion": "error",
+          "unstableApiUsage": "off"
+        }
+      }
+    ]
+  }
+}

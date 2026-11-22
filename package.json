@@ -1,0 +1,23 @@
+{
+  "name": "blob-1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "prepare": "vp config --no-agent",
+    "dev": "vp run --filter @blob-1/web dev",
+    "build": "vp run --filter @blob-1/web build",
+    "typecheck": "vp run -r typecheck",
+    "lint": "vp lint --deny-warnings --report-unused-disable-directives",
+    "fmt": "vp fmt",
+    "fmt:check": "vp fmt --check",
+    "check": "vp fmt --check && vp lint --deny-warnings --report-unused-disable-directives && vp run -r typecheck"
+  },
+  "devDependencies": {
+    "@effect/tsgo": "catalog:",
+    "@oxlint/plugins": "catalog:",
+    "@types/node": "catalog:",
+    "effect": "catalog:",
+    "vite-plus": "catalog:"
+  },
+  "packageManager": "pnpm@12.6.0"
+}

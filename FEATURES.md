@@ -21,7 +21,8 @@ Where each feature lives: code, CLI, model tools and storage.
 
 ## Web settings
 
-- Code: `crates/agent/src/web.rs`, `crates/storage-sqlite/src/web_auth.rs`, `web/src/session.ts`, `web/src/api/{client,ws,mock,protocol}.ts`, `web/src/page/settings/{identity,models,providers,discord,mcp}.ts`
+- Code: `crates/agent/src/web.rs`, `crates/storage-sqlite/src/web_auth.rs`, `packages/contracts/src/protocol.ts` (wire schemas), `packages/client/src/{api,ws,session,mock}.ts` (API client), `apps/web/src/routes/*` and `apps/web/src/features/{session,identity,models,providers,chat,mcp}/` (pages)
+- The app is a pnpm workspace (vite-plus, React, TanStack Router, shadcn on Base UI, Effect, effect-machine) that `agent` embeds from `apps/web/dist`; `VITE_MOCK=1 pnpm dev` runs it against an in-memory mock (password `blob`)
 - `agent serve --web <addr>` serves the app (default `127.0.0.1:7878`); `agent web password set` sets the password.
 - `agent serve --public-url <url>` sets the absolute http(s) URL the app is publicly reached at (e.g. `https://silicon.tailcd7ccb.ts.net:7878` via Tailscale Serve proxying to `--web 127.0.0.1:7878`): the OAuth redirect URI and `mcp.login` URL use it instead of the Host header, the WebSocket Origin check accepts exactly that origin, and the session cookie gets `Secure` when it is https. `serve` persists it so `agent mcp login` prints the same URL; running `serve` without it clears the stored value.
 - The session cookie is `HttpOnly; SameSite=Lax` so the cross-site OAuth callback's top-level GET still carries it.
@@ -131,7 +132,7 @@ One-shot generation: one request, no tools, no memory, no session.
 
 Blob-1 is an MCP client: chat and background tasks can call tools, read resources and use prompts from configured servers.
 
-- Code: `crates/mcp/src/{lib,oauth,tools}.rs`, `crates/storage-sqlite/src/mcp.rs`, `crates/agent/src/web.rs` (`/api/mcp/login`, `/api/mcp/callback`), `web/src/page/settings/mcp.ts`
+- Code: `crates/mcp/src/{lib,oauth,tools}.rs`, `crates/storage-sqlite/src/mcp.rs`, `crates/agent/src/web.rs` (`/api/mcp/login`, `/api/mcp/callback`), `apps/web/src/features/mcp/`
 - Servers are stdio (command, args, env) or Streamable HTTP (url, static headers whose values are env var names); no legacy SSE
 - One shared `mcp::Mcp` per `serve` keeps one connection per server for chat and tasks; config changes apply without a restart
 - Server ids are lowercase letters, digits and `-` (no `_`: it separates `server__tool` wire names)

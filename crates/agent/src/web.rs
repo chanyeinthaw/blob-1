@@ -53,7 +53,7 @@ impl std::ops::Deref for WebContext {
 type Context = Arc<WebContext>;
 
 #[derive(RustEmbed)]
-#[folder = "../../web/dist/"]
+#[folder = "../../apps/web/dist/"]
 #[allow_missing = true]
 struct Assets;
 

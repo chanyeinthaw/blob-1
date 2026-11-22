@@ -1,2 +1,7 @@
 /target
 :memory:*
+node_modules
+dist
+.vite-plus
+*.tsbuildinfo
+.vite-hooks/_
