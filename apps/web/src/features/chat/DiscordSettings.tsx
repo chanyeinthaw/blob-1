@@ -19,7 +19,7 @@ import { AtomMachine } from '@typeonce/effect-machine/reactivity'
 import { MachineState, useMachineResult } from '@typeonce/effect-machine-react'
 import { type Cause, Option } from 'effect'
 import { AsyncResult } from 'effect/reactivity'
-import { CircleHelp, Hash, KeyRound, Pencil, Plus, Server, Trash2, User } from 'lucide-react'
+import { CircleHelp, Globe, Hash, KeyRound, Pencil, Plus, Server, Trash2, User } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 
 import { ConfirmDialog } from '~/components/ConfirmDialog'
@@ -761,6 +761,41 @@ function AccessAddDialog(props: AccessAddDialogProps) {
 const modeToggleItemClassName =
   'h-full rounded-full px-3 text-muted-foreground hover:bg-transparent hover:text-foreground aria-pressed:bg-background aria-pressed:text-foreground aria-pressed:shadow-sm'
 
+interface DefaultModeRowProps {
+  readonly labelId: string
+  /** Who the default applies to, e.g. "Everyone else". */
+  readonly label: string
+  /** Short muted note after the label, e.g. why Auto cannot take effect. */
+  readonly status: string | null
+  readonly children: React.ReactNode
+}
+
+/** The Default row of a mode list, laid out like the override rows below it. */
+function DefaultModeRow(props: DefaultModeRowProps) {
+  return (
+    <li className="flex min-h-12 flex-wrap items-center gap-x-3 gap-y-2 py-2">
+      <span
+        aria-hidden="true"
+        className="grid size-7 shrink-0 place-items-center rounded-full bg-muted text-muted-foreground"
+      >
+        <Globe className="size-3.5" />
+      </span>
+      <div className="flex min-w-0 flex-1 basis-40 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span id={props.labelId} className="text-sm">
+          {props.label}
+        </span>
+        {props.status === null ? null : (
+          <span className="text-xs text-muted-foreground">{props.status}</span>
+        )}
+      </div>
+      <div className="ml-auto flex items-center gap-1">
+        {props.children}
+        <span aria-hidden="true" className="size-10 shrink-0 md:size-8" />
+      </div>
+    </li>
+  )
+}
+
 interface ModeHelpItem {
   readonly term: string
   readonly description: string
@@ -884,14 +919,18 @@ function InteractionModeSection() {
             (!value.general.autoRespond || !value.general.hasUtilityModel)
           return (
             <>
-              <FieldRow
-                labelId="discord-default-mode-label"
-                label="Default"
-                labelExtra={
-                  <ModeHelp label="About interaction modes" items={interactionModeHelp} />
-                }
-              >
-                <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <ul className="flex flex-col divide-y">
+                <DefaultModeRow
+                  labelId="discord-default-mode-label"
+                  label="Everyone else"
+                  status={
+                    autoInactive
+                      ? value.general.autoRespond
+                        ? 'Inactive: no utility model'
+                        : 'Inactive: Auto-respond is off'
+                      : null
+                  }
+                >
                   <ToggleGroup
                     aria-labelledby="discord-default-mode-label"
                     spacing={1}
@@ -918,29 +957,16 @@ function InteractionModeSection() {
                       </ToggleGroupItem>
                     ))}
                   </ToggleGroup>
-                  {autoInactive ? (
-                    <span className="text-xs text-muted-foreground">
-                      {value.general.autoRespond
-                        ? 'Inactive: no utility model'
-                        : 'Inactive: Auto-respond is off'}
-                    </span>
-                  ) : null}
-                </div>
-              </FieldRow>
-              {value.discord.interactionModes.length === 0 ? (
-                <EmptyLine>No overrides.</EmptyLine>
-              ) : (
-                <ul className="flex flex-col divide-y">
-                  {value.discord.interactionModes.map(override => (
-                    <OverrideRow
-                      key={`${override.scope}:${override.guildId ?? ''}:${override.targetId}`}
-                      override={override}
-                      directory={value.directory}
-                      disabled={!isIdle}
-                    />
-                  ))}
-                </ul>
-              )}
+                </DefaultModeRow>
+                {value.discord.interactionModes.map(override => (
+                  <OverrideRow
+                    key={`${override.scope}:${override.guildId ?? ''}:${override.targetId}`}
+                    override={override}
+                    directory={value.directory}
+                    disabled={!isIdle}
+                  />
+                ))}
+              </ul>
               {!value.modeDialogOpen && error !== null ? (
                 <FieldError id="discord-mode-error">{error}</FieldError>
               ) : null}
@@ -1361,49 +1387,45 @@ function ReplyModeSection() {
           const error = reply.path === 'ReplyMode.Idle' ? reply.value.error : null
           return (
             <>
-              <FieldRow
-                labelId="discord-default-reply-label"
-                label="Default"
-                labelExtra={<ModeHelp label="About reply modes" items={replyModeHelp} />}
-              >
-                <ToggleGroup
-                  aria-labelledby="discord-default-reply-label"
-                  spacing={1}
-                  disabled={!isIdle}
-                  value={[value.discord.defaultReplyMode]}
-                  onValueChange={values => {
-                    const next = values[0]
-                    if (isReplyMode(next) && next !== value.discord.defaultReplyMode) {
-                      send(DiscordEvents.SetDefaultReplyMode({ mode: next }))
-                    }
-                  }}
-                  className="h-10 rounded-full bg-muted p-[3px] md:h-8"
+              <ul className="flex flex-col divide-y">
+                <DefaultModeRow
+                  labelId="discord-default-reply-label"
+                  label="All channels"
+                  status={null}
                 >
-                  {replyModes.map(item => (
-                    <ToggleGroupItem
-                      key={item.mode}
-                      value={item.mode}
-                      className={modeToggleItemClassName}
-                    >
-                      {item.label}
-                    </ToggleGroupItem>
-                  ))}
-                </ToggleGroup>
-              </FieldRow>
-              {value.discord.replyModes.length === 0 ? (
-                <EmptyLine>No overrides.</EmptyLine>
-              ) : (
-                <ul className="flex flex-col divide-y">
-                  {value.discord.replyModes.map(override => (
-                    <ReplyOverrideRow
-                      key={`${override.scope}:${override.targetId}`}
-                      override={override}
-                      directory={value.directory}
-                      disabled={!isIdle}
-                    />
-                  ))}
-                </ul>
-              )}
+                  <ToggleGroup
+                    aria-labelledby="discord-default-reply-label"
+                    spacing={1}
+                    disabled={!isIdle}
+                    value={[value.discord.defaultReplyMode]}
+                    onValueChange={values => {
+                      const next = values[0]
+                      if (isReplyMode(next) && next !== value.discord.defaultReplyMode) {
+                        send(DiscordEvents.SetDefaultReplyMode({ mode: next }))
+                      }
+                    }}
+                    className="h-10 rounded-full bg-muted p-[3px] md:h-8"
+                  >
+                    {replyModes.map(item => (
+                      <ToggleGroupItem
+                        key={item.mode}
+                        value={item.mode}
+                        className={modeToggleItemClassName}
+                      >
+                        {item.label}
+                      </ToggleGroupItem>
+                    ))}
+                  </ToggleGroup>
+                </DefaultModeRow>
+                {value.discord.replyModes.map(override => (
+                  <ReplyOverrideRow
+                    key={`${override.scope}:${override.targetId}`}
+                    override={override}
+                    directory={value.directory}
+                    disabled={!isIdle}
+                  />
+                ))}
+              </ul>
               {!value.replyDialogOpen && error !== null ? (
                 <FieldError id="discord-reply-error">{error}</FieldError>
               ) : null}
