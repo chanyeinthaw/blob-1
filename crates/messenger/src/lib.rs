@@ -27,7 +27,11 @@ pub enum Target {
         first: bool,
         thread: bool,
     },
-    To(Place),
+    To {
+        place: Place,
+        create_thread: bool,
+        fallback_parent: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +44,7 @@ pub struct Outbound {
 #[derive(Debug, Clone)]
 pub struct Sent {
     pub created_thread: bool,
+    pub used_thread: bool,
 }
 
 #[derive(Debug, Clone)]

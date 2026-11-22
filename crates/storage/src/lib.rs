@@ -784,6 +784,38 @@ pub struct InteractionOverride {
     pub mode: InteractionMode,
 }
 
+/// How the bot replies to plain-channel messages (outside DMs and threads):
+/// `decision` asks the utility model (falling back to a thread), `thread`
+/// always starts a thread, and `direct` always replies inline in the channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyMode {
+    Decision,
+    Thread,
+    Direct,
+}
+
+impl ReplyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Decision => "decision",
+            Self::Thread => "thread",
+            Self::Direct => "direct",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == s)
+    }
+
+    const ALL: [Self; 3] = [Self::Decision, Self::Thread, Self::Direct];
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyOverride {
+    pub channel_id: String,
+    pub mode: ReplyMode,
+}
+
 pub trait MessengerStore: Send + Sync {
     fn destination(&self, messenger: &str, place: &Place) -> Result<u64, StoreError>;
     fn place(&self, id: u64) -> Result<Option<(String, Place)>, StoreError>;
@@ -811,6 +843,26 @@ pub trait MessengerStore: Send + Sync {
         guild_id: Option<&str>,
         target_id: &str,
     ) -> Result<bool, StoreError>;
+    /// Per-channel reply mode overrides, ordered by channel id.
+    fn reply_modes(&self, messenger: &str) -> Result<Vec<ReplyOverride>, StoreError>;
+    fn set_reply_mode(
+        &self,
+        messenger: &str,
+        channel_id: &str,
+        mode: ReplyMode,
+    ) -> Result<(), StoreError>;
+    fn clear_reply_mode(&self, messenger: &str, channel_id: &str) -> Result<bool, StoreError>;
+    /// Persisted markers for synthesized thread destinations that have not yet
+    /// been created on the messenger.
+    fn mark_pending_thread(&self, destination: u64) -> Result<(), StoreError>;
+    fn clear_pending_thread(&self, destination: u64) -> Result<(), StoreError>;
+    fn clear_pending_thread_by_place(
+        &self,
+        messenger: &str,
+        channel: &str,
+        thread: &str,
+    ) -> Result<(), StoreError>;
+    fn is_pending_thread(&self, destination: u64) -> Result<bool, StoreError>;
 }
 
 impl<T: MessengerStore + ?Sized> MessengerStore for std::sync::Arc<T> {
@@ -856,6 +908,37 @@ impl<T: MessengerStore + ?Sized> MessengerStore for std::sync::Arc<T> {
         target_id: &str,
     ) -> Result<bool, StoreError> {
         (**self).clear_interaction_mode(messenger, scope, guild_id, target_id)
+    }
+    fn reply_modes(&self, messenger: &str) -> Result<Vec<ReplyOverride>, StoreError> {
+        (**self).reply_modes(messenger)
+    }
+    fn set_reply_mode(
+        &self,
+        messenger: &str,
+        channel_id: &str,
+        mode: ReplyMode,
+    ) -> Result<(), StoreError> {
+        (**self).set_reply_mode(messenger, channel_id, mode)
+    }
+    fn clear_reply_mode(&self, messenger: &str, channel_id: &str) -> Result<bool, StoreError> {
+        (**self).clear_reply_mode(messenger, channel_id)
+    }
+    fn mark_pending_thread(&self, destination: u64) -> Result<(), StoreError> {
+        (**self).mark_pending_thread(destination)
+    }
+    fn clear_pending_thread(&self, destination: u64) -> Result<(), StoreError> {
+        (**self).clear_pending_thread(destination)
+    }
+    fn clear_pending_thread_by_place(
+        &self,
+        messenger: &str,
+        channel: &str,
+        thread: &str,
+    ) -> Result<(), StoreError> {
+        (**self).clear_pending_thread_by_place(messenger, channel, thread)
+    }
+    fn is_pending_thread(&self, destination: u64) -> Result<bool, StoreError> {
+        (**self).is_pending_thread(destination)
     }
 }
 

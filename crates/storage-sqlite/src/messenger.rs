@@ -1,6 +1,7 @@
 use rusqlite::{params, OptionalExtension};
 use storage::{
-    InteractionMode, InteractionOverride, InteractionScope, MessengerStore, Place, StoreError,
+    InteractionMode, InteractionOverride, InteractionScope, MessengerStore, Place, ReplyMode,
+    ReplyOverride, StoreError,
 };
 
 use crate::{backend, SqliteStorage};
@@ -178,6 +179,98 @@ impl MessengerStore for SqliteStorage {
                 params![messenger, scope.as_str(), guild, target_id],
             )
             .map(|n| n > 0)
+            .map_err(backend)
+    }
+
+    fn reply_modes(&self, messenger: &str) -> Result<Vec<ReplyOverride>, StoreError> {
+        let connection = self.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT channel_id, mode FROM reply_modes WHERE messenger = ?1 ORDER BY channel_id",
+            )
+            .map_err(backend)?;
+        let rows = statement
+            .query_map([messenger], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(backend)?;
+        rows.map(|row| {
+            let (channel_id, mode) = row.map_err(backend)?;
+            let mode = ReplyMode::parse(&mode).ok_or_else(|| {
+                StoreError::Backend(format!("invalid mode in reply_modes: {mode}").into())
+            })?;
+            Ok(ReplyOverride { channel_id, mode })
+        })
+        .collect()
+    }
+
+    fn set_reply_mode(
+        &self,
+        messenger: &str,
+        channel_id: &str,
+        mode: ReplyMode,
+    ) -> Result<(), StoreError> {
+        self.lock()
+            .execute(
+                "INSERT INTO reply_modes (messenger, channel_id, mode) VALUES (?1, ?2, ?3) ON CONFLICT (messenger, channel_id) DO UPDATE SET mode = excluded.mode",
+                params![messenger, channel_id, mode.as_str()],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn clear_reply_mode(&self, messenger: &str, channel_id: &str) -> Result<bool, StoreError> {
+        self.lock()
+            .execute(
+                "DELETE FROM reply_modes WHERE messenger = ?1 AND channel_id = ?2",
+                params![messenger, channel_id],
+            )
+            .map(|n| n > 0)
+            .map_err(backend)
+    }
+
+    fn mark_pending_thread(&self, destination: u64) -> Result<(), StoreError> {
+        self.lock()
+            .execute(
+                "INSERT OR IGNORE INTO pending_threads (destination_id) VALUES (?1)",
+                [destination as i64],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn clear_pending_thread(&self, destination: u64) -> Result<(), StoreError> {
+        self.lock()
+            .execute(
+                "DELETE FROM pending_threads WHERE destination_id = ?1",
+                [destination as i64],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn clear_pending_thread_by_place(
+        &self,
+        messenger: &str,
+        channel: &str,
+        thread: &str,
+    ) -> Result<(), StoreError> {
+        self.lock()
+            .execute(
+                "DELETE FROM pending_threads WHERE destination_id IN (SELECT id FROM destinations WHERE messenger = ?1 AND channel = ?2 AND thread = ?3)",
+                params![messenger, channel, thread],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn is_pending_thread(&self, destination: u64) -> Result<bool, StoreError> {
+        self.lock()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pending_threads WHERE destination_id = ?1)",
+                [destination as i64],
+                |row| row.get(0),
+            )
             .map_err(backend)
     }
 }
@@ -406,6 +499,157 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(store.interaction_modes("discord").unwrap().len(), 1);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reply_modes_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "blob-1-reply-modes-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SqliteStorage::open(dir.join("agent.db"), None).unwrap();
+
+        assert!(store.reply_modes("discord").unwrap().is_empty());
+        store
+            .set_reply_mode("discord", "c2", ReplyMode::Direct)
+            .unwrap();
+        store
+            .set_reply_mode("discord", "c1", ReplyMode::Thread)
+            .unwrap();
+        store
+            .set_reply_mode("discord", "c2", ReplyMode::Decision)
+            .unwrap();
+        store
+            .set_reply_mode("slack", "c9", ReplyMode::Direct)
+            .unwrap();
+
+        assert_eq!(
+            store.reply_modes("discord").unwrap(),
+            vec![
+                ReplyOverride {
+                    channel_id: "c1".into(),
+                    mode: ReplyMode::Thread,
+                },
+                ReplyOverride {
+                    channel_id: "c2".into(),
+                    mode: ReplyMode::Decision,
+                },
+            ]
+        );
+        assert!(store.clear_reply_mode("discord", "c1").unwrap());
+        assert!(!store.clear_reply_mode("discord", "c1").unwrap());
+        assert_eq!(store.reply_modes("discord").unwrap().len(), 1);
+
+        // Pending thread state persists across reopens and clears cleanly.
+        let dest = store
+            .destination(
+                "discord",
+                &Place {
+                    channel: "c2".into(),
+                    thread: Some("m1".into()),
+                    dm: false,
+                },
+            )
+            .unwrap();
+        assert!(!store.is_pending_thread(dest).unwrap());
+        store.mark_pending_thread(dest).unwrap();
+        assert!(store.is_pending_thread(dest).unwrap());
+        drop(store);
+        let store = SqliteStorage::open(dir.join("agent.db"), None).unwrap();
+        assert!(store.is_pending_thread(dest).unwrap());
+        store.clear_pending_thread(dest).unwrap();
+        assert!(!store.is_pending_thread(dest).unwrap());
+        store.mark_pending_thread(dest).unwrap();
+        store
+            .clear_pending_thread_by_place("discord", "c2", "m1")
+            .unwrap();
+        assert!(!store.is_pending_thread(dest).unwrap());
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backfills_pending_threads_for_legacy_db() {
+        let dir = std::env::temp_dir().join(format!(
+            "blob-1-pending-backfill-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("agent.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE destinations (id INTEGER PRIMARY KEY, messenger TEXT NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, dm INTEGER NOT NULL CHECK (dm IN (0,1)), UNIQUE (messenger, channel, thread)) STRICT;
+                 CREATE TABLE memory_messages (i INTEGER PRIMARY KEY, kind TEXT NOT NULL, text TEXT NOT NULL, size INTEGER NOT NULL, date TEXT NOT NULL, more INTEGER NOT NULL, meta TEXT) STRICT;
+                 INSERT INTO destinations VALUES (1, 'discord', 'c1', 'm_pending', 0);
+                 INSERT INTO destinations VALUES (2, 'discord', 'c1', 'm_replied', 0);
+                 INSERT INTO destinations VALUES (3, 'discord', 'c1', 'm_seen_thread', 0);
+                 INSERT INTO destinations VALUES (4, 'discord', 'c1', 'm_ambiguous', 0);",
+            )
+            .unwrap();
+            let mk_meta = |to: u64, msg: &str, thread: Option<&str>| {
+                serde_json::to_string(&storage::Meta::Message {
+                    messenger: "discord".into(),
+                    place: Place {
+                        channel: "c1".into(),
+                        thread: thread.map(Into::into),
+                        dm: false,
+                    },
+                    message: msg.into(),
+                    author: storage::Person {
+                        id: "u1".into(),
+                        name: "u1".into(),
+                    },
+                    to,
+                    inline: false,
+                    unaddressed: false,
+                    location: "#c1".into(),
+                    earlier: None,
+                    quote: None,
+                    attachments: Vec::new(),
+                })
+                .unwrap()
+            };
+            // Dest 1: plain-channel message, never replied/sent, never seen as thread -> pending.
+            conn.execute(
+                "INSERT INTO memory_messages VALUES (10, 'user', 'remind me', 9, '2026-01-01', 0, ?1)",
+                [mk_meta(1, "m_pending", None)],
+            )
+            .unwrap();
+            // Dest 2: plain-channel message, but bot sent reply m20 -> NOT pending.
+            conn.execute(
+                "INSERT INTO memory_messages VALUES (20, 'user', 'hi', 2, '2026-01-01', 0, ?1)",
+                [mk_meta(2, "m_replied", None)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO memory_messages VALUES (21, 'tool', 'send {\"reply\":\"m20\",\"text\":\"ok\"}', 30, '2026-01-01', 0, NULL)",
+                [],
+            )
+            .unwrap();
+            // Dest 3: plain-channel message, then user replied inside thread -> NOT pending.
+            conn.execute(
+                "INSERT INTO memory_messages VALUES (30, 'user', 'hi', 2, '2026-01-01', 0, ?1)",
+                [mk_meta(3, "m_seen_thread", None)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO memory_messages VALUES (31, 'user', 'in thread', 9, '2026-01-01', 0, ?1)",
+                [mk_meta(3, "m_in_thread", Some("m_seen_thread"))],
+            )
+            .unwrap();
+            // Dest 4: no originating plain-channel message in history -> ambiguous, NOT pending.
+        }
+        let store = SqliteStorage::open(&db, None).unwrap();
+        assert!(store.is_pending_thread(1).unwrap());
+        assert!(!store.is_pending_thread(2).unwrap());
+        assert!(!store.is_pending_thread(3).unwrap());
+        assert!(!store.is_pending_thread(4).unwrap());
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

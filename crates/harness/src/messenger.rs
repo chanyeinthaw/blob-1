@@ -345,6 +345,17 @@ impl Messengers {
             _ => Err("exactly one of to or messenger is required".into()),
         }
     }
+    fn is_direct_channel(&self, messenger: &str, channel_id: &str) -> bool {
+        self.store
+            .reply_modes(messenger)
+            .map(|modes| {
+                modes
+                    .iter()
+                    .any(|o| o.channel_id == channel_id && o.mode == storage::ReplyMode::Direct)
+            })
+            .unwrap_or(false)
+    }
+
     pub async fn send(&self, arguments: &str) -> Result<String, Error> {
         let args: SendArgs = serde_json::from_str(arguments)?;
         if args.text.is_empty() {
@@ -385,7 +396,14 @@ impl Messengers {
                             .lock()
                             .expect("moved mutex poisoned")
                             .contains(&id);
-                        let thread = !inline || args.thread || moved;
+                        let forced_direct = !place.dm
+                            && place.thread.is_none()
+                            && self.is_direct_channel(&messenger, &place.channel);
+                        let thread = if forced_direct {
+                            false
+                        } else {
+                            !inline || args.thread || moved
+                        };
                         threading = thread && !place.dm && place.thread.is_none();
                         let first = if threading {
                             !self
@@ -432,11 +450,24 @@ impl Messengers {
                 }
             }
             (None, Some(to)) => {
+                let to_id = token(&to, 'd')?;
                 let (name, place) = self.place(&to, false)?;
-                if place.thread.is_some() && !place.dm {
+                let forced_direct = !place.dm && self.is_direct_channel(&name, &place.channel);
+                let is_pending = place.thread.is_some() && self.store.is_pending_thread(to_id)?;
+                let create_thread = !forced_direct;
+                let fallback_parent = forced_direct && is_pending;
+                if place.thread.is_some() && !place.dm && create_thread {
                     title_prompt = Some((place.clone(), None));
                 }
-                (name, Target::To(place), token(&to, 'd')?)
+                (
+                    name,
+                    Target::To {
+                        place,
+                        create_thread,
+                        fallback_parent,
+                    },
+                    to_id,
+                )
             }
             _ => return Err("exactly one of reply or to is required".into()),
         };
@@ -448,6 +479,9 @@ impl Messengers {
                 mention: args.mention,
             })
             .await?;
+        if sent.created_thread || sent.used_thread {
+            let _ = self.store.clear_pending_thread(destination);
+        }
         if sent.created_thread {
             if let (Some((place, prompt)), Some(utility)) =
                 (title_prompt, self.utility.as_ref().and_then(|u| u()))

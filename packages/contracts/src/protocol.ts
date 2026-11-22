@@ -79,12 +79,22 @@ export const DiscordInteractionOverride = Schema.Struct({
 })
 export type DiscordInteractionOverride = typeof DiscordInteractionOverride.Type
 
+export const DiscordReplyMode = Schema.Literals(['decision', 'thread', 'direct'])
+export type DiscordReplyMode = typeof DiscordReplyMode.Type
+
+export const DiscordReplyOverride = Schema.Struct({
+  channelId: Schema.String,
+  mode: DiscordReplyMode,
+})
+export type DiscordReplyOverride = typeof DiscordReplyOverride.Type
+
 export const Discord = Schema.Struct({
   allowed: Schema.Array(Schema.String),
   home: Home,
   token: Schema.Literals(['set', 'missing']),
   connection: DiscordConnection,
   interactionModes: Schema.Array(DiscordInteractionOverride),
+  replyModes: Schema.Array(DiscordReplyOverride),
 })
 export type Discord = typeof Discord.Type
 
@@ -98,6 +108,7 @@ export const DiscordChannel = Schema.Struct({
   id: Schema.String,
   name: Schema.String,
   server: Schema.String,
+  kind: Schema.Literals(['channel', 'thread']),
 })
 export type DiscordChannel = typeof DiscordChannel.Type
 
@@ -247,6 +258,19 @@ export const requests = {
       scope: DiscordInteractionScope,
       guildId: Schema.NullOr(Schema.String),
       targetId: Schema.String,
+    }),
+    reply: Discord,
+  },
+  'discord.setReplyMode': {
+    payload: Schema.Struct({
+      channelId: Schema.String,
+      mode: DiscordReplyMode,
+    }),
+    reply: Discord,
+  },
+  'discord.clearReplyMode': {
+    payload: Schema.Struct({
+      channelId: Schema.String,
     }),
     reply: Discord,
   },

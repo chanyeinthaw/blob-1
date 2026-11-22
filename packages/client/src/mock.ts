@@ -4,6 +4,7 @@ import { Transport } from './api.ts'
 import {
   Discord,
   type DiscordInteractionOverride,
+  type DiscordReplyOverride,
   Home,
   Identity,
   McpServer,
@@ -39,6 +40,7 @@ type State = Readonly<{
   home: Home
   hasToken: boolean
   interactionModes: ReadonlyArray<DiscordInteractionOverride>
+  replyModes: ReadonlyArray<DiscordReplyOverride>
   mcpServers: ReadonlyArray<McpServer>
 }>
 
@@ -70,6 +72,7 @@ const seedState = (): State => ({
   home: { kind: 'none' },
   hasToken: true,
   interactionModes: [],
+  replyModes: [],
   mcpServers: [
     {
       id: 'filesystem',
@@ -114,6 +117,7 @@ const discordReply = (state: State): Discord => ({
   token: state.hasToken ? 'set' : 'missing',
   connection: state.hasToken ? { state: 'online', bot: 'Blob-1' } : { state: 'off' },
   interactionModes: state.interactionModes,
+  replyModes: state.replyModes,
 })
 
 const setToken = (state: State, token: string): Effect.Effect<State, string> =>
@@ -297,6 +301,43 @@ const clearInteractionMode = (
     })
   })
 
+const sortedReplyModes = (
+  modes: ReadonlyArray<DiscordReplyOverride>,
+): ReadonlyArray<DiscordReplyOverride> =>
+  modes.toSorted((a, b) => a.channelId.localeCompare(b.channelId))
+
+const setReplyMode = (
+  state: State,
+  payload: RequestPayload<'discord.setReplyMode'>,
+): Effect.Effect<State, string> =>
+  Effect.gen(function* () {
+    if (!SNOWFLAKE.test(payload.channelId)) {
+      return yield* Effect.fail('Channel IDs must be 17–20 digits')
+    }
+
+    return Struct.evolve(state, {
+      replyModes: modes =>
+        sortedReplyModes([
+          ...modes.filter(entry => entry.channelId !== payload.channelId),
+          payload,
+        ]),
+    })
+  })
+
+const clearReplyMode = (
+  state: State,
+  payload: RequestPayload<'discord.clearReplyMode'>,
+): Effect.Effect<State, string> =>
+  Effect.gen(function* () {
+    if (payload.channelId === '') {
+      return yield* Effect.fail('Invalid channel id')
+    }
+
+    return Struct.evolve(state, {
+      replyModes: modes => modes.filter(entry => entry.channelId !== payload.channelId),
+    })
+  })
+
 const MCP_ID = /^[a-z0-9-]+$/
 
 const addMcpServer = (
@@ -470,10 +511,10 @@ const handlers: { readonly [K in RequestType]: Handler<K> } = {
         { id: '842724454677348000', name: 'Studio' },
       ],
       channels: [
-        { id: '928368271290421338', name: 'server-man', server: 'Blob Lab' },
-        { id: '928368271290421339', name: 'general', server: 'Blob Lab' },
-        { id: '928368271290421340', name: 'eng', server: 'Blob Lab' },
-        { id: '842724454677348360', name: 'announcements', server: 'Studio' },
+        { id: '928368271290421338', name: 'server-man', server: 'Blob Lab', kind: 'channel' },
+        { id: '928368271290421339', name: 'general', server: 'Blob Lab', kind: 'channel' },
+        { id: '928368271290421340', name: 'eng', server: 'Blob Lab', kind: 'channel' },
+        { id: '842724454677348360', name: 'announcements', server: 'Studio', kind: 'channel' },
       ],
       people: [
         {
@@ -520,6 +561,12 @@ const handlers: { readonly [K in RequestType]: Handler<K> } = {
     transition(state, current => clearInteractionMode(current, payload)).pipe(
       Effect.map(discordReply),
     ),
+
+  'discord.setReplyMode': (payload, state) =>
+    transition(state, current => setReplyMode(current, payload)).pipe(Effect.map(discordReply)),
+
+  'discord.clearReplyMode': (payload, state) =>
+    transition(state, current => clearReplyMode(current, payload)).pipe(Effect.map(discordReply)),
 
   'mcp.list': (_payload, state) => Ref.get(state).pipe(Effect.map(current => current.mcpServers)),
 

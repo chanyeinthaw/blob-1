@@ -4,6 +4,7 @@ import {
   DiscordDirectory,
   DiscordInteractionMode,
   DiscordInteractionScope,
+  DiscordReplyMode,
   Home,
 } from '@blob-1/contracts'
 import { Machine } from '@typeonce/effect-machine'
@@ -52,6 +53,21 @@ const clearInteractionMode = Effect.fn('DiscordSettings.clearInteractionMode')(f
   return yield* api.request('discord.clearInteractionMode', input)
 })
 
+const setReplyMode = Effect.fn('DiscordSettings.setReplyMode')(function* (input: {
+  readonly channelId: string
+  readonly mode: DiscordReplyMode
+}) {
+  const api = yield* Api
+  return yield* api.request('discord.setReplyMode', input)
+})
+
+const clearReplyMode = Effect.fn('DiscordSettings.clearReplyMode')(function* (input: {
+  readonly channelId: string
+}) {
+  const api = yield* Api
+  return yield* api.request('discord.clearReplyMode', input)
+})
+
 /** Polls every 2 seconds until the bot leaves "connecting", then loads the new bot's directory. */
 const watchConnection = Effect.gen(function* () {
   const api = yield* Api
@@ -94,6 +110,9 @@ export const DiscordStates = Machine.state({
     modeGuild: Schema.String,
     modeTarget: Schema.String,
     modeSetting: DiscordInteractionMode,
+    /** Reply-mode add form draft. */
+    replyChannel: Schema.String,
+    replySetting: DiscordReplyMode,
   },
   states: {
     Token: {
@@ -150,6 +169,22 @@ export const DiscordStates = Machine.state({
         },
       },
     },
+    ReplyMode: {
+      states: {
+        Idle: { fields: { error: ErrorMessage } },
+        Saving: {
+          fields: {
+            channelId: Schema.String,
+            mode: DiscordReplyMode,
+          },
+        },
+        Removing: {
+          fields: {
+            channelId: Schema.String,
+          },
+        },
+      },
+    },
   },
 })
 
@@ -179,9 +214,13 @@ export const DiscordEvents = Machine.events({
     guildId: Schema.NullOr(Schema.String),
     targetId: Schema.String,
   },
+  SelectReplyChannel: { channelId: Schema.String },
+  SelectReplySetting: { mode: DiscordReplyMode },
+  SetReplyMode: { channelId: Schema.String, mode: DiscordReplyMode },
+  ClearReplyMode: { channelId: Schema.String },
 })
 
-/** The Discord settings page: token, live connection status, allowlist and home channel. */
+/** The Discord settings page: token, live connection status, allowlist, overrides and home channel. */
 export const DiscordMachine = Machine.make({
   id: 'DiscordSettings',
   root: DiscordStates,
@@ -196,6 +235,8 @@ export const DiscordMachine = Machine.make({
     setHome,
     setInteractionMode,
     clearInteractionMode,
+    setReplyMode,
+    clearReplyMode,
   },
 }).handle({
   root: ({ input }) => ({
@@ -206,6 +247,8 @@ export const DiscordMachine = Machine.make({
     modeGuild: input.directory.guilds.length === 1 ? (input.directory.guilds[0]?.id ?? '') : '',
     modeTarget: '',
     modeSetting: 'mention-only',
+    replyChannel: '',
+    replySetting: 'direct',
   }),
   states: {
     Token: {
@@ -257,6 +300,7 @@ export const DiscordMachine = Machine.make({
                         directory: emptyDirectory,
                         modeGuild: '',
                         modeTarget: '',
+                        replyChannel: '',
                         tokenGeneration: root.tokenGeneration + 1,
                       },
               }),
@@ -281,6 +325,7 @@ export const DiscordMachine = Machine.make({
                   directory: emptyDirectory,
                   modeGuild: '',
                   modeTarget: '',
+                  replyChannel: '',
                   tokenGeneration: root.tokenGeneration + 1,
                 },
               }),
@@ -585,6 +630,89 @@ export const DiscordMachine = Machine.make({
             },
             onFailure: {
               target: 'Interaction.Idle',
+              data: ({ error }) => ({ error: error.message }),
+            },
+          },
+        },
+      },
+    },
+    ReplyMode: {
+      initial: { target: 'ReplyMode.Idle', data: { error: null } },
+      states: {
+        Idle: {
+          on: {
+            SelectReplyChannel: {
+              target: 'ReplyMode.Idle',
+              update: 'root',
+              data: ({ event, root, state }) => ({
+                target: { ...state, error: null },
+                update: { ...root, replyChannel: event.channelId },
+              }),
+            },
+            SelectReplySetting: {
+              target: 'ReplyMode.Idle',
+              update: 'root',
+              data: ({ event, root, state }) => ({
+                target: { ...state, error: null },
+                update: { ...root, replySetting: event.mode },
+              }),
+            },
+            SetReplyMode: {
+              target: 'ReplyMode.Saving',
+              data: ({ event }) => ({
+                channelId: event.channelId,
+                mode: event.mode,
+              }),
+            },
+            ClearReplyMode: {
+              target: 'ReplyMode.Removing',
+              data: ({ event }) => ({ channelId: event.channelId }),
+            },
+          },
+        },
+        Saving: {
+          invoke: {
+            src: 'setReplyMode',
+            input: ({ state }) => ({
+              channelId: state.channelId,
+              mode: state.mode,
+            }),
+            onDone: {
+              target: 'ReplyMode.Idle',
+              update: 'root',
+              data: ({ root, state, output }) => ({
+                target: { error: null },
+                update: {
+                  ...root,
+                  discord: { ...root.discord, replyModes: output.replyModes },
+                  replyChannel: state.channelId === root.replyChannel ? '' : root.replyChannel,
+                },
+              }),
+            },
+            onFailure: {
+              target: 'ReplyMode.Idle',
+              data: ({ error }) => ({ error: error.message }),
+            },
+          },
+        },
+        Removing: {
+          invoke: {
+            src: 'clearReplyMode',
+            input: ({ state }) => ({ channelId: state.channelId }),
+            onDone: {
+              target: 'ReplyMode.Idle',
+              update: 'root',
+              data: ({ root, state, output }) => ({
+                target: { error: null },
+                update: {
+                  ...root,
+                  discord: { ...root.discord, replyModes: output.replyModes },
+                  replyChannel: state.channelId === root.replyChannel ? '' : root.replyChannel,
+                },
+              }),
+            },
+            onFailure: {
+              target: 'ReplyMode.Idle',
               data: ({ error }) => ({ error: error.message }),
             },
           },

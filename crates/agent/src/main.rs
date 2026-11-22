@@ -267,6 +267,43 @@ enum MessengerCommand {
         #[command(subcommand)]
         command: MessengerModeCommand,
     },
+    Reply {
+        #[command(subcommand)]
+        command: MessengerReplyCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum MessengerReplyCommand {
+    List {
+        messenger: String,
+    },
+    Set {
+        messenger: String,
+        channel_id: String,
+        mode: ReplyModeSetting,
+    },
+    Clear {
+        messenger: String,
+        channel_id: String,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ReplyModeSetting {
+    Decision,
+    Thread,
+    Direct,
+}
+
+impl From<ReplyModeSetting> for storage::ReplyMode {
+    fn from(mode: ReplyModeSetting) -> Self {
+        match mode {
+            ReplyModeSetting::Decision => Self::Decision,
+            ReplyModeSetting::Thread => Self::Thread,
+            ReplyModeSetting::Direct => Self::Direct,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -1116,6 +1153,41 @@ async fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<(
                 }
                 let guild_ref = guild.as_deref().filter(|g| !g.is_empty());
                 store.clear_interaction_mode(&messenger, scope, guild_ref, &id)?;
+            }
+        },
+        MessengerCommand::Reply { command } => match command {
+            MessengerReplyCommand::List { messenger } => {
+                if messenger != "discord" {
+                    return Err(format!("unknown messenger: {messenger}").into());
+                }
+                for item in store.reply_modes(&messenger)? {
+                    println!("{} {}", item.channel_id, item.mode.as_str());
+                }
+            }
+            MessengerReplyCommand::Set {
+                messenger,
+                channel_id,
+                mode,
+            } => {
+                if messenger != "discord" {
+                    return Err(format!("unknown messenger: {messenger}").into());
+                }
+                if !valid_discord_id(&channel_id) {
+                    return Err("Discord channel IDs must be 17–20 digits".into());
+                }
+                store.set_reply_mode(&messenger, &channel_id, mode.into())?;
+            }
+            MessengerReplyCommand::Clear {
+                messenger,
+                channel_id,
+            } => {
+                if messenger != "discord" {
+                    return Err(format!("unknown messenger: {messenger}").into());
+                }
+                if channel_id.is_empty() {
+                    return Err("channel ID cannot be empty".into());
+                }
+                store.clear_reply_mode(&messenger, &channel_id)?;
             }
         },
     }

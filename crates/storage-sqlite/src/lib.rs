@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS skill_files (skill TEXT NOT NULL REFERENCES skills (n
 CREATE TABLE IF NOT EXISTS destinations (id INTEGER PRIMARY KEY, messenger TEXT NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, dm INTEGER NOT NULL CHECK (dm IN (0,1)), UNIQUE (messenger, channel, thread)) STRICT;
 CREATE TABLE IF NOT EXISTS allowed_users (messenger TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (messenger, user_id)) STRICT;
 CREATE TABLE IF NOT EXISTS interaction_modes (messenger TEXT NOT NULL, scope TEXT NOT NULL CHECK (scope IN ('channel', 'user')), guild_id TEXT NOT NULL DEFAULT '', target_id TEXT NOT NULL, mode TEXT NOT NULL CHECK (mode IN ('mention-only', 'always')), CHECK ((scope = 'channel' AND guild_id = '') OR scope = 'user'), PRIMARY KEY (messenger, scope, guild_id, target_id)) STRICT;
+CREATE TABLE IF NOT EXISTS reply_modes (messenger TEXT NOT NULL, channel_id TEXT NOT NULL, mode TEXT NOT NULL CHECK (mode IN ('decision', 'thread', 'direct')), PRIMARY KEY (messenger, channel_id)) STRICT;
+CREATE TABLE IF NOT EXISTS pending_threads (destination_id INTEGER PRIMARY KEY REFERENCES destinations (id) ON DELETE CASCADE) STRICT;
 
 CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK (id = 1), text TEXT NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS public_url (id INTEGER PRIMARY KEY CHECK (id = 1), url TEXT NOT NULL) STRICT;
@@ -203,6 +205,25 @@ impl SqliteStorage {
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(backend)?;
+        let had_destinations: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'destinations')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        let had_pending_threads: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pending_threads')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        if had_destinations && !had_pending_threads && owner.is_none() {
+            return Err(StoreError::Backend(
+                "this database needs an upgrade: restart blob-1 serve or run an exclusive command once".into(),
+            ));
+        }
         connection
             .pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))
             .map_err(backend)?;
@@ -265,6 +286,9 @@ impl SqliteStorage {
             .map_err(backend)?;
             tx.commit().map_err(backend)?;
         }
+        if had_destinations && !had_pending_threads {
+            backfill_pending_threads(&mut connection)?;
+        }
         let key = match app_key {
             Some(app_key) => Some(crypto::setup(&connection, &app_key)?),
             None => None,
@@ -301,4 +325,125 @@ fn maint_lock_path(path: &Path) -> std::path::PathBuf {
 
 fn backend(error: rusqlite::Error) -> StoreError {
     StoreError::Backend(Box::new(error))
+}
+
+/// One-time upgrade backfill for pre-`pending_threads` databases: recovers
+/// pending markers only where `memory_messages` provably establishes a
+/// synthesized plain-channel thread destination that was never observed as a
+/// thread and never targeted by a `send` tool call. Ambiguous legacy
+/// destinations remain non-pending.
+fn backfill_pending_threads(connection: &mut Connection) -> Result<(), StoreError> {
+    use std::collections::{HashMap, HashSet};
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    let destinations: HashMap<u64, (String, String)> = {
+        let mut stmt = tx
+            .prepare("SELECT id, channel, thread FROM destinations WHERE thread != '' AND dm = 0")
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(backend)?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (id, channel, thread) = row.map_err(backend)?;
+            map.insert(id, (channel, thread));
+        }
+        map
+    };
+    if destinations.is_empty() {
+        tx.commit().map_err(backend)?;
+        return Ok(());
+    }
+    let mut synthesized: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut observed_threads: HashSet<(String, String)> = HashSet::new();
+    let mut sent_replies: HashSet<u64> = HashSet::new();
+    let mut sent_tos: HashSet<u64> = HashSet::new();
+    {
+        let mut stmt = tx
+            .prepare("SELECT i, kind, text, meta FROM memory_messages WHERE kind IN ('user', 'tool')")
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(backend)?;
+        for row in rows {
+            let (i, kind, text, meta) = row.map_err(backend)?;
+            if kind == "user" {
+                let Some(meta_str) = meta else { continue };
+                let Ok(storage::Meta::Message {
+                    place,
+                    message,
+                    to,
+                    inline,
+                    ..
+                }) = serde_json::from_str::<storage::Meta>(&meta_str)
+                else {
+                    continue;
+                };
+                if let Some(thread) = place.thread {
+                    observed_threads.insert((place.channel, thread));
+                } else if !place.dm && !inline {
+                    if let Some((channel, thread)) = destinations.get(&to) {
+                        if channel == &place.channel && thread == &message {
+                            synthesized.entry(to).or_default().push(i);
+                        }
+                    }
+                }
+            } else if kind == "tool" {
+                let Some(args) = text.strip_prefix("send ") else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(args) else {
+                    continue;
+                };
+                if let Some(id) = value
+                    .get("reply")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.strip_prefix('m'))
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    sent_replies.insert(id);
+                }
+                if let Some(id) = value
+                    .get("to")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.strip_prefix('d'))
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    sent_tos.insert(id);
+                }
+            }
+        }
+    }
+    for (dest_id, msg_ids) in synthesized {
+        let Some(place_key) = destinations.get(&dest_id) else {
+            continue;
+        };
+        if observed_threads.contains(place_key)
+            || sent_tos.contains(&dest_id)
+            || msg_ids.iter().any(|m| sent_replies.contains(m))
+        {
+            continue;
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO pending_threads (destination_id) VALUES (?1)",
+            [dest_id as i64],
+        )
+        .map_err(backend)?;
+    }
+    tx.commit().map_err(backend)?;
+    Ok(())
 }

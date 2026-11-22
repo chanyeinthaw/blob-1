@@ -442,6 +442,7 @@ fn discord_reply(ctx: &Context) -> crate::Result<Value> {
         "token": if store.messenger_token("discord")?.is_some() { "set" } else { "missing" },
         "connection": connection,
         "interactionModes": store.interaction_modes("discord")?.into_iter().map(|o| json!({"scope":o.scope.as_str(),"guildId":o.guild_id,"targetId":o.target_id,"mode":o.mode.as_str()})).collect::<Vec<_>>(),
+        "replyModes": store.reply_modes("discord")?.into_iter().map(|o| json!({"channelId":o.channel_id,"mode":o.mode.as_str()})).collect::<Vec<_>>(),
     }))
 }
 fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -748,6 +749,27 @@ async fn dispatch(
                 }
                 discord_reply(ctx)
             }
+            "discord.setReplyMode" | "discord.clearReplyMode" => {
+                let channel_id = get("channelId")?;
+                if request_type == "discord.setReplyMode" {
+                    if !crate::valid_discord_id(channel_id) {
+                        return Err("Channel IDs must be 17–20 digits".into());
+                    }
+                    let mode = match get("mode")? {
+                        "decision" => storage::ReplyMode::Decision,
+                        "thread" => storage::ReplyMode::Thread,
+                        "direct" => storage::ReplyMode::Direct,
+                        _ => return Err(invalid().into()),
+                    };
+                    store.set_reply_mode("discord", channel_id, mode)?;
+                } else {
+                    if channel_id.is_empty() {
+                        return Err(invalid().into());
+                    }
+                    store.clear_reply_mode("discord", channel_id)?;
+                }
+                discord_reply(ctx)
+            }
             "discord.directory" => {
                 let (guilds, mut channels, people) = match ctx.discord.directory().await {
                     Ok(result) => result,
@@ -757,24 +779,31 @@ async fn dispatch(
                     }
                 };
                 // Resolve any stored channel/thread overrides missing from the
-                // top-level guild channel list so threads still show their name
-                // and server in Settings.
+                // top-level guild channel list so threads/channels still show
+                // their name and server in Settings.
+                let mut extra_ids = Vec::new();
                 if let Ok(overrides) = store.interaction_modes("discord") {
-                    for o in overrides
-                        .into_iter()
-                        .filter(|o| o.scope == storage::InteractionScope::Channel)
-                    {
-                        if !channels.iter().any(|(id, _, _)| id == &o.target_id) {
-                            if let Ok(Some(resolved)) =
-                                ctx.discord.resolve_channel(&o.target_id, &guilds).await
-                            {
-                                channels.push(resolved);
-                            }
+                    extra_ids.extend(
+                        overrides
+                            .into_iter()
+                            .filter(|o| o.scope == storage::InteractionScope::Channel)
+                            .map(|o| o.target_id),
+                    );
+                }
+                if let Ok(overrides) = store.reply_modes("discord") {
+                    extra_ids.extend(overrides.into_iter().map(|o| o.channel_id));
+                }
+                for cid in extra_ids {
+                    if !channels.iter().any(|(id, _, _, _)| id == &cid) {
+                        if let Ok(Some(resolved)) =
+                            ctx.discord.resolve_channel(&cid, &guilds).await
+                        {
+                            channels.push(resolved);
                         }
                     }
                 }
                 Ok(
-                    json!({"guilds":guilds.into_iter().map(|(id,name)| json!({"id":id,"name":name})).collect::<Vec<_>>(),"channels":channels.into_iter().map(|(id,name,server)| json!({"id":id,"name":name,"server":server})).collect::<Vec<_>>(),"people":people.into_iter().map(|(p,g)| json!({"id":p.id,"name":p.name,"guilds":g})).collect::<Vec<_>>() }),
+                    json!({"guilds":guilds.into_iter().map(|(id,name)| json!({"id":id,"name":name})).collect::<Vec<_>>(),"channels":channels.into_iter().map(|(id,name,server,is_thread)| json!({"id":id,"name":name,"server":server,"kind":if is_thread { "thread" } else { "channel" }})).collect::<Vec<_>>(),"people":people.into_iter().map(|(p,g)| json!({"id":p.id,"name":p.name,"guilds":g})).collect::<Vec<_>>() }),
                 )
             }
             "mcp.list" => Ok(mcp_reply(&ctx.mcp).await?),

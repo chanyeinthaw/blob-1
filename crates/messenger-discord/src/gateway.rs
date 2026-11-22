@@ -16,14 +16,19 @@ struct CachedChannel {
 }
 
 fn cache_channel(
+    discord: &Discord,
     known: &mut HashMap<Id<ChannelMarker>, CachedChannel>,
     ch: &twilight_model::channel::Channel,
 ) {
+    let parent = ch.kind.is_thread().then_some(ch.parent_id).flatten();
+    if let Some(parent_id) = parent {
+        discord.notify_thread_seen(&parent_id.to_string(), &ch.id.to_string());
+    }
     known.insert(
         ch.id,
         CachedChannel {
             name: ch.name.clone().unwrap_or_default(),
-            parent: ch.kind.is_thread().then_some(ch.parent_id).flatten(),
+            parent,
         },
     );
 }
@@ -130,17 +135,17 @@ async fn run(
                     *guild
                 {
                     for ch in guild.channels.iter().chain(guild.threads.iter()) {
-                        cache_channel(&mut known_channels, ch);
+                        cache_channel(discord, &mut known_channels, ch);
                     }
                 }
             }
-            Some(Ok(Event::ChannelCreate(ch))) => cache_channel(&mut known_channels, &ch),
-            Some(Ok(Event::ChannelUpdate(ch))) => cache_channel(&mut known_channels, &ch),
-            Some(Ok(Event::ThreadCreate(ch))) => cache_channel(&mut known_channels, &ch),
-            Some(Ok(Event::ThreadUpdate(ch))) => cache_channel(&mut known_channels, &ch),
+            Some(Ok(Event::ChannelCreate(ch))) => cache_channel(discord, &mut known_channels, &ch),
+            Some(Ok(Event::ChannelUpdate(ch))) => cache_channel(discord, &mut known_channels, &ch),
+            Some(Ok(Event::ThreadCreate(ch))) => cache_channel(discord, &mut known_channels, &ch),
+            Some(Ok(Event::ThreadUpdate(ch))) => cache_channel(discord, &mut known_channels, &ch),
             Some(Ok(Event::ThreadListSync(sync))) => {
                 for ch in &sync.threads {
-                    cache_channel(&mut known_channels, ch);
+                    cache_channel(discord, &mut known_channels, ch);
                 }
             }
             Some(Ok(Event::MessageCreate(message))) => {
@@ -231,7 +236,7 @@ async fn run(
                             }
                         };
                         let parent = ch.kind.is_thread().then_some(ch.parent_id).flatten();
-                        cache_channel(&mut known_channels, &ch);
+                        cache_channel(discord, &mut known_channels, &ch);
                         if let Some(filter) = &pre_filter {
                             let recheck = match parent {
                                 Some(parent) => filter(
@@ -288,7 +293,7 @@ async fn run(
                                     .model()
                                     .await
                                     .map_err(backend)?;
-                                cache_channel(&mut known_channels, &ch);
+                                cache_channel(discord, &mut known_channels, &ch);
                                 ch
                             }
                         };

@@ -41,6 +41,10 @@ type PreFilter = Arc<
     dyn Fn(&str, Option<&str>, &str, Option<&str>, bool, bool) -> PreFilterDecision + Send + Sync,
 >;
 
+/// Callback invoked whenever Discord reports or confirms that a thread exists
+/// `(parent_channel_id, thread_id)`.
+type ThreadSeen = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
 /// The Discord messenger. It starts disconnected and swaps its HTTP client
 /// and gateway live when `connect` is called with a new token. Operations
 /// while disconnected fail with "Discord is not connected".
@@ -48,6 +52,7 @@ pub struct Discord {
     inner: watch::Sender<Option<Arc<Inner>>>,
     connection: watch::Sender<Connection>,
     pre_filter: std::sync::RwLock<Option<PreFilter>>,
+    on_thread_seen: std::sync::RwLock<Option<ThreadSeen>>,
 }
 
 /// One bot connection: its HTTP client plus the state the gateway fills in.
@@ -68,11 +73,11 @@ pub enum Connection {
     Error { message: String },
 }
 
-/// `(guilds, channels, people)` where each person carries the guild IDs they
-/// belong to so guild-scoped pickers can filter by server.
+/// `(guilds, channels, people)` where each channel carries `(id, name, server, is_thread)`
+/// and each person carries the guild IDs they belong to so pickers can filter accurately.
 type Directory = (
     Vec<(String, String)>,
-    Vec<(String, String, String)>,
+    Vec<(String, String, String, bool)>,
     Vec<(Person, Vec<String>)>,
 );
 
@@ -150,6 +155,7 @@ impl Discord {
             inner: watch::channel(None).0,
             connection: watch::channel(Connection::Off).0,
             pre_filter: std::sync::RwLock::new(None),
+            on_thread_seen: std::sync::RwLock::new(None),
         }
     }
 
@@ -167,6 +173,26 @@ impl Discord {
             .read()
             .expect("pre_filter lock poisoned")
             .clone()
+    }
+
+    /// Installs a callback notified whenever Discord reports or creates a
+    /// thread `(parent_channel_id, thread_id)`.
+    pub fn set_on_thread_seen(&self, cb: ThreadSeen) {
+        *self
+            .on_thread_seen
+            .write()
+            .expect("on_thread_seen lock poisoned") = Some(cb);
+    }
+
+    pub(crate) fn notify_thread_seen(&self, parent: &str, thread: &str) {
+        if let Some(cb) = self
+            .on_thread_seen
+            .read()
+            .expect("on_thread_seen lock poisoned")
+            .clone()
+        {
+            cb(parent, thread);
+        }
     }
 
     /// Connects with a bot token, replacing any current connection.
@@ -225,12 +251,12 @@ impl Discord {
     }
 
     /// Resolve a single channel or thread id (e.g. a stored thread override
-    /// not in the top-level channel list) to `(id, name, server_name)`.
+    /// not in the top-level channel list) to `(id, name, server_name, is_thread)`.
     pub async fn resolve_channel(
         &self,
         channel_id: &str,
         guilds: &[(String, String)],
-    ) -> Result<Option<(String, String, String)>, MessengerError> {
+    ) -> Result<Option<(String, String, String, bool)>, MessengerError> {
         let Some(inner) = self.inner.borrow().clone() else {
             return Ok(None);
         };
@@ -251,7 +277,12 @@ impl Discord {
             .or(guild_id)
             .unwrap_or_default();
         let name = channel.name.unwrap_or_else(|| channel_id.to_owned());
-        Ok(Some((channel.id.to_string(), name, server)))
+        Ok(Some((
+            channel.id.to_string(),
+            name,
+            server,
+            channel.kind.is_thread(),
+        )))
     }
 }
 
@@ -345,7 +376,7 @@ impl Inner {
                     ChannelType::GuildText | ChannelType::GuildAnnouncement
                 ) {
                     if let Some(name) = channel.name {
-                        channels.push((channel.id.to_string(), name, guild.name.clone()));
+                        channels.push((channel.id.to_string(), name, guild.name.clone(), false));
                     }
                 }
             }
@@ -646,7 +677,7 @@ impl Messenger for Discord {
     }
     async fn send(&self, outbound: Outbound) -> Result<messenger::Sent, MessengerError> {
         let inner = self.current()?;
-        render::send(&inner, outbound).await
+        render::send(self, &inner, outbound).await
     }
     async fn rename(&self, place: &Place, name: &str) -> Result<(), MessengerError> {
         let thread = place

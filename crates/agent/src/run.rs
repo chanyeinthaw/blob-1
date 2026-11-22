@@ -747,6 +747,18 @@ fn admitted(store: &SqliteStorage, inbound: &messenger::Inbound) -> Result<bool>
     )
 }
 
+/// The effective reply mode for a plain-channel message: a channel override
+/// if configured, otherwise `Decision`.
+fn effective_reply_mode(
+    overrides: &[storage::ReplyOverride],
+    channel_id: &str,
+) -> storage::ReplyMode {
+    overrides
+        .iter()
+        .find(|o| o.channel_id == channel_id)
+        .map_or(storage::ReplyMode::Decision, |o| o.mode)
+}
+
 async fn admit(
     store: &Arc<SqliteStorage>,
     discord: Arc<dyn messenger::Messenger>,
@@ -758,25 +770,32 @@ async fn admit(
         return Ok(None);
     }
     let inline = if inbound.place.thread.is_none() && !inbound.place.dm {
-        if let Some(utility) = utility {
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                let history = discord
-                    .history(&inbound.place, Some(&inbound.message), 5)
+        match effective_reply_mode(&store.reply_modes("discord")?, &inbound.place.channel) {
+            storage::ReplyMode::Direct => true,
+            storage::ReplyMode::Thread => false,
+            storage::ReplyMode::Decision => {
+                if let Some(utility) = utility {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        let history = discord
+                            .history(&inbound.place, Some(&inbound.message), 5)
+                            .await
+                            .ok()?;
+                        Some(decide_inline(utility, &history, &inbound).await)
+                    })
                     .await
-                    .ok()?;
-                Some(decide_inline(utility, &history, &inbound).await)
-            })
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(false)
-        } else {
-            false
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false)
+                } else {
+                    false
+                }
+            }
         }
     } else {
         false
     };
-    let dest = if inline || inbound.place.thread.is_some() || inbound.place.dm {
+    let pending_thread = !inline && inbound.place.thread.is_none() && !inbound.place.dm;
+    let dest = if !pending_thread {
         inbound.place.clone()
     } else {
         storage::Place {
@@ -786,6 +805,11 @@ async fn admit(
         }
     };
     let to = store.destination("discord", &dest)?;
+    if pending_thread {
+        store.mark_pending_thread(to)?;
+    } else if inbound.place.thread.is_some() {
+        store.clear_pending_thread(to)?;
+    }
     if inbound.addressed {
         let (place, message) = (inbound.place.clone(), inbound.message.clone());
         tokio::spawn(async move {
@@ -891,6 +915,13 @@ pub async fn serve(
                 }
             },
         ));
+        let thread_store = store.clone();
+        discord.set_on_thread_seen(Arc::new(move |parent: &str, thread: &str| {
+            if let Err(error) = thread_store.clear_pending_thread_by_place("discord", parent, thread)
+            {
+                eprintln!("{error}");
+            }
+        }));
     }
     let (tx, mut rx) = tokio::sync::mpsc::channel(128);
     let listener_discord = discord.clone();
@@ -1250,5 +1281,28 @@ mod tests {
         assert!(!admitted(&store, &inbound(channel("c9", None), Some("g2"), "u1", false)).unwrap());
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reply_mode_resolution() {
+        use storage::{ReplyMode, ReplyOverride};
+        let overrides = vec![
+            ReplyOverride {
+                channel_id: "c1".into(),
+                mode: ReplyMode::Direct,
+            },
+            ReplyOverride {
+                channel_id: "c2".into(),
+                mode: ReplyMode::Thread,
+            },
+            ReplyOverride {
+                channel_id: "c3".into(),
+                mode: ReplyMode::Decision,
+            },
+        ];
+        assert_eq!(effective_reply_mode(&overrides, "c1"), ReplyMode::Direct);
+        assert_eq!(effective_reply_mode(&overrides, "c2"), ReplyMode::Thread);
+        assert_eq!(effective_reply_mode(&overrides, "c3"), ReplyMode::Decision);
+        assert_eq!(effective_reply_mode(&overrides, "c9"), ReplyMode::Decision);
     }
 }

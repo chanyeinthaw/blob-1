@@ -3,6 +3,8 @@ import type {
   DiscordConnection,
   DiscordDirectory,
   DiscordInteractionOverride,
+  DiscordReplyMode,
+  DiscordReplyOverride,
   Home,
 } from '@blob-1/contracts'
 import { useAtomRefresh, useAtomSet, useAtomValue } from '@effect/atom-react'
@@ -138,6 +140,7 @@ export function DiscordSettings() {
       <TokenSection />
       <AllowlistSection />
       <InteractionModeSection />
+      <ReplyModeSection />
       <HomeSection />
     </div>
   )
@@ -853,6 +856,249 @@ function ModeForm(props: ModeFormProps) {
               </div>
             </FieldRow>
             {error === null ? null : <FieldError id="discord-mode-error">{error}</FieldError>}
+          </div>
+        )
+      }}
+    </MachineState>
+  )
+}
+
+const replyModes: ReadonlyArray<{ readonly mode: DiscordReplyMode; readonly label: string }> = [
+  { mode: 'decision', label: 'Decision' },
+  { mode: 'thread', label: 'Thread' },
+  { mode: 'direct', label: 'Direct' },
+]
+
+function isReplyMode(value: string | undefined): value is DiscordReplyMode {
+  return value === 'decision' || value === 'thread' || value === 'direct'
+}
+
+function ReplyModeSection() {
+  const machine = DiscordOwner.useMachine()
+  const isIdle = AsyncResult.getOrElse(
+    useMachineResult(AtomMachine.matches(machine, 'ReplyMode.Idle')),
+    () => false,
+  )
+  return (
+    <Section title="Reply mode">
+      <MachineState machine={machine} path="">
+        {({ value }) =>
+          value.discord.replyModes.length === 0 ? (
+            <EmptyLine>No reply mode overrides.</EmptyLine>
+          ) : (
+            <ul className="flex flex-col divide-y">
+              {value.discord.replyModes.map(override => (
+                <ReplyOverrideRow
+                  key={override.channelId}
+                  override={override}
+                  directory={value.directory}
+                  disabled={!isIdle}
+                />
+              ))}
+            </ul>
+          )
+        }
+      </MachineState>
+      <ReplyModeForm isIdle={isIdle} />
+    </Section>
+  )
+}
+
+interface ReplyOverrideRowProps {
+  readonly override: DiscordReplyOverride
+  readonly directory: DiscordDirectory
+  readonly disabled: boolean
+}
+
+function describeReplyOverride(override: DiscordReplyOverride, directory: DiscordDirectory) {
+  const channel = directory.channels.find(entry => entry.id === override.channelId)
+  const name = channel?.name
+  const label = name === undefined ? override.channelId : `#${name}`
+  const guildLabel = channel?.server ?? null
+  const detail = [label, guildLabel].filter(Boolean).join(' · ')
+  return {
+    name,
+    label,
+    guildLabel,
+    accessibleTarget: guildLabel === null ? label : `${label} in ${guildLabel}`,
+    confirmDetail: name === undefined ? detail : `${detail} (${override.channelId})`,
+  }
+}
+
+function ReplyOverrideRow(props: ReplyOverrideRowProps) {
+  const machine = DiscordOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  const { channelId, mode } = props.override
+  const { name, label, guildLabel, accessibleTarget, confirmDetail } = describeReplyOverride(
+    props.override,
+    props.directory,
+  )
+  return (
+    <li className="flex min-h-12 flex-wrap items-center gap-x-3 gap-y-2 py-2">
+      <span
+        aria-hidden="true"
+        className="grid size-7 shrink-0 place-items-center rounded-full bg-muted text-[11px] font-semibold text-muted-foreground"
+      >
+        <Hash className="size-3.5" />
+      </span>
+      <div className="flex min-w-0 flex-1 basis-40 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span className="break-words text-sm [overflow-wrap:anywhere]">{label}</span>
+        {guildLabel === null ? null : (
+          <span className="break-words text-xs text-muted-foreground [overflow-wrap:anywhere]">
+            {guildLabel}
+          </span>
+        )}
+        {name === undefined ? null : (
+          <span className="font-mono text-xs text-muted-foreground">{channelId}</span>
+        )}
+      </div>
+      <div className="ml-auto flex items-center gap-1">
+        <ToggleGroup
+          aria-label={`Reply mode for ${accessibleTarget}`}
+          spacing={1}
+          disabled={props.disabled}
+          value={[mode]}
+          onValueChange={values => {
+            const next = values[0]
+            if (isReplyMode(next) && next !== mode) {
+              send(DiscordEvents.SetReplyMode({ channelId, mode: next }))
+            }
+          }}
+          className="h-10 rounded-full bg-muted p-[3px] md:h-8"
+        >
+          {replyModes.map(entry => (
+            <ToggleGroupItem
+              key={entry.mode}
+              value={entry.mode}
+              className={modeToggleItemClassName}
+            >
+              {entry.label}
+            </ToggleGroupItem>
+          ))}
+        </ToggleGroup>
+        <ConfirmDialog
+          tooltip="Remove override"
+          trigger={
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label={`Remove reply mode override for ${accessibleTarget}`}
+              disabled={props.disabled}
+              className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+            >
+              <Trash2 />
+            </Button>
+          }
+          title="Remove reply mode override?"
+          detail={confirmDetail}
+          confirmLabel="Remove"
+          onConfirm={() => send(DiscordEvents.ClearReplyMode({ channelId }))}
+        />
+      </div>
+    </li>
+  )
+}
+
+interface ReplyModeFormProps {
+  readonly isIdle: boolean
+}
+
+/** Add a channel reply mode override (`decision`, `thread`, or `direct`). */
+function ReplyModeForm(props: ReplyModeFormProps) {
+  const machine = DiscordOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  return (
+    <MachineState machine={machine} path="">
+      {({ value, states }) => {
+        const reply = states.ReplyMode.state
+        const error = reply.path === 'ReplyMode.Idle' ? reply.value.error : null
+        const overridden = (channelId: string) =>
+          value.discord.replyModes.some(entry => entry.channelId === channelId)
+        const isKnownThread = (channelId: string) =>
+          value.directory.channels.some(
+            channel => channel.id === channelId && channel.kind === 'thread',
+          )
+        const options = value.directory.channels
+          .filter(channel => channel.kind === 'channel' && !overridden(channel.id))
+          .map(channel => ({
+            value: channel.id,
+            label: `#${channel.name}`,
+            hint: channel.server,
+          }))
+        const channelValid =
+          SNOWFLAKE.test(value.replyChannel) &&
+          !overridden(value.replyChannel) &&
+          !isKnownThread(value.replyChannel)
+        return (
+          <div className="mt-2.5">
+            <FieldRow id="discord-reply-channel" label="Channel">
+              <Picker
+                id="discord-reply-channel"
+                placeholder="Choose a channel"
+                value={value.replyChannel}
+                disabled={!props.isIdle}
+                clearOnEdit
+                options={options}
+                customOption={raw => {
+                  const id = raw.trim()
+                  if (!SNOWFLAKE.test(id) || overridden(id) || isKnownThread(id)) return null
+                  return { value: id, label: `Use ID ${id}`, hint: null }
+                }}
+                emptyMessage={raw => {
+                  const trimmed = raw.trim()
+                  if (trimmed === '') return 'No matches'
+                  if (overridden(trimmed)) return 'Already has an override'
+                  if (isKnownThread(trimmed)) return 'Reply mode applies to channels, not threads'
+                  if (/^\d+$/.test(trimmed) && !SNOWFLAKE.test(trimmed)) {
+                    return 'Discord IDs have 17–20 digits'
+                  }
+                  return 'No matches'
+                }}
+                onChange={channelId => send(DiscordEvents.SelectReplyChannel({ channelId }))}
+              />
+            </FieldRow>
+            <FieldRow labelId="discord-reply-setting-label" label="Mode">
+              <div className="flex flex-wrap items-center gap-2">
+                <ToggleGroup
+                  aria-labelledby="discord-reply-setting-label"
+                  spacing={1}
+                  disabled={!props.isIdle}
+                  value={[value.replySetting]}
+                  onValueChange={values => {
+                    const next = values[0]
+                    if (isReplyMode(next) && next !== value.replySetting) {
+                      send(DiscordEvents.SelectReplySetting({ mode: next }))
+                    }
+                  }}
+                  className="h-10 rounded-full bg-muted p-[3px] md:h-8"
+                >
+                  {replyModes.map(entry => (
+                    <ToggleGroupItem
+                      key={entry.mode}
+                      value={entry.mode}
+                      className={modeToggleItemClassName}
+                    >
+                      {entry.label}
+                    </ToggleGroupItem>
+                  ))}
+                </ToggleGroup>
+                <Button
+                  className="ml-auto"
+                  disabled={!props.isIdle || !channelValid}
+                  onClick={() =>
+                    send(
+                      DiscordEvents.SetReplyMode({
+                        channelId: value.replyChannel,
+                        mode: value.replySetting,
+                      }),
+                    )
+                  }
+                >
+                  Add override
+                </Button>
+              </div>
+            </FieldRow>
+            {error === null ? null : <FieldError id="discord-reply-error">{error}</FieldError>}
           </div>
         )
       }}
