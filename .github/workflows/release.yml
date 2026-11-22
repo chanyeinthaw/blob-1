@@ -42,16 +42,8 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
-            cross_linux_arm64: false
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04
-            cross_linux_arm64: true
           - target: aarch64-apple-darwin
             os: macos-15
-            cross_linux_arm64: false
-          - target: x86_64-apple-darwin
-            os: macos-15
-            cross_linux_arm64: false
     steps:
       - uses: actions/checkout@v4
 
@@ -59,12 +51,6 @@ jobs:
         with:
           name: web-dist
           path: apps/web/dist
-
-      - name: Install Linux ARM64 cross-compiler
-        if: matrix.cross_linux_arm64
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -75,10 +61,6 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release binary
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
         run: cargo build --release --locked --target ${{ matrix.target }} -p agent
 
       - name: Package binary
