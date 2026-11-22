@@ -206,10 +206,10 @@ function ProviderRow(props: ProviderRowProps) {
             tooltip="Remove provider"
             trigger={
               <Button
-                variant="outline"
+                variant="ghost"
                 size="icon"
                 aria-label={`Remove ${provider.id}`}
-                className="text-destructive"
+                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
                 disabled={removing}
               >
                 <Trash2 />

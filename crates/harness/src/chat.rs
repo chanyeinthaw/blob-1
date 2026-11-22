@@ -71,17 +71,21 @@ Messages sent while you work reach you between tool calls."#;
 
 const MESSENGER_PROMPT: &str = r#"# Messengers
 
-People on messengers only see what you send. Messenger messages have a <message ...>...</message> element with messenger, reply and to tokens, author id and name, where, and earlier messages in the thread. Outside DMs you only receive messages that mention you or reply to you; the rest of the conversation reaches you only through history. DMs arrive directly. A message with no text, or one that refers to something you have not seen, asks you to act on the conversation: read recent messages with history first, then answer what was asked, or ask what they need if it is still unclear. Answer every message delivered to you with at least one send.
+People on messengers only see what you send. Messenger messages have a <message ...>...</message> element with messenger, reply and to tokens, author id and name, where, and earlier messages in the thread. DMs arrive directly. In group channels and threads, you receive mentions and replies to you, and—where interaction mode is set to always—plain group messages marked unaddressed="true".
+
+Always answer DMs, mentions and replies to you with at least one send. For group-chat messages marked unaddressed="true", people may be talking to each other rather than to you: decide first whether to reply to that message. Chime in when it is aimed at you, continues an exchange with you, or asks for something you should help with; otherwise skip sending a reply to it.
+
+For a message you are answering that has no text or refers to something you have not seen, read recent messages with history first, then answer what was asked, or ask what they need if it is still unclear.
 
 Write plain, unescaped text in send. Send with reply to answer the message; send with to to post plainly in that conversation. You may send any number of messages per turn. Several people and conversations can be active, so pick the right token. Talk like a human teammate. Keep each send at most 300 characters. For longer answers, issue multiple send calls together. Mention people by user id with mention; find ids with participants.
 
-Messages marked mode="inline" were judged quick, so answer them inline with reply. If an inline exchange turns into real work, send with thread: true to continue in a thread.
+When you answer a message marked mode="inline", answer inline with reply. If an inline exchange turns into real work, send with thread: true to continue in a thread.
 
 A reply includes the referenced message as <quote>. Use message to read a linked message or one by id. Messages, quotes and lookup results can carry <attachment name type size url/> elements. You cannot download files yourself. Spawn a task with the URLs and what to do; tell it to download them immediately, because links expire in about a day, to a new path it chooses under the working directory (never one built from the attachment name, which is only a label), with curl --fail --location --output '<path>' '<url>', and only then read or process the files and report what matters. For images, the chosen path must end with an extension matching the attachment type (e.g. .png for image/png); when the type is missing, the task identifies the downloaded file from its bytes (e.g. with file) and renames it to the matching extension before reading, so read can show it the image. If its model cannot view images, spawn it on one that can; models lists image support.
 
 Tasks can also read messengers: message, history, search and participants, never send. For a quick look at recent context, call history yourself. For anything longer, like paging far back, checking several conversations, or finding what was decided about something, spawn a task with the question and the to tokens of the conversations involved, or the messenger name when it must look across a whole messenger, and send people the answer from its report. When you delegate, briefly tell the person you are on it.
 
-Once every delivered message has its answer and no further words are needed, end with exactly NO_UPDATES."#;
+Once every message that needs a reply has been answered and nothing else remains to report, end with exactly NO_UPDATES."#;
 
 pub(crate) const EXTRA: &[ToolSpec] = &[
     ToolSpec {

@@ -239,7 +239,22 @@ const SNOWFLAKE = /^\d{17,20}$/
 const sortedModes = (
   modes: ReadonlyArray<DiscordInteractionOverride>,
 ): ReadonlyArray<DiscordInteractionOverride> =>
-  modes.toSorted((a, b) => a.scope.localeCompare(b.scope) || a.targetId.localeCompare(b.targetId))
+  modes.toSorted(
+    (a, b) =>
+      a.scope.localeCompare(b.scope) ||
+      (a.guildId ?? '').localeCompare(b.guildId ?? '') ||
+      a.targetId.localeCompare(b.targetId),
+  )
+
+const sameOverrideKey = (
+  entry: DiscordInteractionOverride,
+  key: {
+    readonly scope: DiscordInteractionOverride['scope']
+    readonly guildId: string | null
+    readonly targetId: string
+  },
+): boolean =>
+  entry.scope === key.scope && entry.guildId === key.guildId && entry.targetId === key.targetId
 
 const setInteractionMode = (
   state: State,
@@ -249,15 +264,19 @@ const setInteractionMode = (
     if (!SNOWFLAKE.test(payload.targetId)) {
       return yield* Effect.fail('Ids must be 17–20 digits')
     }
+    if (payload.scope === 'channel' && payload.guildId !== null) {
+      return yield* Effect.fail('Channel overrides cannot specify a server')
+    }
+    if (
+      payload.scope === 'user' &&
+      (payload.guildId === null || !SNOWFLAKE.test(payload.guildId))
+    ) {
+      return yield* Effect.fail('Server IDs must be 17–20 digits')
+    }
 
     return Struct.evolve(state, {
       interactionModes: modes =>
-        sortedModes([
-          ...modes.filter(
-            entry => !(entry.scope === payload.scope && entry.targetId === payload.targetId),
-          ),
-          payload,
-        ]),
+        sortedModes([...modes.filter(entry => !sameOverrideKey(entry, payload)), payload]),
     })
   })
 
@@ -269,12 +288,12 @@ const clearInteractionMode = (
     if (payload.targetId === '') {
       return yield* Effect.fail('Invalid target id')
     }
+    if (payload.scope === 'channel' && payload.guildId !== null) {
+      return yield* Effect.fail('Invalid payload')
+    }
 
     return Struct.evolve(state, {
-      interactionModes: modes =>
-        modes.filter(
-          entry => !(entry.scope === payload.scope && entry.targetId === payload.targetId),
-        ),
+      interactionModes: modes => modes.filter(entry => !sameOverrideKey(entry, payload)),
     })
   })
 
@@ -446,6 +465,10 @@ const handlers: { readonly [K in RequestType]: Handler<K> } = {
 
   'discord.directory': () =>
     Effect.succeed({
+      guilds: [
+        { id: '928368271290421000', name: 'Blob Lab' },
+        { id: '842724454677348000', name: 'Studio' },
+      ],
       channels: [
         { id: '928368271290421338', name: 'server-man', server: 'Blob Lab' },
         { id: '928368271290421339', name: 'general', server: 'Blob Lab' },
@@ -453,9 +476,21 @@ const handlers: { readonly [K in RequestType]: Handler<K> } = {
         { id: '842724454677348360', name: 'announcements', server: 'Studio' },
       ],
       people: [
-        { id: '435482941515104257', name: 'Chan Nyein Thaw' },
-        { id: '694730852973805679', name: 'Su Hlaing Hnin' },
-        { id: '1090496556781809745', name: 'Pinn' },
+        {
+          id: '435482941515104257',
+          name: 'Chan Nyein Thaw',
+          guilds: ['928368271290421000', '842724454677348000'],
+        },
+        {
+          id: '694730852973805679',
+          name: 'Su Hlaing Hnin',
+          guilds: ['928368271290421000'],
+        },
+        {
+          id: '1090496556781809745',
+          name: 'Pinn',
+          guilds: ['842724454677348000'],
+        },
       ],
     }),
 

@@ -4,6 +4,8 @@ use tokio::sync::mpsc;
 #[derive(Debug, Clone)]
 pub struct Inbound {
     pub place: Place,
+    /// Discord guild id when the message arrived in a server; `None` for DMs.
+    pub guild: Option<String>,
     pub message: String,
     pub author: Person,
     pub text: String,

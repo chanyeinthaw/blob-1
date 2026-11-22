@@ -455,6 +455,8 @@ pub enum Meta {
         to: u64,
         #[serde(default)]
         inline: bool,
+        #[serde(default)]
+        unaddressed: bool,
         #[serde(rename = "where")]
         location: String,
         earlier: Option<u32>,
@@ -566,15 +568,21 @@ impl Meta {
                 quote,
                 attachments,
                 inline,
+                unaddressed,
                 ..
             } => format!(
-                "<message messenger=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}{}>\n{}{}{body}\n</message>",
+                "<message messenger=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}{}{}>\n{}{}{body}\n</message>",
                 attribute(messenger),
                 attribute(&author.id),
                 attribute(&author.name),
                 attribute(location),
                 earlier.map_or_else(String::new, |n| format!(" earlier=\"{n}\"")),
                 if *inline { " mode=\"inline\"" } else { "" },
+                if *unaddressed {
+                    " unaddressed=\"true\""
+                } else {
+                    ""
+                },
                 quote.as_ref().map_or_else(String::new, |quote| format!(
                     "<quote author=\"{}\" author_name=\"{}\" message=\"{}\">\n{}{}\n</quote>\n",
                     attribute(&quote.author.id), attribute(&quote.author.name), attribute(&quote.message), render_attachments(&quote.attachments), escape(&quote.text)
@@ -770,6 +778,8 @@ impl InteractionMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InteractionOverride {
     pub scope: InteractionScope,
+    /// Discord guild id for `User` overrides; `None` for `Channel` overrides.
+    pub guild_id: Option<String>,
     pub target_id: String,
     pub mode: InteractionMode,
 }
@@ -783,13 +793,14 @@ pub trait MessengerStore: Send + Sync {
     /// The bot token for a chat platform (e.g. `discord`); stored encrypted.
     fn messenger_token(&self, messenger: &str) -> Result<Option<String>, StoreError>;
     fn set_messenger_token(&self, messenger: &str, token: Option<&str>) -> Result<(), StoreError>;
-    /// Per-channel and per-user interaction overrides, ordered by scope then
-    /// target id.
+    /// Per-channel and per-guild-user interaction overrides, ordered by scope,
+    /// guild id, then target id.
     fn interaction_modes(&self, messenger: &str) -> Result<Vec<InteractionOverride>, StoreError>;
     fn set_interaction_mode(
         &self,
         messenger: &str,
         scope: InteractionScope,
+        guild_id: Option<&str>,
         target_id: &str,
         mode: InteractionMode,
     ) -> Result<(), StoreError>;
@@ -797,6 +808,7 @@ pub trait MessengerStore: Send + Sync {
         &self,
         messenger: &str,
         scope: InteractionScope,
+        guild_id: Option<&str>,
         target_id: &str,
     ) -> Result<bool, StoreError>;
 }
@@ -830,18 +842,20 @@ impl<T: MessengerStore + ?Sized> MessengerStore for std::sync::Arc<T> {
         &self,
         messenger: &str,
         scope: InteractionScope,
+        guild_id: Option<&str>,
         target_id: &str,
         mode: InteractionMode,
     ) -> Result<(), StoreError> {
-        (**self).set_interaction_mode(messenger, scope, target_id, mode)
+        (**self).set_interaction_mode(messenger, scope, guild_id, target_id, mode)
     }
     fn clear_interaction_mode(
         &self,
         messenger: &str,
         scope: InteractionScope,
+        guild_id: Option<&str>,
         target_id: &str,
     ) -> Result<bool, StoreError> {
-        (**self).clear_interaction_mode(messenger, scope, target_id)
+        (**self).clear_interaction_mode(messenger, scope, guild_id, target_id)
     }
 }
 

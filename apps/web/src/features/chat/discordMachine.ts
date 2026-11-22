@@ -9,7 +9,7 @@ import {
 import { Machine } from '@typeonce/effect-machine'
 import { Effect, Schedule, Schema } from 'effect'
 
-const emptyDirectory: DiscordDirectory = { channels: [], people: [] }
+const emptyDirectory: DiscordDirectory = { guilds: [], channels: [], people: [] }
 
 const saveToken = Effect.fn('DiscordSettings.saveToken')(function* (token: string) {
   const api = yield* Api
@@ -35,6 +35,7 @@ const setHome = Effect.fn('DiscordSettings.setHome')(function* (home: Home) {
 
 const setInteractionMode = Effect.fn('DiscordSettings.setInteractionMode')(function* (input: {
   readonly scope: DiscordInteractionScope
+  readonly guildId: string | null
   readonly targetId: string
   readonly mode: DiscordInteractionMode
 }) {
@@ -44,6 +45,7 @@ const setInteractionMode = Effect.fn('DiscordSettings.setInteractionMode')(funct
 
 const clearInteractionMode = Effect.fn('DiscordSettings.clearInteractionMode')(function* (input: {
   readonly scope: DiscordInteractionScope
+  readonly guildId: string | null
   readonly targetId: string
 }) {
   const api = yield* Api
@@ -89,6 +91,7 @@ export const DiscordStates = Machine.state({
     pendingHomeKind: Schema.NullOr(HomeKind),
     /** Add-override form draft; root fields so busy states can't lose it. */
     modeScope: DiscordInteractionScope,
+    modeGuild: Schema.String,
     modeTarget: Schema.String,
     modeSetting: DiscordInteractionMode,
   },
@@ -133,12 +136,17 @@ export const DiscordStates = Machine.state({
         Saving: {
           fields: {
             scope: DiscordInteractionScope,
+            guildId: Schema.NullOr(Schema.String),
             targetId: Schema.String,
             mode: DiscordInteractionMode,
           },
         },
         Removing: {
-          fields: { scope: DiscordInteractionScope, targetId: Schema.String },
+          fields: {
+            scope: DiscordInteractionScope,
+            guildId: Schema.NullOr(Schema.String),
+            targetId: Schema.String,
+          },
         },
       },
     },
@@ -157,14 +165,20 @@ export const DiscordEvents = Machine.events({
   SelectHomeKind: { kind: HomeKind },
   SetHome: { home: Home },
   SelectModeScope: { scope: DiscordInteractionScope },
+  SelectModeGuild: { guildId: Schema.String },
   SelectModeTarget: { targetId: Schema.String },
   SelectModeSetting: { mode: DiscordInteractionMode },
   SetInteractionMode: {
     scope: DiscordInteractionScope,
+    guildId: Schema.NullOr(Schema.String),
     targetId: Schema.String,
     mode: DiscordInteractionMode,
   },
-  ClearInteractionMode: { scope: DiscordInteractionScope, targetId: Schema.String },
+  ClearInteractionMode: {
+    scope: DiscordInteractionScope,
+    guildId: Schema.NullOr(Schema.String),
+    targetId: Schema.String,
+  },
 })
 
 /** The Discord settings page: token, live connection status, allowlist and home channel. */
@@ -189,6 +203,7 @@ export const DiscordMachine = Machine.make({
     tokenGeneration: 0,
     pendingHomeKind: null,
     modeScope: 'channel',
+    modeGuild: input.directory.guilds.length === 1 ? (input.directory.guilds[0]?.id ?? '') : '',
     modeTarget: '',
     modeSetting: 'mention-only',
   }),
@@ -240,6 +255,8 @@ export const DiscordMachine = Machine.make({
                         ...root,
                         discord: withToken(root.discord, output),
                         directory: emptyDirectory,
+                        modeGuild: '',
+                        modeTarget: '',
                         tokenGeneration: root.tokenGeneration + 1,
                       },
               }),
@@ -262,6 +279,8 @@ export const DiscordMachine = Machine.make({
                   ...root,
                   discord: withToken(root.discord, output),
                   directory: emptyDirectory,
+                  modeGuild: '',
+                  modeTarget: '',
                   tokenGeneration: root.tokenGeneration + 1,
                 },
               }),
@@ -298,6 +317,10 @@ export const DiscordMachine = Machine.make({
                         ...root,
                         discord: { ...root.discord, connection: output.discord.connection },
                         directory: output.directory,
+                        modeGuild:
+                          root.modeGuild === '' && output.directory.guilds.length === 1
+                            ? (output.directory.guilds[0]?.id ?? '')
+                            : root.modeGuild,
                       }
                     : root,
               }),
@@ -446,7 +469,25 @@ export const DiscordMachine = Machine.make({
               update: 'root',
               data: ({ event, root, state }) => ({
                 target: { ...state, error: null },
-                update: { ...root, modeScope: event.scope, modeTarget: '' },
+                update: {
+                  ...root,
+                  modeScope: event.scope,
+                  modeGuild:
+                    event.scope === 'user' &&
+                    root.modeGuild === '' &&
+                    root.directory.guilds.length === 1
+                      ? (root.directory.guilds[0]?.id ?? '')
+                      : root.modeGuild,
+                  modeTarget: '',
+                },
+              }),
+            },
+            SelectModeGuild: {
+              target: 'Interaction.Idle',
+              update: 'root',
+              data: ({ event, root, state }) => ({
+                target: { ...state, error: null },
+                update: { ...root, modeGuild: event.guildId, modeTarget: '' },
               }),
             },
             SelectModeTarget: {
@@ -469,13 +510,18 @@ export const DiscordMachine = Machine.make({
               target: 'Interaction.Saving',
               data: ({ event }) => ({
                 scope: event.scope,
+                guildId: event.guildId,
                 targetId: event.targetId,
                 mode: event.mode,
               }),
             },
             ClearInteractionMode: {
               target: 'Interaction.Removing',
-              data: ({ event }) => ({ scope: event.scope, targetId: event.targetId }),
+              data: ({ event }) => ({
+                scope: event.scope,
+                guildId: event.guildId,
+                targetId: event.targetId,
+              }),
             },
           },
         },
@@ -484,6 +530,7 @@ export const DiscordMachine = Machine.make({
             src: 'setInteractionMode',
             input: ({ state }) => ({
               scope: state.scope,
+              guildId: state.guildId,
               targetId: state.targetId,
               mode: state.mode,
             }),
@@ -497,7 +544,9 @@ export const DiscordMachine = Machine.make({
                   discord: { ...root.discord, interactionModes: output.interactionModes },
                   // Drop the draft only when the saved row was the draft.
                   modeTarget:
-                    state.scope === root.modeScope && state.targetId === root.modeTarget
+                    state.scope === root.modeScope &&
+                    (state.scope === 'channel' || state.guildId === root.modeGuild) &&
+                    state.targetId === root.modeTarget
                       ? ''
                       : root.modeTarget,
                 },
@@ -512,7 +561,11 @@ export const DiscordMachine = Machine.make({
         Removing: {
           invoke: {
             src: 'clearInteractionMode',
-            input: ({ state }) => ({ scope: state.scope, targetId: state.targetId }),
+            input: ({ state }) => ({
+              scope: state.scope,
+              guildId: state.guildId,
+              targetId: state.targetId,
+            }),
             onDone: {
               target: 'Interaction.Idle',
               update: 'root',
@@ -522,7 +575,9 @@ export const DiscordMachine = Machine.make({
                   ...root,
                   discord: { ...root.discord, interactionModes: output.interactionModes },
                   modeTarget:
-                    state.scope === root.modeScope && state.targetId === root.modeTarget
+                    state.scope === root.modeScope &&
+                    (state.scope === 'channel' || state.guildId === root.modeGuild) &&
+                    state.targetId === root.modeTarget
                       ? ''
                       : root.modeTarget,
                 },

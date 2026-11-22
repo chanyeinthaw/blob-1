@@ -626,36 +626,52 @@ async fn decide_inline(
 }
 
 /// The effective interaction mode for an inbound message: a thread-level
-/// channel override, then the channel, then the author, default
-/// mention-only.
+/// channel override, then the channel, then the guild-scoped author override,
+/// default mention-only.
 fn effective_mode(
     overrides: &[storage::InteractionOverride],
     inbound: &messenger::Inbound,
 ) -> storage::InteractionMode {
     use storage::{InteractionMode, InteractionScope};
-    let find = |scope: InteractionScope, target: &str| {
+    let find_channel = |target: &str| {
         overrides
             .iter()
-            .find(|o| o.scope == scope && o.target_id == target)
+            .find(|o| o.scope == InteractionScope::Channel && o.target_id == target)
+            .map(|o| o.mode)
+    };
+    let find_user = |guild: &str, user: &str| {
+        overrides
+            .iter()
+            .find(|o| {
+                o.scope == InteractionScope::User
+                    && o.guild_id.as_deref() == Some(guild)
+                    && o.target_id == user
+            })
             .map(|o| o.mode)
     };
     if let Some(thread) = inbound.place.thread.as_deref() {
-        if let Some(mode) = find(InteractionScope::Channel, thread) {
+        if let Some(mode) = find_channel(thread) {
             return mode;
         }
     }
-    find(InteractionScope::Channel, &inbound.place.channel)
-        .or_else(|| find(InteractionScope::User, &inbound.author.id))
+    find_channel(&inbound.place.channel)
+        .or_else(|| {
+            inbound
+                .guild
+                .as_deref()
+                .and_then(|guild| find_user(guild, &inbound.author.id))
+        })
         .unwrap_or(InteractionMode::MentionOnly)
 }
 
 /// Evaluates the gateway pre-filter decision for a message given its known
-/// channel/thread identity (`thread == Some(t)` when `channel` is the resolved
-/// parent channel; `thread == None` when `channel` is a known top-level channel
-/// or an uncached channel/thread).
+/// guild/channel/thread identity (`thread == Some(t)` when `channel` is the
+/// resolved parent channel; `thread == None` when `channel` is a known
+/// top-level channel or an uncached channel/thread).
 fn pre_filter_decision(
     overrides: &[storage::InteractionOverride],
     author: &str,
+    guild: Option<&str>,
     channel: &str,
     thread: Option<&str>,
     addressed: bool,
@@ -666,27 +682,38 @@ fn pre_filter_decision(
     if addressed {
         return PreFilterDecision::Allow;
     }
-    let find = |scope: InteractionScope, target: &str| {
+    let find_channel = |target: &str| {
         overrides
             .iter()
-            .find(|o| o.scope == scope && o.target_id == target)
+            .find(|o| o.scope == InteractionScope::Channel && o.target_id == target)
             .map(|o| o.mode)
     };
     if let Some(thread) = thread {
-        if let Some(mode) = find(InteractionScope::Channel, thread) {
+        if let Some(mode) = find_channel(thread) {
             return match mode {
                 InteractionMode::Always => PreFilterDecision::Allow,
                 InteractionMode::MentionOnly => PreFilterDecision::Reject,
             };
         }
     }
-    if let Some(mode) = find(InteractionScope::Channel, channel) {
+    if let Some(mode) = find_channel(channel) {
         return match mode {
             InteractionMode::Always => PreFilterDecision::Allow,
             InteractionMode::MentionOnly => PreFilterDecision::Reject,
         };
     }
-    let user_mode = find(InteractionScope::User, author).unwrap_or(InteractionMode::MentionOnly);
+    let user_mode = guild
+        .and_then(|g| {
+            overrides
+                .iter()
+                .find(|o| {
+                    o.scope == InteractionScope::User
+                        && o.guild_id.as_deref() == Some(g)
+                        && o.target_id == author
+                })
+                .map(|o| o.mode)
+        })
+        .unwrap_or(InteractionMode::MentionOnly);
     // If `channel` is an uncached ID (not yet known to be a top-level channel
     // or thread), ask to resolve its parent only when a parent channel override
     // could flip the user's default/override decision.
@@ -759,13 +786,15 @@ async fn admit(
         }
     };
     let to = store.destination("discord", &dest)?;
-    let (place, message) = (inbound.place.clone(), inbound.message.clone());
-    tokio::spawn(async move {
-        if let Err(error) = discord.react(&place, &message, messenger::Mark::Seen).await {
-            eprintln!("{error}");
-        }
-    });
-    messengers.live("discord", to, dest);
+    if inbound.addressed {
+        let (place, message) = (inbound.place.clone(), inbound.message.clone());
+        tokio::spawn(async move {
+            if let Err(error) = discord.react(&place, &message, messenger::Mark::Seen).await {
+                eprintln!("{error}");
+            }
+        });
+        messengers.live("discord", to, dest);
+    }
     Ok(Some((
         inbound.text,
         storage::Meta::Message {
@@ -775,6 +804,7 @@ async fn admit(
             author: inbound.author,
             to,
             inline,
+            unaddressed: !inbound.addressed,
             location: inbound.location,
             earlier: inbound.earlier,
             quote: inbound.quote,
@@ -827,6 +857,7 @@ pub async fn serve(
         let filter_store = store.clone();
         discord.set_pre_filter(Arc::new(
             move |author: &str,
+                  guild: Option<&str>,
                   channel: &str,
                   thread: Option<&str>,
                   addressed: bool,
@@ -847,6 +878,7 @@ pub async fn serve(
                     Ok(overrides) => pre_filter_decision(
                         &overrides,
                         author,
+                        guild,
                         channel,
                         thread,
                         addressed,
@@ -1001,7 +1033,13 @@ pub async fn serve(
             }
         }
         for (_, meta) in &pending {
-            if let storage::Meta::Message { messenger, to, .. } = meta {
+            if let storage::Meta::Message {
+                messenger,
+                to,
+                unaddressed: false,
+                ..
+            } = meta
+            {
                 let (_, destination) = store.place(*to)?.ok_or("unknown destination")?;
                 messengers.live(messenger, *to, destination);
             }
@@ -1017,21 +1055,33 @@ mod tests {
     use super::*;
     use storage::{InteractionMode, InteractionOverride, InteractionScope, Person, Place};
 
-    fn override_at(
-        scope: InteractionScope,
-        target: &str,
-        mode: InteractionMode,
-    ) -> InteractionOverride {
+    fn channel_override(target: &str, mode: InteractionMode) -> InteractionOverride {
         InteractionOverride {
-            scope,
+            scope: InteractionScope::Channel,
+            guild_id: None,
             target_id: target.into(),
             mode,
         }
     }
 
-    fn inbound(place: Place, author: &str, addressed: bool) -> messenger::Inbound {
+    fn user_override(guild: &str, target: &str, mode: InteractionMode) -> InteractionOverride {
+        InteractionOverride {
+            scope: InteractionScope::User,
+            guild_id: Some(guild.into()),
+            target_id: target.into(),
+            mode,
+        }
+    }
+
+    fn inbound(
+        place: Place,
+        guild: Option<&str>,
+        author: &str,
+        addressed: bool,
+    ) -> messenger::Inbound {
         messenger::Inbound {
             place,
+            guild: guild.map(Into::into),
             message: "m1".into(),
             author: Person {
                 id: author.into(),
@@ -1056,48 +1106,52 @@ mod tests {
 
     #[test]
     fn mode_precedence() {
-        // Channel overrides beat user overrides; the default is mention-only.
+        // Channel overrides beat guild-scoped user overrides; default is mention-only.
         let overrides = vec![
-            override_at(InteractionScope::Channel, "c1", InteractionMode::Always),
-            override_at(InteractionScope::User, "u1", InteractionMode::MentionOnly),
+            channel_override("c1", InteractionMode::Always),
+            user_override("g1", "u1", InteractionMode::MentionOnly),
+            user_override("g2", "u1", InteractionMode::Always),
         ];
         assert_eq!(
-            effective_mode(
-                &overrides,
-                &inbound(channel("c1", None), "u1", false)
-            ),
+            effective_mode(&overrides, &inbound(channel("c1", None), Some("g1"), "u1", false)),
             InteractionMode::Always
         );
         assert_eq!(
-            effective_mode(
-                &overrides,
-                &inbound(channel("c2", None), "u1", false)
-            ),
+            effective_mode(&overrides, &inbound(channel("c2", None), Some("g1"), "u1", false)),
+            InteractionMode::MentionOnly
+        );
+        // Same user in guild g2 gets g2's always override, but not in g3.
+        assert_eq!(
+            effective_mode(&overrides, &inbound(channel("c2", None), Some("g2"), "u1", false)),
+            InteractionMode::Always
+        );
+        assert_eq!(
+            effective_mode(&overrides, &inbound(channel("c2", None), Some("g3"), "u1", false)),
             InteractionMode::MentionOnly
         );
         assert_eq!(
-            effective_mode(&[], &inbound(channel("c2", None), "u2", false)),
+            effective_mode(&[], &inbound(channel("c2", None), Some("g1"), "u2", false)),
             InteractionMode::MentionOnly
         );
 
-        // A thread-level override wins over its parent channel and the user;
+        // A thread-level override wins over its parent channel and the guild user;
         // a thread without one inherits the parent channel's.
         let overrides = vec![
-            override_at(InteractionScope::Channel, "c1", InteractionMode::Always),
-            override_at(InteractionScope::Channel, "t1", InteractionMode::MentionOnly),
-            override_at(InteractionScope::User, "u1", InteractionMode::Always),
+            channel_override("c1", InteractionMode::Always),
+            channel_override("t1", InteractionMode::MentionOnly),
+            user_override("g1", "u1", InteractionMode::Always),
         ];
         assert_eq!(
             effective_mode(
                 &overrides,
-                &inbound(channel("c1", Some("t1")), "u1", false)
+                &inbound(channel("c1", Some("t1")), Some("g1"), "u1", false)
             ),
             InteractionMode::MentionOnly
         );
         assert_eq!(
             effective_mode(
                 &overrides,
-                &inbound(channel("c1", Some("t2")), "u2", false)
+                &inbound(channel("c1", Some("t2")), Some("g1"), "u2", false)
             ),
             InteractionMode::Always
         );
@@ -1107,27 +1161,32 @@ mod tests {
     fn pre_filter_avoids_rest_for_unrelated_channels() {
         use messenger_discord::PreFilterDecision;
         let overrides = vec![
-            override_at(InteractionScope::Channel, "c1", InteractionMode::Always),
-            override_at(InteractionScope::Channel, "t1", InteractionMode::MentionOnly),
+            channel_override("c1", InteractionMode::Always),
+            channel_override("t1", InteractionMode::MentionOnly),
+            user_override("g1", "u1", InteractionMode::Always),
         ];
-        // Known unrelated top-level channel rejects without REST.
+        // User override applies in g1, not in g2.
         assert_eq!(
-            pre_filter_decision(&overrides, "u1", "c2", None, false, true),
+            pre_filter_decision(&overrides, "u1", Some("g1"), "c2", None, false, true),
+            PreFilterDecision::Allow
+        );
+        assert_eq!(
+            pre_filter_decision(&overrides, "u1", Some("g2"), "c2", None, false, true),
             PreFilterDecision::Reject
         );
         // Thread explicitly set to mention-only rejects even before parent lookup.
         assert_eq!(
-            pre_filter_decision(&overrides, "u1", "t1", None, false, false),
+            pre_filter_decision(&overrides, "u1", Some("g1"), "t1", None, false, false),
             PreFilterDecision::Reject
         );
         // Known thread under c1 allows directly.
         assert_eq!(
-            pre_filter_decision(&overrides, "u1", "c1", Some("t2"), false, true),
+            pre_filter_decision(&overrides, "u2", Some("g1"), "c1", Some("t2"), false, true),
             PreFilterDecision::Allow
         );
         // Unknown channel id asks to resolve parent once because c1 is always.
         assert_eq!(
-            pre_filter_decision(&overrides, "u1", "t2", None, false, false),
+            pre_filter_decision(&overrides, "u2", Some("g1"), "t2", None, false, false),
             PreFilterDecision::NeedParent
         );
     }
@@ -1144,43 +1203,57 @@ mod tests {
         store.allow_user("discord", "u1").unwrap();
 
         // With no overrides, only addressed messages are admitted.
-        assert!(admitted(&store, &inbound(channel("c1", None), "u1", true)).unwrap());
-        assert!(!admitted(&store, &inbound(channel("c1", None), "u1", false)).unwrap());
+        assert!(admitted(&store, &inbound(channel("c1", None), Some("g1"), "u1", true)).unwrap());
+        assert!(!admitted(&store, &inbound(channel("c1", None), Some("g1"), "u1", false)).unwrap());
         // DMs count as addressed.
         let dm = Place {
             channel: "dm1".into(),
             thread: None,
             dm: true,
         };
-        assert!(admitted(&store, &inbound(dm, "u1", true)).unwrap());
+        assert!(admitted(&store, &inbound(dm, None, "u1", true)).unwrap());
 
         // An `always` channel override admits unaddressed messages, but the
         // allowlist still gates unallowlisted authors.
         store
-            .set_interaction_mode("discord", InteractionScope::Channel, "c1", InteractionMode::Always)
+            .set_interaction_mode(
+                "discord",
+                InteractionScope::Channel,
+                None,
+                "c1",
+                InteractionMode::Always,
+            )
             .unwrap();
-        assert!(admitted(&store, &inbound(channel("c1", None), "u1", false)).unwrap());
-        assert!(!admitted(&store, &inbound(channel("c1", None), "u9", false)).unwrap());
+        assert!(admitted(&store, &inbound(channel("c1", None), Some("g1"), "u1", false)).unwrap());
+        assert!(!admitted(&store, &inbound(channel("c1", None), Some("g1"), "u9", false)).unwrap());
 
         // A mention-only thread override wins over the channel's `always`.
         store
             .set_interaction_mode(
                 "discord",
                 InteractionScope::Channel,
+                None,
                 "t1",
                 InteractionMode::MentionOnly,
             )
             .unwrap();
         assert!(
-            !admitted(&store, &inbound(channel("c1", Some("t1")), "u1", false)).unwrap()
+            !admitted(&store, &inbound(channel("c1", Some("t1")), Some("g1"), "u1", false)).unwrap()
         );
 
-        // An `always` user override admits the user anywhere without a
-        // channel override.
+        // A guild-scoped `always` user override admits the user in that guild
+        // only, not in other guilds.
         store
-            .set_interaction_mode("discord", InteractionScope::User, "u1", InteractionMode::Always)
+            .set_interaction_mode(
+                "discord",
+                InteractionScope::User,
+                Some("g1"),
+                "u1",
+                InteractionMode::Always,
+            )
             .unwrap();
-        assert!(admitted(&store, &inbound(channel("c9", None), "u1", false)).unwrap());
+        assert!(admitted(&store, &inbound(channel("c9", None), Some("g1"), "u1", false)).unwrap());
+        assert!(!admitted(&store, &inbound(channel("c9", None), Some("g2"), "u1", false)).unwrap());
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

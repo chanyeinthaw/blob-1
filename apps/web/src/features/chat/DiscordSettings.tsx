@@ -14,7 +14,7 @@ import {
 } from '@typeonce/effect-machine-react'
 import { type Cause, Option } from 'effect'
 import { AsyncResult } from 'effect/reactivity'
-import { Hash, KeyRound, Trash2, User } from 'lucide-react'
+import { Hash, KeyRound, Pencil, Trash2, User } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 
 import { ConfirmDialog } from '~/components/ConfirmDialog'
@@ -23,6 +23,7 @@ import { Picker } from '~/components/Picker'
 import { Button } from '~/components/ui/button'
 import { Input } from '~/components/ui/input'
 import { ToggleGroup, ToggleGroupItem } from '~/components/ui/toggle-group'
+import { Tooltip, TooltipContent, TooltipTrigger } from '~/components/ui/tooltip'
 import { MachineAtoms } from '~/lib/runtime'
 import { cn } from '~/lib/utils'
 
@@ -167,22 +168,31 @@ function TokenSection() {
             <span className="mr-auto font-mono text-sm tracking-widest text-muted-foreground">
               ••••••••••••••••
             </span>
-            <div className="flex items-center gap-2">
-              <Button
-                ref={replaceButtonRef}
-                variant="outline"
-                onClick={() => send(DiscordEvents.ReplaceToken())}
-              >
-                Replace
-              </Button>
+            <div className="flex items-center gap-1">
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Button
+                      ref={replaceButtonRef}
+                      variant="ghost"
+                      size="icon"
+                      aria-label="Replace token"
+                      onClick={() => send(DiscordEvents.ReplaceToken())}
+                    >
+                      <Pencil />
+                    </Button>
+                  }
+                />
+                <TooltipContent>Replace token</TooltipContent>
+              </Tooltip>
               <ConfirmDialog
                 tooltip="Remove token"
                 trigger={
                   <Button
-                    variant="outline"
+                    variant="ghost"
                     size="icon"
                     aria-label="Remove token"
-                    className="text-destructive"
+                    className="text-destructive hover:bg-destructive/10 hover:text-destructive"
                   >
                     <Trash2 />
                   </Button>
@@ -392,11 +402,11 @@ function AllowedRow(props: AllowedRowProps) {
         tooltip="Remove from allowlist"
         trigger={
           <Button
-            variant="outline"
+            variant="ghost"
             size="icon"
             aria-label={`Remove ${props.name ?? props.user}`}
             disabled={!props.isIdle}
-            className="text-destructive"
+            className="text-destructive hover:bg-destructive/10 hover:text-destructive"
           >
             <Trash2 />
           </Button>
@@ -547,7 +557,7 @@ function InteractionModeSection() {
             <ul className="flex flex-col divide-y">
               {value.discord.interactionModes.map(override => (
                 <OverrideRow
-                  key={`${override.scope}:${override.targetId}`}
+                  key={`${override.scope}:${override.guildId ?? ''}:${override.targetId}`}
                   override={override}
                   directory={value.directory}
                   disabled={!isIdle}
@@ -568,16 +578,45 @@ interface OverrideRowProps {
   readonly disabled: boolean
 }
 
+function resolveOverrideTarget(override: DiscordInteractionOverride, directory: DiscordDirectory) {
+  if (override.scope === 'channel') {
+    const channel = directory.channels.find(entry => entry.id === override.targetId)
+    const name = channel?.name
+    return {
+      name,
+      label: name === undefined ? override.targetId : `#${name}`,
+      guildLabel: channel?.server ?? null,
+    }
+  }
+  const name = directory.people.find(person => person.id === override.targetId)?.name
+  const guildLabel =
+    override.guildId === null
+      ? 'Unassigned server (inactive)'
+      : (directory.guilds.find(guild => guild.id === override.guildId)?.name ??
+        `server ${override.guildId}`)
+  return { name, label: name ?? override.targetId, guildLabel }
+}
+
+function describeOverride(override: DiscordInteractionOverride, directory: DiscordDirectory) {
+  const { name, label, guildLabel } = resolveOverrideTarget(override, directory)
+  const detail = [label, guildLabel].filter(Boolean).join(' · ')
+  return {
+    name,
+    label,
+    guildLabel,
+    accessibleTarget: guildLabel === null ? label : `${label} in ${guildLabel}`,
+    confirmDetail: name === undefined ? detail : `${detail} (${override.targetId})`,
+  }
+}
+
 function OverrideRow(props: OverrideRowProps) {
   const machine = DiscordOwner.useMachine()
   const send = useAtomSet(machine.send)
-  const { scope, targetId, mode } = props.override
-  const name =
-    scope === 'channel'
-      ? props.directory.channels.find(channel => channel.id === targetId)?.name
-      : props.directory.people.find(person => person.id === targetId)?.name
-  const label =
-    scope === 'channel' ? (name === undefined ? targetId : `#${name}`) : (name ?? targetId)
+  const { scope, guildId, targetId, mode } = props.override
+  const { name, label, guildLabel, accessibleTarget, confirmDetail } = describeOverride(
+    props.override,
+    props.directory,
+  )
   return (
     <li className="flex min-h-12 flex-wrap items-center gap-x-3 gap-y-2 py-2">
       <span
@@ -594,20 +633,25 @@ function OverrideRow(props: OverrideRowProps) {
       </span>
       <div className="flex min-w-0 flex-1 basis-40 flex-wrap items-baseline gap-x-2 gap-y-0.5">
         <span className="break-words text-sm [overflow-wrap:anywhere]">{label}</span>
+        {guildLabel === null ? null : (
+          <span className="break-words text-xs text-muted-foreground [overflow-wrap:anywhere]">
+            {guildLabel}
+          </span>
+        )}
         {name === undefined ? null : (
           <span className="font-mono text-xs text-muted-foreground">{targetId}</span>
         )}
       </div>
-      <div className="ml-auto flex items-center gap-2">
+      <div className="ml-auto flex items-center gap-1">
         <ToggleGroup
-          aria-label={`Interaction mode for ${label}`}
+          aria-label={`Interaction mode for ${accessibleTarget}`}
           spacing={1}
-          disabled={props.disabled}
+          disabled={props.disabled || (scope === 'user' && guildId === null)}
           value={[mode]}
           onValueChange={values => {
             const next = values[0]
             if ((next === 'mention-only' || next === 'always') && next !== mode) {
-              send(DiscordEvents.SetInteractionMode({ scope, targetId, mode: next }))
+              send(DiscordEvents.SetInteractionMode({ scope, guildId, targetId, mode: next }))
             }
           }}
           className="h-10 rounded-full bg-muted p-[3px] md:h-8"
@@ -623,19 +667,19 @@ function OverrideRow(props: OverrideRowProps) {
           tooltip="Remove override"
           trigger={
             <Button
-              variant="outline"
+              variant="ghost"
               size="icon"
-              aria-label={`Remove override for ${label}`}
+              aria-label={`Remove override for ${accessibleTarget}`}
               disabled={props.disabled}
-              className="text-destructive"
+              className="text-destructive hover:bg-destructive/10 hover:text-destructive"
             >
               <Trash2 />
             </Button>
           }
           title="Remove interaction override?"
-          detail={name === undefined ? targetId : `${label} (${targetId})`}
+          detail={confirmDetail}
           confirmLabel="Remove"
-          onConfirm={() => send(DiscordEvents.ClearInteractionMode({ scope, targetId }))}
+          onConfirm={() => send(DiscordEvents.ClearInteractionMode({ scope, guildId, targetId }))}
         />
       </div>
     </li>
@@ -646,7 +690,7 @@ interface ModeFormProps {
   readonly isIdle: boolean
 }
 
-/** The add-override form: scope toggle, target picker and mode toggle. */
+/** The add-override form: scope toggle, optional server picker, target picker and mode toggle. */
 function ModeForm(props: ModeFormProps) {
   const machine = DiscordOwner.useMachine()
   const send = useAtomSet(machine.send)
@@ -656,12 +700,19 @@ function ModeForm(props: ModeFormProps) {
         const interaction = states.Interaction.state
         const error = interaction.path === 'Interaction.Idle' ? interaction.value.error : null
         const scope = value.modeScope
+        const selectedGuild = scope === 'user' ? value.modeGuild : null
         const overridden = (targetId: string) =>
           value.discord.interactionModes.some(
-            entry => entry.scope === scope && entry.targetId === targetId,
+            entry =>
+              entry.scope === scope &&
+              (scope === 'channel' || entry.guildId === selectedGuild) &&
+              entry.targetId === targetId,
           )
-        const multipleServers =
-          new Set(value.directory.channels.map(channel => channel.server)).size > 1
+        const guildOptions = value.directory.guilds.map(guild => ({
+          value: guild.id,
+          label: guild.name,
+          hint: guild.id,
+        }))
         const options =
           scope === 'channel'
             ? value.directory.channels
@@ -669,14 +720,21 @@ function ModeForm(props: ModeFormProps) {
                 .map(channel => ({
                   value: channel.id,
                   label: `#${channel.name}`,
-                  hint: multipleServers ? channel.server : null,
+                  hint: channel.server,
                 }))
             : value.directory.people
                 .filter(
-                  person => value.discord.allowed.includes(person.id) && !overridden(person.id),
+                  person =>
+                    value.discord.allowed.includes(person.id) &&
+                    !overridden(person.id) &&
+                    (selectedGuild === null ||
+                      selectedGuild === '' ||
+                      person.guilds.includes(selectedGuild)),
                 )
                 .map(person => ({ value: person.id, label: person.name, hint: person.id }))
-        const targetValid = SNOWFLAKE.test(value.modeTarget) && !overridden(value.modeTarget)
+        const guildValid = scope === 'channel' || SNOWFLAKE.test(value.modeGuild)
+        const targetValid =
+          guildValid && SNOWFLAKE.test(value.modeTarget) && !overridden(value.modeTarget)
         return (
           <div className="mt-2.5">
             <FieldRow labelId="discord-mode-scope-label" label="For">
@@ -701,6 +759,31 @@ function ModeForm(props: ModeFormProps) {
                 </ToggleGroupItem>
               </ToggleGroup>
             </FieldRow>
+            {scope === 'user' ? (
+              <FieldRow id="discord-mode-guild" label="Server">
+                <Picker
+                  id="discord-mode-guild"
+                  placeholder="Choose a server"
+                  value={value.modeGuild}
+                  disabled={!props.isIdle}
+                  clearOnEdit
+                  options={guildOptions}
+                  customOption={raw => {
+                    const id = raw.trim()
+                    if (!SNOWFLAKE.test(id)) return null
+                    return { value: id, label: `Use ID ${id}`, hint: null }
+                  }}
+                  emptyMessage={raw => {
+                    const trimmed = raw.trim()
+                    if (/^\d+$/.test(trimmed) && !SNOWFLAKE.test(trimmed)) {
+                      return 'Discord IDs have 17–20 digits'
+                    }
+                    return 'No matches'
+                  }}
+                  onChange={guildId => send(DiscordEvents.SelectModeGuild({ guildId }))}
+                />
+              </FieldRow>
+            ) : null}
             <FieldRow id="discord-mode-target" label={scope === 'channel' ? 'Channel' : 'Person'}>
               <Picker
                 id="discord-mode-target"
@@ -758,6 +841,7 @@ function ModeForm(props: ModeFormProps) {
                     send(
                       DiscordEvents.SetInteractionMode({
                         scope,
+                        guildId: selectedGuild,
                         targetId: value.modeTarget,
                         mode: value.modeSetting,
                       }),

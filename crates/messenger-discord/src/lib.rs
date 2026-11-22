@@ -31,13 +31,15 @@ pub enum PreFilterDecision {
 }
 
 /// Cheap gate consulted per incoming gateway message before any REST call:
-/// `(author_id, channel_id, thread_id, addressed, channel_known)`. When
-/// `thread_id` is `Some`, `channel_id` is the resolved parent channel; when
-/// `None` and `channel_known` is `true`, `channel_id` is a known top-level
-/// channel (or DM); when `channel_known` is `false`, `channel_id` is uncached
-/// and may be a thread. Without a pre-filter, only addressed messages run.
-type PreFilter =
-    Arc<dyn Fn(&str, &str, Option<&str>, bool, bool) -> PreFilterDecision + Send + Sync>;
+/// `(author_id, guild_id, channel_id, thread_id, addressed, channel_known)`.
+/// When `thread_id` is `Some`, `channel_id` is the resolved parent channel;
+/// when `None` and `channel_known` is `true`, `channel_id` is a known
+/// top-level channel (or DM); when `channel_known` is `false`, `channel_id` is
+/// uncached and may be a thread. Without a pre-filter, only addressed messages
+/// run.
+type PreFilter = Arc<
+    dyn Fn(&str, Option<&str>, &str, Option<&str>, bool, bool) -> PreFilterDecision + Send + Sync,
+>;
 
 /// The Discord messenger. It starts disconnected and swaps its HTTP client
 /// and gateway live when `connect` is called with a new token. Operations
@@ -66,7 +68,13 @@ pub enum Connection {
     Error { message: String },
 }
 
-type Directory = (Vec<(String, String, String)>, Vec<Person>);
+/// `(guilds, channels, people)` where each person carries the guild IDs they
+/// belong to so guild-scoped pickers can filter by server.
+type Directory = (
+    Vec<(String, String)>,
+    Vec<(String, String, String)>,
+    Vec<(Person, Vec<String>)>,
+);
 
 const DIRECTORY_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
@@ -206,14 +214,44 @@ impl Discord {
         self.inner.borrow().clone().ok_or_else(disconnected)
     }
 
-    /// Channels and people the bot can see; empty while disconnected or not
-    /// yet ready.
+    /// Channels, servers, and people the bot can see; empty while disconnected
+    /// or not yet ready.
     pub async fn directory(&self) -> Result<Directory, MessengerError> {
         let inner = self.inner.borrow().clone();
         match inner {
             Some(inner) => inner.directory().await,
             None => Ok(Default::default()),
         }
+    }
+
+    /// Resolve a single channel or thread id (e.g. a stored thread override
+    /// not in the top-level channel list) to `(id, name, server_name)`.
+    pub async fn resolve_channel(
+        &self,
+        channel_id: &str,
+        guilds: &[(String, String)],
+    ) -> Result<Option<(String, String, String)>, MessengerError> {
+        let Some(inner) = self.inner.borrow().clone() else {
+            return Ok(None);
+        };
+        if !inner.is_ready() {
+            return Ok(None);
+        }
+        let Ok(cid) = id::<ChannelMarker>(channel_id) else {
+            return Ok(None);
+        };
+        let channel = match inner.http.channel(cid).await {
+            Ok(resp) => resp.model().await.map_err(backend)?,
+            Err(_) => return Ok(None),
+        };
+        let guild_id = channel.guild_id.map(|g| g.to_string());
+        let server = guild_id
+            .as_deref()
+            .and_then(|gid| guilds.iter().find(|(id, _)| id == gid).map(|(_, n)| n.clone()))
+            .or(guild_id)
+            .unwrap_or_default();
+        let name = channel.name.unwrap_or_else(|| channel_id.to_owned());
+        Ok(Some((channel.id.to_string(), name, server)))
     }
 }
 
@@ -267,10 +305,13 @@ impl Inner {
             .models()
             .await
             .map_err(backend)?;
+        let mut guild_list = Vec::new();
         let mut channels = Vec::new();
-        let mut people = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut people_map: std::collections::BTreeMap<String, (Person, Vec<String>)> =
+            std::collections::BTreeMap::new();
         for guild in guilds {
+            let gid = guild.id.to_string();
+            guild_list.push((gid.clone(), guild.name.clone()));
             let members = match self.http.guild_members(guild.id).limit(1000).await {
                 Ok(response) => response.models().await.map_err(backend)?,
                 Err(error) => {
@@ -279,9 +320,15 @@ impl Inner {
                 }
             };
             for member in members {
+                if member.user.bot {
+                    continue;
+                }
                 let p = person(&member.user);
-                if !member.user.bot && seen.insert(p.id.clone()) {
-                    people.push(p);
+                let entry = people_map
+                    .entry(p.id.clone())
+                    .or_insert_with(|| (p, Vec::new()));
+                if !entry.1.contains(&gid) {
+                    entry.1.push(gid.clone());
                 }
             }
             for channel in self
@@ -303,7 +350,10 @@ impl Inner {
                 }
             }
         }
-        Ok((channels, people))
+        guild_list.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let mut people: Vec<(Person, Vec<String>)> = people_map.into_values().collect();
+        people.sort_by(|a, b| a.0.name.cmp(&b.0.name).then_with(|| a.0.id.cmp(&b.0.id)));
+        Ok((guild_list, channels, people))
     }
 
     async fn ping_state(

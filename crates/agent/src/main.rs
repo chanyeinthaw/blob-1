@@ -271,17 +271,25 @@ enum MessengerCommand {
 
 #[derive(Subcommand)]
 enum MessengerModeCommand {
-    List { messenger: String },
+    List {
+        messenger: String,
+    },
     Set {
         messenger: String,
         scope: ModeScope,
         id: String,
         mode: ModeSetting,
+        /// Discord server (guild) id; required when scope is `user`.
+        #[arg(long)]
+        guild: Option<String>,
     },
     Clear {
         messenger: String,
         scope: ModeScope,
         id: String,
+        /// Discord server (guild) id; pass for guild-scoped user overrides, or omit to clear a migrated unassigned user override.
+        #[arg(long)]
+        guild: Option<String>,
     },
 }
 
@@ -1040,12 +1048,20 @@ async fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<(
                     return Err(format!("unknown messenger: {messenger}").into());
                 }
                 for item in store.interaction_modes(&messenger)? {
-                    println!(
-                        "{} {} {}",
-                        item.scope.as_str(),
-                        item.target_id,
-                        item.mode.as_str()
-                    );
+                    match item.guild_id {
+                        Some(guild) => println!(
+                            "{} {} {} guild={guild}",
+                            item.scope.as_str(),
+                            item.target_id,
+                            item.mode.as_str()
+                        ),
+                        None => println!(
+                            "{} {} {}",
+                            item.scope.as_str(),
+                            item.target_id,
+                            item.mode.as_str()
+                        ),
+                    }
                 }
             }
             MessengerModeCommand::Set {
@@ -1053,6 +1069,7 @@ async fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<(
                 scope,
                 id,
                 mode,
+                guild,
             } => {
                 if messenger != "discord" {
                     return Err(format!("unknown messenger: {messenger}").into());
@@ -1060,17 +1077,45 @@ async fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<(
                 if !valid_discord_id(&id) {
                     return Err("Discord IDs must be 17–20 digits".into());
                 }
-                store.set_interaction_mode(&messenger, scope.into(), &id, mode.into())?;
+                let scope: storage::InteractionScope = scope.into();
+                match (scope, guild.as_deref()) {
+                    (storage::InteractionScope::Channel, Some(_)) => {
+                        return Err("--guild applies only to user overrides".into());
+                    }
+                    (storage::InteractionScope::User, None) => {
+                        return Err("--guild <GUILD_ID> is required for user overrides".into());
+                    }
+                    (storage::InteractionScope::User, Some(g)) if !valid_discord_id(g) => {
+                        return Err("Discord guild IDs must be 17–20 digits".into());
+                    }
+                    _ => {}
+                }
+                store.set_interaction_mode(
+                    &messenger,
+                    scope,
+                    guild.as_deref(),
+                    &id,
+                    mode.into(),
+                )?;
             }
             MessengerModeCommand::Clear {
                 messenger,
                 scope,
                 id,
+                guild,
             } => {
                 if messenger != "discord" {
                     return Err(format!("unknown messenger: {messenger}").into());
                 }
-                store.clear_interaction_mode(&messenger, scope.into(), &id)?;
+                if id.is_empty() {
+                    return Err("target ID cannot be empty".into());
+                }
+                let scope: storage::InteractionScope = scope.into();
+                if scope == storage::InteractionScope::Channel && guild.is_some() {
+                    return Err("--guild applies only to user overrides".into());
+                }
+                let guild_ref = guild.as_deref().filter(|g| !g.is_empty());
+                store.clear_interaction_mode(&messenger, scope, guild_ref, &id)?;
             }
         },
     }

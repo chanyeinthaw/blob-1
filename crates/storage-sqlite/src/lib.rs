@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS skill_files (skill TEXT NOT NULL REFERENCES skills (n
 
 CREATE TABLE IF NOT EXISTS destinations (id INTEGER PRIMARY KEY, messenger TEXT NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, dm INTEGER NOT NULL CHECK (dm IN (0,1)), UNIQUE (messenger, channel, thread)) STRICT;
 CREATE TABLE IF NOT EXISTS allowed_users (messenger TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (messenger, user_id)) STRICT;
-CREATE TABLE IF NOT EXISTS interaction_modes (messenger TEXT NOT NULL, scope TEXT NOT NULL CHECK (scope IN ('channel', 'user')), target_id TEXT NOT NULL, mode TEXT NOT NULL CHECK (mode IN ('mention-only', 'always')), PRIMARY KEY (messenger, scope, target_id)) STRICT;
+CREATE TABLE IF NOT EXISTS interaction_modes (messenger TEXT NOT NULL, scope TEXT NOT NULL CHECK (scope IN ('channel', 'user')), guild_id TEXT NOT NULL DEFAULT '', target_id TEXT NOT NULL, mode TEXT NOT NULL CHECK (mode IN ('mention-only', 'always')), CHECK ((scope = 'channel' AND guild_id = '') OR scope = 'user'), PRIMARY KEY (messenger, scope, guild_id, target_id)) STRICT;
 
 CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK (id = 1), text TEXT NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS public_url (id INTEGER PRIMARY KEY CHECK (id = 1), url TEXT NOT NULL) STRICT;
@@ -199,7 +199,7 @@ impl SqliteStorage {
             }
             Err(TryLockError::Error(error)) => return Err(StoreError::Backend(Box::new(error))),
         }
-        let connection = Connection::open(path).map_err(backend)?;
+        let mut connection = Connection::open(path).map_err(backend)?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(backend)?;
@@ -230,6 +230,40 @@ impl SqliteStorage {
                     ))
                     .map_err(backend)?;
             }
+        }
+        let has_guild_id: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('interaction_modes') WHERE name = 'guild_id')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        if !has_guild_id {
+            if owner.is_none() {
+                return Err(StoreError::Backend(
+                    "this database needs an upgrade: restart blob-1 serve or run an exclusive command once".into(),
+                ));
+            }
+            let tx = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(backend)?;
+            tx.execute_batch(
+                "CREATE TABLE interaction_modes_v2 (
+                     messenger TEXT NOT NULL,
+                     scope TEXT NOT NULL CHECK (scope IN ('channel', 'user')),
+                     guild_id TEXT NOT NULL DEFAULT '',
+                     target_id TEXT NOT NULL,
+                     mode TEXT NOT NULL CHECK (mode IN ('mention-only', 'always')),
+                     CHECK ((scope = 'channel' AND guild_id = '') OR scope = 'user'),
+                     PRIMARY KEY (messenger, scope, guild_id, target_id)
+                 ) STRICT;
+                 INSERT INTO interaction_modes_v2 (messenger, scope, guild_id, target_id, mode)
+                 SELECT messenger, scope, '', target_id, mode FROM interaction_modes;
+                 DROP TABLE interaction_modes;
+                 ALTER TABLE interaction_modes_v2 RENAME TO interaction_modes;",
+            )
+            .map_err(backend)?;
+            tx.commit().map_err(backend)?;
         }
         let key = match app_key {
             Some(app_key) => Some(crypto::setup(&connection, &app_key)?),

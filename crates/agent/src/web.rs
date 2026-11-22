@@ -441,7 +441,7 @@ fn discord_reply(ctx: &Context) -> crate::Result<Value> {
         "home": home,
         "token": if store.messenger_token("discord")?.is_some() { "set" } else { "missing" },
         "connection": connection,
-        "interactionModes": store.interaction_modes("discord")?.into_iter().map(|o| json!({"scope":o.scope.as_str(),"targetId":o.target_id,"mode":o.mode.as_str()})).collect::<Vec<_>>(),
+        "interactionModes": store.interaction_modes("discord")?.into_iter().map(|o| json!({"scope":o.scope.as_str(),"guildId":o.guild_id,"targetId":o.target_id,"mode":o.mode.as_str()})).collect::<Vec<_>>(),
     }))
 }
 fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -711,34 +711,70 @@ async fn dispatch(
                     _ => return Err(invalid().into()),
                 };
                 let target = get("targetId")?;
+                let guild_id = match payload.get("guildId") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(s)) => Some(s.as_str()),
+                    Some(_) => return Err(invalid().into()),
+                };
                 if request_type == "discord.setInteractionMode" {
                     if !crate::valid_discord_id(target) {
                         return Err("Ids must be 17–20 digits".into());
+                    }
+                    match (scope, guild_id) {
+                        (storage::InteractionScope::Channel, None) => {}
+                        (storage::InteractionScope::User, Some(g)) if crate::valid_discord_id(g) => {}
+                        (storage::InteractionScope::User, _) => {
+                            return Err("Server IDs must be 17–20 digits".into());
+                        }
+                        (storage::InteractionScope::Channel, Some(_)) => {
+                            return Err(invalid().into());
+                        }
                     }
                     let mode = match get("mode")? {
                         "always" => storage::InteractionMode::Always,
                         "mention-only" => storage::InteractionMode::MentionOnly,
                         _ => return Err(invalid().into()),
                     };
-                    store.set_interaction_mode("discord", scope, target, mode)?;
+                    store.set_interaction_mode("discord", scope, guild_id, target, mode)?;
                 } else {
                     if target.is_empty() {
                         return Err(invalid().into());
                     }
-                    store.clear_interaction_mode("discord", scope, target)?;
+                    if scope == storage::InteractionScope::Channel && guild_id.is_some() {
+                        return Err(invalid().into());
+                    }
+                    let guild_ref = guild_id.filter(|g| !g.is_empty());
+                    store.clear_interaction_mode("discord", scope, guild_ref, target)?;
                 }
                 discord_reply(ctx)
             }
             "discord.directory" => {
-                let (channels, people) = match ctx.discord.directory().await {
+                let (guilds, mut channels, people) = match ctx.discord.directory().await {
                     Ok(result) => result,
                     Err(error) => {
                         eprintln!("discord directory: {error}");
                         Default::default()
                     }
                 };
+                // Resolve any stored channel/thread overrides missing from the
+                // top-level guild channel list so threads still show their name
+                // and server in Settings.
+                if let Ok(overrides) = store.interaction_modes("discord") {
+                    for o in overrides
+                        .into_iter()
+                        .filter(|o| o.scope == storage::InteractionScope::Channel)
+                    {
+                        if !channels.iter().any(|(id, _, _)| id == &o.target_id) {
+                            if let Ok(Some(resolved)) =
+                                ctx.discord.resolve_channel(&o.target_id, &guilds).await
+                            {
+                                channels.push(resolved);
+                            }
+                        }
+                    }
+                }
                 Ok(
-                    json!({"channels":channels.into_iter().map(|(id,name,server)| json!({"id":id,"name":name,"server":server})).collect::<Vec<_>>(),"people":people.into_iter().map(|p| json!({"id":p.id,"name":p.name})).collect::<Vec<_>>() }),
+                    json!({"guilds":guilds.into_iter().map(|(id,name)| json!({"id":id,"name":name})).collect::<Vec<_>>(),"channels":channels.into_iter().map(|(id,name,server)| json!({"id":id,"name":name,"server":server})).collect::<Vec<_>>(),"people":people.into_iter().map(|(p,g)| json!({"id":p.id,"name":p.name,"guilds":g})).collect::<Vec<_>>() }),
                 )
             }
             "mcp.list" => Ok(mcp_reply(&ctx.mcp).await?),

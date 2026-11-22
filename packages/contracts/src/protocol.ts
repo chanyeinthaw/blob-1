@@ -73,6 +73,7 @@ export type DiscordInteractionMode = typeof DiscordInteractionMode.Type
 
 export const DiscordInteractionOverride = Schema.Struct({
   scope: DiscordInteractionScope,
+  guildId: Schema.NullOr(Schema.String),
   targetId: Schema.String,
   mode: DiscordInteractionMode,
 })
@@ -87,6 +88,12 @@ export const Discord = Schema.Struct({
 })
 export type Discord = typeof Discord.Type
 
+export const DiscordGuild = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+})
+export type DiscordGuild = typeof DiscordGuild.Type
+
 export const DiscordChannel = Schema.Struct({
   id: Schema.String,
   name: Schema.String,
@@ -97,10 +104,12 @@ export type DiscordChannel = typeof DiscordChannel.Type
 export const DiscordPerson = Schema.Struct({
   id: Schema.String,
   name: Schema.String,
+  guilds: Schema.Array(Schema.String),
 })
 export type DiscordPerson = typeof DiscordPerson.Type
 
 export const DiscordDirectory = Schema.Struct({
+  guilds: Schema.Array(DiscordGuild),
   channels: Schema.Array(DiscordChannel),
   people: Schema.Array(DiscordPerson),
 })
@@ -227,6 +236,7 @@ export const requests = {
   'discord.setInteractionMode': {
     payload: Schema.Struct({
       scope: DiscordInteractionScope,
+      guildId: Schema.NullOr(Schema.String),
       targetId: Schema.String,
       mode: DiscordInteractionMode,
     }),
@@ -235,6 +245,7 @@ export const requests = {
   'discord.clearInteractionMode': {
     payload: Schema.Struct({
       scope: DiscordInteractionScope,
+      guildId: Schema.NullOr(Schema.String),
       targetId: Schema.String,
     }),
     reply: Discord,

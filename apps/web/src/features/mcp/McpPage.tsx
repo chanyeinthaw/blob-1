@@ -278,10 +278,10 @@ function ServerRow(props: ServerRowProps) {
           tooltip="Remove server"
           trigger={
             <Button
-              variant="outline"
+              variant="ghost"
               size="icon"
               aria-label={`Remove ${server.id}`}
-              className="text-destructive"
+              className="text-destructive hover:bg-destructive/10 hover:text-destructive"
               disabled={removing}
             >
               <Trash2 />

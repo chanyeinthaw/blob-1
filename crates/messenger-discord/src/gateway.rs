@@ -164,6 +164,7 @@ async fn run(
                     continue;
                 }
                 let author_id = message.author.id.to_string();
+                let guild_id = message.guild_id.map(|id| id.to_string());
                 let channel_id = message.channel_id.to_string();
                 let pre_filter = discord.pre_filter();
                 let cached = (!dm)
@@ -173,20 +174,35 @@ async fn run(
                 let decision = match &pre_filter {
                     Some(filter) => {
                         if dm {
-                            filter(&author_id, &channel_id, None, true, true)
+                            filter(&author_id, None, &channel_id, None, true, true)
                         } else if let Some(cached) = &cached {
                             match cached.parent {
                                 Some(parent) => filter(
                                     &author_id,
+                                    guild_id.as_deref(),
                                     &parent.to_string(),
                                     Some(&channel_id),
                                     addressed,
                                     true,
                                 ),
-                                None => filter(&author_id, &channel_id, None, addressed, true),
+                                None => filter(
+                                    &author_id,
+                                    guild_id.as_deref(),
+                                    &channel_id,
+                                    None,
+                                    addressed,
+                                    true,
+                                ),
                             }
                         } else {
-                            filter(&author_id, &channel_id, None, addressed, false)
+                            filter(
+                                &author_id,
+                                guild_id.as_deref(),
+                                &channel_id,
+                                None,
+                                addressed,
+                                false,
+                            )
                         }
                     }
                     None => {
@@ -220,12 +236,20 @@ async fn run(
                             let recheck = match parent {
                                 Some(parent) => filter(
                                     &author_id,
+                                    guild_id.as_deref(),
                                     &parent.to_string(),
                                     Some(&channel_id),
                                     addressed,
                                     true,
                                 ),
-                                None => filter(&author_id, &channel_id, None, addressed, true),
+                                None => filter(
+                                    &author_id,
+                                    guild_id.as_deref(),
+                                    &channel_id,
+                                    None,
+                                    addressed,
+                                    true,
+                                ),
                             };
                             if recheck != PreFilterDecision::Allow {
                                 continue;
@@ -331,6 +355,7 @@ async fn run(
                 };
                 let inbound = Inbound {
                     place,
+                    guild: guild_id,
                     message: message.id.to_string(),
                     author: person(&message.author),
                     text,
