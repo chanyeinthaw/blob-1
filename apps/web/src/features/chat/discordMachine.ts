@@ -1,6 +1,9 @@
 import { Api } from '@blob-1/client/api'
 import {
   Discord,
+  DiscordAccessList,
+  DiscordAccessMode,
+  DiscordAccessScope,
   DiscordDirectory,
   DiscordInteractionMode,
   DiscordInteractionScope,
@@ -19,14 +22,42 @@ const saveToken = Effect.fn('DiscordSettings.saveToken')(function* (token: strin
 
 const removeToken = Effect.flatMap(Api, api => api.request('discord.clearToken', {}))
 
-const allow = Effect.fn('DiscordSettings.allow')(function* (user: string) {
+const setAccessMode = Effect.fn('DiscordSettings.setAccessMode')(function* (
+  mode: DiscordAccessMode,
+) {
   const api = yield* Api
-  return yield* api.request('discord.allow', { user })
+  return yield* api.request('discord.setAccessMode', { mode })
 })
 
-const disallow = Effect.fn('DiscordSettings.disallow')(function* (user: string) {
+const addAccessEntry = Effect.fn('DiscordSettings.addAccessEntry')(function* (input: {
+  readonly list: DiscordAccessList
+  readonly scope: DiscordAccessScope
+  readonly scopeId: string | null
+  readonly userId: string
+  readonly refreshDirectory: boolean
+}) {
   const api = yield* Api
-  return yield* api.request('discord.disallow', { user })
+  const discord = yield* api.request('discord.addAccessEntry', {
+    list: input.list,
+    scope: input.scope,
+    scopeId: input.scopeId,
+    userId: input.userId,
+  })
+  const directory =
+    input.refreshDirectory && discord.connection.state === 'online'
+      ? yield* api.request('discord.directory', {}).pipe(Effect.orElseSucceed(() => null))
+      : null
+  return { discord, directory }
+})
+
+const removeAccessEntry = Effect.fn('DiscordSettings.removeAccessEntry')(function* (input: {
+  readonly list: DiscordAccessList
+  readonly scope: DiscordAccessScope
+  readonly scopeId: string | null
+  readonly userId: string
+}) {
+  const api = yield* Api
+  return yield* api.request('discord.removeAccessEntry', input)
 })
 
 const setHome = Effect.fn('DiscordSettings.setHome')(function* (home: Home) {
@@ -90,6 +121,19 @@ const withToken = (current: Discord, reply: Discord): Discord => ({
   connection: reply.connection,
 })
 
+/** Merges only newly resolved channels into the cached directory so a transient
+ *  directory fetch failure never clears existing guilds or people. */
+const mergeDirectoryChannels = (
+  current: DiscordDirectory,
+  refreshed: DiscordDirectory | null,
+): DiscordDirectory => {
+  if (refreshed === null) return current
+  const extra = refreshed.channels.filter(
+    channel => !current.channels.some(existing => existing.id === channel.id),
+  )
+  return extra.length === 0 ? current : { ...current, channels: [...current.channels, ...extra] }
+}
+
 export const DiscordInput = Schema.Struct({ discord: Discord, directory: DiscordDirectory })
 export type DiscordInput = typeof DiscordInput.Type
 
@@ -105,6 +149,12 @@ export const DiscordStates = Machine.state({
     tokenGeneration: Schema.Finite,
     /** Transient home type chosen before picking a destination; null follows `discord.home.kind`. */
     pendingHomeKind: Schema.NullOr(HomeKind),
+    /** Which list (`whitelist` or `blacklist`) is being edited, independent of active `accessMode`. */
+    accessList: DiscordAccessList,
+    /** Access add-entry form draft. */
+    accessScope: DiscordAccessScope,
+    accessScopeId: Schema.String,
+    accessUser: Schema.String,
     /** Add-override form draft; root fields so busy states can't lose it. */
     modeScope: DiscordInteractionScope,
     modeGuild: Schema.String,
@@ -129,11 +179,28 @@ export const DiscordStates = Machine.state({
         Watching: { fields: { tokenGeneration: Schema.Finite } },
       },
     },
-    Allowlist: {
+    Access: {
       states: {
-        Idle: { fields: { draft: Schema.String, error: ErrorMessage } },
-        Adding: { fields: { user: Schema.String } },
-        Removing: { fields: { user: Schema.String, draft: Schema.String } },
+        Idle: { fields: { error: ErrorMessage } },
+        SettingMode: { fields: { mode: DiscordAccessMode } },
+        Adding: {
+          fields: {
+            list: DiscordAccessList,
+            scope: DiscordAccessScope,
+            scopeId: Schema.NullOr(Schema.String),
+            userId: Schema.String,
+            refreshDirectory: Schema.Boolean,
+            tokenGeneration: Schema.Finite,
+          },
+        },
+        Removing: {
+          fields: {
+            list: DiscordAccessList,
+            scope: DiscordAccessScope,
+            scopeId: Schema.NullOr(Schema.String),
+            userId: Schema.String,
+          },
+        },
       },
     },
     HomeChannel: {
@@ -194,9 +261,23 @@ export const DiscordEvents = Machine.events({
   ClearTokenError: {},
   SubmitToken: { token: Schema.String },
   RemoveToken: {},
-  EditAllowDraft: { draft: Schema.String },
-  Allow: { user: Schema.String },
-  Disallow: { user: Schema.String },
+  SelectAccessList: { list: DiscordAccessList },
+  SelectAccessScope: { scope: DiscordAccessScope },
+  SelectAccessScopeId: { scopeId: Schema.String },
+  SelectAccessUser: { userId: Schema.String },
+  SetAccessMode: { mode: DiscordAccessMode },
+  AddAccessEntry: {
+    list: DiscordAccessList,
+    scope: DiscordAccessScope,
+    scopeId: Schema.NullOr(Schema.String),
+    userId: Schema.String,
+  },
+  RemoveAccessEntry: {
+    list: DiscordAccessList,
+    scope: DiscordAccessScope,
+    scopeId: Schema.NullOr(Schema.String),
+    userId: Schema.String,
+  },
   SelectHomeKind: { kind: HomeKind },
   SetHome: { home: Home },
   SelectModeScope: { scope: DiscordInteractionScope },
@@ -230,8 +311,9 @@ export const DiscordMachine = Machine.make({
     saveToken,
     removeToken,
     watchConnection,
-    allow,
-    disallow,
+    setAccessMode,
+    addAccessEntry,
+    removeAccessEntry,
     setHome,
     setInteractionMode,
     clearInteractionMode,
@@ -243,6 +325,10 @@ export const DiscordMachine = Machine.make({
     ...input,
     tokenGeneration: 0,
     pendingHomeKind: null,
+    accessList: input.discord.accessMode === 'blacklist' ? 'blacklist' : 'whitelist',
+    accessScope: 'global',
+    accessScopeId: '',
+    accessUser: '',
     modeScope: 'channel',
     modeGuild: input.directory.guilds.length === 1 ? (input.directory.guilds[0]?.id ?? '') : '',
     modeTarget: '',
@@ -298,6 +384,8 @@ export const DiscordMachine = Machine.make({
                         ...root,
                         discord: withToken(root.discord, output),
                         directory: emptyDirectory,
+                        accessScopeId: '',
+                        accessUser: '',
                         modeGuild: '',
                         modeTarget: '',
                         replyChannel: '',
@@ -323,6 +411,8 @@ export const DiscordMachine = Machine.make({
                   ...root,
                   discord: withToken(root.discord, output),
                   directory: emptyDirectory,
+                  accessScopeId: '',
+                  accessUser: '',
                   modeGuild: '',
                   modeTarget: '',
                   replyChannel: '',
@@ -361,7 +451,13 @@ export const DiscordMachine = Machine.make({
                     ? {
                         ...root,
                         discord: { ...root.discord, connection: output.discord.connection },
-                        directory: output.directory,
+                        directory: mergeDirectoryChannels(output.directory, root.directory),
+                        accessScopeId:
+                          root.accessScope === 'guild' &&
+                          root.accessScopeId === '' &&
+                          output.directory.guilds.length === 1
+                            ? (output.directory.guilds[0]?.id ?? '')
+                            : root.accessScopeId,
                         modeGuild:
                           root.modeGuild === '' && output.directory.guilds.length === 1
                             ? (output.directory.guilds[0]?.id ?? '')
@@ -375,58 +471,180 @@ export const DiscordMachine = Machine.make({
         },
       },
     },
-    Allowlist: {
-      initial: { target: 'Allowlist.Idle', data: { draft: '', error: null } },
+    Access: {
+      initial: { target: 'Access.Idle', data: { error: null } },
       states: {
         Idle: {
           on: {
-            EditAllowDraft: {
-              update: 'Allowlist.Idle',
-              data: ({ event }) => ({ draft: event.draft, error: null }),
+            SelectAccessList: {
+              target: 'Access.Idle',
+              update: 'root',
+              data: ({ event, root, state }) => ({
+                target: { ...state, error: null },
+                update: { ...root, accessList: event.list, accessUser: '' },
+              }),
             },
-            Allow: {
-              target: 'Allowlist.Adding',
-              data: ({ event }) => ({ user: event.user }),
+            SelectAccessScope: {
+              target: 'Access.Idle',
+              update: 'root',
+              data: ({ event, root, state }) => ({
+                target: { ...state, error: null },
+                update: {
+                  ...root,
+                  accessScope: event.scope,
+                  accessScopeId:
+                    event.scope === 'guild' && root.directory.guilds.length === 1
+                      ? (root.directory.guilds[0]?.id ?? '')
+                      : '',
+                  accessUser: '',
+                },
+              }),
             },
-            Disallow: {
-              target: 'Allowlist.Removing',
-              data: ({ state, event }) => ({ user: event.user, draft: state.draft }),
+            SelectAccessScopeId: {
+              target: 'Access.Idle',
+              update: 'root',
+              data: ({ event, root, state }) => ({
+                target: { ...state, error: null },
+                update: { ...root, accessScopeId: event.scopeId, accessUser: '' },
+              }),
+            },
+            SelectAccessUser: {
+              target: 'Access.Idle',
+              update: 'root',
+              data: ({ event, root, state }) => ({
+                target: { ...state, error: null },
+                update: { ...root, accessUser: event.userId },
+              }),
+            },
+            SetAccessMode: {
+              target: 'Access.SettingMode',
+              data: ({ event }) => ({ mode: event.mode }),
+            },
+            AddAccessEntry: {
+              target: 'Access.Adding',
+              data: ({ event, root }) => ({
+                list: event.list,
+                scope: event.scope,
+                scopeId: event.scopeId,
+                userId: event.userId,
+                refreshDirectory:
+                  event.scope === 'channel' &&
+                  event.scopeId !== null &&
+                  !root.directory.channels.some(channel => channel.id === event.scopeId),
+                tokenGeneration: root.tokenGeneration,
+              }),
+            },
+            RemoveAccessEntry: {
+              target: 'Access.Removing',
+              data: ({ event }) => ({
+                list: event.list,
+                scope: event.scope,
+                scopeId: event.scopeId,
+                userId: event.userId,
+              }),
+            },
+          },
+        },
+        SettingMode: {
+          invoke: {
+            src: 'setAccessMode',
+            input: ({ state }) => state.mode,
+            onDone: {
+              target: 'Access.Idle',
+              update: 'root',
+              data: ({ root, output }) => ({
+                target: { error: null },
+                update: {
+                  ...root,
+                  discord: {
+                    ...root.discord,
+                    allowed: output.allowed,
+                    accessMode: output.accessMode,
+                    accessEntries: output.accessEntries,
+                  },
+                  accessList:
+                    output.accessMode === 'allow-all' ? root.accessList : output.accessMode,
+                  accessUser: '',
+                },
+              }),
+            },
+            onFailure: {
+              target: 'Access.Idle',
+              data: ({ error }) => ({ error: error.message }),
             },
           },
         },
         Adding: {
           invoke: {
-            src: 'allow',
-            input: ({ state }) => state.user,
+            src: 'addAccessEntry',
+            input: ({ state }) => ({
+              list: state.list,
+              scope: state.scope,
+              scopeId: state.scopeId,
+              userId: state.userId,
+              refreshDirectory: state.refreshDirectory,
+            }),
             onDone: {
-              target: 'Allowlist.Idle',
+              target: 'Access.Idle',
               update: 'root',
-              data: ({ root, output }) => ({
-                target: { draft: '', error: null },
-                update: { ...root, discord: { ...root.discord, allowed: output.allowed } },
+              data: ({ root, state, output }) => ({
+                target: { error: null },
+                update: {
+                  ...root,
+                  discord: {
+                    ...root.discord,
+                    allowed: output.discord.allowed,
+                    accessMode: output.discord.accessMode,
+                    accessEntries: output.discord.accessEntries,
+                  },
+                  directory:
+                    state.tokenGeneration === root.tokenGeneration
+                      ? mergeDirectoryChannels(root.directory, output.directory)
+                      : root.directory,
+                  accessUser:
+                    state.list === root.accessList &&
+                    state.scope === root.accessScope &&
+                    (state.scope === 'global' || state.scopeId === root.accessScopeId) &&
+                    state.userId === root.accessUser
+                      ? ''
+                      : root.accessUser,
+                },
               }),
             },
             onFailure: {
-              target: 'Allowlist.Idle',
-              data: ({ state, error }) => ({ draft: state.user, error: error.message }),
+              target: 'Access.Idle',
+              data: ({ error }) => ({ error: error.message }),
             },
           },
         },
         Removing: {
           invoke: {
-            src: 'disallow',
-            input: ({ state }) => state.user,
+            src: 'removeAccessEntry',
+            input: ({ state }) => ({
+              list: state.list,
+              scope: state.scope,
+              scopeId: state.scopeId,
+              userId: state.userId,
+            }),
             onDone: {
-              target: 'Allowlist.Idle',
+              target: 'Access.Idle',
               update: 'root',
-              data: ({ root, state, output }) => ({
-                target: { draft: state.draft, error: null },
-                update: { ...root, discord: { ...root.discord, allowed: output.allowed } },
+              data: ({ root, output }) => ({
+                target: { error: null },
+                update: {
+                  ...root,
+                  discord: {
+                    ...root.discord,
+                    allowed: output.allowed,
+                    accessMode: output.accessMode,
+                    accessEntries: output.accessEntries,
+                  },
+                },
               }),
             },
             onFailure: {
-              target: 'Allowlist.Idle',
-              data: ({ state, error }) => ({ draft: state.draft, error: error.message }),
+              target: 'Access.Idle',
+              data: ({ error }) => ({ error: error.message }),
             },
           },
         },

@@ -88,8 +88,27 @@ export const DiscordReplyOverride = Schema.Struct({
 })
 export type DiscordReplyOverride = typeof DiscordReplyOverride.Type
 
+export const DiscordAccessMode = Schema.Literals(['allow-all', 'whitelist', 'blacklist'])
+export type DiscordAccessMode = typeof DiscordAccessMode.Type
+
+export const DiscordAccessList = Schema.Literals(['whitelist', 'blacklist'])
+export type DiscordAccessList = typeof DiscordAccessList.Type
+
+export const DiscordAccessScope = Schema.Literals(['global', 'guild', 'channel'])
+export type DiscordAccessScope = typeof DiscordAccessScope.Type
+
+export const DiscordAccessEntry = Schema.Struct({
+  list: DiscordAccessList,
+  scope: DiscordAccessScope,
+  scopeId: Schema.NullOr(Schema.String),
+  userId: Schema.String,
+})
+export type DiscordAccessEntry = typeof DiscordAccessEntry.Type
+
 export const Discord = Schema.Struct({
   allowed: Schema.Array(Schema.String),
+  accessMode: DiscordAccessMode,
+  accessEntries: Schema.Array(DiscordAccessEntry),
   home: Home,
   token: Schema.Literals(['set', 'missing']),
   connection: DiscordConnection,
@@ -108,6 +127,7 @@ export const DiscordChannel = Schema.Struct({
   id: Schema.String,
   name: Schema.String,
   server: Schema.String,
+  guildId: Schema.String,
   kind: Schema.Literals(['channel', 'thread']),
 })
 export type DiscordChannel = typeof DiscordChannel.Type
@@ -271,6 +291,30 @@ export const requests = {
   'discord.clearReplyMode': {
     payload: Schema.Struct({
       channelId: Schema.String,
+    }),
+    reply: Discord,
+  },
+  'discord.setAccessMode': {
+    payload: Schema.Struct({
+      mode: DiscordAccessMode,
+    }),
+    reply: Discord,
+  },
+  'discord.addAccessEntry': {
+    payload: Schema.Struct({
+      list: DiscordAccessList,
+      scope: DiscordAccessScope,
+      scopeId: Schema.NullOr(Schema.String),
+      userId: Schema.String,
+    }),
+    reply: Discord,
+  },
+  'discord.removeAccessEntry': {
+    payload: Schema.Struct({
+      list: DiscordAccessList,
+      scope: DiscordAccessScope,
+      scopeId: Schema.NullOr(Schema.String),
+      userId: Schema.String,
     }),
     reply: Discord,
   },

@@ -73,11 +73,11 @@ pub enum Connection {
     Error { message: String },
 }
 
-/// `(guilds, channels, people)` where each channel carries `(id, name, server, is_thread)`
+/// `(guilds, channels, people)` where each channel carries `(id, name, server, guild_id, is_thread)`
 /// and each person carries the guild IDs they belong to so pickers can filter accurately.
 type Directory = (
     Vec<(String, String)>,
-    Vec<(String, String, String, bool)>,
+    Vec<(String, String, String, String, bool)>,
     Vec<(Person, Vec<String>)>,
 );
 
@@ -251,12 +251,12 @@ impl Discord {
     }
 
     /// Resolve a single channel or thread id (e.g. a stored thread override
-    /// not in the top-level channel list) to `(id, name, server_name, is_thread)`.
+    /// not in the top-level channel list) to `(id, name, server_name, guild_id, is_thread)`.
     pub async fn resolve_channel(
         &self,
         channel_id: &str,
         guilds: &[(String, String)],
-    ) -> Result<Option<(String, String, String, bool)>, MessengerError> {
+    ) -> Result<Option<(String, String, String, String, bool)>, MessengerError> {
         let Some(inner) = self.inner.borrow().clone() else {
             return Ok(None);
         };
@@ -270,17 +270,22 @@ impl Discord {
             Ok(resp) => resp.model().await.map_err(backend)?,
             Err(_) => return Ok(None),
         };
-        let guild_id = channel.guild_id.map(|g| g.to_string());
-        let server = guild_id
-            .as_deref()
-            .and_then(|gid| guilds.iter().find(|(id, _)| id == gid).map(|(_, n)| n.clone()))
-            .or(guild_id)
+        let guild_id = channel.guild_id.map(|g| g.to_string()).unwrap_or_default();
+        let server = (!guild_id.is_empty())
+            .then(|| {
+                guilds
+                    .iter()
+                    .find(|(id, _)| id == &guild_id)
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_else(|| guild_id.clone())
+            })
             .unwrap_or_default();
         let name = channel.name.unwrap_or_else(|| channel_id.to_owned());
         Ok(Some((
             channel.id.to_string(),
             name,
             server,
+            guild_id,
             channel.kind.is_thread(),
         )))
     }
@@ -376,7 +381,13 @@ impl Inner {
                     ChannelType::GuildText | ChannelType::GuildAnnouncement
                 ) {
                     if let Some(name) = channel.name {
-                        channels.push((channel.id.to_string(), name, guild.name.clone(), false));
+                        channels.push((
+                            channel.id.to_string(),
+                            name,
+                            guild.name.clone(),
+                            gid.clone(),
+                            false,
+                        ));
                     }
                 }
             }

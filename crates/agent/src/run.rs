@@ -664,11 +664,49 @@ fn effective_mode(
         .unwrap_or(InteractionMode::MentionOnly)
 }
 
-/// Evaluates the gateway pre-filter decision for a message given its known
-/// guild/channel/thread identity (`thread == Some(t)` when `channel` is the
-/// resolved parent channel; `thread == None` when `channel` is a known
-/// top-level channel or an uncached channel/thread).
+/// Evaluates whether `author` is permitted to talk to the bot under the active
+/// access mode (`allow-all`, `whitelist`, or `blacklist`) and scoped entries
+/// (`global`, `guild`, or `channel`/thread). DMs only match `global` entries.
+fn access_allowed(
+    mode: storage::AccessMode,
+    entries: &[storage::AccessEntry],
+    author: &str,
+    guild: Option<&str>,
+    channel: &str,
+    thread: Option<&str>,
+    dm: bool,
+) -> bool {
+    use storage::{AccessList, AccessMode, AccessScope};
+    let matches_list = |list: AccessList| {
+        entries.iter().any(|e| {
+            e.list == list
+                && e.user_id == author
+                && match e.scope {
+                    AccessScope::Global => true,
+                    AccessScope::Guild => !dm && guild.is_some() && e.scope_id.as_deref() == guild,
+                    AccessScope::Channel => {
+                        !dm && (e.scope_id.as_deref() == Some(channel)
+                            || (thread.is_some() && e.scope_id.as_deref() == thread))
+                    }
+                }
+        })
+    };
+    match mode {
+        AccessMode::AllowAll => true,
+        AccessMode::Whitelist => matches_list(AccessList::Whitelist),
+        AccessMode::Blacklist => !matches_list(AccessList::Blacklist),
+    }
+}
+
+/// Evaluates the gateway pre-filter decision for a message given its access
+/// policy, interaction overrides, and known guild/channel/thread identity
+/// (`thread == Some(t)` when `channel` is the resolved parent channel;
+/// `thread == None` when `channel` is a known top-level channel or an uncached
+/// channel/thread).
+#[allow(clippy::too_many_arguments)]
 fn pre_filter_decision(
+    access_mode: storage::AccessMode,
+    access_entries: &[storage::AccessEntry],
     overrides: &[storage::InteractionOverride],
     author: &str,
     guild: Option<&str>,
@@ -678,65 +716,123 @@ fn pre_filter_decision(
     channel_known: bool,
 ) -> messenger_discord::PreFilterDecision {
     use messenger_discord::PreFilterDecision;
-    use storage::{InteractionMode, InteractionScope};
-    if addressed {
-        return PreFilterDecision::Allow;
-    }
-    let find_channel = |target: &str| {
-        overrides
-            .iter()
-            .find(|o| o.scope == InteractionScope::Channel && o.target_id == target)
-            .map(|o| o.mode)
-    };
-    if let Some(thread) = thread {
-        if let Some(mode) = find_channel(thread) {
-            return match mode {
-                InteractionMode::Always => PreFilterDecision::Allow,
-                InteractionMode::MentionOnly => PreFilterDecision::Reject,
-            };
+    use storage::{AccessList, AccessMode, AccessScope, InteractionMode, InteractionScope};
+    let dm = guild.is_none();
+    let access_decision = match access_mode {
+        AccessMode::AllowAll => PreFilterDecision::Allow,
+        AccessMode::Whitelist => {
+            if access_allowed(access_mode, access_entries, author, guild, channel, thread, dm) {
+                PreFilterDecision::Allow
+            } else if !channel_known
+                && !dm
+                && access_entries.iter().any(|e| {
+                    e.list == AccessList::Whitelist
+                        && e.scope == AccessScope::Channel
+                        && e.user_id == author
+                })
+            {
+                PreFilterDecision::NeedParent
+            } else {
+                PreFilterDecision::Reject
+            }
         }
+        AccessMode::Blacklist => {
+            if !access_allowed(access_mode, access_entries, author, guild, channel, thread, dm) {
+                PreFilterDecision::Reject
+            } else if !channel_known
+                && !dm
+                && access_entries.iter().any(|e| {
+                    e.list == AccessList::Blacklist
+                        && e.scope == AccessScope::Channel
+                        && e.user_id == author
+                })
+            {
+                PreFilterDecision::NeedParent
+            } else {
+                PreFilterDecision::Allow
+            }
+        }
+    };
+    if access_decision == PreFilterDecision::Reject {
+        return PreFilterDecision::Reject;
     }
-    if let Some(mode) = find_channel(channel) {
-        return match mode {
-            InteractionMode::Always => PreFilterDecision::Allow,
-            InteractionMode::MentionOnly => PreFilterDecision::Reject,
-        };
-    }
-    let user_mode = guild
-        .and_then(|g| {
+    let interaction_decision = if addressed {
+        PreFilterDecision::Allow
+    } else {
+        let find_channel = |target: &str| {
             overrides
                 .iter()
-                .find(|o| {
-                    o.scope == InteractionScope::User
-                        && o.guild_id.as_deref() == Some(g)
-                        && o.target_id == author
-                })
+                .find(|o| o.scope == InteractionScope::Channel && o.target_id == target)
                 .map(|o| o.mode)
-        })
-        .unwrap_or(InteractionMode::MentionOnly);
-    // If `channel` is an uncached ID (not yet known to be a top-level channel
-    // or thread), ask to resolve its parent only when a parent channel override
-    // could flip the user's default/override decision.
-    if !channel_known {
-        let could_flip = match user_mode {
-            InteractionMode::MentionOnly => overrides
-                .iter()
-                .any(|o| o.scope == InteractionScope::Channel && o.mode == InteractionMode::Always),
-            InteractionMode::Always => overrides.iter().any(|o| {
-                o.scope == InteractionScope::Channel && o.mode == InteractionMode::MentionOnly
-            }),
         };
-        if could_flip {
-            return PreFilterDecision::NeedParent;
+        if let Some(mode) = thread.and_then(find_channel).or_else(|| find_channel(channel)) {
+            match mode {
+                InteractionMode::Always => PreFilterDecision::Allow,
+                InteractionMode::MentionOnly => PreFilterDecision::Reject,
+            }
+        } else {
+            let user_mode = guild
+                .and_then(|g| {
+                    overrides
+                        .iter()
+                        .find(|o| {
+                            o.scope == InteractionScope::User
+                                && o.guild_id.as_deref() == Some(g)
+                                && o.target_id == author
+                        })
+                        .map(|o| o.mode)
+                })
+                .unwrap_or(InteractionMode::MentionOnly);
+            if !channel_known {
+                let could_flip = match user_mode {
+                    InteractionMode::MentionOnly => overrides.iter().any(|o| {
+                        o.scope == InteractionScope::Channel && o.mode == InteractionMode::Always
+                    }),
+                    InteractionMode::Always => overrides.iter().any(|o| {
+                        o.scope == InteractionScope::Channel
+                            && o.mode == InteractionMode::MentionOnly
+                    }),
+                };
+                if could_flip {
+                    PreFilterDecision::NeedParent
+                } else {
+                    match user_mode {
+                        InteractionMode::Always => PreFilterDecision::Allow,
+                        InteractionMode::MentionOnly => PreFilterDecision::Reject,
+                    }
+                }
+            } else {
+                match user_mode {
+                    InteractionMode::Always => PreFilterDecision::Allow,
+                    InteractionMode::MentionOnly => PreFilterDecision::Reject,
+                }
+            }
         }
+    };
+    if interaction_decision == PreFilterDecision::Reject {
+        return PreFilterDecision::Reject;
     }
-    match user_mode {
-        InteractionMode::Always => PreFilterDecision::Allow,
-        InteractionMode::MentionOnly => PreFilterDecision::Reject,
+    if access_decision == PreFilterDecision::NeedParent
+        || interaction_decision == PreFilterDecision::NeedParent
+    {
+        PreFilterDecision::NeedParent
+    } else {
+        PreFilterDecision::Allow
     }
 }
+
 fn admitted(store: &SqliteStorage, inbound: &messenger::Inbound) -> Result<bool> {
-    if !store.allowed_users("discord")?.contains(&inbound.author.id) {
+    let mode = store.access_mode("discord")?;
+    let entries = store.access_entries("discord")?;
+    if !access_allowed(
+        mode,
+        &entries,
+        &inbound.author.id,
+        inbound.guild.as_deref(),
+        &inbound.place.channel,
+        inbound.place.thread.as_deref(),
+        inbound.place.dm,
+    ) {
         return Ok(false);
     }
     Ok(
@@ -874,9 +970,9 @@ pub async fn serve(
             }
         });
     // The cheap per-message gate the gateway runs before any Discord REST
-    // call: check the allowlist, then evaluate exact channel/thread/user
-    // overrides and only ask for parent resolution when an uncached ID could
-    // inherit an `always` channel override.
+    // call: evaluate the access policy and exact channel/thread/user
+    // interaction overrides, asking for parent resolution only when an
+    // uncached ID could inherit a parent channel rule.
     {
         let filter_store = store.clone();
         discord.set_pre_filter(Arc::new(
@@ -887,32 +983,38 @@ pub async fn serve(
                   addressed: bool,
                   channel_known: bool| {
                 use messenger_discord::PreFilterDecision;
-                match filter_store.allowed_users("discord") {
-                    Ok(users) if users.iter().any(|u| u == author) => {}
-                    Ok(_) => return PreFilterDecision::Reject,
+                let access_mode = match filter_store.access_mode("discord") {
+                    Ok(mode) => mode,
                     Err(error) => {
                         eprintln!("{error}");
                         return PreFilterDecision::Reject;
                     }
-                }
-                if addressed {
-                    return PreFilterDecision::Allow;
-                }
-                match filter_store.interaction_modes("discord") {
-                    Ok(overrides) => pre_filter_decision(
-                        &overrides,
-                        author,
-                        guild,
-                        channel,
-                        thread,
-                        addressed,
-                        channel_known,
-                    ),
+                };
+                let access_entries = match filter_store.access_entries("discord") {
+                    Ok(entries) => entries,
                     Err(error) => {
                         eprintln!("{error}");
-                        PreFilterDecision::Reject
+                        return PreFilterDecision::Reject;
                     }
-                }
+                };
+                let overrides = match filter_store.interaction_modes("discord") {
+                    Ok(overrides) => overrides,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        return PreFilterDecision::Reject;
+                    }
+                };
+                pre_filter_decision(
+                    access_mode,
+                    &access_entries,
+                    &overrides,
+                    author,
+                    guild,
+                    channel,
+                    thread,
+                    addressed,
+                    channel_known,
+                )
             },
         ));
         let thread_store = store.clone();
@@ -1185,6 +1287,27 @@ mod tests {
     #[test]
     fn pre_filter_avoids_rest_for_unrelated_channels() {
         use messenger_discord::PreFilterDecision;
+        use storage::{AccessEntry, AccessList, AccessMode, AccessScope};
+        let access = vec![
+            AccessEntry {
+                list: AccessList::Whitelist,
+                scope: AccessScope::Global,
+                scope_id: None,
+                user_id: "u1".into(),
+            },
+            AccessEntry {
+                list: AccessList::Whitelist,
+                scope: AccessScope::Guild,
+                scope_id: Some("g1".into()),
+                user_id: "u2".into(),
+            },
+            AccessEntry {
+                list: AccessList::Whitelist,
+                scope: AccessScope::Channel,
+                scope_id: Some("c1".into()),
+                user_id: "u3".into(),
+            },
+        ];
         let overrides = vec![
             channel_override("c1", InteractionMode::Always),
             channel_override("t1", InteractionMode::MentionOnly),
@@ -1192,28 +1315,206 @@ mod tests {
         ];
         // User override applies in g1, not in g2.
         assert_eq!(
-            pre_filter_decision(&overrides, "u1", Some("g1"), "c2", None, false, true),
+            pre_filter_decision(
+                AccessMode::Whitelist,
+                &access,
+                &overrides,
+                "u1",
+                Some("g1"),
+                "c2",
+                None,
+                false,
+                true
+            ),
             PreFilterDecision::Allow
         );
         assert_eq!(
-            pre_filter_decision(&overrides, "u1", Some("g2"), "c2", None, false, true),
+            pre_filter_decision(
+                AccessMode::Whitelist,
+                &access,
+                &overrides,
+                "u1",
+                Some("g2"),
+                "c2",
+                None,
+                false,
+                true
+            ),
             PreFilterDecision::Reject
         );
         // Thread explicitly set to mention-only rejects even before parent lookup.
         assert_eq!(
-            pre_filter_decision(&overrides, "u1", Some("g1"), "t1", None, false, false),
+            pre_filter_decision(
+                AccessMode::Whitelist,
+                &access,
+                &overrides,
+                "u1",
+                Some("g1"),
+                "t1",
+                None,
+                false,
+                false
+            ),
             PreFilterDecision::Reject
         );
-        // Known thread under c1 allows directly.
+        // Known thread under c1 allows directly for guild-whitelisted u2.
         assert_eq!(
-            pre_filter_decision(&overrides, "u2", Some("g1"), "c1", Some("t2"), false, true),
+            pre_filter_decision(
+                AccessMode::Whitelist,
+                &access,
+                &overrides,
+                "u2",
+                Some("g1"),
+                "c1",
+                Some("t2"),
+                false,
+                true
+            ),
             PreFilterDecision::Allow
         );
         // Unknown channel id asks to resolve parent once because c1 is always.
         assert_eq!(
-            pre_filter_decision(&overrides, "u2", Some("g1"), "t2", None, false, false),
+            pre_filter_decision(
+                AccessMode::Whitelist,
+                &access,
+                &overrides,
+                "u2",
+                Some("g1"),
+                "t2",
+                None,
+                false,
+                false
+            ),
             PreFilterDecision::NeedParent
         );
+        // Channel-whitelisted u3 in an uncached thread asks for parent even when addressed.
+        assert_eq!(
+            pre_filter_decision(
+                AccessMode::Whitelist,
+                &access,
+                &[],
+                "u3",
+                Some("g1"),
+                "t2",
+                None,
+                true,
+                false
+            ),
+            PreFilterDecision::NeedParent
+        );
+        // Non-whitelisted u9 rejects immediately with no REST.
+        assert_eq!(
+            pre_filter_decision(
+                AccessMode::Whitelist,
+                &access,
+                &overrides,
+                "u9",
+                Some("g1"),
+                "t2",
+                None,
+                true,
+                false
+            ),
+            PreFilterDecision::Reject
+        );
+        // Blacklist mode: channel-blacklisted user in uncached thread resolves parent once.
+        let bl = vec![AccessEntry {
+            list: AccessList::Blacklist,
+            scope: AccessScope::Channel,
+            scope_id: Some("c1".into()),
+            user_id: "u4".into(),
+        }];
+        assert_eq!(
+            pre_filter_decision(
+                AccessMode::Blacklist,
+                &bl,
+                &[],
+                "u4",
+                Some("g1"),
+                "t2",
+                None,
+                true,
+                false
+            ),
+            PreFilterDecision::NeedParent
+        );
+        assert_eq!(
+            pre_filter_decision(
+                AccessMode::Blacklist,
+                &bl,
+                &[],
+                "u4",
+                Some("g1"),
+                "c1",
+                Some("t2"),
+                true,
+                true
+            ),
+            PreFilterDecision::Reject
+        );
+    }
+
+    #[test]
+    fn access_modes_and_scopes() {
+        use storage::{AccessEntry, AccessList, AccessMode, AccessScope};
+        let entries = vec![
+            AccessEntry {
+                list: AccessList::Whitelist,
+                scope: AccessScope::Global,
+                scope_id: None,
+                user_id: "u_global".into(),
+            },
+            AccessEntry {
+                list: AccessList::Whitelist,
+                scope: AccessScope::Guild,
+                scope_id: Some("g1".into()),
+                user_id: "u_guild".into(),
+            },
+            AccessEntry {
+                list: AccessList::Whitelist,
+                scope: AccessScope::Channel,
+                scope_id: Some("c1".into()),
+                user_id: "u_chan".into(),
+            },
+            AccessEntry {
+                list: AccessList::Blacklist,
+                scope: AccessScope::Global,
+                scope_id: None,
+                user_id: "b_global".into(),
+            },
+            AccessEntry {
+                list: AccessList::Blacklist,
+                scope: AccessScope::Guild,
+                scope_id: Some("g1".into()),
+                user_id: "b_guild".into(),
+            },
+            AccessEntry {
+                list: AccessList::Blacklist,
+                scope: AccessScope::Channel,
+                scope_id: Some("c1".into()),
+                user_id: "b_chan".into(),
+            },
+        ];
+        // AllowAll admits anyone everywhere.
+        assert!(access_allowed(AccessMode::AllowAll, &entries, "anyone", Some("g9"), "c9", None, false));
+        assert!(access_allowed(AccessMode::AllowAll, &entries, "b_global", None, "dm1", None, true));
+
+        // Whitelist: global works everywhere + DM; guild only in g1 (not DM); channel only in c1/threads (not DM).
+        assert!(access_allowed(AccessMode::Whitelist, &entries, "u_global", None, "dm1", None, true));
+        assert!(access_allowed(AccessMode::Whitelist, &entries, "u_guild", Some("g1"), "c9", None, false));
+        assert!(!access_allowed(AccessMode::Whitelist, &entries, "u_guild", Some("g2"), "c9", None, false));
+        assert!(!access_allowed(AccessMode::Whitelist, &entries, "u_guild", None, "dm1", None, true));
+        assert!(access_allowed(AccessMode::Whitelist, &entries, "u_chan", Some("g1"), "c1", Some("t1"), false));
+        assert!(!access_allowed(AccessMode::Whitelist, &entries, "u_chan", Some("g1"), "c2", None, false));
+
+        // Blacklist: everyone allowed except matched blacklist entries.
+        assert!(access_allowed(AccessMode::Blacklist, &entries, "anyone", Some("g1"), "c1", None, false));
+        assert!(!access_allowed(AccessMode::Blacklist, &entries, "b_global", None, "dm1", None, true));
+        assert!(!access_allowed(AccessMode::Blacklist, &entries, "b_guild", Some("g1"), "c2", None, false));
+        assert!(access_allowed(AccessMode::Blacklist, &entries, "b_guild", Some("g2"), "c2", None, false));
+        assert!(access_allowed(AccessMode::Blacklist, &entries, "b_guild", None, "dm1", None, true));
+        assert!(!access_allowed(AccessMode::Blacklist, &entries, "b_chan", Some("g1"), "c1", Some("t1"), false));
+        assert!(access_allowed(AccessMode::Blacklist, &entries, "b_chan", Some("g1"), "c2", None, false));
     }
 
     #[test]

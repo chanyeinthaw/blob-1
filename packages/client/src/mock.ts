@@ -3,6 +3,8 @@ import { Array, Duration, Effect, Layer, Random, Ref, Schema, Stream, Struct } f
 import { Transport } from './api.ts'
 import {
   Discord,
+  type DiscordAccessEntry,
+  type DiscordAccessMode,
   type DiscordInteractionOverride,
   type DiscordReplyOverride,
   Home,
@@ -36,7 +38,8 @@ type State = Readonly<{
   compaction: Slot | null
   utility: Slot | null
   providers: ReadonlyArray<ProviderRecord>
-  allowed: ReadonlyArray<string>
+  accessMode: DiscordAccessMode
+  accessEntries: ReadonlyArray<DiscordAccessEntry>
   home: Home
   hasToken: boolean
   interactionModes: ReadonlyArray<DiscordInteractionOverride>
@@ -68,7 +71,10 @@ const seedState = (): State => ({
       ],
     },
   ],
-  allowed: ['435482941515104257'],
+  accessMode: 'whitelist',
+  accessEntries: [
+    { list: 'whitelist', scope: 'global', scopeId: null, userId: '435482941515104257' },
+  ],
   home: { kind: 'none' },
   hasToken: true,
   interactionModes: [],
@@ -112,7 +118,11 @@ const providersReply = (state: State): ReadonlyArray<Provider> =>
   }))
 
 const discordReply = (state: State): Discord => ({
-  allowed: state.allowed,
+  allowed: state.accessEntries
+    .filter(entry => entry.list === 'whitelist' && entry.scope === 'global')
+    .map(entry => entry.userId),
+  accessMode: state.accessMode,
+  accessEntries: state.accessEntries,
   home: state.home,
   token: state.hasToken ? 'set' : 'missing',
   connection: state.hasToken ? { state: 'online', bot: 'Blob-1' } : { state: 'off' },
@@ -206,12 +216,18 @@ const allowUser = (state: State, user: string): Effect.Effect<State, string> =>
     if (!NUMERIC_ID.test(user)) {
       return yield* Effect.fail('User id must be numeric')
     }
-    if (state.allowed.includes(user)) {
+    const entry: DiscordAccessEntry = {
+      list: 'whitelist',
+      scope: 'global',
+      scopeId: null,
+      userId: user,
+    }
+    if (state.accessEntries.some(existing => sameAccessKey(existing, entry))) {
       return yield* Effect.fail('User is already allowed')
     }
 
     return Struct.evolve(state, {
-      allowed: allowed => Array.append(allowed, user),
+      accessEntries: entries => sortedAccessEntries([...entries, entry]),
     })
   })
 
@@ -220,12 +236,18 @@ const disallowUser = (state: State, user: string): Effect.Effect<State, string> 
     if (!NUMERIC_ID.test(user)) {
       return yield* Effect.fail('User id must be numeric')
     }
-    if (!state.allowed.includes(user)) {
+    const entry: DiscordAccessEntry = {
+      list: 'whitelist',
+      scope: 'global',
+      scopeId: null,
+      userId: user,
+    }
+    if (!state.accessEntries.some(existing => sameAccessKey(existing, entry))) {
       return yield* Effect.fail('User is not allowed')
     }
 
     return Struct.evolve(state, {
-      allowed: allowed => Array.filter(allowed, entry => entry !== user),
+      accessEntries: entries => entries.filter(existing => !sameAccessKey(existing, entry)),
     })
   })
 
@@ -335,6 +357,81 @@ const clearReplyMode = (
 
     return Struct.evolve(state, {
       replyModes: modes => modes.filter(entry => entry.channelId !== payload.channelId),
+    })
+  })
+
+const sortedAccessEntries = (
+  entries: ReadonlyArray<DiscordAccessEntry>,
+): ReadonlyArray<DiscordAccessEntry> =>
+  entries.toSorted(
+    (a, b) =>
+      a.list.localeCompare(b.list) ||
+      a.scope.localeCompare(b.scope) ||
+      (a.scopeId ?? '').localeCompare(b.scopeId ?? '') ||
+      a.userId.localeCompare(b.userId),
+  )
+
+const sameAccessKey = (
+  entry: DiscordAccessEntry,
+  key: {
+    readonly list: DiscordAccessEntry['list']
+    readonly scope: DiscordAccessEntry['scope']
+    readonly scopeId: string | null
+    readonly userId: string
+  },
+): boolean =>
+  entry.list === key.list &&
+  entry.scope === key.scope &&
+  entry.scopeId === key.scopeId &&
+  entry.userId === key.userId
+
+const addAccessEntry = (
+  state: State,
+  payload: RequestPayload<'discord.addAccessEntry'>,
+): Effect.Effect<State, string> =>
+  Effect.gen(function* () {
+    if (!SNOWFLAKE.test(payload.userId)) {
+      return yield* Effect.fail('User IDs must be 17–20 digits')
+    }
+    if (payload.scope === 'global' && payload.scopeId !== null) {
+      return yield* Effect.fail('Global access entries cannot specify a scope')
+    }
+    if (
+      payload.scope === 'guild' &&
+      (payload.scopeId === null || !SNOWFLAKE.test(payload.scopeId))
+    ) {
+      return yield* Effect.fail('Server IDs must be 17–20 digits')
+    }
+    if (
+      payload.scope === 'channel' &&
+      (payload.scopeId === null || !SNOWFLAKE.test(payload.scopeId))
+    ) {
+      return yield* Effect.fail('Channel IDs must be 17–20 digits')
+    }
+
+    return Struct.evolve(state, {
+      accessEntries: entries =>
+        sortedAccessEntries([...entries.filter(entry => !sameAccessKey(entry, payload)), payload]),
+    })
+  })
+
+const removeAccessEntry = (
+  state: State,
+  payload: RequestPayload<'discord.removeAccessEntry'>,
+): Effect.Effect<State, string> =>
+  Effect.gen(function* () {
+    if (payload.userId === '') {
+      return yield* Effect.fail('Invalid user id')
+    }
+    if (payload.scope === 'global' && payload.scopeId !== null) {
+      return yield* Effect.fail('Invalid payload')
+    }
+    if (payload.scope !== 'global' && (payload.scopeId === null || payload.scopeId === '')) {
+      return yield* Effect.fail('Invalid scope id')
+    }
+
+    return Struct.evolve(state, {
+      accessEntries: entries => entries.filter(entry => !sameAccessKey(entry, payload)),
     })
   })
 
@@ -511,10 +608,34 @@ const handlers: { readonly [K in RequestType]: Handler<K> } = {
         { id: '842724454677348000', name: 'Studio' },
       ],
       channels: [
-        { id: '928368271290421338', name: 'server-man', server: 'Blob Lab', kind: 'channel' },
-        { id: '928368271290421339', name: 'general', server: 'Blob Lab', kind: 'channel' },
-        { id: '928368271290421340', name: 'eng', server: 'Blob Lab', kind: 'channel' },
-        { id: '842724454677348360', name: 'announcements', server: 'Studio', kind: 'channel' },
+        {
+          id: '928368271290421338',
+          name: 'server-man',
+          server: 'Blob Lab',
+          guildId: '928368271290421000',
+          kind: 'channel',
+        },
+        {
+          id: '928368271290421339',
+          name: 'general',
+          server: 'Blob Lab',
+          guildId: '928368271290421000',
+          kind: 'channel',
+        },
+        {
+          id: '928368271290421340',
+          name: 'eng',
+          server: 'Blob Lab',
+          guildId: '928368271290421000',
+          kind: 'channel',
+        },
+        {
+          id: '842724454677348360',
+          name: 'announcements',
+          server: 'Studio',
+          guildId: '842724454677348000',
+          kind: 'channel',
+        },
       ],
       people: [
         {
@@ -567,6 +688,19 @@ const handlers: { readonly [K in RequestType]: Handler<K> } = {
 
   'discord.clearReplyMode': (payload, state) =>
     transition(state, current => clearReplyMode(current, payload)).pipe(Effect.map(discordReply)),
+
+  'discord.setAccessMode': ({ mode }, state) =>
+    transition(state, current =>
+      Effect.succeed(Struct.evolve(current, { accessMode: () => mode })),
+    ).pipe(Effect.map(discordReply)),
+
+  'discord.addAccessEntry': (payload, state) =>
+    transition(state, current => addAccessEntry(current, payload)).pipe(Effect.map(discordReply)),
+
+  'discord.removeAccessEntry': (payload, state) =>
+    transition(state, current => removeAccessEntry(current, payload)).pipe(
+      Effect.map(discordReply),
+    ),
 
   'mcp.list': (_payload, state) => Ref.get(state).pipe(Effect.map(current => current.mcpServers)),
 

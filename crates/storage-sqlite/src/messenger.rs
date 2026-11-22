@@ -1,7 +1,7 @@
 use rusqlite::{params, OptionalExtension};
 use storage::{
-    InteractionMode, InteractionOverride, InteractionScope, MessengerStore, Place, ReplyMode,
-    ReplyOverride, StoreError,
+    AccessEntry, AccessList, AccessMode, AccessScope, InteractionMode, InteractionOverride,
+    InteractionScope, MessengerStore, Place, ReplyMode, ReplyOverride, StoreError,
 };
 
 use crate::{backend, SqliteStorage};
@@ -50,7 +50,9 @@ impl MessengerStore for SqliteStorage {
     fn allowed_users(&self, messenger: &str) -> Result<Vec<String>, StoreError> {
         let connection = self.lock();
         let mut statement = connection
-            .prepare("SELECT user_id FROM allowed_users WHERE messenger = ?1 ORDER BY user_id")
+            .prepare(
+                "SELECT user_id FROM access_entries WHERE messenger = ?1 AND list = 'whitelist' AND scope = 'global' AND scope_id = '' ORDER BY user_id",
+            )
             .map_err(backend)?;
         let rows = statement
             .query_map([messenger], |row| row.get(0))
@@ -59,13 +61,119 @@ impl MessengerStore for SqliteStorage {
     }
 
     fn allow_user(&self, messenger: &str, user: &str) -> Result<(), StoreError> {
+        self.add_access_entry(
+            messenger,
+            AccessList::Whitelist,
+            AccessScope::Global,
+            None,
+            user,
+        )
+    }
+
+    fn disallow_user(&self, messenger: &str, user: &str) -> Result<bool, StoreError> {
+        self.remove_access_entry(
+            messenger,
+            AccessList::Whitelist,
+            AccessScope::Global,
+            None,
+            user,
+        )
+    }
+
+    fn access_mode(&self, messenger: &str) -> Result<AccessMode, StoreError> {
+        let mode: Option<String> = self
+            .lock()
+            .query_row(
+                "SELECT mode FROM access_modes WHERE messenger = ?1",
+                [messenger],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        match mode {
+            None => Ok(AccessMode::Whitelist),
+            Some(value) => AccessMode::parse(&value).ok_or_else(|| {
+                StoreError::Backend(format!("invalid mode in access_modes: {value}").into())
+            }),
+        }
+    }
+
+    fn set_access_mode(&self, messenger: &str, mode: AccessMode) -> Result<(), StoreError> {
         self.lock()
             .execute(
-                "INSERT OR IGNORE INTO allowed_users (messenger, user_id) VALUES (?1, ?2)",
-                params![messenger, user],
+                "INSERT INTO access_modes (messenger, mode) VALUES (?1, ?2) ON CONFLICT (messenger) DO UPDATE SET mode = excluded.mode",
+                params![messenger, mode.as_str()],
             )
             .map_err(backend)?;
         Ok(())
+    }
+
+    fn access_entries(&self, messenger: &str) -> Result<Vec<AccessEntry>, StoreError> {
+        let connection = self.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT list, scope, scope_id, user_id FROM access_entries WHERE messenger = ?1 ORDER BY list, scope, scope_id, user_id",
+            )
+            .map_err(backend)?;
+        let rows = statement
+            .query_map([messenger], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(backend)?;
+        rows.map(|row| {
+            let (list, scope, scope_id, user_id) = row.map_err(backend)?;
+            let invalid = |kind: &str, value: &str| {
+                StoreError::Backend(format!("invalid {kind} in access_entries: {value}").into())
+            };
+            Ok(AccessEntry {
+                list: AccessList::parse(&list).ok_or_else(|| invalid("list", &list))?,
+                scope: AccessScope::parse(&scope).ok_or_else(|| invalid("scope", &scope))?,
+                scope_id: (!scope_id.is_empty()).then_some(scope_id),
+                user_id,
+            })
+        })
+        .collect()
+    }
+
+    fn add_access_entry(
+        &self,
+        messenger: &str,
+        list: AccessList,
+        scope: AccessScope,
+        scope_id: Option<&str>,
+        user_id: &str,
+    ) -> Result<(), StoreError> {
+        let sid = normalize_access_scope(scope, scope_id)?;
+        self.lock()
+            .execute(
+                "INSERT OR IGNORE INTO access_entries (messenger, list, scope, scope_id, user_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![messenger, list.as_str(), scope.as_str(), sid, user_id],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn remove_access_entry(
+        &self,
+        messenger: &str,
+        list: AccessList,
+        scope: AccessScope,
+        scope_id: Option<&str>,
+        user_id: &str,
+    ) -> Result<bool, StoreError> {
+        let sid = normalize_access_scope(scope, scope_id)?;
+        self.lock()
+            .execute(
+                "DELETE FROM access_entries WHERE messenger = ?1 AND list = ?2 AND scope = ?3 AND scope_id = ?4 AND user_id = ?5",
+                params![messenger, list.as_str(), scope.as_str(), sid, user_id],
+            )
+            .map(|n| n > 0)
+            .map_err(backend)
     }
 
     fn messenger_token(&self, messenger: &str) -> Result<Option<String>, StoreError> {
@@ -102,16 +210,6 @@ impl MessengerStore for SqliteStorage {
             }
         }
         Ok(())
-    }
-
-    fn disallow_user(&self, messenger: &str, user: &str) -> Result<bool, StoreError> {
-        self.lock()
-            .execute(
-                "DELETE FROM allowed_users WHERE messenger = ?1 AND user_id = ?2",
-                params![messenger, user],
-            )
-            .map(|n| n > 0)
-            .map_err(backend)
     }
 
     fn interaction_modes(&self, messenger: &str) -> Result<Vec<InteractionOverride>, StoreError> {
@@ -303,6 +401,25 @@ impl MessengerStore for SqliteStorage {
                 |row| row.get(0),
             )
             .map_err(backend)
+    }
+}
+
+fn normalize_access_scope<'a>(
+    scope: AccessScope,
+    scope_id: Option<&'a str>,
+) -> Result<&'a str, StoreError> {
+    match (scope, scope_id) {
+        (AccessScope::Global, None | Some("")) => Ok(""),
+        (AccessScope::Global, Some(_)) => Err(StoreError::Backend(
+            "global access entries cannot specify a scope id".into(),
+        )),
+        (AccessScope::Guild | AccessScope::Channel, Some(id)) if !id.is_empty() => Ok(id),
+        (AccessScope::Guild, _) => Err(StoreError::Backend(
+            "guild access entries require a guild id".into(),
+        )),
+        (AccessScope::Channel, _) => Err(StoreError::Backend(
+            "channel access entries require a channel id".into(),
+        )),
     }
 }
 
@@ -704,5 +821,105 @@ mod tests {
         assert!(!store.is_pending_thread(4).unwrap());
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn access_modes_and_legacy_migration() {
+        let dir = std::env::temp_dir().join(format!(
+            "blob-1-access-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("agent.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE allowed_users (messenger TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (messenger, user_id)) STRICT;
+                 INSERT INTO allowed_users VALUES ('discord', 'u_legacy');",
+            )
+            .unwrap();
+        }
+        // Opening in shared mode when no server holds the lock upgrades cleanly.
+        let store = SqliteStorage::open_shared(&db, None).unwrap();
+        assert_eq!(store.access_mode("discord").unwrap(), AccessMode::Whitelist);
+        assert_eq!(store.allowed_users("discord").unwrap(), vec!["u_legacy"]);
+        assert_eq!(
+            store.access_entries("discord").unwrap(),
+            vec![AccessEntry {
+                list: AccessList::Whitelist,
+                scope: AccessScope::Global,
+                scope_id: None,
+                user_id: "u_legacy".into(),
+            }]
+        );
+        // Scope validation
+        assert!(
+            store
+                .add_access_entry("discord", AccessList::Whitelist, AccessScope::Global, Some("g1"), "u1")
+                .is_err()
+        );
+        assert!(
+            store
+                .add_access_entry("discord", AccessList::Whitelist, AccessScope::Guild, None, "u1")
+                .is_err()
+        );
+        assert!(
+            store
+                .add_access_entry("discord", AccessList::Blacklist, AccessScope::Channel, None, "u1")
+                .is_err()
+        );
+        // Separate whitelist and blacklist entries coexist safely across mode changes.
+        store
+            .add_access_entry("discord", AccessList::Whitelist, AccessScope::Guild, Some("g1"), "u2")
+            .unwrap();
+        store
+            .add_access_entry("discord", AccessList::Blacklist, AccessScope::Channel, Some("c1"), "u3")
+            .unwrap();
+        store
+            .set_access_mode("discord", AccessMode::Blacklist)
+            .unwrap();
+        assert_eq!(store.access_mode("discord").unwrap(), AccessMode::Blacklist);
+        assert_eq!(store.access_entries("discord").unwrap().len(), 3);
+        assert!(
+            store
+                .remove_access_entry("discord", AccessList::Whitelist, AccessScope::Guild, Some("g1"), "u2")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .remove_access_entry("discord", AccessList::Whitelist, AccessScope::Guild, Some("g1"), "u2")
+                .unwrap()
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // An empty legacy `allowed_users` table still requires the owner lock
+        // when upgrading, so an older running server cannot race with migration.
+        let dir2 = std::env::temp_dir().join(format!(
+            "blob-1-access-lock-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(&dir2).unwrap();
+        let db2 = dir2.join("agent.db");
+        {
+            let conn = rusqlite::Connection::open(&db2).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE allowed_users (messenger TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (messenger, user_id)) STRICT;",
+            )
+            .unwrap();
+        }
+        let owner_lock = std::fs::File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(dir2.join("agent.db.lock"))
+            .unwrap();
+        owner_lock.try_lock().unwrap();
+        assert!(SqliteStorage::open_shared(&db2, None).is_err());
+        drop(owner_lock);
+        assert!(SqliteStorage::open_shared(&db2, None).is_ok());
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }

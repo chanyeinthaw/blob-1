@@ -271,6 +271,75 @@ enum MessengerCommand {
         #[command(subcommand)]
         command: MessengerReplyCommand,
     },
+    Access {
+        #[command(subcommand)]
+        command: MessengerAccessCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum MessengerAccessCommand {
+    /// Show the access mode and all whitelist/blacklist entries.
+    Show {
+        messenger: String,
+    },
+    /// Set the access mode (`allow-all`, `whitelist`, or `blacklist`).
+    Mode {
+        messenger: String,
+        mode: AccessModeSetting,
+    },
+    /// Add a user to the whitelist or blacklist (global by default, or scoped with `--guild` or `--channel`).
+    Add {
+        messenger: String,
+        list: AccessListSetting,
+        user_id: String,
+        #[arg(long, conflicts_with = "channel")]
+        guild: Option<String>,
+        #[arg(long, conflicts_with = "guild")]
+        channel: Option<String>,
+    },
+    /// Remove a user from the whitelist or blacklist.
+    Remove {
+        messenger: String,
+        list: AccessListSetting,
+        user_id: String,
+        #[arg(long, conflicts_with = "channel")]
+        guild: Option<String>,
+        #[arg(long, conflicts_with = "guild")]
+        channel: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum AccessModeSetting {
+    AllowAll,
+    Whitelist,
+    Blacklist,
+}
+
+impl From<AccessModeSetting> for storage::AccessMode {
+    fn from(mode: AccessModeSetting) -> Self {
+        match mode {
+            AccessModeSetting::AllowAll => Self::AllowAll,
+            AccessModeSetting::Whitelist => Self::Whitelist,
+            AccessModeSetting::Blacklist => Self::Blacklist,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum AccessListSetting {
+    Whitelist,
+    Blacklist,
+}
+
+impl From<AccessListSetting> for storage::AccessList {
+    fn from(list: AccessListSetting) -> Self {
+        match list {
+            AccessListSetting::Whitelist => Self::Whitelist,
+            AccessListSetting::Blacklist => Self::Blacklist,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -1188,6 +1257,94 @@ async fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<(
                     return Err("channel ID cannot be empty".into());
                 }
                 store.clear_reply_mode(&messenger, &channel_id)?;
+            }
+        },
+        MessengerCommand::Access { command } => match command {
+            MessengerAccessCommand::Show { messenger } => {
+                if messenger != "discord" {
+                    return Err(format!("unknown messenger: {messenger}").into());
+                }
+                println!("mode {}", store.access_mode(&messenger)?.as_str());
+                for entry in store.access_entries(&messenger)? {
+                    match entry.scope_id {
+                        Some(scope_id) => println!(
+                            "{} {} {} {}",
+                            entry.list.as_str(),
+                            entry.scope.as_str(),
+                            scope_id,
+                            entry.user_id
+                        ),
+                        None => println!(
+                            "{} {} {}",
+                            entry.list.as_str(),
+                            entry.scope.as_str(),
+                            entry.user_id
+                        ),
+                    }
+                }
+            }
+            MessengerAccessCommand::Mode { messenger, mode } => {
+                if messenger != "discord" {
+                    return Err(format!("unknown messenger: {messenger}").into());
+                }
+                store.set_access_mode(&messenger, mode.into())?;
+            }
+            MessengerAccessCommand::Add {
+                messenger,
+                list,
+                user_id,
+                guild,
+                channel,
+            } => {
+                if messenger != "discord" {
+                    return Err(format!("unknown messenger: {messenger}").into());
+                }
+                if !valid_discord_id(&user_id) {
+                    return Err("Discord user IDs must be 17–20 digits".into());
+                }
+                let (scope, scope_id) = match (guild.as_deref(), channel.as_deref()) {
+                    (None, None) => (storage::AccessScope::Global, None),
+                    (Some(g), None) => {
+                        if !valid_discord_id(g) {
+                            return Err("Discord guild IDs must be 17–20 digits".into());
+                        }
+                        (storage::AccessScope::Guild, Some(g))
+                    }
+                    (None, Some(c)) => {
+                        if !valid_discord_id(c) {
+                            return Err("Discord channel IDs must be 17–20 digits".into());
+                        }
+                        (storage::AccessScope::Channel, Some(c))
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err("cannot specify both --guild and --channel".into());
+                    }
+                };
+                store.add_access_entry(&messenger, list.into(), scope, scope_id, &user_id)?;
+            }
+            MessengerAccessCommand::Remove {
+                messenger,
+                list,
+                user_id,
+                guild,
+                channel,
+            } => {
+                if messenger != "discord" {
+                    return Err(format!("unknown messenger: {messenger}").into());
+                }
+                if user_id.is_empty() {
+                    return Err("user ID cannot be empty".into());
+                }
+                let (scope, scope_id) = match (guild.as_deref(), channel.as_deref()) {
+                    (None, None) => (storage::AccessScope::Global, None),
+                    (Some(g), None) if !g.is_empty() => (storage::AccessScope::Guild, Some(g)),
+                    (None, Some(c)) if !c.is_empty() => (storage::AccessScope::Channel, Some(c)),
+                    (Some(_), Some(_)) => {
+                        return Err("cannot specify both --guild and --channel".into());
+                    }
+                    _ => return Err("scope ID cannot be empty".into()),
+                };
+                store.remove_access_entry(&messenger, list.into(), scope, scope_id, &user_id)?;
             }
         },
     }

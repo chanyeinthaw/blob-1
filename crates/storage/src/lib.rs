@@ -816,12 +816,115 @@ pub struct ReplyOverride {
     pub mode: ReplyMode,
 }
 
+/// Who can talk to the bot on a messenger: everyone (`allow-all`), only listed
+/// users (`whitelist`, the default), or everyone except listed users (`blacklist`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessMode {
+    AllowAll,
+    Whitelist,
+    Blacklist,
+}
+
+impl AccessMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AllowAll => "allow-all",
+            Self::Whitelist => "whitelist",
+            Self::Blacklist => "blacklist",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == s)
+    }
+
+    const ALL: [Self; 3] = [Self::AllowAll, Self::Whitelist, Self::Blacklist];
+}
+
+/// Which access list an entry belongs to. Whitelist and blacklist entries are
+/// stored separately so switching modes never flips trusted users into banned ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessList {
+    Whitelist,
+    Blacklist,
+}
+
+impl AccessList {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Whitelist => "whitelist",
+            Self::Blacklist => "blacklist",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|list| list.as_str() == s)
+    }
+
+    const ALL: [Self; 2] = [Self::Whitelist, Self::Blacklist];
+}
+
+/// Where an access entry applies: globally (including DMs), in a specific
+/// Discord server (guild), or in a specific channel/thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessScope {
+    Global,
+    Guild,
+    Channel,
+}
+
+impl AccessScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Guild => "guild",
+            Self::Channel => "channel",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|scope| scope.as_str() == s)
+    }
+
+    const ALL: [Self; 3] = [Self::Global, Self::Guild, Self::Channel];
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessEntry {
+    pub list: AccessList,
+    pub scope: AccessScope,
+    /// Server (guild) id for `Guild`, channel/thread id for `Channel`, `None` for `Global`.
+    pub scope_id: Option<String>,
+    pub user_id: String,
+}
+
 pub trait MessengerStore: Send + Sync {
     fn destination(&self, messenger: &str, place: &Place) -> Result<u64, StoreError>;
     fn place(&self, id: u64) -> Result<Option<(String, Place)>, StoreError>;
     fn allowed_users(&self, messenger: &str) -> Result<Vec<String>, StoreError>;
     fn allow_user(&self, messenger: &str, user: &str) -> Result<(), StoreError>;
     fn disallow_user(&self, messenger: &str, user: &str) -> Result<bool, StoreError>;
+    /// Access policy for a messenger; defaults to `AccessMode::Whitelist`.
+    fn access_mode(&self, messenger: &str) -> Result<AccessMode, StoreError>;
+    fn set_access_mode(&self, messenger: &str, mode: AccessMode) -> Result<(), StoreError>;
+    /// Whitelist and blacklist entries, ordered by list, scope, scope id, then user id.
+    fn access_entries(&self, messenger: &str) -> Result<Vec<AccessEntry>, StoreError>;
+    fn add_access_entry(
+        &self,
+        messenger: &str,
+        list: AccessList,
+        scope: AccessScope,
+        scope_id: Option<&str>,
+        user_id: &str,
+    ) -> Result<(), StoreError>;
+    fn remove_access_entry(
+        &self,
+        messenger: &str,
+        list: AccessList,
+        scope: AccessScope,
+        scope_id: Option<&str>,
+        user_id: &str,
+    ) -> Result<bool, StoreError>;
     /// The bot token for a chat platform (e.g. `discord`); stored encrypted.
     fn messenger_token(&self, messenger: &str) -> Result<Option<String>, StoreError>;
     fn set_messenger_token(&self, messenger: &str, token: Option<&str>) -> Result<(), StoreError>;
@@ -880,6 +983,35 @@ impl<T: MessengerStore + ?Sized> MessengerStore for std::sync::Arc<T> {
     }
     fn disallow_user(&self, messenger: &str, user: &str) -> Result<bool, StoreError> {
         (**self).disallow_user(messenger, user)
+    }
+    fn access_mode(&self, messenger: &str) -> Result<AccessMode, StoreError> {
+        (**self).access_mode(messenger)
+    }
+    fn set_access_mode(&self, messenger: &str, mode: AccessMode) -> Result<(), StoreError> {
+        (**self).set_access_mode(messenger, mode)
+    }
+    fn access_entries(&self, messenger: &str) -> Result<Vec<AccessEntry>, StoreError> {
+        (**self).access_entries(messenger)
+    }
+    fn add_access_entry(
+        &self,
+        messenger: &str,
+        list: AccessList,
+        scope: AccessScope,
+        scope_id: Option<&str>,
+        user_id: &str,
+    ) -> Result<(), StoreError> {
+        (**self).add_access_entry(messenger, list, scope, scope_id, user_id)
+    }
+    fn remove_access_entry(
+        &self,
+        messenger: &str,
+        list: AccessList,
+        scope: AccessScope,
+        scope_id: Option<&str>,
+        user_id: &str,
+    ) -> Result<bool, StoreError> {
+        (**self).remove_access_entry(messenger, list, scope, scope_id, user_id)
     }
     fn messenger_token(&self, messenger: &str) -> Result<Option<String>, StoreError> {
         (**self).messenger_token(messenger)

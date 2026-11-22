@@ -1,5 +1,9 @@
 import type { ApiError } from '@blob-1/client/api'
 import type {
+  DiscordAccessEntry,
+  DiscordAccessList,
+  DiscordAccessMode,
+  DiscordAccessScope,
   DiscordConnection,
   DiscordDirectory,
   DiscordInteractionOverride,
@@ -138,7 +142,7 @@ export function DiscordSettings() {
   return (
     <div>
       <TokenSection />
-      <AllowlistSection />
+      <AccessSection />
       <InteractionModeSection />
       <ReplyModeSection />
       <HomeSection />
@@ -343,197 +347,383 @@ function initials(name: string) {
     .join('')
 }
 
-function AllowlistSection() {
+const accessModes: ReadonlyArray<{ readonly mode: DiscordAccessMode; readonly label: string }> = [
+  { mode: 'whitelist', label: 'Whitelist' },
+  { mode: 'blacklist', label: 'Blacklist' },
+  { mode: 'allow-all', label: 'Allow all' },
+]
+
+const accessScopes: ReadonlyArray<{ readonly scope: DiscordAccessScope; readonly label: string }> =
+  [
+    { scope: 'global', label: 'Global' },
+    { scope: 'guild', label: 'Server' },
+    { scope: 'channel', label: 'Channel' },
+  ]
+
+const accessLists: ReadonlyArray<{ readonly list: DiscordAccessList; readonly label: string }> = [
+  { list: 'whitelist', label: 'Whitelist' },
+  { list: 'blacklist', label: 'Blacklist' },
+]
+
+function isAccessMode(value: string | undefined): value is DiscordAccessMode {
+  return value === 'allow-all' || value === 'whitelist' || value === 'blacklist'
+}
+
+function isAccessList(value: string | undefined): value is DiscordAccessList {
+  return value === 'whitelist' || value === 'blacklist'
+}
+
+function isAccessScope(value: string | undefined): value is DiscordAccessScope {
+  return value === 'global' || value === 'guild' || value === 'channel'
+}
+
+function describeAccessScope(entry: DiscordAccessEntry, directory: DiscordDirectory): string {
+  if (entry.scope === 'global') return 'Global'
+  if (entry.scope === 'guild') {
+    const guild = directory.guilds.find(item => item.id === entry.scopeId)
+    return guild?.name ?? `server ${entry.scopeId ?? ''}`
+  }
+  const channel = directory.channels.find(item => item.id === entry.scopeId)
+  if (channel === undefined) return `channel ${entry.scopeId ?? ''}`
+  return channel.server === '' ? `#${channel.name}` : `#${channel.name} · ${channel.server}`
+}
+
+function AccessSection() {
   const machine = DiscordOwner.useMachine()
+  const send = useAtomSet(machine.send)
   const isIdle = AsyncResult.getOrElse(
-    useMachineResult(AtomMachine.matches(machine, 'Allowlist.Idle')),
+    useMachineResult(AtomMachine.matches(machine, 'Access.Idle')),
     () => false,
   )
   return (
     <Section title="Who can talk to Blob-1">
       <MachineState machine={machine} path="">
-        {({ value }) =>
-          value.discord.allowed.length === 0 ? (
-            <EmptyLine>Nobody can talk to Blob-1 yet.</EmptyLine>
-          ) : (
-            <ul className="flex flex-col divide-y">
-              {value.discord.allowed.map(user => (
-                <AllowedRow
-                  key={user}
-                  user={user}
-                  name={personName(value.directory, user)}
-                  isIdle={isIdle}
-                />
-              ))}
-            </ul>
+        {({ value, states }) => {
+          const accessState = states.Access.state
+          const error = accessState.path === 'Access.Idle' ? accessState.value.error : null
+          const mode = value.discord.accessMode
+          const editingList = value.accessList
+          const entries = value.discord.accessEntries.filter(entry => entry.list === editingList)
+          return (
+            <div>
+              <FieldRow labelId="discord-access-mode-label" label="Mode">
+                <ToggleGroup
+                  aria-labelledby="discord-access-mode-label"
+                  spacing={1}
+                  disabled={!isIdle}
+                  value={[mode]}
+                  onValueChange={values => {
+                    const next = values[0]
+                    if (isAccessMode(next) && next !== mode) {
+                      send(DiscordEvents.SetAccessMode({ mode: next }))
+                    }
+                  }}
+                  className="h-10 rounded-full bg-muted p-[3px] md:h-8"
+                >
+                  {accessModes.map(item => (
+                    <ToggleGroupItem
+                      key={item.mode}
+                      value={item.mode}
+                      className={modeToggleItemClassName}
+                    >
+                      {item.label}
+                    </ToggleGroupItem>
+                  ))}
+                </ToggleGroup>
+              </FieldRow>
+              <FieldRow labelId="discord-access-list-label" label="Edit list">
+                <ToggleGroup
+                  aria-labelledby="discord-access-list-label"
+                  spacing={1}
+                  disabled={!isIdle}
+                  value={[editingList]}
+                  onValueChange={values => {
+                    const next = values[0]
+                    if (isAccessList(next) && next !== editingList) {
+                      send(DiscordEvents.SelectAccessList({ list: next }))
+                    }
+                  }}
+                  className="h-10 rounded-full bg-muted p-[3px] md:h-8"
+                >
+                  {accessLists.map(item => (
+                    <ToggleGroupItem
+                      key={item.list}
+                      value={item.list}
+                      className={modeToggleItemClassName}
+                    >
+                      {item.label}
+                    </ToggleGroupItem>
+                  ))}
+                </ToggleGroup>
+              </FieldRow>
+              {entries.length === 0 ? (
+                <EmptyLine>
+                  {editingList === 'whitelist'
+                    ? 'Nobody is whitelisted yet.'
+                    : 'Nobody is blacklisted.'}
+                </EmptyLine>
+              ) : (
+                <ul className="mt-2 flex flex-col divide-y">
+                  {entries.map(entry => (
+                    <AccessRow
+                      key={`${entry.list}:${entry.scope}:${entry.scopeId ?? ''}:${entry.userId}`}
+                      entry={entry}
+                      directory={value.directory}
+                      disabled={!isIdle}
+                    />
+                  ))}
+                </ul>
+              )}
+              <AccessForm list={editingList} isIdle={isIdle} error={error} />
+            </div>
           )
-        }
+        }}
       </MachineState>
-      <AllowForm />
     </Section>
   )
 }
 
-interface AllowedRowProps {
-  readonly user: string
-  readonly name: string | undefined
-  readonly isIdle: boolean
+interface AccessRowProps {
+  readonly entry: DiscordAccessEntry
+  readonly directory: DiscordDirectory
+  readonly disabled: boolean
 }
 
-function AllowedRow(props: AllowedRowProps) {
+function AccessRow(props: AccessRowProps) {
   const machine = DiscordOwner.useMachine()
   const send = useAtomSet(machine.send)
+  const { entry, directory, disabled } = props
+  const name = personName(directory, entry.userId)
+  const scopeLabel = describeAccessScope(entry, directory)
+  const listName = entry.list === 'whitelist' ? 'whitelist' : 'blacklist'
+  const label = name ?? entry.userId
+  const detail =
+    name === undefined
+      ? `${entry.userId} · ${scopeLabel}`
+      : `${name} · ${scopeLabel} (${entry.userId})`
   return (
     <li className="flex min-h-12 items-center gap-3 py-2">
       <span
         aria-hidden="true"
         className="grid size-7 shrink-0 place-items-center rounded-full bg-muted text-[11px] font-semibold text-muted-foreground"
       >
-        {props.name === undefined ? <User className="size-3.5" /> : initials(props.name)}
+        {name === undefined ? <User className="size-3.5" /> : initials(name)}
       </span>
       <div className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-2 gap-y-0.5">
-        {props.name === undefined ? (
-          <span className="break-all font-mono text-sm">{props.user}</span>
-        ) : (
-          <>
-            <span className="break-words text-sm [overflow-wrap:anywhere]">{props.name}</span>
-            <span className="font-mono text-xs text-muted-foreground">{props.user}</span>
-          </>
+        <span className="break-words text-sm [overflow-wrap:anywhere]">{label}</span>
+        <span className="break-words text-xs text-muted-foreground [overflow-wrap:anywhere]">
+          {scopeLabel}
+        </span>
+        {name === undefined ? null : (
+          <span className="font-mono text-xs text-muted-foreground">{entry.userId}</span>
         )}
       </div>
       <ConfirmDialog
-        tooltip="Remove from allowlist"
+        tooltip={`Remove from ${listName}`}
         trigger={
           <Button
             variant="ghost"
             size="icon"
-            aria-label={`Remove ${props.name ?? props.user}`}
-            disabled={!props.isIdle}
+            aria-label={`Remove ${label} (${scopeLabel}) from ${listName}`}
+            disabled={disabled}
             className="text-destructive hover:bg-destructive/10 hover:text-destructive"
           >
             <Trash2 />
           </Button>
         }
-        title="Remove from allowlist?"
-        detail={props.name === undefined ? props.user : `${props.name} (${props.user})`}
+        title={`Remove from ${listName}?`}
+        detail={detail}
         confirmLabel="Remove"
-        onConfirm={() => send(DiscordEvents.Disallow({ user: props.user }))}
+        onConfirm={() => send(DiscordEvents.RemoveAccessEntry(entry))}
       />
     </li>
   )
 }
 
-function AllowForm() {
+interface AccessFormProps {
+  readonly list: DiscordAccessList
+  readonly isIdle: boolean
+  readonly error: string | null
+}
+
+function accessGuildFilter(
+  scope: DiscordAccessScope,
+  scopeId: string,
+  directory: DiscordDirectory,
+): string | null {
+  if (scope === 'guild') return scopeId === '' ? null : scopeId
+  if (scope === 'channel') {
+    const guildId = directory.channels.find(channel => channel.id === scopeId)?.guildId ?? ''
+    return guildId === '' ? null : guildId
+  }
+  return null
+}
+
+function AccessScopePicker(props: {
+  readonly scope: DiscordAccessScope
+  readonly scopeId: string
+  readonly directory: DiscordDirectory
+  readonly disabled: boolean
+  readonly onChange: (scopeId: string) => void
+}) {
+  if (props.scope === 'global') return null
+  const isGuild = props.scope === 'guild'
+  const options = isGuild
+    ? props.directory.guilds.map(guild => ({
+        value: guild.id,
+        label: guild.name,
+        hint: guild.id,
+      }))
+    : props.directory.channels.map(channel => ({
+        value: channel.id,
+        label: `#${channel.name}`,
+        hint: channel.server,
+      }))
+  return (
+    <FieldRow id="discord-access-scope-target" label={isGuild ? 'Server' : 'Channel'}>
+      <Picker
+        id="discord-access-scope-target"
+        placeholder={isGuild ? 'Choose a server' : 'Choose a channel'}
+        value={props.scopeId}
+        disabled={props.disabled}
+        clearOnEdit
+        options={options}
+        customOption={raw => {
+          const id = raw.trim()
+          if (!SNOWFLAKE.test(id)) return null
+          return { value: id, label: `Use ID ${id}`, hint: null }
+        }}
+        emptyMessage={raw => {
+          const trimmed = raw.trim()
+          if (/^\d+$/.test(trimmed) && !SNOWFLAKE.test(trimmed)) {
+            return 'Discord IDs have 17–20 digits'
+          }
+          return 'No matches'
+        }}
+        onChange={props.onChange}
+      />
+    </FieldRow>
+  )
+}
+
+/** Add a global, server-scoped, or channel-scoped whitelist/blacklist entry. */
+function AccessForm(props: AccessFormProps) {
   const machine = DiscordOwner.useMachine()
   const send = useAtomSet(machine.send)
-  const [localError, setLocalError] = useState('')
-  const idle = Option.getOrNull(
-    AsyncResult.getOrElse(useMachineResult(AtomMachine.select(machine, 'Allowlist.Idle')), () =>
-      Option.none(),
-    ),
-  )
-  const adding = Option.getOrNull(
-    AsyncResult.getOrElse(useMachineResult(AtomMachine.select(machine, 'Allowlist.Adding')), () =>
-      Option.none(),
-    ),
-  )
-  const draft = idle?.draft ?? adding?.user ?? ''
-  const error = localError === '' ? (idle?.error ?? null) : localError
   return (
     <MachineState machine={machine} path="">
       {({ value }) => {
-        const availablePeople = value.directory.people.filter(
-          person => !value.discord.allowed.includes(person.id),
-        )
-        return availablePeople.length > 0 ? (
+        const scope = value.accessScope
+        const selectedScopeId = scope === 'global' ? null : value.accessScopeId
+        const exists = (userId: string) =>
+          value.discord.accessEntries.some(
+            entry =>
+              entry.list === props.list &&
+              entry.scope === scope &&
+              entry.scopeId === selectedScopeId &&
+              entry.userId === userId,
+          )
+        const guildFilter = accessGuildFilter(scope, value.accessScopeId, value.directory)
+        const peopleOptions = value.directory.people
+          .filter(
+            person =>
+              !exists(person.id) && (guildFilter === null || person.guilds.includes(guildFilter)),
+          )
+          .map(person => ({ value: person.id, label: person.name, hint: person.id }))
+        const scopeValid = scope === 'global' || SNOWFLAKE.test(value.accessScopeId)
+        const canSubmit =
+          props.isIdle &&
+          scopeValid &&
+          SNOWFLAKE.test(value.accessUser) &&
+          !exists(value.accessUser)
+        const verb = props.list === 'whitelist' ? 'Allow' : 'Block'
+        return (
           <div className="mt-2.5">
-            <label htmlFor="discord-allow-picker" className="sr-only">
-              Add a person or Discord user ID
-            </label>
-            <Picker
-              id="discord-allow-picker"
-              placeholder="Add a person or paste a user ID"
-              value=""
-              clearOnSelect
-              disabled={idle === null}
-              options={availablePeople.map(person => ({
-                value: person.id,
-                label: person.name,
-                hint: person.id,
-              }))}
-              customOption={raw => {
-                const user = raw.trim()
-                if (!SNOWFLAKE.test(user) || value.discord.allowed.includes(user)) return null
-                return { value: user, label: `Allow ID ${user}`, hint: null }
-              }}
-              emptyMessage={raw => {
-                const trimmed = raw.trim()
-                if (trimmed === '') return 'No matches'
-                if (value.discord.allowed.includes(trimmed)) return 'Already allowed'
-                if (/^\d+$/.test(trimmed) && !SNOWFLAKE.test(trimmed)) {
-                  return 'Discord user IDs have 17–20 digits'
-                }
-                return 'No matches'
-              }}
-              onChange={user => {
-                setLocalError('')
-                send(DiscordEvents.Allow({ user }))
-              }}
-            />
-            {adding === null ? null : (
-              <p aria-live="polite" className="mt-1.5 px-3.5 text-xs text-muted-foreground">
-                Adding…
-              </p>
-            )}
-            {error === null ? null : <FieldError id="discord-allow-error">{error}</FieldError>}
-          </div>
-        ) : (
-          <form
-            noValidate
-            className="mt-2.5"
-            onSubmit={event => {
-              event.preventDefault()
-              const user = draft.trim()
-              if (!SNOWFLAKE.test(user)) {
-                setLocalError('Enter a Discord user ID with 17–20 digits.')
-              } else if (value.discord.allowed.includes(user)) {
-                setLocalError('This user is already allowed.')
-              } else {
-                setLocalError('')
-                send(DiscordEvents.Allow({ user }))
-              }
-            }}
-          >
-            <label htmlFor="discord-allow" className="sr-only">
-              Discord user ID
-            </label>
-            <div className="flex items-start gap-2">
-              <div className="min-w-0 flex-1">
-                <Input
-                  id="discord-allow"
-                  inputMode="numeric"
-                  placeholder="Discord user ID"
-                  className="font-mono"
-                  value={draft}
-                  readOnly={idle === null}
-                  aria-invalid={error !== null}
-                  aria-describedby={error === null ? undefined : 'discord-allow-error'}
-                  onChange={event => {
-                    setLocalError('')
-                    send(DiscordEvents.EditAllowDraft({ draft: event.target.value }))
-                  }}
-                />
-                {error === null ? null : <FieldError id="discord-allow-error">{error}</FieldError>}
-              </div>
-              <Button
-                type="submit"
-                variant="outline"
-                disabled={idle === null || draft.trim() === ''}
+            <FieldRow labelId="discord-access-scope-label" label="Scope">
+              <ToggleGroup
+                aria-labelledby="discord-access-scope-label"
+                spacing={1}
+                disabled={!props.isIdle}
+                value={[scope]}
+                onValueChange={values => {
+                  const next = values[0]
+                  if (isAccessScope(next) && next !== scope) {
+                    send(DiscordEvents.SelectAccessScope({ scope: next }))
+                  }
+                }}
+                className="h-10 rounded-full bg-muted p-[3px] md:h-8"
               >
-                {adding !== null ? 'Adding…' : 'Allow'}
-              </Button>
-            </div>
-          </form>
+                {accessScopes.map(item => (
+                  <ToggleGroupItem
+                    key={item.scope}
+                    value={item.scope}
+                    className={modeToggleItemClassName}
+                  >
+                    {item.label}
+                  </ToggleGroupItem>
+                ))}
+              </ToggleGroup>
+            </FieldRow>
+            <AccessScopePicker
+              scope={scope}
+              scopeId={value.accessScopeId}
+              directory={value.directory}
+              disabled={!props.isIdle}
+              onChange={scopeId => send(DiscordEvents.SelectAccessScopeId({ scopeId }))}
+            />
+            <FieldRow id="discord-access-user" label="Person">
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="min-w-0 flex-1 basis-48">
+                  <Picker
+                    id="discord-access-user"
+                    placeholder="Choose a person or paste a user ID"
+                    value={value.accessUser}
+                    disabled={!props.isIdle}
+                    clearOnEdit
+                    options={peopleOptions}
+                    customOption={raw => {
+                      const id = raw.trim()
+                      if (!SNOWFLAKE.test(id) || exists(id)) return null
+                      return { value: id, label: `Use ID ${id}`, hint: null }
+                    }}
+                    emptyMessage={raw => {
+                      const trimmed = raw.trim()
+                      if (trimmed === '') return 'No matches'
+                      if (exists(trimmed)) {
+                        return props.list === 'whitelist'
+                          ? 'Already whitelisted'
+                          : 'Already blacklisted'
+                      }
+                      if (/^\d+$/.test(trimmed) && !SNOWFLAKE.test(trimmed)) {
+                        return 'Discord user IDs have 17–20 digits'
+                      }
+                      return 'No matches'
+                    }}
+                    onChange={userId => send(DiscordEvents.SelectAccessUser({ userId }))}
+                  />
+                </div>
+                <Button
+                  className="ml-auto"
+                  disabled={!canSubmit}
+                  onClick={() =>
+                    send(
+                      DiscordEvents.AddAccessEntry({
+                        list: props.list,
+                        scope,
+                        scopeId: selectedScopeId,
+                        userId: value.accessUser,
+                      }),
+                    )
+                  }
+                >
+                  {verb}
+                </Button>
+              </div>
+            </FieldRow>
+            {props.error === null ? null : (
+              <FieldError id="discord-access-error">{props.error}</FieldError>
+            )}
+          </div>
         )
       }}
     </MachineState>
@@ -728,7 +918,6 @@ function ModeForm(props: ModeFormProps) {
             : value.directory.people
                 .filter(
                   person =>
-                    value.discord.allowed.includes(person.id) &&
                     !overridden(person.id) &&
                     (selectedGuild === null ||
                       selectedGuild === '' ||

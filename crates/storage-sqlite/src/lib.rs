@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS skill_files (skill TEXT NOT NULL REFERENCES skills (n
 
 CREATE TABLE IF NOT EXISTS destinations (id INTEGER PRIMARY KEY, messenger TEXT NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, dm INTEGER NOT NULL CHECK (dm IN (0,1)), UNIQUE (messenger, channel, thread)) STRICT;
 CREATE TABLE IF NOT EXISTS allowed_users (messenger TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (messenger, user_id)) STRICT;
+CREATE TABLE IF NOT EXISTS access_modes (messenger TEXT PRIMARY KEY, mode TEXT NOT NULL CHECK (mode IN ('allow-all', 'whitelist', 'blacklist'))) STRICT;
 CREATE TABLE IF NOT EXISTS interaction_modes (messenger TEXT NOT NULL, scope TEXT NOT NULL CHECK (scope IN ('channel', 'user')), guild_id TEXT NOT NULL DEFAULT '', target_id TEXT NOT NULL, mode TEXT NOT NULL CHECK (mode IN ('mention-only', 'always')), CHECK ((scope = 'channel' AND guild_id = '') OR scope = 'user'), PRIMARY KEY (messenger, scope, guild_id, target_id)) STRICT;
 CREATE TABLE IF NOT EXISTS reply_modes (messenger TEXT NOT NULL, channel_id TEXT NOT NULL, mode TEXT NOT NULL CHECK (mode IN ('decision', 'thread', 'direct')), PRIMARY KEY (messenger, channel_id)) STRICT;
 CREATE TABLE IF NOT EXISTS seen_threads (messenger TEXT NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, PRIMARY KEY (messenger, channel, thread)) STRICT;
@@ -212,11 +213,33 @@ impl SqliteStorage {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(backend)?;
-        // Initialize schema + `pending_threads` atomically inside one immediate
-        // transaction when `pending_threads` is absent, so a concurrent shared
-        // open on a fresh DB can never observe `destinations` without
-        // `pending_threads`, and an interrupted legacy backfill rolls back cleanly.
-        init_schema_and_pending_threads(&mut connection, owner.is_some())?;
+        // Hold a temporary owner lock only when a shared open needs a one-time
+        // schema migration and no server currently owns the database.
+        let mut upgrade_owner: Option<File> = None;
+        let has_exclusive = owner.is_some();
+        let mut require_exclusive = |msg: &'static str| -> Result<(), StoreError> {
+            if has_exclusive || upgrade_owner.is_some() {
+                return Ok(());
+            }
+            let file = File::options()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(lock_path(path))
+                .map_err(|error| StoreError::Backend(Box::new(error)))?;
+            match file.try_lock() {
+                Ok(()) => {
+                    upgrade_owner = Some(file);
+                    Ok(())
+                }
+                Err(TryLockError::WouldBlock) => Err(StoreError::Backend(msg.into())),
+                Err(TryLockError::Error(error)) => Err(StoreError::Backend(Box::new(error))),
+            }
+        };
+        // Initialize schema + `pending_threads` + `access_entries` atomically
+        // inside one immediate transaction on fresh DBs, so concurrent shared
+        // opens never observe half-initialized tables.
+        init_schema_and_pending_threads(&mut connection, &mut require_exclusive)?;
         for table in ["destinations", "allowed_users"] {
             let old_column: bool = connection
                 .query_row(
@@ -226,11 +249,9 @@ impl SqliteStorage {
                 )
                 .map_err(backend)?;
             if old_column {
-                if owner.is_none() {
-                    return Err(StoreError::Backend(
-                        "this database needs an upgrade: stop agent serve and run any other agent command once".into(),
-                    ));
-                }
+                require_exclusive(
+                    "this database needs an upgrade: stop agent serve and run any other agent command once",
+                )?;
                 connection
                     .execute_batch(&format!(
                         "ALTER TABLE {table} RENAME COLUMN interface TO messenger"
@@ -246,11 +267,9 @@ impl SqliteStorage {
             )
             .map_err(backend)?;
         if !has_guild_id {
-            if owner.is_none() {
-                return Err(StoreError::Backend(
-                    "this database needs an upgrade: restart blob-1 serve or run an exclusive command once".into(),
-                ));
-            }
+            require_exclusive(
+                "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
+            )?;
             let tx = connection
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(backend)?;
@@ -272,6 +291,8 @@ impl SqliteStorage {
             .map_err(backend)?;
             tx.commit().map_err(backend)?;
         }
+        ensure_access_entries(&mut connection, &mut require_exclusive)?;
+        drop(upgrade_owner);
         let key = match app_key {
             Some(app_key) => Some(crypto::setup(&connection, &app_key)?),
             None => None,
@@ -318,7 +339,7 @@ fn backend(error: rusqlite::Error) -> StoreError {
 /// ownership and runs the one-time backfill in the same transaction.
 fn init_schema_and_pending_threads(
     connection: &mut Connection,
-    exclusive: bool,
+    require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
     use std::collections::{HashMap, HashSet};
     let table_exists = |conn: &Connection, name: &str| -> Result<bool, StoreError> {
@@ -342,10 +363,11 @@ fn init_schema_and_pending_threads(
         return Ok(());
     }
     let had_destinations = table_exists(&tx, "destinations")?;
-    if had_destinations && !exclusive {
-        return Err(StoreError::Backend(
-            "this database needs an upgrade: restart blob-1 serve or run an exclusive command once".into(),
-        ));
+    let had_allowed_users = table_exists(&tx, "allowed_users")?;
+    if had_destinations {
+        require_exclusive(
+            "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
+        )?;
     }
     tx.execute_batch(SCHEMA).map_err(backend)?;
     tx.execute_batch(
@@ -355,6 +377,20 @@ fn init_schema_and_pending_threads(
     )
     .map_err(backend)?;
     if !had_destinations {
+        if !had_allowed_users {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS access_entries (
+                     messenger TEXT NOT NULL,
+                     list TEXT NOT NULL CHECK (list IN ('whitelist', 'blacklist')),
+                     scope TEXT NOT NULL CHECK (scope IN ('global', 'guild', 'channel')),
+                     scope_id TEXT NOT NULL DEFAULT '',
+                     user_id TEXT NOT NULL,
+                     CHECK ((scope = 'global' AND scope_id = '') OR (scope IN ('guild', 'channel') AND scope_id != '')),
+                     PRIMARY KEY (messenger, list, scope, scope_id, user_id)
+                 ) STRICT;",
+            )
+            .map_err(backend)?;
+        }
         tx.commit().map_err(backend)?;
         return Ok(());
     }
@@ -465,6 +501,54 @@ fn init_schema_and_pending_threads(
         )
         .map_err(backend)?;
     }
+    tx.commit().map_err(backend)?;
+    Ok(())
+}
+
+/// Creates `access_entries` on legacy databases (where it wasn't created during
+/// fresh-DB initialization) and migrates any existing `allowed_users` rows into
+/// the global whitelist inside one atomic immediate transaction. Always requires
+/// the exclusive owner lock (even if `allowed_users` is empty) so an older
+/// running server cannot write legacy rows that miss migration.
+fn ensure_access_entries(
+    connection: &mut Connection,
+    require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let table_exists = |conn: &Connection, name: &str| -> Result<bool, StoreError> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |row| row.get(0),
+        )
+        .map_err(backend)
+    };
+    if table_exists(connection, "access_entries")? {
+        return Ok(());
+    }
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    if table_exists(&tx, "access_entries")? {
+        tx.commit().map_err(backend)?;
+        return Ok(());
+    }
+    require_exclusive(
+        "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
+    )?;
+    tx.execute_batch(
+        "CREATE TABLE access_entries (
+             messenger TEXT NOT NULL,
+             list TEXT NOT NULL CHECK (list IN ('whitelist', 'blacklist')),
+             scope TEXT NOT NULL CHECK (scope IN ('global', 'guild', 'channel')),
+             scope_id TEXT NOT NULL DEFAULT '',
+             user_id TEXT NOT NULL,
+             CHECK ((scope = 'global' AND scope_id = '') OR (scope IN ('guild', 'channel') AND scope_id != '')),
+             PRIMARY KEY (messenger, list, scope, scope_id, user_id)
+         ) STRICT;
+         INSERT OR IGNORE INTO access_entries (messenger, list, scope, scope_id, user_id)
+         SELECT messenger, 'whitelist', 'global', '', user_id FROM allowed_users;",
+    )
+    .map_err(backend)?;
     tx.commit().map_err(backend)?;
     Ok(())
 }

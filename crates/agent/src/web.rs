@@ -438,6 +438,8 @@ fn discord_reply(ctx: &Context) -> crate::Result<Value> {
     };
     Ok(json!({
         "allowed": store.allowed_users("discord")?,
+        "accessMode": store.access_mode("discord")?.as_str(),
+        "accessEntries": store.access_entries("discord")?.into_iter().map(|e| json!({"list":e.list.as_str(),"scope":e.scope.as_str(),"scopeId":e.scope_id,"userId":e.user_id})).collect::<Vec<_>>(),
         "home": home,
         "token": if store.messenger_token("discord")?.is_some() { "set" } else { "missing" },
         "connection": connection,
@@ -770,6 +772,65 @@ async fn dispatch(
                 }
                 discord_reply(ctx)
             }
+            "discord.setAccessMode" => {
+                let mode = match get("mode")? {
+                    "allow-all" => storage::AccessMode::AllowAll,
+                    "whitelist" => storage::AccessMode::Whitelist,
+                    "blacklist" => storage::AccessMode::Blacklist,
+                    _ => return Err(invalid().into()),
+                };
+                store.set_access_mode("discord", mode)?;
+                discord_reply(ctx)
+            }
+            "discord.addAccessEntry" | "discord.removeAccessEntry" => {
+                let list = match get("list")? {
+                    "whitelist" => storage::AccessList::Whitelist,
+                    "blacklist" => storage::AccessList::Blacklist,
+                    _ => return Err(invalid().into()),
+                };
+                let scope = match get("scope")? {
+                    "global" => storage::AccessScope::Global,
+                    "guild" => storage::AccessScope::Guild,
+                    "channel" => storage::AccessScope::Channel,
+                    _ => return Err(invalid().into()),
+                };
+                let scope_id = match payload.get("scopeId") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(s)) => Some(s.as_str()),
+                    Some(_) => return Err(invalid().into()),
+                };
+                let user_id = get("userId")?;
+                if request_type == "discord.addAccessEntry" {
+                    if !crate::valid_discord_id(user_id) {
+                        return Err("User IDs must be 17–20 digits".into());
+                    }
+                    match (scope, scope_id) {
+                        (storage::AccessScope::Global, None) => {}
+                        (storage::AccessScope::Guild, Some(id)) if crate::valid_discord_id(id) => {}
+                        (storage::AccessScope::Channel, Some(id)) if crate::valid_discord_id(id) => {}
+                        (storage::AccessScope::Global, Some(_)) => return Err(invalid().into()),
+                        (storage::AccessScope::Guild, _) => {
+                            return Err("Server IDs must be 17–20 digits".into());
+                        }
+                        (storage::AccessScope::Channel, _) => {
+                            return Err("Channel IDs must be 17–20 digits".into());
+                        }
+                    }
+                    store.add_access_entry("discord", list, scope, scope_id, user_id)?;
+                } else {
+                    if user_id.is_empty() {
+                        return Err(invalid().into());
+                    }
+                    match (scope, scope_id) {
+                        (storage::AccessScope::Global, None) => {}
+                        (storage::AccessScope::Guild | storage::AccessScope::Channel, Some(id))
+                            if !id.is_empty() => {}
+                        _ => return Err(invalid().into()),
+                    }
+                    store.remove_access_entry("discord", list, scope, scope_id, user_id)?;
+                }
+                discord_reply(ctx)
+            }
             "discord.directory" => {
                 let (guilds, mut channels, people) = match ctx.discord.directory().await {
                     Ok(result) => result,
@@ -793,8 +854,16 @@ async fn dispatch(
                 if let Ok(overrides) = store.reply_modes("discord") {
                     extra_ids.extend(overrides.into_iter().map(|o| o.channel_id));
                 }
+                if let Ok(entries) = store.access_entries("discord") {
+                    extra_ids.extend(
+                        entries
+                            .into_iter()
+                            .filter(|e| e.scope == storage::AccessScope::Channel)
+                            .filter_map(|e| e.scope_id),
+                    );
+                }
                 for cid in extra_ids {
-                    if !channels.iter().any(|(id, _, _, _)| id == &cid) {
+                    if !channels.iter().any(|(id, _, _, _, _)| id == &cid) {
                         if let Ok(Some(resolved)) =
                             ctx.discord.resolve_channel(&cid, &guilds).await
                         {
@@ -803,7 +872,7 @@ async fn dispatch(
                     }
                 }
                 Ok(
-                    json!({"guilds":guilds.into_iter().map(|(id,name)| json!({"id":id,"name":name})).collect::<Vec<_>>(),"channels":channels.into_iter().map(|(id,name,server,is_thread)| json!({"id":id,"name":name,"server":server,"kind":if is_thread { "thread" } else { "channel" }})).collect::<Vec<_>>(),"people":people.into_iter().map(|(p,g)| json!({"id":p.id,"name":p.name,"guilds":g})).collect::<Vec<_>>() }),
+                    json!({"guilds":guilds.into_iter().map(|(id,name)| json!({"id":id,"name":name})).collect::<Vec<_>>(),"channels":channels.into_iter().map(|(id,name,server,guild_id,is_thread)| json!({"id":id,"name":name,"server":server,"guildId":guild_id,"kind":if is_thread { "thread" } else { "channel" }})).collect::<Vec<_>>(),"people":people.into_iter().map(|(p,g)| json!({"id":p.id,"name":p.name,"guilds":g})).collect::<Vec<_>>() }),
                 )
             }
             "mcp.list" => {
