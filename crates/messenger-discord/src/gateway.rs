@@ -118,6 +118,7 @@ async fn run(
             Some(Ok(Event::Ready(ready))) => {
                 bot = Some(ready.user.id);
                 let _ = inner.user.set(ready.user.id);
+                inner.clear_recent();
                 inner
                     .ready
                     .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -149,8 +150,20 @@ async fn run(
                     cache_channel(discord, &mut known_channels, ch);
                 }
             }
+            Some(Ok(Event::MessageUpdate(update))) => {
+                inner.invalidate_recent(update.channel_id);
+            }
+            Some(Ok(Event::MessageDelete(delete))) => {
+                inner.invalidate_recent(delete.channel_id);
+            }
+            Some(Ok(Event::MessageDeleteBulk(delete))) => {
+                inner.invalidate_recent(delete.channel_id);
+            }
             Some(Ok(Event::MessageCreate(message))) => {
                 let Some(bot) = bot else { continue };
+                if matches!(message.kind, MessageType::Regular | MessageType::Reply) {
+                    inner.record_gateway_message(&message, message.author.id == bot);
+                }
                 if message.author.bot || message.author.id == bot {
                     continue;
                 }

@@ -609,6 +609,16 @@ impl Mcp {
 
     /// Servers configured in storage, with live status for `mcp.list`.
     pub async fn server_statuses(&self) -> Vec<ServerStatus> {
+        self.collect_statuses(true).await
+    }
+
+    /// Servers configured in storage with cached in-memory status (no network calls),
+    /// used to acknowledge toggle mutations immediately while probes run in background.
+    pub async fn cached_server_statuses(&self) -> Vec<ServerStatus> {
+        self.collect_statuses(false).await
+    }
+
+    async fn collect_statuses(&self, probe_tools: bool) -> Vec<ServerStatus> {
         if self.sync().await.is_err() {
             return Vec::new();
         }
@@ -666,31 +676,37 @@ impl Mcp {
             } else {
                 "idle"
             };
-            let mut tool_count = None;
-            if let Some((_, conn)) = &state.conn {
-                match tokio::time::timeout(STATUS_TIMEOUT, conn.service.peer().list_all_tools())
+            let mut tool_count = state.tool_count;
+            if probe_tools {
+                if let Some((_, conn)) = &state.conn {
+                    match tokio::time::timeout(
+                        STATUS_TIMEOUT,
+                        conn.service.peer().list_all_tools(),
+                    )
                     .await
-                {
-                    Ok(Ok(tools)) => {
-                        state.tool_count = Some(tools.len());
-                        tool_count = Some(tools.len());
-                    }
-                    Ok(Err(error)) => {
-                        if Self::is_transport_error(&error) || error.is_authorization_required() {
-                            if let Some((_, conn)) = state.conn.take() {
-                                conn.service.cancellation_token().cancel();
-                            }
-                            state.last_failure = None;
-                            if let Some(challenge) = error.auth_challenge() {
-                                state.needs_login = true;
-                                state.challenge = Some(challenge.to_string());
-                            }
+                    {
+                        Ok(Ok(tools)) => {
+                            state.tool_count = Some(tools.len());
+                            tool_count = Some(tools.len());
                         }
-                        state.error = Some(error.to_string());
-                        status = "error";
-                        tool_count = state.tool_count;
+                        Ok(Err(error)) => {
+                            if Self::is_transport_error(&error) || error.is_authorization_required()
+                            {
+                                if let Some((_, conn)) = state.conn.take() {
+                                    conn.service.cancellation_token().cancel();
+                                }
+                                state.last_failure = None;
+                                if let Some(challenge) = error.auth_challenge() {
+                                    state.needs_login = true;
+                                    state.challenge = Some(challenge.to_string());
+                                }
+                            }
+                            state.error = Some(error.to_string());
+                            status = "error";
+                            tool_count = state.tool_count;
+                        }
+                        Err(_) => tool_count = state.tool_count,
                     }
-                    Err(_) => tool_count = state.tool_count,
                 }
             }
             out.push(ServerStatus {

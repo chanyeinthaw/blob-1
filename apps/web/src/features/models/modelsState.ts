@@ -1,6 +1,7 @@
 import { request } from '@blob-1/client/api'
+import { Atom } from 'effect/reactivity'
 
 import { AppRuntime } from '~/lib/runtime'
 
-/** Loads the model catalog each time the page mounts. */
-export const modelsPageAtom = AppRuntime.atom(request('models.get', {}))
+/** Loads and caches the model catalog across tab switches. */
+export const modelsPageAtom = AppRuntime.atom(request('models.get', {})).pipe(Atom.keepAlive)

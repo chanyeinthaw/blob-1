@@ -13,11 +13,7 @@ import type {
 } from '@blob-1/contracts'
 import { useAtomRefresh, useAtomSet, useAtomValue } from '@effect/atom-react'
 import { AtomMachine } from '@typeonce/effect-machine/reactivity'
-import {
-  createMachineContext,
-  MachineState,
-  useMachineResult,
-} from '@typeonce/effect-machine-react'
+import { MachineState, useMachineResult } from '@typeonce/effect-machine-react'
 import { type Cause, Option } from 'effect'
 import { AsyncResult } from 'effect/reactivity'
 import { Hash, KeyRound, Pencil, Plus, Trash2, User } from 'lucide-react'
@@ -38,13 +34,16 @@ import { Input } from '~/components/ui/input'
 import { ToggleGroup, ToggleGroupItem } from '~/components/ui/toggle-group'
 import { Tooltip, TooltipContent, TooltipTrigger } from '~/components/ui/tooltip'
 import { MachineAtoms } from '~/lib/runtime'
+import { createPersistentMachineContext } from '~/lib/shellMachines'
+import { matchCached } from '~/lib/useBackgroundRefresh'
 import { cn } from '~/lib/utils'
 
 import { DiscordEvents, type DiscordInput, DiscordMachine } from './discordMachine'
 import { discordPageAtom } from './discordState'
 
-const DiscordOwner = createMachineContext(({ input }: { input: DiscordInput }) =>
-  MachineAtoms.make(DiscordMachine, input),
+const DiscordOwner = createPersistentMachineContext(
+  'discord',
+  ({ input }: { input: DiscordInput }) => MachineAtoms.make(DiscordMachine, input),
 )
 
 interface Status {
@@ -79,15 +78,25 @@ interface DiscordOwnerProps {
 export function DiscordSettingsOwner(props: DiscordOwnerProps) {
   const result = useAtomValue(discordPageAtom)
   const retry = useAtomRefresh(discordPageAtom)
-  return AsyncResult.match(result, {
+  return matchCached(result, {
     onInitial: () => props.children({ kind: 'loading' }),
     onFailure: failure => props.children({ kind: 'failed', cause: failure.cause, onRetry: retry }),
-    onSuccess: ({ value }) => (
+    onSuccess: value => (
       <DiscordOwner.Provider input={value}>
+        <DiscordSyncBridge />
         {props.children({ kind: 'loaded' })}
       </DiscordOwner.Provider>
     ),
   })
+}
+
+function DiscordSyncBridge() {
+  const machine = DiscordOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  useEffect(() => {
+    send(DiscordEvents.Refresh())
+  }, [send])
+  return null
 }
 
 /** The Discord status pill shown in the detail title row. */
@@ -421,7 +430,6 @@ function AccessSection() {
               <ToggleGroup
                 aria-label="Access mode"
                 spacing={1}
-                disabled={!isIdle}
                 value={[mode]}
                 onValueChange={values => {
                   const next = values[0]

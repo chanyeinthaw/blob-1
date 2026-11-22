@@ -1,11 +1,7 @@
 import { useAtomRefresh, useAtomSet, useAtomValue } from '@effect/atom-react'
 import { Link, useBlocker } from '@tanstack/react-router'
 import { AtomMachine } from '@typeonce/effect-machine/reactivity'
-import {
-  createMachineContext,
-  MachineState,
-  useMachineResult,
-} from '@typeonce/effect-machine-react'
+import { MachineState, useMachineResult } from '@typeonce/effect-machine-react'
 import { Option } from 'effect'
 import { AsyncResult } from 'effect/reactivity'
 import { Undo2 } from 'lucide-react'
@@ -25,18 +21,22 @@ import {
 import { Button } from '~/components/ui/button'
 import { Switch } from '~/components/ui/switch'
 import { MachineAtoms } from '~/lib/runtime'
+import { createPersistentMachineContext } from '~/lib/shellMachines'
+import { matchCached } from '~/lib/useBackgroundRefresh'
 import { cn } from '~/lib/utils'
 
 import { GeneralEvents, type GeneralInput, GeneralMachine } from './generalMachine'
 import { IdentityEvents, type IdentityInput, IdentityMachine } from './identityMachine'
 import { generalPageAtom } from './identityState'
 
-const GeneralOwner = createMachineContext(({ input }: { input: GeneralInput }) =>
-  MachineAtoms.make(GeneralMachine, input),
+const GeneralOwner = createPersistentMachineContext(
+  'general',
+  ({ input }: { input: GeneralInput }) => MachineAtoms.make(GeneralMachine, input),
 )
 
-const IdentityOwner = createMachineContext(({ input }: { input: IdentityInput }) =>
-  MachineAtoms.make(IdentityMachine, input),
+const IdentityOwner = createPersistentMachineContext(
+  'identity',
+  ({ input }: { input: IdentityInput }) => MachineAtoms.make(IdentityMachine, input),
 )
 
 const resetAllowed = AtomMachine.can(IdentityEvents.Reset())
@@ -48,7 +48,7 @@ const textClassName =
 export function GeneralPage() {
   const result = useAtomValue(generalPageAtom)
   const retry = useAtomRefresh(generalPageAtom)
-  return AsyncResult.match(result, {
+  return matchCached(result, {
     onInitial: () => (
       <Page title="General">
         <EmptyLine>Loading…</EmptyLine>
@@ -59,7 +59,7 @@ export function GeneralPage() {
         <PageError cause={failure.cause} onRetry={retry} />
       </Page>
     ),
-    onSuccess: ({ value }) => (
+    onSuccess: value => (
       <GeneralOwner.Provider input={value.general}>
         <IdentityOwner.Provider input={value.identity}>
           <Page title="General">
@@ -80,10 +80,9 @@ export function GeneralPage() {
 function AutoRespondSection() {
   const machine = GeneralOwner.useMachine()
   const send = useAtomSet(machine.send)
-  const isSaving = AsyncResult.getOrElse(
-    useMachineResult(AtomMachine.matches(machine, 'Saving')),
-    () => false,
-  )
+  useEffect(() => {
+    send(GeneralEvents.Refresh())
+  }, [send])
   return (
     <MachineState machine={machine} path="">
       {({ value }) => (
@@ -108,7 +107,6 @@ function AutoRespondSection() {
           <Switch
             aria-label="Auto-respond without @mention"
             checked={value.autoRespond}
-            disabled={isSaving}
             onCheckedChange={enabled => send(GeneralEvents.SetAutoRespond({ enabled }))}
           />
         </div>

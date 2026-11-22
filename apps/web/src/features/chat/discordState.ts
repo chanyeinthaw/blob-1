@@ -1,9 +1,10 @@
 import { Api } from '@blob-1/client/api'
 import { Effect } from 'effect'
+import { Atom } from 'effect/reactivity'
 
 import { AppRuntime } from '~/lib/runtime'
 
-/** Loads the Discord settings and directory each time the page mounts. */
+/** Loads and caches Discord settings and directory across tab switches. */
 export const discordPageAtom = AppRuntime.atom(
   Effect.flatMap(Api, api =>
     Effect.all(
@@ -11,4 +12,4 @@ export const discordPageAtom = AppRuntime.atom(
       { concurrency: 'unbounded' },
     ),
   ),
-)
+).pipe(Atom.keepAlive)

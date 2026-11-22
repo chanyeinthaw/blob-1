@@ -15,6 +15,17 @@ import { Effect, Schedule, Schema } from 'effect'
 
 const emptyDirectory: DiscordDirectory = { guilds: [], channels: [], people: [] }
 
+const fetchDiscordAll = Effect.gen(function* () {
+  const api = yield* Api
+  return yield* Effect.all(
+    {
+      discord: api.request('discord.get', {}),
+      directory: api.request('discord.directory', {}),
+    },
+    { concurrency: 'unbounded' },
+  ).pipe(Effect.orElseSucceed(() => null))
+})
+
 const saveToken = Effect.fn('DiscordSettings.saveToken')(function* (token: string) {
   const api = yield* Api
   return yield* api.request('discord.setToken', { token })
@@ -145,6 +156,11 @@ export const DiscordStates = Machine.state({
   fields: {
     discord: Discord,
     directory: DiscordDirectory,
+    serverAccessMode: DiscordAccessMode,
+    pendingAccessMode: Schema.NullOr(DiscordAccessMode),
+    inFlightAccessMode: Schema.NullOr(DiscordAccessMode),
+    inFlightWrites: Schema.Finite,
+    mutationSeq: Schema.Finite,
     /** Bumped on every token save or removal; a connection watch started earlier is stale. */
     tokenGeneration: Schema.Finite,
     /** Transient home type chosen before picking a destination; null follows `discord.home.kind`. */
@@ -166,6 +182,12 @@ export const DiscordStates = Machine.state({
     replySetting: DiscordReplyMode,
   },
   states: {
+    Sync: {
+      states: {
+        Idle: {},
+        Refreshing: { fields: { mutationSeq: Schema.Finite } },
+      },
+    },
     Token: {
       states: {
         Saved: {},
@@ -257,6 +279,7 @@ export const DiscordStates = Machine.state({
 })
 
 export const DiscordEvents = Machine.events({
+  Refresh: {},
   ReplaceToken: {},
   CancelToken: {},
   ClearTokenError: {},
@@ -314,6 +337,7 @@ export const DiscordMachine = Machine.make({
   events: DiscordEvents,
   input: DiscordInput,
   effects: {
+    fetchDiscordAll,
     saveToken,
     removeToken,
     watchConnection,
@@ -329,6 +353,11 @@ export const DiscordMachine = Machine.make({
 }).handle({
   root: ({ input }) => ({
     ...input,
+    serverAccessMode: input.discord.accessMode,
+    pendingAccessMode: null,
+    inFlightAccessMode: null,
+    inFlightWrites: 0,
+    mutationSeq: 0,
     tokenGeneration: 0,
     pendingHomeKind: null,
     accessDialogOpen: false,
@@ -344,7 +373,68 @@ export const DiscordMachine = Machine.make({
     replyChannel: '',
     replySetting: 'direct',
   }),
+  on: {
+    SetAccessMode: {
+      update: 'root',
+      data: ({ root, event }) => ({
+        ...root,
+        pendingAccessMode:
+          root.inFlightAccessMode === null && event.mode === root.serverAccessMode
+            ? null
+            : event.mode,
+        mutationSeq: root.mutationSeq + 1,
+        discord: { ...root.discord, accessMode: event.mode },
+      }),
+    },
+  },
   states: {
+    Sync: {
+      initial: { target: 'Sync.Idle' },
+      states: {
+        Idle: {
+          on: {
+            Refresh: {
+              target: 'Sync.Refreshing',
+              data: ({ root }) => ({ mutationSeq: root.mutationSeq }),
+            },
+          },
+        },
+        Refreshing: {
+          invoke: {
+            src: 'fetchDiscordAll',
+            onDone: {
+              target: 'Sync.Idle',
+              update: 'root',
+              data: ({ root, state, output }) => {
+                if (
+                  output === null ||
+                  state.mutationSeq !== root.mutationSeq ||
+                  root.inFlightWrites > 0 ||
+                  root.inFlightAccessMode !== null ||
+                  root.pendingAccessMode !== null
+                ) {
+                  return { target: undefined, update: root }
+                }
+                return {
+                  target: undefined,
+                  update: {
+                    ...root,
+                    serverAccessMode: output.discord.accessMode,
+                    discord: output.discord,
+                    directory:
+                      output.directory.guilds.length > 0 ||
+                      output.directory.channels.length > 0 ||
+                      output.directory.people.length > 0
+                        ? output.directory
+                        : root.directory,
+                  },
+                }
+              },
+            },
+          },
+        },
+      },
+    },
     Token: {
       initial: { target: 'Token.Saved' },
       states: {
@@ -356,7 +446,18 @@ export const DiscordMachine = Machine.make({
           },
           on: {
             ReplaceToken: { target: 'Token.Editing', data: { error: null } },
-            RemoveToken: { target: 'Token.Removing' },
+            RemoveToken: {
+              target: 'Token.Removing',
+              update: 'root',
+              data: ({ root }) => ({
+                target: undefined,
+                update: {
+                  ...root,
+                  inFlightWrites: root.inFlightWrites + 1,
+                  mutationSeq: root.mutationSeq + 1,
+                },
+              }),
+            },
           },
         },
         Editing: {
@@ -372,7 +473,15 @@ export const DiscordMachine = Machine.make({
             SubmitToken: {
               target: 'Token.Saving',
               guard: ({ event }) => event.token.trim() !== '',
-              data: ({ event }) => ({ token: event.token.trim() }),
+              update: 'root',
+              data: ({ event, root }) => ({
+                target: { token: event.token.trim() },
+                update: {
+                  ...root,
+                  inFlightWrites: root.inFlightWrites + 1,
+                  mutationSeq: root.mutationSeq + 1,
+                },
+              }),
             },
           },
         },
@@ -387,9 +496,16 @@ export const DiscordMachine = Machine.make({
                 target: undefined,
                 update:
                   output.connection.state === 'online'
-                    ? { ...root, discord: withToken(root.discord, output) }
+                    ? {
+                        ...root,
+                        inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                        mutationSeq: root.mutationSeq + 1,
+                        discord: withToken(root.discord, output),
+                      }
                     : {
                         ...root,
+                        inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                        mutationSeq: root.mutationSeq + 1,
                         discord: withToken(root.discord, output),
                         directory: emptyDirectory,
                         accessScopeId: '',
@@ -403,7 +519,15 @@ export const DiscordMachine = Machine.make({
             },
             onFailure: {
               target: 'Token.Editing',
-              data: ({ error }) => ({ error: error.message }),
+              update: 'root',
+              data: ({ root, error }) => ({
+                target: { error: error.message },
+                update: {
+                  ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
+                },
+              }),
             },
           },
         },
@@ -417,6 +541,8 @@ export const DiscordMachine = Machine.make({
                 target: { error: null },
                 update: {
                   ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
                   discord: withToken(root.discord, output),
                   directory: emptyDirectory,
                   accessScopeId: '',
@@ -430,7 +556,15 @@ export const DiscordMachine = Machine.make({
             },
             onFailure: {
               target: 'Token.Editing',
-              data: ({ error }) => ({ error: error.message }),
+              update: 'root',
+              data: ({ root, error }) => ({
+                target: { error: error.message },
+                update: {
+                  ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
+                },
+              }),
             },
           },
         },
@@ -483,6 +617,24 @@ export const DiscordMachine = Machine.make({
       initial: { target: 'Access.Idle', data: { error: null } },
       states: {
         Idle: {
+          always: {
+            guard: ({ root }) =>
+              root.pendingAccessMode !== null && root.pendingAccessMode !== root.serverAccessMode,
+            target: 'Access.SettingMode',
+            update: 'root',
+            data: ({ root }) => {
+              const mode = root.pendingAccessMode ?? root.serverAccessMode
+              return {
+                target: { mode },
+                update: {
+                  ...root,
+                  pendingAccessMode: null,
+                  inFlightAccessMode: mode,
+                  mutationSeq: root.mutationSeq + 1,
+                },
+              }
+            },
+          },
           on: {
             OpenAccessDialog: {
               target: 'Access.Idle',
@@ -538,31 +690,43 @@ export const DiscordMachine = Machine.make({
                 update: { ...root, accessUser: event.userId },
               }),
             },
-            SetAccessMode: {
-              target: 'Access.SettingMode',
-              data: ({ event }) => ({ mode: event.mode }),
-            },
             AddAccessEntry: {
               target: 'Access.Adding',
+              update: 'root',
               data: ({ event, root }) => ({
-                list: event.list,
-                scope: event.scope,
-                scopeId: event.scopeId,
-                userId: event.userId,
-                refreshDirectory:
-                  event.scope === 'channel' &&
-                  event.scopeId !== null &&
-                  !root.directory.channels.some(channel => channel.id === event.scopeId),
-                tokenGeneration: root.tokenGeneration,
+                target: {
+                  list: event.list,
+                  scope: event.scope,
+                  scopeId: event.scopeId,
+                  userId: event.userId,
+                  refreshDirectory:
+                    event.scope === 'channel' &&
+                    event.scopeId !== null &&
+                    !root.directory.channels.some(channel => channel.id === event.scopeId),
+                  tokenGeneration: root.tokenGeneration,
+                },
+                update: {
+                  ...root,
+                  inFlightWrites: root.inFlightWrites + 1,
+                  mutationSeq: root.mutationSeq + 1,
+                },
               }),
             },
             RemoveAccessEntry: {
               target: 'Access.Removing',
-              data: ({ event }) => ({
-                list: event.list,
-                scope: event.scope,
-                scopeId: event.scopeId,
-                userId: event.userId,
+              update: 'root',
+              data: ({ event, root }) => ({
+                target: {
+                  list: event.list,
+                  scope: event.scope,
+                  scopeId: event.scopeId,
+                  userId: event.userId,
+                },
+                update: {
+                  ...root,
+                  inFlightWrites: root.inFlightWrites + 1,
+                  mutationSeq: root.mutationSeq + 1,
+                },
               }),
             },
           },
@@ -574,23 +738,48 @@ export const DiscordMachine = Machine.make({
             onDone: {
               target: 'Access.Idle',
               update: 'root',
-              data: ({ root, output }) => ({
-                target: { error: null },
-                update: {
-                  ...root,
-                  discord: {
-                    ...root.discord,
-                    allowed: output.allowed,
-                    accessMode: output.accessMode,
-                    accessEntries: output.accessEntries,
+              data: ({ root, output }) => {
+                const nextPending =
+                  root.pendingAccessMode === output.accessMode ? null : root.pendingAccessMode
+                return {
+                  target: { error: null },
+                  update: {
+                    ...root,
+                    serverAccessMode: output.accessMode,
+                    pendingAccessMode: nextPending,
+                    inFlightAccessMode: null,
+                    mutationSeq: root.mutationSeq + 1,
+                    discord: {
+                      ...root.discord,
+                      allowed: output.allowed,
+                      accessMode: nextPending ?? output.accessMode,
+                      accessEntries: output.accessEntries,
+                    },
+                    accessUser: '',
                   },
-                  accessUser: '',
-                },
-              }),
+                }
+              },
             },
             onFailure: {
               target: 'Access.Idle',
-              data: ({ error }) => ({ error: error.message }),
+              update: 'root',
+              data: ({ root, error }) => {
+                const nextPending =
+                  root.pendingAccessMode === root.serverAccessMode ? null : root.pendingAccessMode
+                return {
+                  target: { error: error.message },
+                  update: {
+                    ...root,
+                    pendingAccessMode: nextPending,
+                    inFlightAccessMode: null,
+                    mutationSeq: root.mutationSeq + 1,
+                    discord: {
+                      ...root.discord,
+                      accessMode: nextPending ?? root.serverAccessMode,
+                    },
+                  },
+                }
+              },
             },
           },
         },
@@ -607,28 +796,46 @@ export const DiscordMachine = Machine.make({
             onDone: {
               target: 'Access.Idle',
               update: 'root',
-              data: ({ root, state, output }) => ({
-                target: { error: null },
-                update: {
-                  ...root,
-                  discord: {
-                    ...root.discord,
-                    allowed: output.discord.allowed,
-                    accessMode: output.discord.accessMode,
-                    accessEntries: output.discord.accessEntries,
+              data: ({ root, state, output }) => {
+                const nextPending =
+                  root.pendingAccessMode === output.discord.accessMode
+                    ? null
+                    : root.pendingAccessMode
+                return {
+                  target: { error: null },
+                  update: {
+                    ...root,
+                    inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                    serverAccessMode: output.discord.accessMode,
+                    pendingAccessMode: nextPending,
+                    mutationSeq: root.mutationSeq + 1,
+                    discord: {
+                      ...root.discord,
+                      allowed: output.discord.allowed,
+                      accessMode: nextPending ?? output.discord.accessMode,
+                      accessEntries: output.discord.accessEntries,
+                    },
+                    directory:
+                      state.tokenGeneration === root.tokenGeneration
+                        ? mergeDirectoryChannels(root.directory, output.directory)
+                        : root.directory,
+                    accessDialogOpen: false,
+                    accessUser: '',
                   },
-                  directory:
-                    state.tokenGeneration === root.tokenGeneration
-                      ? mergeDirectoryChannels(root.directory, output.directory)
-                      : root.directory,
-                  accessDialogOpen: false,
-                  accessUser: '',
-                },
-              }),
+                }
+              },
             },
             onFailure: {
               target: 'Access.Idle',
-              data: ({ error }) => ({ error: error.message }),
+              update: 'root',
+              data: ({ root, error }) => ({
+                target: { error: error.message },
+                update: {
+                  ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
+                },
+              }),
             },
           },
         },
@@ -644,22 +851,38 @@ export const DiscordMachine = Machine.make({
             onDone: {
               target: 'Access.Idle',
               update: 'root',
-              data: ({ root, output }) => ({
-                target: { error: null },
-                update: {
-                  ...root,
-                  discord: {
-                    ...root.discord,
-                    allowed: output.allowed,
-                    accessMode: output.accessMode,
-                    accessEntries: output.accessEntries,
+              data: ({ root, output }) => {
+                const nextPending =
+                  root.pendingAccessMode === output.accessMode ? null : root.pendingAccessMode
+                return {
+                  target: { error: null },
+                  update: {
+                    ...root,
+                    inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                    serverAccessMode: output.accessMode,
+                    pendingAccessMode: nextPending,
+                    mutationSeq: root.mutationSeq + 1,
+                    discord: {
+                      ...root.discord,
+                      allowed: output.allowed,
+                      accessMode: nextPending ?? output.accessMode,
+                      accessEntries: output.accessEntries,
+                    },
                   },
-                },
-              }),
+                }
+              },
             },
             onFailure: {
               target: 'Access.Idle',
-              data: ({ error }) => ({ error: error.message }),
+              update: 'root',
+              data: ({ root, error }) => ({
+                target: { error: error.message },
+                update: {
+                  ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
+                },
+              }),
             },
           },
         },
@@ -675,7 +898,15 @@ export const DiscordMachine = Machine.make({
           always: {
             target: 'HomeChannel.Saving',
             guard: ({ state }) => state.queued !== null,
-            data: ({ state }) => ({ home: state.queued ?? { kind: 'none' }, queued: null }),
+            update: 'root',
+            data: ({ state, root }) => ({
+              target: { home: state.queued ?? { kind: 'none' }, queued: null },
+              update: {
+                ...root,
+                inFlightWrites: root.inFlightWrites + 1,
+                mutationSeq: root.mutationSeq + 1,
+              },
+            }),
           },
           on: {
             SelectHomeKind: {
@@ -691,7 +922,15 @@ export const DiscordMachine = Machine.make({
             },
             SetHome: {
               target: 'HomeChannel.Saving',
-              data: ({ event }) => ({ home: event.home, queued: null }),
+              update: 'root',
+              data: ({ event, root }) => ({
+                target: { home: event.home, queued: null },
+                update: {
+                  ...root,
+                  inFlightWrites: root.inFlightWrites + 1,
+                  mutationSeq: root.mutationSeq + 1,
+                },
+              }),
             },
           },
         },
@@ -712,6 +951,8 @@ export const DiscordMachine = Machine.make({
                 target: { error: null, saved: true, queued: state.queued, failedHome: null },
                 update: {
                   ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
                   discord: { ...root.discord, home: output.home },
                   pendingHomeKind: state.queued === null ? null : root.pendingHomeKind,
                 },
@@ -729,6 +970,8 @@ export const DiscordMachine = Machine.make({
                 },
                 update: {
                   ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
                   pendingHomeKind: state.home.kind === 'none' ? null : root.pendingHomeKind,
                 },
               }),
@@ -810,19 +1053,35 @@ export const DiscordMachine = Machine.make({
             },
             SetInteractionMode: {
               target: 'Interaction.Saving',
-              data: ({ event }) => ({
-                scope: event.scope,
-                guildId: event.guildId,
-                targetId: event.targetId,
-                mode: event.mode,
+              update: 'root',
+              data: ({ event, root }) => ({
+                target: {
+                  scope: event.scope,
+                  guildId: event.guildId,
+                  targetId: event.targetId,
+                  mode: event.mode,
+                },
+                update: {
+                  ...root,
+                  inFlightWrites: root.inFlightWrites + 1,
+                  mutationSeq: root.mutationSeq + 1,
+                },
               }),
             },
             ClearInteractionMode: {
               target: 'Interaction.Removing',
-              data: ({ event }) => ({
-                scope: event.scope,
-                guildId: event.guildId,
-                targetId: event.targetId,
+              update: 'root',
+              data: ({ event, root }) => ({
+                target: {
+                  scope: event.scope,
+                  guildId: event.guildId,
+                  targetId: event.targetId,
+                },
+                update: {
+                  ...root,
+                  inFlightWrites: root.inFlightWrites + 1,
+                  mutationSeq: root.mutationSeq + 1,
+                },
               }),
             },
           },
@@ -843,6 +1102,8 @@ export const DiscordMachine = Machine.make({
                 target: { error: null },
                 update: {
                   ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
                   discord: { ...root.discord, interactionModes: output.interactionModes },
                   modeDialogOpen: false,
                   // Drop the draft only when the saved row was the draft.
@@ -857,7 +1118,15 @@ export const DiscordMachine = Machine.make({
             },
             onFailure: {
               target: 'Interaction.Idle',
-              data: ({ error }) => ({ error: error.message }),
+              update: 'root',
+              data: ({ root, error }) => ({
+                target: { error: error.message },
+                update: {
+                  ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
+                },
+              }),
             },
           },
         },
@@ -876,6 +1145,8 @@ export const DiscordMachine = Machine.make({
                 target: { error: null },
                 update: {
                   ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
                   discord: { ...root.discord, interactionModes: output.interactionModes },
                   modeTarget:
                     state.scope === root.modeScope &&
@@ -888,7 +1159,15 @@ export const DiscordMachine = Machine.make({
             },
             onFailure: {
               target: 'Interaction.Idle',
-              data: ({ error }) => ({ error: error.message }),
+              update: 'root',
+              data: ({ root, error }) => ({
+                target: { error: error.message },
+                update: {
+                  ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
+                },
+              }),
             },
           },
         },
@@ -938,14 +1217,30 @@ export const DiscordMachine = Machine.make({
             },
             SetReplyMode: {
               target: 'ReplyMode.Saving',
-              data: ({ event }) => ({
-                channelId: event.channelId,
-                mode: event.mode,
+              update: 'root',
+              data: ({ event, root }) => ({
+                target: {
+                  channelId: event.channelId,
+                  mode: event.mode,
+                },
+                update: {
+                  ...root,
+                  inFlightWrites: root.inFlightWrites + 1,
+                  mutationSeq: root.mutationSeq + 1,
+                },
               }),
             },
             ClearReplyMode: {
               target: 'ReplyMode.Removing',
-              data: ({ event }) => ({ channelId: event.channelId }),
+              update: 'root',
+              data: ({ event, root }) => ({
+                target: { channelId: event.channelId },
+                update: {
+                  ...root,
+                  inFlightWrites: root.inFlightWrites + 1,
+                  mutationSeq: root.mutationSeq + 1,
+                },
+              }),
             },
           },
         },
@@ -963,6 +1258,8 @@ export const DiscordMachine = Machine.make({
                 target: { error: null },
                 update: {
                   ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
                   discord: { ...root.discord, replyModes: output.replyModes },
                   replyDialogOpen: false,
                   replyChannel: state.channelId === root.replyChannel ? '' : root.replyChannel,
@@ -971,7 +1268,15 @@ export const DiscordMachine = Machine.make({
             },
             onFailure: {
               target: 'ReplyMode.Idle',
-              data: ({ error }) => ({ error: error.message }),
+              update: 'root',
+              data: ({ root, error }) => ({
+                target: { error: error.message },
+                update: {
+                  ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
+                },
+              }),
             },
           },
         },
@@ -986,6 +1291,8 @@ export const DiscordMachine = Machine.make({
                 target: { error: null },
                 update: {
                   ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
                   discord: { ...root.discord, replyModes: output.replyModes },
                   replyChannel: state.channelId === root.replyChannel ? '' : root.replyChannel,
                 },
@@ -993,7 +1300,15 @@ export const DiscordMachine = Machine.make({
             },
             onFailure: {
               target: 'ReplyMode.Idle',
-              data: ({ error }) => ({ error: error.message }),
+              update: 'root',
+              data: ({ root, error }) => ({
+                target: { error: error.message },
+                update: {
+                  ...root,
+                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
+                  mutationSeq: root.mutationSeq + 1,
+                },
+              }),
             },
           },
         },

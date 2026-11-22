@@ -6,10 +6,9 @@ import {
   type Slot,
 } from '@blob-1/contracts'
 import { useAtomRefresh, useAtomSet, useAtomValue } from '@effect/atom-react'
-import { createMachineContext, MachineState } from '@typeonce/effect-machine-react'
-import { AsyncResult } from 'effect/reactivity'
+import { MachineState } from '@typeonce/effect-machine-react'
 import { ChevronDown, Plus, Search, X } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
 import { EmptyLine, focusRingClassName, Page, PageError } from '~/components/layout/Page'
 import { Button } from '~/components/ui/button'
@@ -26,6 +25,8 @@ import { Input } from '~/components/ui/input'
 import { Switch } from '~/components/ui/switch'
 import { Tooltip, TooltipContent, TooltipTrigger } from '~/components/ui/tooltip'
 import { MachineAtoms } from '~/lib/runtime'
+import { createPersistentMachineContext } from '~/lib/shellMachines'
+import { matchCached } from '~/lib/useBackgroundRefresh'
 import { cn } from '~/lib/utils'
 
 import {
@@ -39,7 +40,7 @@ import {
 } from './modelsMachine'
 import { modelsPageAtom } from './modelsState'
 
-const ModelsOwner = createMachineContext(({ input }: { input: ModelsInput }) =>
+const ModelsOwner = createPersistentMachineContext('models', ({ input }: { input: ModelsInput }) =>
   MachineAtoms.make(ModelsMachine, input),
 )
 
@@ -119,7 +120,7 @@ const gridClassName = (showProvider: boolean): string =>
 export function ModelsPage() {
   const result = useAtomValue(modelsPageAtom)
   const retry = useAtomRefresh(modelsPageAtom)
-  return AsyncResult.match(result, {
+  return matchCached(result, {
     onInitial: () => (
       <Page title="Models" wide>
         <EmptyLine>Loading…</EmptyLine>
@@ -130,7 +131,7 @@ export function ModelsPage() {
         <PageError cause={failure.cause} onRetry={retry} />
       </Page>
     ),
-    onSuccess: ({ value }) => (
+    onSuccess: value => (
       <ModelsOwner.Provider input={value}>
         <ModelsLoaded />
       </ModelsOwner.Provider>
@@ -139,6 +140,11 @@ export function ModelsPage() {
 }
 
 function ModelsLoaded() {
+  const machine = ModelsOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  useEffect(() => {
+    send(ModelsEvents.Refresh())
+  }, [send])
   const [filters, setFilters] = useState<Filters>({
     query: '',
     providerFilter: '',
@@ -422,7 +428,7 @@ function ModelRow(props: ModelRowProps) {
         <ContextInput entry={props.entry} draft={props.draft} />
         <ImagesSwitch provider={props.entry.provider} info={props.entry.info} />
         <div className="ml-auto sm:ml-0 sm:flex sm:justify-end">
-          <AssignMenu entry={props.entry} shown={props.shown} roleStatuses={props.roleStatuses} />
+          <AssignMenu entry={props.entry} shown={props.shown} />
         </div>
       </div>
     </li>
@@ -439,7 +445,6 @@ function RoleChip(props: RoleChipProps) {
   const machine = ModelsOwner.useMachine()
   const send = useAtomSet(machine.send)
   const role = props.role
-  const saving = props.status === 'Saving…'
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
@@ -447,9 +452,8 @@ function RoleChip(props: RoleChipProps) {
           <button
             type="button"
             aria-label={`${roleLabels[role]} reasoning: ${props.slot.reasoning}`}
-            disabled={saving}
             className={cn(
-              'inline-flex h-8 cursor-pointer items-center gap-1 rounded-full bg-muted pr-2 pl-3 text-xs font-medium hover:bg-border data-[disabled]:cursor-not-allowed data-[disabled]:opacity-60 md:h-6 md:pr-1.5 md:pl-2.5',
+              'inline-flex h-8 cursor-pointer items-center gap-1 rounded-full bg-muted pr-2 pl-3 text-xs font-medium hover:bg-border md:h-6 md:pr-1.5 md:pl-2.5',
               focusRingClassName,
             )}
           >
@@ -459,7 +463,7 @@ function RoleChip(props: RoleChipProps) {
                 ·
               </span>
               <span className="font-normal text-muted-foreground capitalize">
-                {saving ? 'Saving…' : props.slot.reasoning}
+                {props.slot.reasoning}
               </span>
               <ChevronDown className="size-3 shrink-0" />
             </span>
@@ -502,14 +506,12 @@ function RoleChip(props: RoleChipProps) {
 interface AssignMenuProps {
   readonly entry: Entry
   readonly shown: Models
-  readonly roleStatuses: Record<string, string>
 }
 
 function AssignMenu(props: AssignMenuProps) {
   const machine = ModelsOwner.useMachine()
   const send = useAtomSet(machine.send)
   const held = rolesHeldBy(props.shown, props.entry)
-  const isBusy = roles.some(role => props.roleStatuses[role] === 'Saving…')
   return (
     <DropdownMenu>
       <Tooltip>
@@ -520,7 +522,6 @@ function AssignMenu(props: AssignMenuProps) {
                 <Button
                   variant="outline"
                   aria-label={`Assign ${props.entry.info.id} to a role`}
-                  disabled={isBusy}
                   className="h-10 gap-1 px-2.5 text-foreground sm:size-8 sm:border-transparent sm:bg-transparent sm:px-0 sm:text-muted-foreground sm:hover:bg-muted sm:hover:text-foreground"
                 >
                   <Plus />

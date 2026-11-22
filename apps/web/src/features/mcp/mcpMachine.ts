@@ -1,9 +1,37 @@
 import { Api } from '@blob-1/client/api'
 import { McpAddPayload, McpServer, type RequestPayload } from '@blob-1/contracts'
 import { Machine } from '@typeonce/effect-machine'
-import { Effect, Schema } from 'effect'
+import { Array, Effect, Option, Schema } from 'effect'
 
 import { Notify } from '~/lib/notify'
+
+const ToggleJob = Schema.Struct({
+  id: Schema.String,
+  enabled: Schema.Boolean,
+})
+type ToggleJob = typeof ToggleJob.Type
+
+const withToggled = (
+  servers: ReadonlyArray<McpServer>,
+  id: string,
+  enabled: boolean,
+): ReadonlyArray<McpServer> =>
+  servers.map(server =>
+    server.id === id
+      ? {
+          ...server,
+          enabled,
+          status: enabled ? 'connecting' : 'disconnected',
+          error: undefined,
+        }
+      : server,
+  )
+
+const replayToggles = (
+  base: ReadonlyArray<McpServer>,
+  jobs: ReadonlyArray<ToggleJob>,
+): ReadonlyArray<McpServer> =>
+  jobs.reduce((list, job) => withToggled(list, job.id, job.enabled), base)
 
 const refreshServers = Effect.gen(function* () {
   const api = yield* Api
@@ -54,18 +82,23 @@ const ErrorMessage = Schema.NullOr(Schema.String)
 
 export const McpStates = Machine.state({
   type: 'parallel',
-  fields: { servers: Schema.Array(McpServer) },
+  fields: {
+    serverList: Schema.Array(McpServer),
+    servers: Schema.Array(McpServer),
+    toggleJobs: Schema.Array(ToggleJob),
+    mutationSeq: Schema.Finite,
+  },
   states: {
     Refresh: {
       states: {
         Idle: {},
-        Working: {},
+        Working: { fields: { mutationSeq: Schema.Finite } },
       },
     },
     Toggle: {
       states: {
         Idle: {},
-        Working: { fields: { id: Schema.String, enabled: Schema.Boolean } },
+        Working: {},
       },
     },
     Remove: {
@@ -101,7 +134,7 @@ export const McpEvents = Machine.events({
   Login: { id: Schema.String },
 })
 
-/** The MCP page: the server list plus refresh, toggle, remove, OAuth login and add workflows. */
+/** The MCP page: optimistic enable/disable toggles plus refresh, remove, OAuth login and add workflows. */
 export const McpMachine = Machine.make({
   id: 'Mcp',
   root: McpStates,
@@ -109,14 +142,39 @@ export const McpMachine = Machine.make({
   input: McpInput,
   effects: { refreshServers, setEnabled, removeServer, login, addServer },
 }).handle({
-  root: ({ input }) => input,
+  root: ({ input }) => ({
+    serverList: input.servers,
+    servers: input.servers,
+    toggleJobs: [],
+    mutationSeq: 0,
+  }),
+  on: {
+    SetEnabled: {
+      update: 'root',
+      data: ({ root, event }) => {
+        const nextJobs = [
+          ...root.toggleJobs.filter((job, index) => index === 0 || job.id !== event.id),
+          { id: event.id, enabled: event.enabled },
+        ]
+        return {
+          ...root,
+          servers: withToggled(root.servers, event.id, event.enabled),
+          toggleJobs: nextJobs,
+          mutationSeq: root.mutationSeq + 1,
+        }
+      },
+    },
+  },
   states: {
     Refresh: {
       initial: { target: 'Refresh.Idle' },
       states: {
         Idle: {
           on: {
-            Refresh: { target: 'Refresh.Working' },
+            Refresh: {
+              target: 'Refresh.Working',
+              data: ({ root }) => ({ mutationSeq: root.mutationSeq }),
+            },
           },
         },
         Working: {
@@ -125,10 +183,19 @@ export const McpMachine = Machine.make({
             onDone: {
               target: 'Refresh.Idle',
               update: 'root',
-              data: ({ root, output }) => ({
-                target: undefined,
-                update: { ...root, servers: output ?? root.servers },
-              }),
+              data: ({ root, state, output }) => {
+                if (output === null || state.mutationSeq !== root.mutationSeq) {
+                  return { target: undefined, update: root }
+                }
+                return {
+                  target: undefined,
+                  update: {
+                    ...root,
+                    serverList: output,
+                    servers: replayToggles(output, root.toggleJobs),
+                  },
+                }
+              },
             },
           },
         },
@@ -138,24 +205,32 @@ export const McpMachine = Machine.make({
       initial: { target: 'Toggle.Idle' },
       states: {
         Idle: {
-          on: {
-            SetEnabled: {
-              target: 'Toggle.Working',
-              data: ({ event }) => ({ id: event.id, enabled: event.enabled }),
-            },
+          always: {
+            target: 'Toggle.Working',
+            guard: ({ root }) => root.toggleJobs.length > 0,
           },
         },
         Working: {
           invoke: {
             src: 'setEnabled',
-            input: ({ state }) => state,
+            input: ({ root }) => Option.getOrThrow(Array.head(root.toggleJobs)),
             onDone: {
               target: 'Toggle.Idle',
               update: 'root',
-              data: ({ root, output }) => ({
-                target: undefined,
-                update: { ...root, servers: output ?? root.servers },
-              }),
+              data: ({ root, output }) => {
+                const rest = root.toggleJobs.slice(1)
+                const base = output ?? root.serverList
+                return {
+                  target: undefined,
+                  update: {
+                    ...root,
+                    serverList: base,
+                    servers: replayToggles(base, rest),
+                    toggleJobs: rest,
+                    mutationSeq: root.mutationSeq + 1,
+                  },
+                }
+              },
             },
           },
         },
@@ -179,10 +254,18 @@ export const McpMachine = Machine.make({
             onDone: {
               target: 'Remove.Idle',
               update: 'root',
-              data: ({ root, output }) => ({
-                target: undefined,
-                update: { ...root, servers: output ?? root.servers },
-              }),
+              data: ({ root, output }) => {
+                const base = output ?? root.serverList
+                return {
+                  target: undefined,
+                  update: {
+                    ...root,
+                    serverList: base,
+                    servers: replayToggles(base, root.toggleJobs),
+                    mutationSeq: root.mutationSeq + 1,
+                  },
+                }
+              },
             },
           },
         },
@@ -235,7 +318,11 @@ export const McpMachine = Machine.make({
               update: 'root',
               data: ({ root, output }) => ({
                 target: undefined,
-                update: { ...root, servers: output },
+                update: {
+                  ...root,
+                  serverList: output,
+                  servers: replayToggles(output, root.toggleJobs),
+                },
               }),
             },
             onFailure: {

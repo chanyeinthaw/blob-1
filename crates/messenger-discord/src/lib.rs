@@ -62,6 +62,54 @@ pub(crate) struct Inner {
     user: tokio::sync::OnceCell<Id<UserMarker>>,
     ready: std::sync::atomic::AtomicBool,
     directory: tokio::sync::Mutex<Option<(std::time::Instant, Directory)>>,
+    recent: std::sync::Mutex<std::collections::HashMap<String, RecentChannel>>,
+}
+
+/// Process-wide monotonic token bound to each live cache entry so seeds from
+/// invalidated channels, evicted entries, earlier `Ready` sessions, or replaced
+/// connections can never match a newer entry.
+static NEXT_CACHE_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+struct RecentChannel {
+    token: u64,
+    messages: std::collections::VecDeque<Fetched>,
+    expires_at: std::time::Instant,
+    ttl: std::time::Duration,
+    warming: bool,
+    warming_holders: usize,
+    /// True only when the retained window starts at the very beginning of the
+    /// channel/thread history (no older messages exist on Discord before `front`).
+    complete_from_start: bool,
+}
+
+const RECENT_WARMING_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+const RECENT_CHANNEL_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const RECENT_THREAD_TTL: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+const RECENT_MAX_MESSAGES: usize = 20;
+const RECENT_MAX_CHANNELS: usize = 128;
+
+fn snowflake_key(id: &str) -> u64 {
+    id.parse::<u64>().unwrap_or(0)
+}
+
+fn insert_ordered(
+    messages: &mut std::collections::VecDeque<Fetched>,
+    complete_from_start: &mut bool,
+    item: Fetched,
+) {
+    if messages.iter().any(|m| m.message == item.message) {
+        return;
+    }
+    let key = snowflake_key(&item.message);
+    let pos = messages
+        .iter()
+        .position(|m| snowflake_key(&m.message) > key)
+        .unwrap_or(messages.len());
+    messages.insert(pos, item);
+    while messages.len() > RECENT_MAX_MESSAGES {
+        messages.pop_front();
+        *complete_from_start = false;
+    }
 }
 
 /// What the web settings reports for the bot connection.
@@ -299,6 +347,205 @@ impl Inner {
             user: tokio::sync::OnceCell::new(),
             ready: std::sync::atomic::AtomicBool::new(false),
             directory: tokio::sync::Mutex::new(None),
+            recent: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn recent_key(place: &Place) -> &str {
+        place.thread.as_deref().unwrap_or(&place.channel)
+    }
+
+    fn ttl_for(place: &Place) -> std::time::Duration {
+        if place.thread.is_some() {
+            RECENT_THREAD_TTL
+        } else {
+            RECENT_CHANNEL_TTL
+        }
+    }
+
+    /// Appends a live gateway message into the ring buffer ONLY when this channel/thread
+    /// is actively tracked or transiently warming. Bot messages refresh participating TTL.
+    pub(crate) fn record_gateway_message(&self, message: &Message, is_bot: bool) {
+        let now = std::time::Instant::now();
+        let key = message.channel_id.to_string();
+        let mut guard = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = guard.get_mut(&key) else {
+            return;
+        };
+        if now >= entry.expires_at {
+            guard.remove(&key);
+            return;
+        }
+        if is_bot && !entry.warming {
+            entry.expires_at = now + entry.ttl;
+        }
+        insert_ordered(
+            &mut entry.messages,
+            &mut entry.complete_from_start,
+            fetched(message.clone()),
+        );
+    }
+
+    pub(crate) fn invalidate_recent(&self, channel_id: Id<ChannelMarker>) {
+        let key = channel_id.to_string();
+        let mut guard = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(&key);
+    }
+
+    pub(crate) fn clear_recent(&self) {
+        let mut guard = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        guard.clear();
+    }
+
+    fn begin_warming(&self, place: &Place) -> u64 {
+        let now = std::time::Instant::now();
+        let key = Self::recent_key(place).to_owned();
+        let mut guard = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        guard.retain(|_, entry| now < entry.expires_at);
+        if let Some(entry) = guard.get_mut(&key) {
+            if entry.warming {
+                entry.warming_holders += 1;
+                entry.expires_at = now + RECENT_WARMING_TTL;
+            }
+            return entry.token;
+        }
+        if guard.len() >= RECENT_MAX_CHANNELS {
+            if let Some(oldest_key) = guard
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(k, _)| k.clone())
+            {
+                guard.remove(&oldest_key);
+            }
+        }
+        let token = NEXT_CACHE_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        guard.insert(
+            key,
+            RecentChannel {
+                token,
+                messages: std::collections::VecDeque::with_capacity(RECENT_MAX_MESSAGES),
+                expires_at: now + RECENT_WARMING_TTL,
+                ttl: Self::ttl_for(place),
+                warming: true,
+                warming_holders: 1,
+                complete_from_start: false,
+            },
+        );
+        token
+    }
+
+    fn cancel_warming(&self, place: &Place, token: u64) {
+        let key = Self::recent_key(place);
+        let mut guard = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        let remove = if let Some(entry) = guard.get_mut(key) {
+            if entry.warming && entry.token == token {
+                entry.warming_holders = entry.warming_holders.saturating_sub(1);
+                entry.warming_holders == 0
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if remove {
+            guard.remove(key);
+        }
+    }
+
+    fn touch_history(&self, place: &Place) {
+        let now = std::time::Instant::now();
+        let key = Self::recent_key(place);
+        let mut guard = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = guard.get_mut(key) {
+            if !entry.warming && now < entry.expires_at {
+                entry.expires_at = now + entry.ttl;
+            }
+        }
+    }
+
+    fn recent_history(
+        &self,
+        place: &Place,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Option<Vec<Fetched>> {
+        let now = std::time::Instant::now();
+        let key = Self::recent_key(place);
+        let mut guard = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard.get(key)?;
+        if now >= entry.expires_at {
+            guard.remove(key);
+            return None;
+        }
+        if entry.warming {
+            return None;
+        }
+        let filtered: Vec<&Fetched> = match before {
+            Some(before_id) => {
+                let before_num = before_id.parse::<u64>().ok()?;
+                let list: Vec<&Fetched> = entry
+                    .messages
+                    .iter()
+                    .filter(|m| snowflake_key(&m.message) < before_num)
+                    .collect();
+                // Fall back to REST whenever the retained window doesn't cover
+                // `limit` messages and may have older history before it.
+                if !entry.complete_from_start && list.len() < limit {
+                    return None;
+                }
+                list
+            }
+            None => {
+                let list: Vec<&Fetched> = entry.messages.iter().collect();
+                if !entry.complete_from_start && list.len() < limit {
+                    return None;
+                }
+                list
+            }
+        };
+        let start = filtered.len().saturating_sub(limit);
+        Some(filtered[start..].iter().map(|m| (*m).clone()).collect())
+    }
+
+    fn seed_history(
+        &self,
+        place: &Place,
+        messages: &[Fetched],
+        complete_from_start: bool,
+        token: u64,
+    ) {
+        let now = std::time::Instant::now();
+        let key = Self::recent_key(place);
+        let ttl = Self::ttl_for(place);
+        let mut guard = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        // Only promote/seed a still-live entry matching `token`. If the entry was
+        // invalidated (edit/delete), cleared (`Ready`), evicted, or belongs to a
+        // previous connection, its token will not match and the stale seed is rejected.
+        let Some(entry) = guard.get_mut(key) else {
+            return;
+        };
+        if now >= entry.expires_at {
+            guard.remove(key);
+            return;
+        }
+        if entry.token != token {
+            return;
+        }
+        if entry.warming {
+            entry.complete_from_start = complete_from_start;
+        } else if complete_from_start {
+            entry.complete_from_start = true;
+        }
+        entry.warming = false;
+        entry.warming_holders = 0;
+        entry.ttl = ttl;
+        entry.expires_at = now + ttl;
+        for msg in messages {
+            insert_ordered(
+                &mut entry.messages,
+                &mut entry.complete_from_start,
+                msg.clone(),
+            );
         }
     }
 
@@ -470,6 +717,47 @@ impl Lookup for Discord {
         self.current()
             .ok()
             .and_then(|inner| inner.user.get().map(ToString::to_string))
+    }
+
+    fn recent_history(
+        &self,
+        place: &Place,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Option<Vec<Fetched>> {
+        self.current()
+            .ok()
+            .and_then(|inner| inner.recent_history(place, before, limit))
+    }
+
+    fn begin_warming(&self, place: &Place) -> u64 {
+        self.current()
+            .ok()
+            .map_or(0, |inner| inner.begin_warming(place))
+    }
+
+    fn cancel_warming(&self, place: &Place, token: u64) {
+        if let Ok(inner) = self.current() {
+            inner.cancel_warming(place, token);
+        }
+    }
+
+    fn seed_history(
+        &self,
+        place: &Place,
+        messages: &[Fetched],
+        complete_from_start: bool,
+        token: u64,
+    ) {
+        if let Ok(inner) = self.current() {
+            inner.seed_history(place, messages, complete_from_start, token);
+        }
+    }
+
+    fn touch_history(&self, place: &Place) {
+        if let Ok(inner) = self.current() {
+            inner.touch_history(place);
+        }
     }
 
     async fn message(&self, place: &Place, message: &str) -> Result<Fetched, MessengerError> {
@@ -708,5 +996,133 @@ impl Messenger for Discord {
             .await
             .map_err(backend)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod recent_history_tests {
+    use super::*;
+
+    fn mk_fetched(id: &str, text: &str) -> Fetched {
+        Fetched {
+            message: id.into(),
+            author: Person {
+                id: "u1".into(),
+                name: "Chan".into(),
+            },
+            text: text.into(),
+            date: String::new(),
+            attachments: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn warming_retains_cold_burst_and_orders_by_snowflake() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let inner = Inner::new("token".into());
+        let place = Place {
+            channel: "1".into(),
+            thread: None,
+            dm: false,
+        };
+        // Cold warming collects arrivals B(200) and C(300) without serving cache hits yet.
+        let token = inner.begin_warming(&place);
+        {
+            let mut guard = inner.recent.lock().unwrap();
+            let entry = guard.get_mut("1").unwrap();
+            insert_ordered(
+                &mut entry.messages,
+                &mut entry.complete_from_start,
+                mk_fetched("200", "B"),
+            );
+            insert_ordered(
+                &mut entry.messages,
+                &mut entry.complete_from_start,
+                mk_fetched("300", "C"),
+            );
+        }
+        assert!(inner.recent_history(&place, Some("300"), 10).is_none());
+
+        // Overlapping warming holds refcount safely: cancelling one does not drop the buffer.
+        let token_hold2 = inner.begin_warming(&place);
+        assert_eq!(token_hold2, token);
+        inner.cancel_warming(&place, token_hold2);
+        assert!(inner.recent.lock().unwrap().contains_key("1"));
+
+        // Seeding with complete_from_start=true promotes warming -> participating and serves <10 cleanly.
+        inner.seed_history(&place, &[mk_fetched("100", "A")], true, token);
+        let before_c = inner.recent_history(&place, Some("300"), 10).unwrap();
+        let ids: Vec<&str> = before_c.iter().map(|m| m.message.as_str()).collect();
+        assert_eq!(ids, vec!["100", "200"]);
+
+        // Out-of-order older message (50) inserts in snowflake order and never leaks after before=100.
+        inner.seed_history(&place, &[mk_fetched("50", "Z")], true, token);
+        let before_a = inner.recent_history(&place, Some("100"), 10).unwrap();
+        let ids: Vec<&str> = before_a.iter().map(|m| m.message.as_str()).collect();
+        assert_eq!(ids, vec!["50"]);
+
+        // cancel_warming does not remove an already promoted participating channel.
+        inner.cancel_warming(&place, token);
+        assert!(inner.recent_history(&place, Some("300"), 10).is_some());
+
+        // Edit/delete invalidation removes the entry so stale in-flight seeds are rejected
+        // without retaining any per-channel map state for uncached channels.
+        inner.invalidate_recent(Id::new(1));
+        assert!(inner.recent_history(&place, Some("300"), 10).is_none());
+        inner.seed_history(&place, &[mk_fetched("100", "stale")], true, token);
+        assert!(inner.recent_history(&place, Some("300"), 10).is_none());
+
+        // Fresh gateway Ready clears entries so pre-reconnect seeds are rejected.
+        let token2 = inner.begin_warming(&place);
+        inner.clear_recent();
+        inner.seed_history(&place, &[mk_fetched("100", "pre-ready")], true, token2);
+        assert!(inner.recent_history(&place, Some("300"), 10).is_none());
+
+        // Replaced Inner (new connection) rejects seeds issued by an older Inner.
+        let old_token = inner.begin_warming(&place);
+        let inner_new = Inner::new("token".into());
+        let _new_token = inner_new.begin_warming(&place);
+        inner_new.seed_history(&place, &[mk_fetched("100", "old-conn")], true, old_token);
+        assert!(inner_new.recent_history(&place, Some("300"), 10).is_none());
+
+        // Partial seed (5 items from a limit=5 fetch, complete_from_start=false) falls back to REST
+        // when a later caller asks for 10, but hits cache for limit=5.
+        let partial_place = Place {
+            channel: "2".into(),
+            thread: None,
+            dm: false,
+        };
+        let p_token = inner.begin_warming(&partial_place);
+        let partial: Vec<Fetched> = (10u64..15).map(|n| mk_fetched(&n.to_string(), "p")).collect();
+        inner.seed_history(&partial_place, &partial, false, p_token);
+        assert!(inner.recent_history(&partial_place, Some("20"), 10).is_none());
+        assert_eq!(
+            inner.recent_history(&partial_place, Some("20"), 5).unwrap().len(),
+            5
+        );
+
+        // Evicted ring clears complete_from_start and falls back to None when < limit remain.
+        let token3 = inner.begin_warming(&place);
+        let mut full = Vec::new();
+        for n in 1000u64..1025 {
+            full.push(mk_fetched(&n.to_string(), "m"));
+        }
+        inner.seed_history(&place, &full, false, token3);
+        assert!(inner.recent_history(&place, Some("500"), 10).is_none());
+        assert!(inner.recent_history(&place, Some("1007"), 10).is_none());
+        let hit = inner.recent_history(&place, Some("1020"), 10).unwrap();
+        assert_eq!(hit.len(), 10);
+        assert_eq!(hit.first().unwrap().message, "1010");
+        assert_eq!(hit.last().unwrap().message, "1019");
+
+        // cancel_warming cleans up an unpromoted warming channel once the last holder drops.
+        let cold = Place {
+            channel: "3".into(),
+            thread: None,
+            dm: false,
+        };
+        let cold_tok = inner.begin_warming(&cold);
+        inner.cancel_warming(&cold, cold_tok);
+        assert!(!inner.recent.lock().unwrap().contains_key("3"));
     }
 }

@@ -1,11 +1,7 @@
 import type { McpServer, RequestPayload } from '@blob-1/contracts'
 import { useAtomRefresh, useAtomSet, useAtomValue } from '@effect/atom-react'
 import { AtomMachine } from '@typeonce/effect-machine/reactivity'
-import {
-  createMachineContext,
-  MachineState,
-  useMachineResult,
-} from '@typeonce/effect-machine-react'
+import { MachineState, useMachineResult } from '@typeonce/effect-machine-react'
 import { Option } from 'effect'
 import { AsyncResult } from 'effect/reactivity'
 import { ExternalLink, Link2, Plus, RefreshCw, Server, Terminal, Trash2 } from 'lucide-react'
@@ -19,12 +15,14 @@ import { Switch } from '~/components/ui/switch'
 import { ToggleGroup, ToggleGroupItem } from '~/components/ui/toggle-group'
 import { Tooltip, TooltipContent, TooltipTrigger } from '~/components/ui/tooltip'
 import { MachineAtoms } from '~/lib/runtime'
+import { createPersistentMachineContext } from '~/lib/shellMachines'
+import { matchCached } from '~/lib/useBackgroundRefresh'
 import { cn } from '~/lib/utils'
 
 import { McpEvents, type McpInput, McpMachine } from './mcpMachine'
 import { mcpPageAtom } from './mcpState'
 
-const McpOwner = createMachineContext(({ input }: { input: McpInput }) =>
+const McpOwner = createPersistentMachineContext('mcp', ({ input }: { input: McpInput }) =>
   MachineAtoms.make(McpMachine, input),
 )
 
@@ -32,7 +30,7 @@ const McpOwner = createMachineContext(({ input }: { input: McpInput }) =>
 export function McpPage() {
   const result = useAtomValue(mcpPageAtom)
   const retry = useAtomRefresh(mcpPageAtom)
-  return AsyncResult.match(result, {
+  return matchCached(result, {
     onInitial: () => (
       <Page title="MCP" wide>
         <EmptyLine>Loading…</EmptyLine>
@@ -43,7 +41,7 @@ export function McpPage() {
         <PageError cause={failure.cause} onRetry={retry} />
       </Page>
     ),
-    onSuccess: ({ value }) => (
+    onSuccess: value => (
       <McpOwner.Provider input={{ servers: value }}>
         <McpContent />
       </McpOwner.Provider>
@@ -51,9 +49,37 @@ export function McpPage() {
   })
 }
 
+function McpProbeWatcher() {
+  const machine = McpOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  return (
+    <MachineState machine={machine} path="">
+      {({ value }) => {
+        const hasProbing = value.servers.some(
+          server => server.enabled && (server.status === 'connecting' || server.status === 'idle'),
+        )
+        return <McpProbePoller active={hasProbing} onRefresh={() => send(McpEvents.Refresh())} />
+      }}
+    </MachineState>
+  )
+}
+
+function McpProbePoller(props: { readonly active: boolean; readonly onRefresh: () => void }) {
+  const { active, onRefresh } = props
+  useEffect(() => {
+    if (!active) return
+    const timer = window.setInterval(onRefresh, 1500)
+    return () => window.clearInterval(timer)
+  }, [active, onRefresh])
+  return null
+}
+
 function McpContent() {
   const machine = McpOwner.useMachine()
   const send = useAtomSet(machine.send)
+  useEffect(() => {
+    send(McpEvents.Refresh())
+  }, [send])
   const addButtonRef = useRef<HTMLButtonElement>(null)
   const isAddClosed = AsyncResult.getOrElse(
     useMachineResult(AtomMachine.matches(machine, 'Add.Closed')),
@@ -110,6 +136,7 @@ function McpContent() {
       <MachineState machine={machine} path="Add.Closed" inactive={<AddSection />}>
         {() => null}
       </MachineState>
+      <McpProbeWatcher />
       <ServersList />
     </Page>
   )
@@ -125,17 +152,12 @@ function ServersList() {
         ) : (
           <ul className="divide-y divide-border overflow-hidden rounded-2xl border border-border bg-card shadow-xs">
             {value.servers.map(server => {
-              const toggleState = states.Toggle.state
               const removeState = states.Remove.state
               const loginState = states.Login.state
               return (
                 <ServerRow
                   key={server.id}
                   server={server}
-                  toggling={toggleState.path === 'Toggle.Working'}
-                  togglingThis={
-                    toggleState.path === 'Toggle.Working' && toggleState.value.id === server.id
-                  }
                   removing={removeState.path === 'Remove.Working'}
                   loggingIn={loginState.path === 'Login.Working'}
                   loggingInThis={
@@ -169,10 +191,7 @@ function Chip(props: ChipProps) {
   )
 }
 
-function statusBadge(server: McpServer, togglingThis: boolean) {
-  if (togglingThis) {
-    return <Chip className="text-muted-foreground">Updating…</Chip>
-  }
+function statusBadge(server: McpServer) {
   if (!server.enabled || server.status === 'disconnected') {
     return <Chip className="text-muted-foreground">Disabled</Chip>
   }
@@ -209,8 +228,6 @@ const needsOauth = (server: McpServer): boolean =>
 
 interface ServerRowProps {
   readonly server: McpServer
-  readonly toggling: boolean
-  readonly togglingThis: boolean
   readonly removing: boolean
   readonly loggingIn: boolean
   readonly loggingInThis: boolean
@@ -219,7 +236,7 @@ interface ServerRowProps {
 function ServerRow(props: ServerRowProps) {
   const machine = McpOwner.useMachine()
   const send = useAtomSet(machine.send)
-  const { server, toggling, togglingThis, removing, loggingIn, loggingInThis } = props
+  const { server, removing, loggingIn, loggingInThis } = props
   return (
     <li className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:gap-4">
       <span
@@ -233,7 +250,7 @@ function ServerRow(props: ServerRowProps) {
           <p className="min-w-0 break-words text-sm font-medium text-foreground [overflow-wrap:anywhere]">
             {server.id}
           </p>
-          {statusBadge(server, togglingThis)}
+          {statusBadge(server)}
         </div>
         <div className="mt-1.5 flex min-w-0 items-start gap-1.5 text-muted-foreground sm:mt-1">
           <span className="mt-0.5 shrink-0">
@@ -270,7 +287,6 @@ function ServerRow(props: ServerRowProps) {
         <Switch
           aria-label={`Enable ${server.id}`}
           checked={server.enabled}
-          disabled={toggling}
           onCheckedChange={enabled => send(McpEvents.SetEnabled({ id: server.id, enabled }))}
         />
         <ConfirmDialog

@@ -369,6 +369,10 @@ async fn mcp_reply(mcp: &mcp::Mcp) -> crate::Result<Value> {
     Ok(serde_json::to_value(mcp.server_statuses().await)?)
 }
 
+async fn mcp_cached_reply(mcp: &mcp::Mcp) -> crate::Result<Value> {
+    Ok(serde_json::to_value(mcp.cached_server_statuses().await)?)
+}
+
 fn str_map(payload: &Value, key: &str) -> BTreeMap<String, String> {
     payload
         .get(key)
@@ -1119,9 +1123,13 @@ async fn dispatch(
                 server.enabled = enabled;
                 store.save_mcp_server(&server)?;
                 if enabled {
-                    ctx.mcp.probe(id).await;
+                    let mcp = ctx.mcp.clone();
+                    let id_owned = id.to_owned();
+                    tokio::spawn(async move {
+                        mcp.probe(&id_owned).await;
+                    });
                 }
-                Ok(mcp_reply(&ctx.mcp).await?)
+                Ok(mcp_cached_reply(&ctx.mcp).await?)
             }
             "mcp.login" => {
                 let id = get("id")?;

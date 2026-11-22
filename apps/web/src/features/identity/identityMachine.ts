@@ -49,6 +49,7 @@ export const IdentityEvents = Machine.events({
   Edit: { text: Schema.String },
   Flush: {},
   Reset: {},
+  Sync: { identity: Identity },
 })
 
 /** The identity editor: autosaves 800ms after typing stops, on blur, and resets on demand. */
@@ -112,6 +113,18 @@ export const IdentityMachine = Machine.make({
             target: undefined,
             update: { ...root, error: null, failedAction: null },
           }),
+        },
+        Sync: {
+          update: 'root',
+          data: ({ root, event }) =>
+            root.draftText !== root.savedText
+              ? root
+              : {
+                  ...root,
+                  savedText: event.identity.text,
+                  draftText: event.identity.text,
+                  isDefault: event.identity.isDefault,
+                },
         },
       },
     },

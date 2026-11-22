@@ -77,6 +77,38 @@ pub trait Lookup: Send + Sync {
     fn self_id(&self) -> Option<String> {
         None
     }
+    /// Returns cached recent history before `before` (oldest -> newest, up to `limit`)
+    /// for a channel/thread the bot is actively participating in, avoiding a REST call.
+    fn recent_history(
+        &self,
+        _place: &Place,
+        _before: Option<&str>,
+        _limit: usize,
+    ) -> Option<Vec<Fetched>> {
+        None
+    }
+    /// Begins transiently collecting live gateway arrivals for a cold `place`
+    /// while triage/reply-mode lookup is in flight, returning a globally unique
+    /// cache token for this warming hold.
+    fn begin_warming(&self, _place: &Place) -> u64 {
+        0
+    }
+    /// Releases one warming hold for `token`, removing the transient warming buffer
+    /// once no holders remain (no-op if already promoted or invalidated).
+    fn cancel_warming(&self, _place: &Place, _token: u64) {}
+    /// Promotes and seeds a warming buffer matching `token` into the participating
+    /// cache. Rejects seeds if the entry was invalidated, evicted, or belongs to
+    /// an earlier connection/session.
+    fn seed_history(
+        &self,
+        _place: &Place,
+        _messages: &[Fetched],
+        _complete_from_start: bool,
+        _token: u64,
+    ) {
+    }
+    /// Refreshes TTL on an already-participating channel without overwriting entries.
+    fn touch_history(&self, _place: &Place) {}
     async fn message(&self, place: &Place, id: &str) -> Result<Fetched, MessengerError>;
     fn parse_link(&self, link: &str) -> Option<(Place, String)>;
     async fn history(

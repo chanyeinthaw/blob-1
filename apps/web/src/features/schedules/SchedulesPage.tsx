@@ -8,11 +8,7 @@ import type {
 } from '@blob-1/contracts'
 import { useAtomRefresh, useAtomSet, useAtomValue } from '@effect/atom-react'
 import { AtomMachine } from '@typeonce/effect-machine/reactivity'
-import {
-  createMachineContext,
-  MachineState,
-  useMachineResult,
-} from '@typeonce/effect-machine-react'
+import { MachineState, useMachineResult } from '@typeonce/effect-machine-react'
 import { AsyncResult } from 'effect/reactivity'
 import { ChevronLeft, ChevronRight, Clock, Eye, Globe, Plus, Repeat, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
@@ -50,6 +46,8 @@ import { Switch } from '~/components/ui/switch'
 import { Textarea } from '~/components/ui/textarea'
 import { ToggleGroup, ToggleGroupItem } from '~/components/ui/toggle-group'
 import { MachineAtoms } from '~/lib/runtime'
+import { createPersistentMachineContext } from '~/lib/shellMachines'
+import { matchCached } from '~/lib/useBackgroundRefresh'
 import { cn } from '~/lib/utils'
 
 import { MonthCalendar, WeekCalendar } from './CalendarGrid'
@@ -66,8 +64,9 @@ import {
 import { SchedulesEvents, type SchedulesInput, SchedulesMachine } from './schedulesMachine'
 import { schedulesPageAtom } from './schedulesState'
 
-const SchedulesOwner = createMachineContext(({ input }: { input: SchedulesInput }) =>
-  MachineAtoms.make(SchedulesMachine, input),
+const SchedulesOwner = createPersistentMachineContext(
+  'schedules',
+  ({ input }: { input: SchedulesInput }) => MachineAtoms.make(SchedulesMachine, input),
 )
 
 const toggleItemClassName =
@@ -160,7 +159,7 @@ export function SchedulesPage() {
   const loaded = useAtomValue(schedulesPageAtom)
   const retry = useAtomRefresh(schedulesPageAtom)
 
-  return AsyncResult.match(loaded, {
+  return matchCached(loaded, {
     onInitial: () => (
       <Page title="Schedules">
         <EmptyLine>Loading…</EmptyLine>
@@ -171,7 +170,7 @@ export function SchedulesPage() {
         <PageError cause={failure.cause} onRetry={retry} />
       </Page>
     ),
-    onSuccess: ({ value }) => <SchedulesMount state={value} />,
+    onSuccess: value => <SchedulesMount state={value} />,
   })
 }
 
@@ -306,6 +305,9 @@ function DueRefreshWatcher(props: { readonly data: ScheduleState; readonly nowSe
 function SchedulesWorkspace(props: SchedulesWorkspaceProps) {
   const machine = SchedulesOwner.useMachine()
   const send = useAtomSet(machine.send)
+  useEffect(() => {
+    send(SchedulesEvents.Refresh())
+  }, [send])
   const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000))
   const [view, setView] = useState<CalendarView>('week')
   const [previewHours, setPreviewHours] = useState<readonly [number, number] | null>(null)
@@ -472,7 +474,6 @@ function SchedulesSidebar(props: SchedulesSidebarProps) {
         timezone={data.timezone}
         nextCheckin={data.nextCheckin}
         hasWatches={data.watches.length > 0}
-        isIdle={props.isIdle}
         error={props.checkinError}
       />
       <div className="p-4">
@@ -543,16 +544,11 @@ interface TimezoneComboboxProps {
 function TimezoneCombobox(props: TimezoneComboboxProps) {
   const machine = SchedulesOwner.useMachine()
   const send = useAtomSet(machine.send)
-  const isIdle = AsyncResult.getOrElse(
-    useMachineResult(AtomMachine.matches(machine, 'Mutation.Idle')),
-    () => false,
-  )
   const zones = useMemo(() => listTimezones(), [])
   return (
     <Combobox
       items={zones}
       value={props.timezone}
-      disabled={!isIdle}
       onValueChange={(next: string | null) => {
         if (next !== null && next !== props.timezone) {
           send(SchedulesEvents.SetTimezone({ timezone: next }))
@@ -594,14 +590,13 @@ interface SidebarCheckinsProps {
   readonly timezone: string
   readonly nextCheckin: number | null
   readonly hasWatches: boolean
-  readonly isIdle: boolean
   readonly error: string | null
 }
 
 function SidebarCheckins(props: SidebarCheckinsProps) {
   const machine = SchedulesOwner.useMachine()
   const send = useAtomSet(machine.send)
-  const { config, isIdle, error } = props
+  const { config, error } = props
   return (
     <div className="p-4">
       <div className="mb-2.5 flex items-center justify-between gap-2">
@@ -614,7 +609,6 @@ function SidebarCheckins(props: SidebarCheckinsProps) {
         <Switch
           aria-label="Enable check-ins"
           checked={config !== null}
-          disabled={!isIdle}
           onCheckedChange={checked =>
             send(
               checked
@@ -634,7 +628,7 @@ function SidebarCheckins(props: SidebarCheckinsProps) {
           timezone={props.timezone}
           nextCheckin={props.nextCheckin}
           hasWatches={props.hasWatches}
-          disabled={!isIdle}
+          disabled={false}
         />
       )}
       {error === null ? null : <FieldError id="sidebar-checkin-error">{error}</FieldError>}

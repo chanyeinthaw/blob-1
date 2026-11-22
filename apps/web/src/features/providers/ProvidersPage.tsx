@@ -1,11 +1,7 @@
 import type { Provider, ProviderApi } from '@blob-1/contracts'
 import { useAtomRefresh, useAtomSet, useAtomValue } from '@effect/atom-react'
 import { AtomMachine } from '@typeonce/effect-machine/reactivity'
-import {
-  createMachineContext,
-  MachineState,
-  useMachineResult,
-} from '@typeonce/effect-machine-react'
+import { MachineState, useMachineResult } from '@typeonce/effect-machine-react'
 import { Option } from 'effect'
 import { AsyncResult } from 'effect/reactivity'
 import { KeyRound, Link2, Pencil, Plus, RefreshCw, Server, Trash2 } from 'lucide-react'
@@ -32,12 +28,15 @@ import {
 } from '~/components/ui/select'
 import { Tooltip, TooltipContent, TooltipTrigger } from '~/components/ui/tooltip'
 import { MachineAtoms } from '~/lib/runtime'
+import { createPersistentMachineContext } from '~/lib/shellMachines'
+import { matchCached } from '~/lib/useBackgroundRefresh'
 
 import { ProvidersEvents, type ProvidersInput, ProvidersMachine } from './providersMachine'
 import { providersPageAtom } from './providersState'
 
-const ProvidersOwner = createMachineContext(({ input }: { input: ProvidersInput }) =>
-  MachineAtoms.make(ProvidersMachine, input),
+const ProvidersOwner = createPersistentMachineContext(
+  'providers',
+  ({ input }: { input: ProvidersInput }) => MachineAtoms.make(ProvidersMachine, input),
 )
 
 const apiLabels = {
@@ -54,7 +53,7 @@ const apiOptions = [
 export function ProvidersPage() {
   const result = useAtomValue(providersPageAtom)
   const retry = useAtomRefresh(providersPageAtom)
-  return AsyncResult.match(result, {
+  return matchCached(result, {
     onInitial: () => (
       <Page title="Providers" wide>
         <EmptyLine>Loading…</EmptyLine>
@@ -65,7 +64,7 @@ export function ProvidersPage() {
         <PageError cause={failure.cause} onRetry={retry} />
       </Page>
     ),
-    onSuccess: ({ value }) => (
+    onSuccess: value => (
       <ProvidersOwner.Provider input={{ providers: value }}>
         <ProvidersContent />
       </ProvidersOwner.Provider>
@@ -76,6 +75,9 @@ export function ProvidersPage() {
 function ProvidersContent() {
   const machine = ProvidersOwner.useMachine()
   const send = useAtomSet(machine.send)
+  useEffect(() => {
+    send(ProvidersEvents.Refresh())
+  }, [send])
   const addButtonRef = useRef<HTMLButtonElement>(null)
   const isAddClosed = AsyncResult.getOrElse(
     useMachineResult(AtomMachine.matches(machine, 'Add.Closed')),

@@ -40,26 +40,30 @@ pub fn parse_respond(answer: &str) -> bool {
     answer.eq_ignore_ascii_case("respond")
 }
 
-const CHANNEL_TRIAGE_PROMPT: &str = "You are a fast response gate deciding whether an AI assistant in a group chat channel should respond to the latest message. Reply with one word: RESPOND or IGNORE. Reply RESPOND only when the user is clearly talking to the assistant (addressing it by name, asking it a direct question/request, or continuing an active conversation with it). Do not be proactive or chime in uninvited. If people are talking to each other or it is ambiguous, reply IGNORE.";
+const CHANNEL_TRIAGE_PROMPT: &str = "You are a fast response gate deciding whether an AI assistant in a group chat channel should respond to the latest incoming message(s). Reply with one word: RESPOND or IGNORE. Reply RESPOND only when any incoming message is clearly talking to the assistant (addressing it by name, asking it a direct question/request, or continuing an active conversation with it). Do not be proactive or chime in uninvited. If people are talking to each other or it is ambiguous, reply IGNORE.";
 
-const THREAD_TRIAGE_PROMPT: &str = "You are a fast response gate deciding whether an AI assistant in a chat thread should respond to the latest message. Reply with one word: RESPOND or IGNORE. Because this is a thread, lean toward RESPOND whenever the message is a follow-up, question, feedback, or request that could plausibly be meant for the assistant. Reply IGNORE only when people are clearly talking purely among themselves or no reply is needed.";
+const THREAD_TRIAGE_PROMPT: &str = "You are a fast response gate deciding whether an AI assistant in a chat thread should respond to the latest incoming message(s). Reply with one word: RESPOND or IGNORE. Because this is a thread, lean toward RESPOND whenever any incoming message is a follow-up, question, feedback, or request that could plausibly be meant for the assistant. Reply IGNORE only when people are clearly talking purely among themselves or no reply is needed.";
 
 /// Shared pre-messenger response gate powered by the utility model.
-/// Decides whether an unaddressed group/thread message is meant for the assistant
-/// before typing indicators, reactions, or waking the main model.
+/// Decides whether an unaddressed group/thread message (or burst of messages)
+/// is meant for the assistant before typing indicators, reactions, or waking
+/// the main model.
 pub async fn decide_respond(
     utility: &Utility,
     identity: Option<&str>,
     bot_id: Option<&str>,
     history: &[messenger::Fetched],
-    inbound: &messenger::Inbound,
+    burst: &[messenger::Inbound],
 ) -> bool {
+    let Some(first) = burst.first() else {
+        return false;
+    };
     let mut sections = Vec::new();
     if let Some(identity) = identity.map(str::trim).filter(|s| !s.is_empty()) {
         let snippet: String = identity.chars().take(300).collect();
         sections.push(format!("Assistant identity:\n{snippet}"));
     }
-    sections.push(format!("Where: {}", inbound.location));
+    sections.push(format!("Where: {}", first.location));
     if !history.is_empty() {
         let recent = history
             .iter()
@@ -75,24 +79,49 @@ pub async fn decide_respond(
             .join("\n");
         sections.push(format!("Recent messages:\n{recent}"));
     }
-    if let Some(quote) = &inbound.quote {
-        sections.push(format!("Quoted ({}): {}", quote.author.name, quote.text));
-    }
-    if !inbound.attachments.is_empty() {
-        let names = inbound
-            .attachments
+    if burst.len() == 1 {
+        let inbound = first;
+        if let Some(quote) = &inbound.quote {
+            sections.push(format!("Quoted ({}): {}", quote.author.name, quote.text));
+        }
+        if !inbound.attachments.is_empty() {
+            let names = inbound
+                .attachments
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            sections.push(format!("Attachments: {names}"));
+        }
+        sections.push(format!(
+            "Latest message ({}): {}",
+            inbound.author.name, inbound.text
+        ));
+    } else {
+        let lines = burst
             .iter()
-            .map(|a| a.name.as_str())
+            .map(|inbound| {
+                let mut line = format!("{}: {}", inbound.author.name, inbound.text);
+                if let Some(quote) = &inbound.quote {
+                    line.push_str(&format!(" [quoting {}: {}]", quote.author.name, quote.text));
+                }
+                if !inbound.attachments.is_empty() {
+                    let names = inbound
+                        .attachments
+                        .iter()
+                        .map(|a| a.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    line.push_str(&format!(" [attachments: {names}]"));
+                }
+                line
+            })
             .collect::<Vec<_>>()
-            .join(", ");
-        sections.push(format!("Attachments: {names}"));
+            .join("\n");
+        sections.push(format!("Incoming burst (oldest to newest):\n{lines}"));
     }
-    sections.push(format!(
-        "Latest message ({}): {}",
-        inbound.author.name, inbound.text
-    ));
     let prompt = sections.join("\n\n");
-    let system = if inbound.place.thread.is_some() {
+    let system = if first.place.thread.is_some() {
         THREAD_TRIAGE_PROMPT
     } else {
         CHANNEL_TRIAGE_PROMPT

@@ -96,16 +96,17 @@ const withLimit = (
 
 type Role = 'main' | 'compaction' | 'utility'
 
-/** A role reply owns that role's slot; other confirmed state is untouched. */
+/** A role reply owns that role's slot; preserves newer optimistic edits if shown moved on. */
 const confirmRole = <R extends Role>(
   root: Pick<RootData, 'server' | 'shown'>,
   role: R,
   output: Models,
+  submitted: Models[R],
 ): Pick<RootData, 'server' | 'shown'> => ({
   server: { ...root.server, [role]: output[role] },
   shown: {
     ...root.shown,
-    [role]: sameSlot(root.shown[role], root.server[role]) ? output[role] : root.shown[role],
+    [role]: sameSlot(root.shown[role], submitted) ? output[role] : root.shown[role],
   },
 })
 
@@ -117,11 +118,14 @@ const confirmRole = <R extends Role>(
 const confirmMain = (
   root: RootData,
   output: Models,
+  submitted: Slot,
   compactionVersion: number,
 ): Pick<RootData, 'server' | 'shown'> => {
-  const own = confirmRole(root, 'main', output)
+  const own = confirmRole(root, 'main', output, submitted)
   if (compactionVersion !== root.compactionVersion) return own
-  const compactionPending = root.roleStatuses['compaction'] === 'Saving…'
+  const compactionPending =
+    root.roleStatuses['compaction'] === 'Saving…' ||
+    !sameSlot(root.shown.compaction, root.server.compaction)
   return {
     server: { ...own.server, compaction: output.compaction },
     shown: compactionPending ? own.shown : { ...own.shown, compaction: output.compaction },
@@ -255,6 +259,11 @@ const settleContext = (root: RootData, models: Models | null, fallback: string):
 
 const notify = (message: string) => Effect.flatMap(Notify, service => service.error(message))
 
+const fetchModels = Effect.gen(function* () {
+  const api = yield* Api
+  return yield* api.request('models.get', {}).pipe(Effect.orElseSucceed(() => null))
+})
+
 const setMain = Effect.fn('ModelsSettings.setMain')(function* (slot: Slot) {
   const api = yield* Api
   return yield* api
@@ -299,15 +308,32 @@ export const ModelsStates = Machine.state({
   type: 'parallel',
   fields: rootFields,
   states: {
-    Main: { states: { Idle: {}, Saving: { fields: { compactionVersion: Schema.Finite } } } },
-    Compaction: { states: { Idle: {}, Saving: {} } },
-    Utility: { states: { Idle: {}, Saving: {} } },
+    Sync: { states: { Idle: {}, Refreshing: {} } },
+    Main: {
+      states: {
+        Idle: {},
+        Saving: { fields: { submitted: Slot, compactionVersion: Schema.Finite } },
+      },
+    },
+    Compaction: {
+      states: {
+        Idle: {},
+        Saving: { fields: { submitted: Schema.NullOr(Slot) } },
+      },
+    },
+    Utility: {
+      states: {
+        Idle: {},
+        Saving: { fields: { submitted: Schema.NullOr(Slot) } },
+      },
+    },
     Images: { states: { Idle: {}, Saving: {} } },
     Context: { states: { Idle: {}, Saving: {} } },
   },
 })
 
 export const ModelsEvents = Machine.events({
+  Refresh: {},
   AssignMain: { slot: Slot },
   AssignCompaction: { slot: Schema.NullOr(Slot) },
   AssignUtility: { slot: Schema.NullOr(Slot) },
@@ -321,7 +347,7 @@ export const ModelsMachine = Machine.make({
   root: ModelsStates,
   events: ModelsEvents,
   input: ModelsInput,
-  effects: { setMain, setCompaction, setUtility, setImages, setContextLimit },
+  effects: { fetchModels, setMain, setCompaction, setUtility, setImages, setContextLimit },
 }).handle({
   root: ({ input }) => ({
     server: input,
@@ -368,16 +394,68 @@ export const ModelsMachine = Machine.make({
     },
   },
   states: {
+    Sync: {
+      initial: { target: 'Sync.Idle' },
+      states: {
+        Idle: {
+          on: {
+            Refresh: { target: 'Sync.Refreshing' },
+          },
+        },
+        Refreshing: {
+          invoke: {
+            src: 'fetchModels',
+            onDone: {
+              target: 'Sync.Idle',
+              update: 'root',
+              data: ({ root, output }) => {
+                if (output === null) return { target: undefined, update: root }
+                const shown: Models = {
+                  providers: root.imageJobs.reduce(
+                    (models, job) => withImages(models, job.provider, job.modelId, job.images),
+                    output,
+                  ).providers,
+                  main:
+                    root.roleStatuses['main'] === 'Saving…' ||
+                    !sameSlot(root.shown.main, root.server.main)
+                      ? root.shown.main
+                      : output.main,
+                  compaction:
+                    root.roleStatuses['compaction'] === 'Saving…' ||
+                    !sameSlot(root.shown.compaction, root.server.compaction)
+                      ? root.shown.compaction
+                      : output.compaction,
+                  utility:
+                    root.roleStatuses['utility'] === 'Saving…' ||
+                    !sameSlot(root.shown.utility, root.server.utility)
+                      ? root.shown.utility
+                      : output.utility,
+                }
+                return { target: undefined, update: { ...root, server: output, shown } }
+              },
+            },
+          },
+        },
+      },
+    },
     Main: {
       initial: { target: 'Main.Idle' },
       states: {
         Idle: {
+          always: {
+            target: 'Main.Saving',
+            guard: ({ root }) => !sameSlot(root.shown.main, root.server.main),
+            data: ({ root }) => ({
+              submitted: root.shown.main,
+              compactionVersion: root.compactionVersion,
+            }),
+          },
           on: {
             AssignMain: {
               target: 'Main.Saving',
               update: 'root',
               data: ({ event, root }) => ({
-                target: { compactionVersion: root.compactionVersion },
+                target: { submitted: event.slot, compactionVersion: root.compactionVersion },
                 update: {
                   ...root,
                   shown: { ...root.shown, main: event.slot },
@@ -388,9 +466,19 @@ export const ModelsMachine = Machine.make({
           },
         },
         Saving: {
+          on: {
+            AssignMain: {
+              update: 'root',
+              data: ({ event, root }) => ({
+                ...root,
+                shown: { ...root.shown, main: event.slot },
+                roleStatuses: { ...root.roleStatuses, main: 'Saving…' },
+              }),
+            },
+          },
           invoke: {
             src: 'setMain',
-            input: ({ root }) => root.shown.main,
+            input: ({ state }) => state.submitted,
             onDone: {
               target: 'Main.Idle',
               update: 'root',
@@ -398,7 +486,7 @@ export const ModelsMachine = Machine.make({
                 target: undefined,
                 update: {
                   ...root,
-                  ...confirmMain(root, output, state.compactionVersion),
+                  ...confirmMain(root, output, state.submitted, state.compactionVersion),
                   roleStatuses: { ...root.roleStatuses, main: 'Saved' },
                 },
               }),
@@ -406,11 +494,16 @@ export const ModelsMachine = Machine.make({
             onFailure: {
               target: 'Main.Idle',
               update: 'root',
-              data: ({ root, error }) => ({
+              data: ({ root, state, error }) => ({
                 target: undefined,
                 update: {
                   ...root,
-                  shown: { ...root.shown, main: root.server.main },
+                  shown: {
+                    ...root.shown,
+                    main: sameSlot(root.shown.main, state.submitted)
+                      ? root.server.main
+                      : root.shown.main,
+                  },
                   roleStatuses: { ...root.roleStatuses, main: error.message },
                 },
               }),
@@ -423,12 +516,17 @@ export const ModelsMachine = Machine.make({
       initial: { target: 'Compaction.Idle' },
       states: {
         Idle: {
+          always: {
+            target: 'Compaction.Saving',
+            guard: ({ root }) => !sameSlot(root.shown.compaction, root.server.compaction),
+            data: ({ root }) => ({ submitted: root.shown.compaction }),
+          },
           on: {
             AssignCompaction: {
               target: 'Compaction.Saving',
               update: 'root',
               data: ({ event, root }) => ({
-                target: undefined,
+                target: { submitted: event.slot },
                 update: {
                   ...root,
                   shown: { ...root.shown, compaction: event.slot },
@@ -439,17 +537,27 @@ export const ModelsMachine = Machine.make({
           },
         },
         Saving: {
+          on: {
+            AssignCompaction: {
+              update: 'root',
+              data: ({ event, root }) => ({
+                ...root,
+                shown: { ...root.shown, compaction: event.slot },
+                roleStatuses: { ...root.roleStatuses, compaction: 'Saving…' },
+              }),
+            },
+          },
           invoke: {
             src: 'setCompaction',
-            input: ({ root }) => root.shown.compaction,
+            input: ({ state }) => state.submitted,
             onDone: {
               target: 'Compaction.Idle',
               update: 'root',
-              data: ({ root, output }) => ({
+              data: ({ root, state, output }) => ({
                 target: undefined,
                 update: {
                   ...root,
-                  ...confirmRole(root, 'compaction', output),
+                  ...confirmRole(root, 'compaction', output, state.submitted),
                   compactionVersion: root.compactionVersion + 1,
                   roleStatuses: { ...root.roleStatuses, compaction: 'Saved' },
                 },
@@ -458,11 +566,16 @@ export const ModelsMachine = Machine.make({
             onFailure: {
               target: 'Compaction.Idle',
               update: 'root',
-              data: ({ root, error }) => ({
+              data: ({ root, state, error }) => ({
                 target: undefined,
                 update: {
                   ...root,
-                  shown: { ...root.shown, compaction: root.server.compaction },
+                  shown: {
+                    ...root.shown,
+                    compaction: sameSlot(root.shown.compaction, state.submitted)
+                      ? root.server.compaction
+                      : root.shown.compaction,
+                  },
                   roleStatuses: { ...root.roleStatuses, compaction: error.message },
                 },
               }),
@@ -475,12 +588,17 @@ export const ModelsMachine = Machine.make({
       initial: { target: 'Utility.Idle' },
       states: {
         Idle: {
+          always: {
+            target: 'Utility.Saving',
+            guard: ({ root }) => !sameSlot(root.shown.utility, root.server.utility),
+            data: ({ root }) => ({ submitted: root.shown.utility }),
+          },
           on: {
             AssignUtility: {
               target: 'Utility.Saving',
               update: 'root',
               data: ({ event, root }) => ({
-                target: undefined,
+                target: { submitted: event.slot },
                 update: {
                   ...root,
                   shown: { ...root.shown, utility: event.slot },
@@ -491,17 +609,27 @@ export const ModelsMachine = Machine.make({
           },
         },
         Saving: {
+          on: {
+            AssignUtility: {
+              update: 'root',
+              data: ({ event, root }) => ({
+                ...root,
+                shown: { ...root.shown, utility: event.slot },
+                roleStatuses: { ...root.roleStatuses, utility: 'Saving…' },
+              }),
+            },
+          },
           invoke: {
             src: 'setUtility',
-            input: ({ root }) => root.shown.utility,
+            input: ({ state }) => state.submitted,
             onDone: {
               target: 'Utility.Idle',
               update: 'root',
-              data: ({ root, output }) => ({
+              data: ({ root, state, output }) => ({
                 target: undefined,
                 update: {
                   ...root,
-                  ...confirmRole(root, 'utility', output),
+                  ...confirmRole(root, 'utility', output, state.submitted),
                   roleStatuses: { ...root.roleStatuses, utility: 'Saved' },
                 },
               }),
@@ -509,11 +637,16 @@ export const ModelsMachine = Machine.make({
             onFailure: {
               target: 'Utility.Idle',
               update: 'root',
-              data: ({ root, error }) => ({
+              data: ({ root, state, error }) => ({
                 target: undefined,
                 update: {
                   ...root,
-                  shown: { ...root.shown, utility: root.server.utility },
+                  shown: {
+                    ...root.shown,
+                    utility: sameSlot(root.shown.utility, state.submitted)
+                      ? root.server.utility
+                      : root.shown.utility,
+                  },
                   roleStatuses: { ...root.roleStatuses, utility: error.message },
                 },
               }),

@@ -15,6 +15,7 @@ import { FieldError } from '~/components/layout/Page'
 import { Button } from '~/components/ui/button'
 import { Input } from '~/components/ui/input'
 import { MachineAtoms } from '~/lib/runtime'
+import { markSignedIn } from '~/lib/session'
 
 import { SignInEvents, SignInMachine } from './signIn'
 
@@ -34,6 +35,11 @@ export function SignInScreen() {
       </div>
     </SignIn.Provider>
   )
+}
+
+function SignedInRedirect() {
+  markSignedIn()
+  return <Navigate to="/settings/general" replace />
 }
 
 function SignInForm() {
@@ -96,7 +102,7 @@ function SignInForm() {
         {error === null ? null : <FieldError id="signin-error">{error}</FieldError>}
       </div>
       <MachineState machine={machine} path="SignedIn" inactive={null}>
-        {() => <Navigate to="/settings/general" replace />}
+        {() => <SignedInRedirect />}
       </MachineState>
       <Button type="submit" disabled={isSubmitting || password === ''}>
         {isSubmitting ? 'Signing in…' : 'Sign in'}

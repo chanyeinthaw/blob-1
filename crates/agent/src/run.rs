@@ -879,55 +879,65 @@ fn effective_reply_mode(
         .map_or(storage::ReplyMode::Decision, |o| o.mode)
 }
 
-async fn admit(
-    store: &Arc<SqliteStorage>,
+/// RAII guard that releases a per-caller warming hold on drop (covering timeouts,
+/// errors, and `IGNORE` exits) without disrupting overlapping callers on the same place.
+struct WarmingHold {
     discord: Arc<dyn messenger::Messenger>,
+    place: storage::Place,
+    token: u64,
+}
+
+impl WarmingHold {
+    fn acquire(discord: Arc<dyn messenger::Messenger>, place: storage::Place) -> Self {
+        let token = discord.begin_warming(&place);
+        Self {
+            discord,
+            place,
+            token,
+        }
+    }
+}
+
+impl Drop for WarmingHold {
+    fn drop(&mut self) {
+        self.discord.cancel_warming(&self.place, self.token);
+    }
+}
+
+fn filter_history_before(
+    history: &[messenger::Fetched],
+    message_id: &str,
+    limit: usize,
+) -> Vec<messenger::Fetched> {
+    let cutoff = message_id.parse::<u64>().ok();
+    let filtered: Vec<messenger::Fetched> = match cutoff {
+        Some(cutoff_num) => history
+            .iter()
+            .filter(|m| m.message.parse::<u64>().ok().is_none_or(|n| n < cutoff_num))
+            .cloned()
+            .collect(),
+        None => history
+            .iter()
+            .take_while(|m| m.message != message_id)
+            .cloned()
+            .collect(),
+    };
+    let start = filtered.len().saturating_sub(limit);
+    filtered[start..].to_vec()
+}
+
+/// Admits one already-authorized message, resolving reply mode, re-verifying
+/// policy after async awaits (before any side effects), then recording destination,
+/// pending-thread state, seen reaction, and live typing independently.
+async fn admit_approved(
+    store: &Arc<SqliteStorage>,
+    discord: &Arc<dyn messenger::Messenger>,
     messengers: &harness::Messengers,
     inbound: messenger::Inbound,
     utility: Option<&harness::Utility>,
+    prefetched_history: Option<&[messenger::Fetched]>,
+    auto_responded: bool,
 ) -> Result<Option<(String, storage::Meta)>> {
-    let mut prefetched_history: Option<Vec<messenger::Fetched>> = None;
-    let mut auto_responded = false;
-    match admission_policy(store, &inbound)? {
-        AdmissionPolicy::Deny => return Ok(None),
-        AdmissionPolicy::AdmitDirect => {}
-        AdmissionPolicy::AutoRespondCheck => {
-            // Shared pre-messenger response gate: when auto-respond is on and a
-            // utility model is configured, fetch recent history and ask the
-            // utility model whether this unaddressed message is meant for us.
-            let auto_respond = store.auto_respond()?;
-            let Some(utility) = utility.filter(|_| auto_respond) else {
-                return Ok(None);
-            };
-            let identity = store
-                .identity()?
-                .or_else(|| Some(harness::DEFAULT_IDENTITY.into()));
-            let bot_id = discord.self_id();
-            let decision = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                let history = discord
-                    .history(&inbound.place, Some(&inbound.message), 10)
-                    .await
-                    .ok()?;
-                let respond = harness::decide_respond(
-                    utility,
-                    identity.as_deref(),
-                    bot_id.as_deref(),
-                    &history,
-                    &inbound,
-                )
-                .await;
-                Some((respond, history))
-            })
-            .await;
-            match decision {
-                Ok(Some((true, history))) => {
-                    prefetched_history = Some(history);
-                    auto_responded = true;
-                }
-                _ => return Ok(None),
-            }
-        }
-    }
     let inline = if inbound.place.thread.is_none() && !inbound.place.dm {
         match effective_reply_mode(&store.reply_modes("discord")?, &inbound.place.channel) {
             storage::ReplyMode::Direct => true,
@@ -936,13 +946,44 @@ async fn admit(
                 if let Some(utility) = utility {
                     tokio::time::timeout(std::time::Duration::from_secs(5), async {
                         let fetched;
-                        let slice: &[messenger::Fetched] = match prefetched_history.as_deref() {
+                        let slice: &[messenger::Fetched] = match prefetched_history {
                             Some(h) => &h[h.len().saturating_sub(5)..],
                             None => {
-                                fetched = discord
-                                    .history(&inbound.place, Some(&inbound.message), 5)
-                                    .await
-                                    .ok()?;
+                                if let Some(cached) = discord.recent_history(
+                                    &inbound.place,
+                                    Some(&inbound.message),
+                                    5,
+                                ) {
+                                    fetched = cached;
+                                } else if inbound.addressed {
+                                    // Start warming before a live latest-20 REST fetch (no `before`
+                                    // cursor) so all messages up to now—including edits, deletes,
+                                    // and intervening bot messages—are covered with zero gap.
+                                    let hold =
+                                        WarmingHold::acquire(discord.clone(), inbound.place.clone());
+                                    let latest = discord.history(&inbound.place, None, 20).await.ok()?;
+                                    let complete_from_start = latest.len() < 20;
+                                    discord.seed_history(
+                                        &inbound.place,
+                                        &latest,
+                                        complete_from_start,
+                                        hold.token,
+                                    );
+                                    let before = filter_history_before(&latest, &inbound.message, 5);
+                                    fetched = if !complete_from_start && before.len() < 5 {
+                                        discord
+                                            .history(&inbound.place, Some(&inbound.message), 5)
+                                            .await
+                                            .ok()?
+                                    } else {
+                                        before
+                                    };
+                                } else {
+                                    fetched = discord
+                                        .history(&inbound.place, Some(&inbound.message), 5)
+                                        .await
+                                        .ok()?;
+                                }
                                 &fetched
                             }
                         };
@@ -960,6 +1001,17 @@ async fn admit(
     } else {
         false
     };
+    // Recheck policy after async triage / reply-mode awaits before any side effects.
+    match admission_policy(store, &inbound)? {
+        AdmissionPolicy::Deny => return Ok(None),
+        AdmissionPolicy::AutoRespondCheck if auto_responded => {
+            if !store.auto_respond()? {
+                return Ok(None);
+            }
+        }
+        AdmissionPolicy::AutoRespondCheck => return Ok(None),
+        AdmissionPolicy::AdmitDirect => {}
+    }
     let pending_thread = !inline && inbound.place.thread.is_none() && !inbound.place.dm;
     let dest = if !pending_thread {
         inbound.place.clone()
@@ -977,9 +1029,13 @@ async fn admit(
         store.clear_pending_thread(to)?;
     }
     if inbound.addressed {
-        let (place, message) = (inbound.place.clone(), inbound.message.clone());
+        let (discord_react, place, message) =
+            (discord.clone(), inbound.place.clone(), inbound.message.clone());
         tokio::spawn(async move {
-            if let Err(error) = discord.react(&place, &message, messenger::Mark::Seen).await {
+            if let Err(error) = discord_react
+                .react(&place, &message, messenger::Mark::Seen)
+                .await
+            {
                 eprintln!("{error}");
             }
         });
@@ -1003,6 +1059,157 @@ async fn admit(
             attachments: inbound.attachments,
         },
     )))
+}
+
+#[cfg(test)]
+async fn admit(
+    store: &Arc<SqliteStorage>,
+    discord: Arc<dyn messenger::Messenger>,
+    messengers: &harness::Messengers,
+    inbound: messenger::Inbound,
+    utility: Option<&harness::Utility>,
+) -> Result<Option<(String, storage::Meta)>> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    admit_batch(store, discord, messengers, vec![inbound], utility, &tx).await?;
+    drop(tx);
+    match rx.recv().await {
+        Some(Ok(item)) => Ok(Some(item)),
+        Some(Err(err)) => Err(err),
+        None => Ok(None),
+    }
+}
+
+/// Evaluates a burst of messages from one `Place`: re-checks policy on every
+/// message, runs a single utility-model gate over unaddressed `AutoRespondCheck`
+/// messages as a burst, and emits each approved message immediately in strict
+/// arrival order.
+async fn admit_batch(
+    store: &Arc<SqliteStorage>,
+    discord: Arc<dyn messenger::Messenger>,
+    messengers: &harness::Messengers,
+    batch: Vec<messenger::Inbound>,
+    utility: Option<&harness::Utility>,
+    tx: &tokio::sync::mpsc::Sender<Result<(String, storage::Meta)>>,
+) -> Result<()> {
+    let mut ordered: Vec<(messenger::Inbound, AdmissionPolicy)> = Vec::with_capacity(batch.len());
+    let mut triage_snapshot: Vec<messenger::Inbound> = Vec::new();
+    for inbound in batch {
+        match admission_policy(store, &inbound)? {
+            AdmissionPolicy::Deny => {}
+            AdmissionPolicy::AdmitDirect => ordered.push((inbound, AdmissionPolicy::AdmitDirect)),
+            AdmissionPolicy::AutoRespondCheck => {
+                triage_snapshot.push(inbound.clone());
+                ordered.push((inbound, AdmissionPolicy::AutoRespondCheck));
+            }
+        }
+    }
+
+    let mut triage_approved = false;
+    // Reuse triage's prefetched history ONLY for the exact message whose cutoff it
+    // was fetched for; other items in the burst read the live cache (or REST fallback).
+    let mut triage_prefetched: Option<(String, Vec<messenger::Fetched>)> = None;
+    if !triage_snapshot.is_empty() {
+        let place = triage_snapshot[0].place.clone();
+        let first_msg_id = triage_snapshot[0].message.clone();
+        let auto_respond = store.auto_respond()?;
+        if let Some(utility) = utility.filter(|_| auto_respond) {
+            let identity = store
+                .identity()?
+                .or_else(|| Some(harness::DEFAULT_IDENTITY.into()));
+            let bot_id = discord.self_id();
+            let cached_history = discord.recent_history(&place, Some(&first_msg_id), 10);
+            let warm_hold = cached_history
+                .is_none()
+                .then(|| WarmingHold::acquire(discord.clone(), place.clone()));
+            let decision = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let (prompt_history, seed_snapshot, complete_from_start) = match cached_history {
+                    Some(history) => (history, None, false),
+                    None => {
+                        // Fetch the latest 20 live messages (no `before` cursor) after
+                        // starting `warm_hold` so edits, deletes, and intervening bot
+                        // messages are captured accurately with zero gap.
+                        let latest = discord.history(&place, None, 20).await.ok()?;
+                        let complete = latest.len() < 20;
+                        let before = filter_history_before(&latest, &first_msg_id, 10);
+                        let before_first = if !complete && before.len() < 10 {
+                            discord
+                                .history(&place, Some(&first_msg_id), 10)
+                                .await
+                                .ok()?
+                        } else {
+                            before
+                        };
+                        (before_first, Some(latest), complete)
+                    }
+                };
+                let respond = harness::decide_respond(
+                    utility,
+                    identity.as_deref(),
+                    bot_id.as_deref(),
+                    &prompt_history,
+                    &triage_snapshot,
+                )
+                .await;
+                Some((respond, prompt_history, seed_snapshot, complete_from_start))
+            })
+            .await;
+            if let Ok(Some((true, prompt_history, seed_snapshot, complete_from_start))) = decision {
+                match (seed_snapshot, &warm_hold) {
+                    (Some(latest), Some(hold)) => {
+                        // Seed solely from the fresh REST snapshot bound to `hold.token`
+                        // (never re-inserting stale queued inbound payloads).
+                        discord.seed_history(&place, &latest, complete_from_start, hold.token);
+                    }
+                    _ => {
+                        discord.touch_history(&place);
+                    }
+                }
+                triage_approved = true;
+                triage_prefetched = Some((first_msg_id, prompt_history));
+            }
+            drop(warm_hold);
+        }
+    }
+
+    for (inbound, policy) in ordered {
+        match policy {
+            AdmissionPolicy::AdmitDirect => {
+                if let Some(item) = admit_approved(
+                    store,
+                    &discord,
+                    messengers,
+                    inbound,
+                    utility,
+                    None,
+                    false,
+                )
+                .await?
+                {
+                    let _ = tx.send(Ok(item)).await;
+                }
+            }
+            AdmissionPolicy::AutoRespondCheck if triage_approved => {
+                let prefetched = triage_prefetched
+                    .as_ref()
+                    .and_then(|(id, h)| (*id == inbound.message).then_some(h.as_slice()));
+                if let Some(item) = admit_approved(
+                    store,
+                    &discord,
+                    messengers,
+                    inbound,
+                    utility,
+                    prefetched,
+                    true,
+                )
+                .await?
+                {
+                    let _ = tx.send(Ok(item)).await;
+                }
+            }
+            AdmissionPolicy::AutoRespondCheck | AdmissionPolicy::Deny => {}
+        }
+    }
+    Ok(())
 }
 
 pub async fn serve(
@@ -1165,64 +1372,366 @@ pub async fn serve(
         })
     };
     let (admitted_tx, mut admitted_rx) = tokio::sync::mpsc::channel(128);
+    let turn_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let admission_store = store.clone();
     let admission_discord = discord.clone();
     let admission_messengers = messengers.clone();
     let admission_models = models.clone();
+    let admission_turn_active = turn_active.clone();
     let admission = tokio::spawn(async move {
-        const MAX_INFLIGHT_ADMISSIONS: usize = 64;
-        let limit = Arc::new(tokio::sync::Semaphore::new(8));
-        let mut inflight = tokio::task::JoinSet::new();
-        // Per-conversation FIFO chain: preserves arrival order within each
-        // channel/thread/DM while letting separate conversations admit concurrently.
-        let mut place_tail: std::collections::HashMap<
+        const MAX_DIRECT_QUEUED: usize = 64;
+        const MAX_TRIAGE_QUEUED: usize = 128;
+        const MAX_BURST_MESSAGES: usize = 10;
+        const DEBOUNCE_QUIET: std::time::Duration = std::time::Duration::from_millis(1500);
+        const DEBOUNCE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
+
+        struct DebounceBatch {
+            messages: Vec<messenger::Inbound>,
+            flush_at: tokio::time::Instant,
+            deadline: tokio::time::Instant,
+        }
+
+        // Buffers a message in `debounce`; when a batch reaches `MAX_BURST_MESSAGES`,
+        // seals it into `ready` (never discarding messages) so the next arrival starts
+        // a new batch.
+        fn push_debounced(
+            debounce: &mut std::collections::HashMap<storage::Place, DebounceBatch>,
+            ready: &mut std::collections::HashMap<
+                storage::Place,
+                std::collections::VecDeque<Vec<messenger::Inbound>>,
+            >,
+            inbound: messenger::Inbound,
+            now: tokio::time::Instant,
+        ) {
+            let place = inbound.place.clone();
+            // Seal an already-expired batch before appending a new arrival so
+            // simultaneous inbound + timer readiness never stretches past `flush_at`.
+            if debounce.get(&place).is_some_and(|b| now >= b.flush_at) {
+                if let Some(expired) = debounce.remove(&place) {
+                    ready.entry(place.clone()).or_default().push_back(expired.messages);
+                }
+            }
+            let sealed = if let Some(batch) = debounce.get_mut(&place) {
+                batch.messages.push(inbound);
+                batch.flush_at = (now + DEBOUNCE_QUIET).min(batch.deadline);
+                batch.messages.len() >= MAX_BURST_MESSAGES
+            } else {
+                let deadline = now + DEBOUNCE_MAX_WAIT;
+                debounce.insert(
+                    place.clone(),
+                    DebounceBatch {
+                        messages: vec![inbound],
+                        flush_at: (now + DEBOUNCE_QUIET).min(deadline),
+                        deadline,
+                    },
+                );
+                false
+            };
+            if sealed {
+                if let Some(batch) = debounce.remove(&place) {
+                    ready.entry(place).or_default().push_back(batch.messages);
+                }
+            }
+        }
+
+        // Separate fast-lane for DMs, @mentions, replies, and explicit `always`
+        // overrides: never stalled by unaddressed triage traffic.
+        let direct_limit = Arc::new(tokio::sync::Semaphore::new(8));
+        let mut direct_inflight: tokio::task::JoinSet<storage::Place> =
+            tokio::task::JoinSet::new();
+        let mut direct_active: std::collections::HashSet<storage::Place> =
+            std::collections::HashSet::new();
+        let mut direct_debounce: std::collections::HashMap<storage::Place, DebounceBatch> =
+            std::collections::HashMap::new();
+        let mut direct_ready: std::collections::HashMap<
             storage::Place,
-            tokio::sync::oneshot::Receiver<()>,
+            std::collections::VecDeque<Vec<messenger::Inbound>>,
         > = std::collections::HashMap::new();
+
+        // Separate per-place coalescing lane for unaddressed Auto-respond triage:
+        // runs 1 utility decision per sealed burst and admits each approved message
+        // individually with its own destination and reply/to tokens.
+        let triage_limit = Arc::new(tokio::sync::Semaphore::new(8));
+        let mut triage_inflight: tokio::task::JoinSet<storage::Place> =
+            tokio::task::JoinSet::new();
+        let mut triage_active: std::collections::HashSet<storage::Place> =
+            std::collections::HashSet::new();
+        let mut triage_debounce: std::collections::HashMap<storage::Place, DebounceBatch> =
+            std::collections::HashMap::new();
+        let mut triage_ready: std::collections::HashMap<
+            storage::Place,
+            std::collections::VecDeque<Vec<messenger::Inbound>>,
+        > = std::collections::HashMap::new();
+
+        let spawn_lane = |inflight: &mut tokio::task::JoinSet<storage::Place>,
+                          active: &mut std::collections::HashSet<storage::Place>,
+                          limit: &Arc<tokio::sync::Semaphore>,
+                          batch: Vec<messenger::Inbound>| {
+            let place = batch[0].place.clone();
+            active.insert(place.clone());
+            let limit = limit.clone();
+            let store = admission_store.clone();
+            let discord = admission_discord.clone();
+            let messengers = admission_messengers.clone();
+            let utility = admission_models
+                .current()
+                .ok()
+                .and_then(|current| current.utility);
+            let tx = admitted_tx.clone();
+            inflight.spawn(async move {
+                let Ok(_permit) = limit.acquire_owned().await else {
+                    return place;
+                };
+                if let Err(error) =
+                    admit_batch(&store, discord, &messengers, batch, utility.as_ref(), &tx).await
+                {
+                    let _ = tx.send(Err(error)).await;
+                }
+                place
+            });
+        };
+
+        let dispatch_ready = |inflight: &mut tokio::task::JoinSet<storage::Place>,
+                              active: &mut std::collections::HashSet<storage::Place>,
+                              ready: &mut std::collections::HashMap<
+                                  storage::Place,
+                                  std::collections::VecDeque<Vec<messenger::Inbound>>,
+                              >,
+                              limit: &Arc<tokio::sync::Semaphore>| {
+            let places: Vec<storage::Place> = ready
+                .keys()
+                .filter(|p| !active.contains(*p))
+                .cloned()
+                .collect();
+            for place in places {
+                if let Some(queue) = ready.get_mut(&place) {
+                    if let Some(batch) = queue.pop_front() {
+                        spawn_lane(inflight, active, limit, batch);
+                    }
+                    if queue.is_empty() {
+                        ready.remove(&place);
+                    }
+                }
+            }
+        };
+
+        let queued_count =
+            |inflight: &tokio::task::JoinSet<storage::Place>,
+             debounce: &std::collections::HashMap<storage::Place, DebounceBatch>,
+             ready: &std::collections::HashMap<
+                 storage::Place,
+                 std::collections::VecDeque<Vec<messenger::Inbound>>,
+             >| {
+                inflight.len()
+                    + debounce.len()
+                    + ready.values().map(std::collections::VecDeque::len).sum::<usize>()
+            };
+
+        let next_flush_at =
+            |direct: &std::collections::HashMap<storage::Place, DebounceBatch>,
+             triage: &std::collections::HashMap<storage::Place, DebounceBatch>|
+             -> Option<tokio::time::Instant> {
+                let d = direct.values().map(|b| b.flush_at).min();
+                let t = triage.values().map(|b| b.flush_at).min();
+                match (d, t) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                }
+            };
+
         loop {
+            let wake_at = next_flush_at(&direct_debounce, &triage_debounce);
+            // Only direct-lane saturation pauses `rx.recv()`; a flooded triage
+            // queue never stalls DMs, @mentions, replies, or `always` traffic.
+            let can_recv =
+                queued_count(&direct_inflight, &direct_debounce, &direct_ready) < MAX_DIRECT_QUEUED;
             tokio::select! {
-                inbound = rx.recv(), if inflight.len() < MAX_INFLIGHT_ADMISSIONS => match inbound {
+                inbound = rx.recv(), if can_recv => match inbound {
                     Some(inbound) => {
-                        place_tail.retain(|_, rx| {
-                            !matches!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed))
-                        });
-                        let prev = place_tail.remove(&inbound.place);
-                        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-                        place_tail.insert(inbound.place.clone(), done_rx);
-                        let limit = limit.clone();
-                        let store = admission_store.clone();
-                        let discord = admission_discord.clone();
-                        let messengers = admission_messengers.clone();
-                        let utility = admission_models
-                            .current()
-                            .ok()
-                            .and_then(|current| current.utility);
-                        let tx = admitted_tx.clone();
-                        inflight.spawn(async move {
-                            let _done = done_tx;
-                            if let Some(prev) = prev {
-                                let _ = prev.await;
-                            }
-                            let Ok(_permit) = limit.acquire_owned().await else {
-                                return;
-                            };
-                            match admit(&store, discord, &messengers, inbound, utility.as_ref()).await {
-                                Ok(Some(next)) => {
-                                    let _ = tx.send(Ok(next)).await;
+                        let now = tokio::time::Instant::now();
+                        let turn_busy = admission_turn_active
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        match admission_policy(&admission_store, &inbound) {
+                            Ok(AdmissionPolicy::Deny) => {}
+                            Ok(AdmissionPolicy::AdmitDirect) => {
+                                let should_debounce = turn_busy
+                                    || direct_active.contains(&inbound.place)
+                                    || direct_debounce.contains_key(&inbound.place)
+                                    || direct_ready.contains_key(&inbound.place);
+                                if should_debounce {
+                                    push_debounced(
+                                        &mut direct_debounce,
+                                        &mut direct_ready,
+                                        inbound,
+                                        now,
+                                    );
+                                    dispatch_ready(
+                                        &mut direct_inflight,
+                                        &mut direct_active,
+                                        &mut direct_ready,
+                                        &direct_limit,
+                                    );
+                                } else {
+                                    spawn_lane(
+                                        &mut direct_inflight,
+                                        &mut direct_active,
+                                        &direct_limit,
+                                        vec![inbound],
+                                    );
                                 }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    let _ = tx.send(Err(error)).await;
+                            }
+                            Ok(AdmissionPolicy::AutoRespondCheck) => {
+                                let triage_full = queued_count(
+                                    &triage_inflight,
+                                    &triage_debounce,
+                                    &triage_ready,
+                                ) >= MAX_TRIAGE_QUEUED;
+                                // Allow coalescing into an existing debouncing batch when
+                                // triage is saturated, but shed excess new unaddressed work
+                                // rather than stalling the direct lane.
+                                if triage_full && !triage_debounce.contains_key(&inbound.place) {
+                                    continue;
+                                }
+                                let should_debounce = turn_busy
+                                    || triage_active.contains(&inbound.place)
+                                    || triage_debounce.contains_key(&inbound.place)
+                                    || triage_ready.contains_key(&inbound.place);
+                                if should_debounce {
+                                    push_debounced(
+                                        &mut triage_debounce,
+                                        &mut triage_ready,
+                                        inbound,
+                                        now,
+                                    );
+                                    dispatch_ready(
+                                        &mut triage_inflight,
+                                        &mut triage_active,
+                                        &mut triage_ready,
+                                        &triage_limit,
+                                    );
+                                } else {
+                                    spawn_lane(
+                                        &mut triage_inflight,
+                                        &mut triage_active,
+                                        &triage_limit,
+                                        vec![inbound],
+                                    );
                                 }
                             }
-                        });
+                            Err(error) => {
+                                let _ = admitted_tx.send(Err(error)).await;
+                            }
+                        }
                     }
                     None => {
-                        while inflight.join_next().await.is_some() {}
+                        for (place, batch) in direct_debounce.drain() {
+                            direct_ready.entry(place).or_default().push_back(batch.messages);
+                        }
+                        for (place, batch) in triage_debounce.drain() {
+                            triage_ready.entry(place).or_default().push_back(batch.messages);
+                        }
+                        dispatch_ready(
+                            &mut direct_inflight,
+                            &mut direct_active,
+                            &mut direct_ready,
+                            &direct_limit,
+                        );
+                        dispatch_ready(
+                            &mut triage_inflight,
+                            &mut triage_active,
+                            &mut triage_ready,
+                            &triage_limit,
+                        );
+                        while !direct_inflight.is_empty() || !triage_inflight.is_empty() {
+                            tokio::select! {
+                                Some(done) = direct_inflight.join_next(), if !direct_inflight.is_empty() => {
+                                    if let Ok(place) = done {
+                                        direct_active.remove(&place);
+                                        dispatch_ready(
+                                            &mut direct_inflight,
+                                            &mut direct_active,
+                                            &mut direct_ready,
+                                            &direct_limit,
+                                        );
+                                    }
+                                }
+                                Some(done) = triage_inflight.join_next(), if !triage_inflight.is_empty() => {
+                                    if let Ok(place) = done {
+                                        triage_active.remove(&place);
+                                        dispatch_ready(
+                                            &mut triage_inflight,
+                                            &mut triage_active,
+                                            &mut triage_ready,
+                                            &triage_limit,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         return;
                     }
                 },
-                Some(_) = inflight.join_next(), if !inflight.is_empty() => {}
+                _ = async {
+                    if let Some(at) = wake_at {
+                        tokio::time::sleep_until(at).await;
+                    }
+                }, if wake_at.is_some() => {
+                    let now = tokio::time::Instant::now();
+                    let expired_direct: Vec<storage::Place> = direct_debounce
+                        .iter()
+                        .filter(|(_, b)| b.flush_at <= now)
+                        .map(|(p, _)| p.clone())
+                        .collect();
+                    for place in expired_direct {
+                        if let Some(batch) = direct_debounce.remove(&place) {
+                            direct_ready.entry(place).or_default().push_back(batch.messages);
+                        }
+                    }
+                    dispatch_ready(
+                        &mut direct_inflight,
+                        &mut direct_active,
+                        &mut direct_ready,
+                        &direct_limit,
+                    );
+                    let expired_triage: Vec<storage::Place> = triage_debounce
+                        .iter()
+                        .filter(|(_, b)| b.flush_at <= now)
+                        .map(|(p, _)| p.clone())
+                        .collect();
+                    for place in expired_triage {
+                        if let Some(batch) = triage_debounce.remove(&place) {
+                            triage_ready.entry(place).or_default().push_back(batch.messages);
+                        }
+                    }
+                    dispatch_ready(
+                        &mut triage_inflight,
+                        &mut triage_active,
+                        &mut triage_ready,
+                        &triage_limit,
+                    );
+                }
+                Some(done) = direct_inflight.join_next(), if !direct_inflight.is_empty() => {
+                    if let Ok(place) = done {
+                        direct_active.remove(&place);
+                        dispatch_ready(
+                            &mut direct_inflight,
+                            &mut direct_active,
+                            &mut direct_ready,
+                            &direct_limit,
+                        );
+                    }
+                }
+                Some(done) = triage_inflight.join_next(), if !triage_inflight.is_empty() => {
+                    if let Ok(place) = done {
+                        triage_active.remove(&place);
+                        dispatch_ready(
+                            &mut triage_inflight,
+                            &mut triage_active,
+                            &mut triage_ready,
+                            &triage_limit,
+                        );
+                    }
+                }
             }
         }
     });
@@ -1248,6 +1757,7 @@ pub async fn serve(
                 _ = shutdown.changed() => { listener.abort(); admission.abort(); supervisor.abort(); return Ok(()); },
             }
         };
+        turn_active.store(true, std::sync::atomic::Ordering::Relaxed);
         let run = async {
             match next {
                 Some((text, meta)) => harness.run_message(text, Some(meta)).await,
@@ -1261,6 +1771,7 @@ pub async fn serve(
         loop {
             tokio::select! {
                 result = &mut run => {
+                    turn_active.store(false, std::sync::atomic::Ordering::Relaxed);
                     backoff = result.is_err();
                     match result {
                         Ok(answer) if !answer.is_empty() => println!("{answer}"),

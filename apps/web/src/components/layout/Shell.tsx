@@ -1,4 +1,4 @@
-import { useAtomSet, useAtomValue } from '@effect/atom-react'
+import { useAtomMount, useAtomSet, useAtomValue } from '@effect/atom-react'
 import { Link, type LinkProps, Navigate, useNavigate } from '@tanstack/react-router'
 import { AsyncResult } from 'effect/reactivity'
 import {
@@ -11,13 +11,21 @@ import {
   SlidersHorizontal,
   type LucideIcon,
 } from 'lucide-react'
-import type { ReactNode } from 'react'
+import { type ReactNode, useEffect } from 'react'
 import { toast } from 'sonner'
 
 import { BlobTile } from '~/components/BlobMark'
 import { ConfirmDialog } from '~/components/ConfirmDialog'
 import { Tooltip, TooltipContent, TooltipTrigger } from '~/components/ui/tooltip'
+import { discordPageAtom } from '~/features/chat/discordState'
+import { generalPageAtom } from '~/features/identity/identityState'
+import { mcpPageAtom } from '~/features/mcp/mcpState'
+import { modelsPageAtom } from '~/features/models/modelsState'
+import { providersPageAtom } from '~/features/providers/providersState'
+import { schedulesPageAtom } from '~/features/schedules/schedulesState'
 import { connectionAtom, signOutAtom, unauthorizedAtom } from '~/features/session/connection'
+import { clearSignedIn } from '~/lib/session'
+import { ShellMachinesProvider } from '~/lib/shellMachines'
 import { cn } from '~/lib/utils'
 
 import { focusRingClassName } from './Page'
@@ -99,7 +107,10 @@ function useSignOut() {
   const navigate = useNavigate()
   return () => {
     signOut().then(
-      () => navigate({ to: '/login', replace: true }),
+      () => {
+        clearSignedIn()
+        return navigate({ to: '/login', replace: true })
+      },
       () => toast.error('Sign out failed. Try again.'),
     )
   }
@@ -243,8 +254,21 @@ function MobileHeader() {
   )
 }
 
+function SettingsPrefetch() {
+  useAtomMount(generalPageAtom)
+  useAtomMount(schedulesPageAtom)
+  useAtomMount(discordPageAtom)
+  useAtomMount(mcpPageAtom)
+  useAtomMount(modelsPageAtom)
+  useAtomMount(providersPageAtom)
+  return null
+}
+
 function UnauthorizedRedirect() {
   const unauthorized = AsyncResult.isSuccess(useAtomValue(unauthorizedAtom))
+  useEffect(() => {
+    if (unauthorized) clearSignedIn()
+  }, [unauthorized])
   return unauthorized ? <Navigate to="/login" replace /> : null
 }
 
@@ -255,13 +279,16 @@ interface ShellProps {
 /** The signed-in frame: icon rail on desktop, header with a sticky tab strip on mobile. */
 export function Shell(props: ShellProps) {
   return (
-    <div className="flex min-h-dvh flex-col bg-shelf">
-      <Rail />
-      <MobileHeader />
-      <main className="flex min-w-0 flex-1 flex-col md:ml-16 md:h-dvh md:max-h-dvh md:min-h-0">
-        {props.children}
-      </main>
-      <UnauthorizedRedirect />
-    </div>
+    <ShellMachinesProvider>
+      <div className="flex min-h-dvh flex-col bg-shelf">
+        <SettingsPrefetch />
+        <Rail />
+        <MobileHeader />
+        <main className="flex min-w-0 flex-1 flex-col md:ml-16 md:h-dvh md:max-h-dvh md:min-h-0">
+          {props.children}
+        </main>
+        <UnauthorizedRedirect />
+      </div>
+    </ShellMachinesProvider>
   )
 }

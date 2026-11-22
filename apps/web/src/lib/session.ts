@@ -4,6 +4,16 @@ import { Effect } from 'effect'
 
 import { sessionLayer } from './runtime'
 
+let confirmedSignedIn = false
+
+export function markSignedIn() {
+  confirmedSignedIn = true
+}
+
+export function clearSignedIn() {
+  confirmedSignedIn = false
+}
+
 const sessionState = Effect.flatMap(Session, session => session.isSignedIn).pipe(
   Effect.map(signedIn => (signedIn ? 'signedIn' : 'signedOut')),
   Effect.orElseSucceed(() => 'unreachable' as const),
@@ -11,18 +21,27 @@ const sessionState = Effect.flatMap(Session, session => session.isSignedIn).pipe
 )
 
 /**
- * Route guard: sends a signed-out browser to the sign-in screen. An unreachable server keeps
- * the user in place; the shell shows them offline and reconnects.
+ * Route guard: sends a signed-out browser to the sign-in screen. Once confirmed
+ * signed in, subsequent settings tab switches return immediately without another
+ * `/api/session` round-trip; `UnauthorizedRedirect` clears the cache on expiry.
  */
 export async function requireSession() {
-  if ((await Effect.runPromise(sessionState)) === 'signedOut') {
+  if (confirmedSignedIn) return
+  const state = await Effect.runPromise(sessionState)
+  if (state === 'signedIn') {
+    confirmedSignedIn = true
+  } else if (state === 'signedOut') {
     throw redirect({ to: '/login', replace: true })
   }
 }
 
 /** Route guard: skips the sign-in screen for a signed-in browser. */
 export async function skipSignInWhenSignedIn() {
+  if (confirmedSignedIn) {
+    throw redirect({ to: '/settings/general', replace: true })
+  }
   if ((await Effect.runPromise(sessionState)) === 'signedIn') {
+    confirmedSignedIn = true
     throw redirect({ to: '/settings/general', replace: true })
   }
 }

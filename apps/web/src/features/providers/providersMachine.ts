@@ -13,6 +13,11 @@ const Draft = Schema.Struct({
 })
 type Draft = typeof Draft.Type
 
+const fetchProviders = Effect.gen(function* () {
+  const api = yield* Api
+  return yield* api.request('providers.list', {}).pipe(Effect.orElseSucceed(() => null))
+})
+
 const refreshProvider = Effect.fn('Providers.refresh')(function* (id: string) {
   const api = yield* Api
   const notify = yield* Notify
@@ -49,8 +54,18 @@ const ErrorMessage = Schema.NullOr(Schema.String)
 
 export const ProvidersStates = Machine.state({
   type: 'parallel',
-  fields: { providers: Schema.Array(Provider), refreshingId: Schema.NullOr(Schema.String) },
+  fields: {
+    providers: Schema.Array(Provider),
+    refreshingId: Schema.NullOr(Schema.String),
+    mutationSeq: Schema.Finite,
+  },
   states: {
+    Sync: {
+      states: {
+        Idle: {},
+        Refreshing: { fields: { mutationSeq: Schema.Finite } },
+      },
+    },
     Action: {
       states: {
         Idle: {},
@@ -76,6 +91,7 @@ export const ProvidersStates = Machine.state({
 })
 
 export const ProvidersEvents = Machine.events({
+  Refresh: {},
   OpenAdd: {},
   CloseAdd: {},
   ClearAddError: {},
@@ -99,10 +115,39 @@ export const ProvidersMachine = Machine.make({
   root: ProvidersStates,
   events: ProvidersEvents,
   input: ProvidersInput,
-  effects: { refreshProvider, removeProvider, addProvider, setProviderKey },
+  effects: { fetchProviders, refreshProvider, removeProvider, addProvider, setProviderKey },
 }).handle({
-  root: ({ input }) => ({ providers: input.providers, refreshingId: null }),
+  root: ({ input }) => ({ providers: input.providers, refreshingId: null, mutationSeq: 0 }),
   states: {
+    Sync: {
+      initial: { target: 'Sync.Idle' },
+      states: {
+        Idle: {
+          on: {
+            Refresh: {
+              target: 'Sync.Refreshing',
+              data: ({ root }) => ({ mutationSeq: root.mutationSeq }),
+            },
+          },
+        },
+        Refreshing: {
+          invoke: {
+            src: 'fetchProviders',
+            onDone: {
+              target: 'Sync.Idle',
+              update: 'root',
+              data: ({ root, state, output }) => ({
+                target: undefined,
+                update:
+                  output === null || state.mutationSeq !== root.mutationSeq
+                    ? root
+                    : { ...root, providers: output },
+              }),
+            },
+          },
+        },
+      },
+    },
     Action: {
       initial: { target: 'Action.Idle' },
       states: {
@@ -131,7 +176,12 @@ export const ProvidersMachine = Machine.make({
               update: 'root',
               data: ({ root, output }) => ({
                 target: undefined,
-                update: { ...root, providers: output ?? root.providers, refreshingId: null },
+                update: {
+                  ...root,
+                  providers: output ?? root.providers,
+                  refreshingId: null,
+                  mutationSeq: root.mutationSeq + 1,
+                },
               }),
             },
           },
@@ -145,7 +195,11 @@ export const ProvidersMachine = Machine.make({
               update: 'root',
               data: ({ root, output }) => ({
                 target: undefined,
-                update: { ...root, providers: output ?? root.providers },
+                update: {
+                  ...root,
+                  providers: output ?? root.providers,
+                  mutationSeq: root.mutationSeq + 1,
+                },
               }),
             },
           },

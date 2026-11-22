@@ -20,6 +20,12 @@ const RangeSchema = Schema.Struct({
   end: Schema.Finite,
 })
 
+const PendingCheckin = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal('set'), config: CheckinConfig }),
+  Schema.Struct({ kind: Schema.Literal('clear') }),
+])
+type PendingCheckin = typeof PendingCheckin.Type
+
 /** Returns true only when schedule definitions or one-off firing times changed,
  *  so a background refresh advancing a recurring job's `nextDue` does not reset
  *  paginated calendar occurrences. */
@@ -46,16 +52,38 @@ function scheduleDefinitionsChanged(
 
 function applyScheduleState<
   T extends {
+    readonly serverData: ScheduleState
     readonly data: ScheduleState
+    readonly pendingTimezone: string | null
+    readonly pendingCheckin: PendingCheckin | null
+    readonly inFlightEdit: PendingEdit | null
     readonly mutationSeq: number
     readonly occurrencesVersion: number
   },
 >(root: T, next: ScheduleState, isMutation: boolean): T {
+  const effectiveTimezone =
+    root.pendingTimezone ??
+    (root.inFlightEdit?.kind === 'timezone' ? root.inFlightEdit.timezone : next.timezone)
+  const effectiveCheckin =
+    root.pendingCheckin !== null
+      ? root.pendingCheckin.kind === 'set'
+        ? root.pendingCheckin.config
+        : null
+      : root.inFlightEdit?.kind === 'setCheckin'
+        ? root.inFlightEdit.config
+        : root.inFlightEdit?.kind === 'clearCheckin'
+          ? null
+          : next.checkin
   return {
     ...root,
-    data: next,
+    serverData: next,
+    data: {
+      ...next,
+      timezone: effectiveTimezone,
+      checkin: effectiveCheckin,
+    },
     mutationSeq: isMutation ? root.mutationSeq + 1 : root.mutationSeq,
-    occurrencesVersion: scheduleDefinitionsChanged(root.data.schedules, next.schedules)
+    occurrencesVersion: scheduleDefinitionsChanged(root.serverData.schedules, next.schedules)
       ? root.occurrencesVersion + 1
       : root.occurrencesVersion,
   }
@@ -87,12 +115,23 @@ const fetchOccurrenceBatch = Effect.fn('Schedules.fetchOccurrenceBatch')(functio
   }).pipe(Effect.catch(error => notify.error(error.message).pipe(Effect.as(null))))
 })
 
-const setTimezone = Effect.fn('Schedules.setTimezone')(function* (timezone: string) {
+const PendingEdit = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal('timezone'), timezone: Schema.String }),
+  Schema.Struct({ kind: Schema.Literal('setCheckin'), config: CheckinConfig }),
+  Schema.Struct({ kind: Schema.Literal('clearCheckin') }),
+])
+type PendingEdit = typeof PendingEdit.Type
+
+const flushPendingEdit = Effect.fn('Schedules.flushPendingEdit')(function* (edit: PendingEdit) {
   const api = yield* Api
   const notify = yield* Notify
-  return yield* api
-    .request('schedule.setTimezone', { timezone })
-    .pipe(Effect.catch(error => notify.error(error.message).pipe(Effect.as(null))))
+  const req =
+    edit.kind === 'timezone'
+      ? api.request('schedule.setTimezone', { timezone: edit.timezone })
+      : edit.kind === 'setCheckin'
+        ? api.request('checkin.set', edit.config)
+        : api.request('checkin.clear', {})
+  return yield* req.pipe(Effect.catch(error => notify.error(error.message).pipe(Effect.as(null))))
 })
 
 const addSchedule = Effect.fn('Schedules.addSchedule')(function* (input: {
@@ -117,13 +156,6 @@ const refreshScheduleState = Effect.gen(function* () {
     .request('schedule.get', {})
     .pipe(Effect.catch(error => notify.error(error.message).pipe(Effect.as(null))))
 })
-
-const setCheckin = Effect.fn('Schedules.setCheckin')(function* (config: CheckinConfig) {
-  const api = yield* Api
-  return yield* api.request('checkin.set', config)
-})
-
-const clearCheckin = Effect.flatMap(Api, api => api.request('checkin.clear', {}))
 
 const addWatch = Effect.fn('Schedules.addWatch')(function* (input: {
   readonly text: string
@@ -151,7 +183,11 @@ const noErrors = { jobError: null, checkinError: null, watchError: null }
 export const SchedulesStates = Machine.state({
   type: 'parallel',
   fields: {
+    serverData: ScheduleState,
     data: ScheduleState,
+    pendingTimezone: Schema.NullOr(Schema.String),
+    pendingCheckin: Schema.NullOr(PendingCheckin),
+    inFlightEdit: Schema.NullOr(PendingEdit),
     occurrences: Schema.Array(ScheduleOccurrence),
     nextOccurrenceCursor: Schema.NullOr(ScheduleOccurrenceCursor),
     visibleRange: RangeSchema,
@@ -185,8 +221,8 @@ export const SchedulesStates = Machine.state({
         Working: { fields: { mutationSeq: Schema.Finite } },
       },
     },
-    /** Serializes all schedule/check-in/watch/timezone mutations so full-state
-     *  replies are never applied out of order across regions. */
+    /** Serializes server writes while optimistic timezone and check-in edits coalesce
+     *  immediately on root state without disabling controls. */
     Mutation: {
       states: {
         Idle: {
@@ -196,7 +232,7 @@ export const SchedulesStates = Machine.state({
             watchError: ErrorMessage,
           },
         },
-        SettingTimezone: { fields: { timezone: Schema.String } },
+        Flushing: { fields: { edit: PendingEdit } },
         AddingJob: {
           fields: {
             text: Schema.String,
@@ -206,8 +242,6 @@ export const SchedulesStates = Machine.state({
           },
         },
         RemovingJob: { fields: { id: Schema.String } },
-        SettingCheckin: { fields: { config: CheckinConfig } },
-        ClearingCheckin: {},
         AddingWatch: {
           fields: {
             text: Schema.String,
@@ -249,19 +283,21 @@ export const SchedulesMachine = Machine.make({
   events: SchedulesEvents,
   input: SchedulesInput,
   effects: {
-    setTimezone,
+    flushPendingEdit,
     fetchOccurrenceBatch,
     refreshScheduleState,
     addSchedule,
     removeSchedule,
-    setCheckin,
-    clearCheckin,
     addWatch,
     removeWatch,
   },
 }).handle({
   root: ({ input }) => ({
+    serverData: input.state,
     data: input.state,
+    pendingTimezone: null,
+    pendingCheckin: null,
+    inFlightEdit: null,
     occurrences: [],
     nextOccurrenceCursor: null,
     visibleRange: input.range,
@@ -272,6 +308,35 @@ export const SchedulesMachine = Machine.make({
     selectedScheduleId: null,
     watchDialogOpen: false,
   }),
+  on: {
+    SetTimezone: {
+      update: 'root',
+      data: ({ root, event }) => ({
+        ...root,
+        pendingTimezone: event.timezone,
+        mutationSeq: root.mutationSeq + 1,
+        data: { ...root.data, timezone: event.timezone },
+      }),
+    },
+    SetCheckin: {
+      update: 'root',
+      data: ({ root, event }) => ({
+        ...root,
+        pendingCheckin: { kind: 'set', config: event.config },
+        mutationSeq: root.mutationSeq + 1,
+        data: { ...root.data, checkin: event.config },
+      }),
+    },
+    ClearCheckin: {
+      update: 'root',
+      data: ({ root }) => ({
+        ...root,
+        pendingCheckin: { kind: 'clear' },
+        mutationSeq: root.mutationSeq + 1,
+        data: { ...root.data, checkin: null, nextCheckin: null },
+      }),
+    },
+  },
   states: {
     Range: {
       initial: {
@@ -419,6 +484,29 @@ export const SchedulesMachine = Machine.make({
       initial: { target: 'Mutation.Idle', data: noErrors },
       states: {
         Idle: {
+          always: {
+            guard: ({ root }) => root.pendingTimezone !== null || root.pendingCheckin !== null,
+            target: 'Mutation.Flushing',
+            update: 'root',
+            data: ({ root }) => {
+              if (root.pendingTimezone !== null) {
+                const edit: PendingEdit = { kind: 'timezone', timezone: root.pendingTimezone }
+                return {
+                  target: { edit },
+                  update: { ...root, pendingTimezone: null, inFlightEdit: edit },
+                }
+              }
+              const pending = root.pendingCheckin
+              const edit: PendingEdit =
+                pending?.kind === 'set'
+                  ? { kind: 'setCheckin', config: pending.config }
+                  : { kind: 'clearCheckin' }
+              return {
+                target: { edit },
+                update: { ...root, pendingCheckin: null, inFlightEdit: edit },
+              }
+            },
+          },
           on: {
             OpenScheduleDialog: {
               target: 'Mutation.Idle',
@@ -464,10 +552,6 @@ export const SchedulesMachine = Machine.make({
                 update: { ...root, watchDialogOpen: false },
               }),
             },
-            SetTimezone: {
-              target: 'Mutation.SettingTimezone',
-              data: ({ event }) => ({ timezone: event.timezone }),
-            },
             AddSchedule: {
               target: 'Mutation.AddingJob',
               data: ({ event }) => ({
@@ -481,13 +565,6 @@ export const SchedulesMachine = Machine.make({
               target: 'Mutation.RemovingJob',
               data: ({ event }) => ({ id: event.id }),
             },
-            SetCheckin: {
-              target: 'Mutation.SettingCheckin',
-              data: ({ event }) => ({ config: event.config }),
-            },
-            ClearCheckin: {
-              target: 'Mutation.ClearingCheckin',
-            },
             AddWatch: {
               target: 'Mutation.AddingWatch',
               data: ({ event }) => ({ text: event.text, until: event.until }),
@@ -498,17 +575,33 @@ export const SchedulesMachine = Machine.make({
             },
           },
         },
-        SettingTimezone: {
+        Flushing: {
           invoke: {
-            src: 'setTimezone',
-            input: ({ state }) => state.timezone,
+            src: 'flushPendingEdit',
+            input: ({ state }) => state.edit,
             onDone: {
               target: 'Mutation.Idle',
               update: 'root',
-              data: ({ root, output }) => ({
-                target: noErrors,
-                update: output === null ? root : applyScheduleState(root, output, true),
-              }),
+              data: ({ root, state, output }) => {
+                const cleared = { ...root, inFlightEdit: null }
+                if (output !== null) {
+                  return { target: noErrors, update: applyScheduleState(cleared, output, true) }
+                }
+                const rolledBack =
+                  state.edit.kind === 'timezone'
+                    ? {
+                        ...cleared.data,
+                        timezone: cleared.pendingTimezone ?? cleared.serverData.timezone,
+                      }
+                    : cleared.pendingCheckin !== null
+                      ? cleared.data
+                      : {
+                          ...cleared.data,
+                          checkin: cleared.serverData.checkin,
+                          nextCheckin: cleared.serverData.nextCheckin,
+                        }
+                return { target: noErrors, update: { ...cleared, data: rolledBack } }
+              },
             },
           },
         },
@@ -558,41 +651,6 @@ export const SchedulesMachine = Machine.make({
             onFailure: {
               target: 'Mutation.Idle',
               data: ({ error }) => ({ ...noErrors, jobError: error.message }),
-            },
-          },
-        },
-        SettingCheckin: {
-          invoke: {
-            src: 'setCheckin',
-            input: ({ state }) => state.config,
-            onDone: {
-              target: 'Mutation.Idle',
-              update: 'root',
-              data: ({ root, output }) => ({
-                target: noErrors,
-                update: applyScheduleState(root, output, true),
-              }),
-            },
-            onFailure: {
-              target: 'Mutation.Idle',
-              data: ({ error }) => ({ ...noErrors, checkinError: error.message }),
-            },
-          },
-        },
-        ClearingCheckin: {
-          invoke: {
-            src: 'clearCheckin',
-            onDone: {
-              target: 'Mutation.Idle',
-              update: 'root',
-              data: ({ root, output }) => ({
-                target: noErrors,
-                update: applyScheduleState(root, output, true),
-              }),
-            },
-            onFailure: {
-              target: 'Mutation.Idle',
-              data: ({ error }) => ({ ...noErrors, checkinError: error.message }),
             },
           },
         },
