@@ -59,7 +59,7 @@ fn decrypt(cipher: &XChaCha20Poly1305, value: &[u8]) -> Result<Vec<u8>, StoreErr
         .map_err(|_| StoreError::Backend("failed to decrypt a stored secret".into()))
 }
 
-fn seal_with(cipher: &XChaCha20Poly1305, plaintext: &str) -> Result<String, StoreError> {
+pub(super) fn seal_with(cipher: &XChaCha20Poly1305, plaintext: &str) -> Result<String, StoreError> {
     Ok(format!(
         "{PREFIX}{}",
         BASE64.encode(encrypt(cipher, plaintext.as_bytes())?)

@@ -9,7 +9,7 @@ const Draft = Schema.Struct({
   id: Schema.String,
   api: ProviderApi,
   baseUrl: Schema.String,
-  keyEnv: Schema.String,
+  apiKey: Schema.NullOr(Schema.String),
 })
 type Draft = typeof Draft.Type
 
@@ -34,6 +34,14 @@ const addProvider = Effect.fn('Providers.add')(function* (draft: Draft) {
   return yield* api.request('providers.add', draft)
 })
 
+const setProviderKey = Effect.fn('Providers.setKey')(function* (input: {
+  readonly id: string
+  readonly apiKey: string | null
+}) {
+  const api = yield* Api
+  return yield* api.request('providers.setKey', input)
+})
+
 export const ProvidersInput = Schema.Struct({ providers: Schema.Array(Provider) })
 export type ProvidersInput = typeof ProvidersInput.Type
 
@@ -43,16 +51,11 @@ export const ProvidersStates = Machine.state({
   type: 'parallel',
   fields: { providers: Schema.Array(Provider), refreshingId: Schema.NullOr(Schema.String) },
   states: {
-    Refresh: {
+    Action: {
       states: {
         Idle: {},
-        Working: { fields: { id: Schema.String } },
-      },
-    },
-    Remove: {
-      states: {
-        Idle: {},
-        Working: { fields: { id: Schema.String } },
+        Refreshing: { fields: { id: Schema.String } },
+        Removing: { fields: { id: Schema.String } },
       },
     },
     Add: {
@@ -60,6 +63,13 @@ export const ProvidersStates = Machine.state({
         Closed: {},
         Editing: { fields: { error: ErrorMessage } },
         Submitting: { fields: { draft: Draft } },
+      },
+    },
+    KeyDialog: {
+      states: {
+        Closed: {},
+        Editing: { fields: { id: Schema.String, error: ErrorMessage } },
+        Submitting: { fields: { id: Schema.String, apiKey: Schema.NullOr(Schema.String) } },
       },
     },
   },
@@ -73,43 +83,51 @@ export const ProvidersEvents = Machine.events({
     id: Schema.String,
     api: ProviderApi,
     baseUrl: Schema.String,
-    keyEnv: Schema.String,
+    apiKey: Schema.NullOr(Schema.String),
   },
+  OpenKeyDialog: { id: Schema.String },
+  CloseKeyDialog: {},
+  ClearKeyError: {},
+  SubmitKey: { id: Schema.String, apiKey: Schema.NullOr(Schema.String) },
   RefreshProvider: { id: Schema.String },
   RemoveProvider: { id: Schema.String },
 })
 
-/** The Providers page: the provider list plus refresh, remove and add workflows. */
+/** The Providers page: the provider list plus refresh, key rotation, remove and add workflows. */
 export const ProvidersMachine = Machine.make({
   id: 'Providers',
   root: ProvidersStates,
   events: ProvidersEvents,
   input: ProvidersInput,
-  effects: { refreshProvider, removeProvider, addProvider },
+  effects: { refreshProvider, removeProvider, addProvider, setProviderKey },
 }).handle({
   root: ({ input }) => ({ providers: input.providers, refreshingId: null }),
   states: {
-    Refresh: {
-      initial: { target: 'Refresh.Idle' },
+    Action: {
+      initial: { target: 'Action.Idle' },
       states: {
         Idle: {
           on: {
             RefreshProvider: {
-              target: 'Refresh.Working',
+              target: 'Action.Refreshing',
               update: 'root',
               data: ({ event, root }) => ({
                 target: { id: event.id },
                 update: { ...root, refreshingId: event.id },
               }),
             },
+            RemoveProvider: {
+              target: 'Action.Removing',
+              data: ({ event }) => ({ id: event.id }),
+            },
           },
         },
-        Working: {
+        Refreshing: {
           invoke: {
             src: 'refreshProvider',
             input: ({ state }) => state.id,
             onDone: {
-              target: 'Refresh.Idle',
+              target: 'Action.Idle',
               update: 'root',
               data: ({ root, output }) => ({
                 target: undefined,
@@ -118,25 +136,12 @@ export const ProvidersMachine = Machine.make({
             },
           },
         },
-      },
-    },
-    Remove: {
-      initial: { target: 'Remove.Idle' },
-      states: {
-        Idle: {
-          on: {
-            RemoveProvider: {
-              target: 'Remove.Working',
-              data: ({ event }) => ({ id: event.id }),
-            },
-          },
-        },
-        Working: {
+        Removing: {
           invoke: {
             src: 'removeProvider',
             input: ({ state }) => state.id,
             onDone: {
-              target: 'Remove.Idle',
+              target: 'Action.Idle',
               update: 'root',
               data: ({ root, output }) => ({
                 target: undefined,
@@ -166,7 +171,7 @@ export const ProvidersMachine = Machine.make({
                   id: event.id,
                   api: event.api,
                   baseUrl: event.baseUrl,
-                  keyEnv: event.keyEnv,
+                  apiKey: event.apiKey,
                 },
               }),
             },
@@ -187,6 +192,50 @@ export const ProvidersMachine = Machine.make({
             onFailure: {
               target: 'Add.Editing',
               data: ({ error }) => ({ error: error.message }),
+            },
+          },
+        },
+      },
+    },
+    KeyDialog: {
+      initial: { target: 'KeyDialog.Closed' },
+      states: {
+        Closed: {
+          on: {
+            OpenKeyDialog: {
+              target: 'KeyDialog.Editing',
+              data: ({ event }) => ({ id: event.id, error: null }),
+            },
+          },
+        },
+        Editing: {
+          on: {
+            CloseKeyDialog: { target: 'KeyDialog.Closed' },
+            ClearKeyError: {
+              update: 'KeyDialog.Editing',
+              data: ({ state }) => ({ id: state.id, error: null }),
+            },
+            SubmitKey: {
+              target: 'KeyDialog.Submitting',
+              data: ({ event }) => ({ id: event.id, apiKey: event.apiKey }),
+            },
+          },
+        },
+        Submitting: {
+          invoke: {
+            src: 'setProviderKey',
+            input: ({ state }) => ({ id: state.id, apiKey: state.apiKey }),
+            onDone: {
+              target: 'KeyDialog.Closed',
+              update: 'root',
+              data: ({ root, output }) => ({
+                target: undefined,
+                update: { ...root, providers: output },
+              }),
+            },
+            onFailure: {
+              target: 'KeyDialog.Editing',
+              data: ({ state, error }) => ({ id: state.id, error: error.message }),
             },
           },
         },

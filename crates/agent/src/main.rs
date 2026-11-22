@@ -479,19 +479,32 @@ enum McpCommand {
 
 #[derive(Subcommand)]
 enum ProviderCommand {
+    /// Add a provider. Reads the API key from stdin unless `--no-key` is passed.
     Add {
         id: String,
         #[arg(long)]
         api: Api,
         #[arg(long)]
         base_url: String,
+        /// Save the provider without an API key (for local endpoints).
         #[arg(long)]
-        key_env: String,
+        no_key: bool,
+    },
+    Key {
+        #[command(subcommand)]
+        command: ProviderKeyCommand,
     },
     List,
     Remove {
         id: String,
     },
+}
+
+#[derive(Subcommand)]
+enum ProviderKeyCommand {
+    /// Reads the provider API key from stdin, never from argv.
+    Set { id: String },
+    Clear { id: String },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -850,7 +863,7 @@ fn provider(store: &SqliteStorage, command: ProviderCommand) -> Result<()> {
             id,
             api,
             base_url,
-            key_env,
+            no_key,
         } => {
             if id.is_empty() || id.contains('/') {
                 return Err(format!(
@@ -858,26 +871,60 @@ fn provider(store: &SqliteStorage, command: ProviderCommand) -> Result<()> {
                 )
                 .into());
             }
-            store.save_provider(Provider {
-                id: ProviderId(id),
-                api: match api {
-                    Api::Responses => ProviderApi::OpenAiResponses,
-                    Api::Completions => ProviderApi::OpenAiCompletions,
+            let api_key = if no_key {
+                None
+            } else {
+                store.require_key()?;
+                let mut key = String::new();
+                std::io::stdin().read_to_string(&mut key)?;
+                let key = key.trim().to_owned();
+                if key.is_empty() {
+                    return Err(
+                        "provider API key is empty; pipe it on stdin or pass --no-key".into(),
+                    );
+                }
+                Some(key)
+            };
+            store.save_provider(
+                Provider {
+                    id: ProviderId(id),
+                    api: match api {
+                        Api::Responses => ProviderApi::OpenAiResponses,
+                        Api::Completions => ProviderApi::OpenAiCompletions,
+                    },
+                    base_url,
+                    has_api_key: api_key.is_some(),
                 },
-                base_url,
-                api_key_env: key_env,
-            })?
+                api_key.as_deref(),
+            )?
         }
+        ProviderCommand::Key { command } => match command {
+            ProviderKeyCommand::Set { id } => {
+                store.require_key()?;
+                let mut key = String::new();
+                std::io::stdin().read_to_string(&mut key)?;
+                let key = key.trim().to_owned();
+                if key.is_empty() {
+                    return Err("provider API key is empty".into());
+                }
+                store.set_provider_api_key(&ProviderId(id), Some(&key))?;
+            }
+            ProviderKeyCommand::Clear { id } => {
+                store.set_provider_api_key(&ProviderId(id), None)?;
+            }
+        },
         ProviderCommand::List => {
             for provider in store.providers()? {
                 let api = match provider.api {
                     ProviderApi::OpenAiResponses => "responses",
                     ProviderApi::OpenAiCompletions => "completions",
                 };
-                println!(
-                    "{}\t{api}\t{}\t${}",
-                    provider.id.0, provider.base_url, provider.api_key_env
-                );
+                let key_status = if provider.has_api_key {
+                    "key set"
+                } else {
+                    "no key"
+                };
+                println!("{}\t{api}\t{}\t{key_status}", provider.id.0, provider.base_url);
             }
         }
         ProviderCommand::Remove { id } => store.remove_provider(&ProviderId(id))?,
@@ -984,7 +1031,7 @@ async fn models(store: &SqliteStorage, command: ModelsCommand) -> Result<()> {
 }
 
 async fn refresh_provider(store: &SqliteStorage, provider: &Provider) -> Result<usize> {
-    let key = api_key(provider)?;
+    let key = api_key(store, provider)?;
     let models = llm_rig::discover(provider, &key).await?;
     let count = models.len();
     store.replace_models(&provider.id, models)?;
@@ -1359,9 +1406,8 @@ impl MessengerTokenCommand {
     }
 }
 
-fn api_key(provider: &Provider) -> Result<String> {
-    std::env::var(&provider.api_key_env)
-        .map_err(|_| format!("{} is not set", provider.api_key_env).into())
+fn api_key(store: &SqliteStorage, provider: &Provider) -> Result<String> {
+    Ok(store.provider_api_key(&provider.id)?.unwrap_or_default())
 }
 
 fn default_data_dir() -> Result<PathBuf> {

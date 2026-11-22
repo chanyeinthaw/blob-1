@@ -45,7 +45,7 @@ export const Provider = Schema.Struct({
   id: Schema.String,
   api: ProviderApi,
   baseUrl: Schema.String,
-  keyEnv: Schema.String,
+  apiKey: Schema.Literals(['set', 'missing']),
   modelCount: Schema.Finite,
 })
 export type Provider = typeof Provider.Type
@@ -293,7 +293,14 @@ export const requests = {
       id: Schema.String,
       api: ProviderApi,
       baseUrl: Schema.String,
-      keyEnv: Schema.String,
+      apiKey: Schema.NullOr(Schema.String),
+    }),
+    reply: Schema.Array(Provider),
+  },
+  'providers.setKey': {
+    payload: Schema.Struct({
+      id: Schema.String,
+      apiKey: Schema.NullOr(Schema.String),
     }),
     reply: Schema.Array(Provider),
   },

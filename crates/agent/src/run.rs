@@ -48,8 +48,8 @@ impl ModelFactory {
         }
     }
 
-    /// Covers every input `resolve` reads, so a change to any of them
-    /// re-resolves. Env vars referenced by key_env are fixed at process start.
+    /// Covers every input `resolve` reads, including a non-secret fingerprint of
+    /// each provider's stored API key ciphertext, so key rotation invalidates cached clients.
     fn fingerprint(&self) -> std::result::Result<u64, harness::HarnessError> {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -57,6 +57,9 @@ impl ModelFactory {
         self.store.utility_model()?.hash(&mut hasher);
         for provider in self.store.providers()? {
             provider.hash(&mut hasher);
+            self.store
+                .provider_key_fingerprint(&provider.id)?
+                .hash(&mut hasher);
             self.store.models(&provider.id)?.hash(&mut hasher);
         }
         Ok(hasher.finish())
@@ -169,12 +172,8 @@ impl harness::Models for ModelFactory {
                 if reasoning == main.selection.reasoning {
                     return Ok((Model::Main(main.llm), main.context, main.selection));
                 }
-                let key = api_key(&main.provider).map_err(|_| {
-                    harness::HarnessError::Compaction(format!(
-                        "API key for provider {} is not set",
-                        main.provider.id.0
-                    ))
-                })?;
+                let key = api_key(&self.store, &main.provider)
+                    .map_err(|error| harness::HarnessError::Compaction(error.to_string()))?;
                 return Ok((
                     Model::Main(llm_rig::connect(
                         &main.provider,
@@ -204,11 +203,8 @@ impl harness::Models for ModelFactory {
             .into_iter()
             .find(|m| m.id == model_id)
             .ok_or_else(unknown)?;
-        let key = api_key(&provider).map_err(|_| {
-            harness::HarnessError::Compaction(format!(
-                "API key for provider {provider_id} is not set"
-            ))
-        })?;
+        let key = api_key(&self.store, &provider)
+            .map_err(|error| harness::HarnessError::Compaction(error.to_string()))?;
         Ok((
             Model::Main(llm_rig::connect(&provider, &key, &model, reasoning)),
             model.effective_context(),
@@ -376,7 +372,7 @@ fn resolve_main(store: &SqliteStorage, settings: &storage::Settings) -> Resolve<
         return Err("no default model; run `agent model set <provider>/<model>`".into());
     };
     let (provider, model) = resolve_model(store, selected)?;
-    let key = api_key(&provider).map_err(|error| error.to_string())?;
+    let key = api_key(store, &provider).map_err(|error| error.to_string())?;
     Ok(Working {
         llm: llm_rig::connect(&provider, &key, &model, settings.reasoning),
         context: model.effective_context(),
@@ -401,7 +397,7 @@ fn resolve_summarizer(
         return Ok(None);
     };
     let (provider, stored) = resolve_model(store, selected)?;
-    let key = api_key(&provider).map_err(|error| error.to_string())?;
+    let key = api_key(store, &provider).map_err(|error| error.to_string())?;
     let llm = llm_rig::connect(
         &provider,
         &key,
@@ -429,7 +425,7 @@ fn resolve_compactor(store: &SqliteStorage, settings: &storage::Settings) -> Res
         return Err("no default model; run `agent model set <provider>/<model>`".into());
     };
     let (provider, stored) = resolve_model(store, selected)?;
-    let key = api_key(&provider).map_err(|error| error.to_string())?;
+    let key = api_key(store, &provider).map_err(|error| error.to_string())?;
     Ok(Model::Main(llm_rig::connect(
         &provider,
         &key,
@@ -465,7 +461,7 @@ fn resolve(store: &SqliteStorage, cached: Option<&Working>) -> Attempt {
             return Ok(None);
         };
         let (provider, model) = resolve_model(store, &selected)?;
-        let key = api_key(&provider).map_err(|error| error.to_string())?;
+        let key = api_key(store, &provider).map_err(|error| error.to_string())?;
         Ok(Some(llm_rig::connect(
             &provider,
             &key,

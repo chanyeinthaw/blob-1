@@ -8,7 +8,7 @@ use rig_core::{
     message::{CallId, ToolCall, ToolFunction, ToolName, ToolResultContent, UserContent},
     operation::Completion,
     providers::{
-        openai::{OpenAI, OpenAIConfig},
+        openai::{wire::Auth, OpenAI, OpenAIConfig},
         registry::ProviderId,
     },
     DynModel,
@@ -172,7 +172,16 @@ pub async fn discover(
     let listed = client(provider, api_key)
         .list_models()
         .await
-        .map_err(request_error)?;
+        .map_err(|error| {
+            // Omit upstream response bodies so an echoed/rejected API key is never exposed.
+            if let Some(status) = error.provider_response_status() {
+                let code = status.as_u16();
+                let reason = status.canonical_reason().unwrap_or("request failed");
+                LlmError::Request(format!("provider returned HTTP {code} ({reason})"))
+            } else {
+                LlmError::Request("failed to reach provider".into())
+            }
+        })?;
     let mut models: Vec<DiscoveredModel> = listed
         .data
         .into_iter()
@@ -187,6 +196,7 @@ pub async fn discover(
 
 fn client(provider: &Provider, api_key: &str) -> OpenAI {
     OpenAIConfig::new(api_key)
+        .with_auth(Auth::OptionalBearer)
         .with_base_url(&provider.base_url)
         .client()
 }

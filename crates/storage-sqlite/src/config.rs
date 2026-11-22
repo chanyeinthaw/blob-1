@@ -91,7 +91,7 @@ impl ConfigStore for SqliteStorage {
     fn providers(&self) -> Result<Vec<Provider>, StoreError> {
         let connection = self.lock();
         let mut statement = connection
-            .prepare("SELECT id, api, base_url, api_key_env FROM providers ORDER BY id")
+            .prepare("SELECT id, api, base_url, api_key IS NOT NULL FROM providers ORDER BY id")
             .map_err(backend)?;
         let providers = statement
             .query_map([], provider_from_row)
@@ -101,22 +101,83 @@ impl ConfigStore for SqliteStorage {
         Ok(providers)
     }
 
-    fn save_provider(&self, provider: Provider) -> Result<(), StoreError> {
+    fn save_provider(&self, provider: Provider, api_key: Option<&str>) -> Result<(), StoreError> {
+        let sealed = match api_key.map(str::trim).filter(|k| !k.is_empty()) {
+            Some(key) => Some(self.seal(key)?),
+            None => None,
+        };
         self.lock()
             .execute(
-                "INSERT INTO providers (id, api, base_url, api_key_env) VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO providers (id, api, base_url, api_key) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT (id) DO UPDATE SET
                      api = excluded.api,
                      base_url = excluded.base_url,
-                     api_key_env = excluded.api_key_env",
+                     api_key = excluded.api_key",
                 params![
                     provider.id.0,
                     api_name(provider.api),
                     provider.base_url,
-                    provider.api_key_env
+                    sealed
                 ],
             )
             .map_err(backend)?;
+        Ok(())
+    }
+
+    fn provider_api_key(&self, id: &ProviderId) -> Result<Option<String>, StoreError> {
+        let stored: Option<String> = self
+            .lock()
+            .query_row(
+                "SELECT api_key FROM providers WHERE id = ?1",
+                [&id.0],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?
+            .flatten();
+        stored.map(|value| self.unseal(&value)).transpose()
+    }
+
+    fn provider_key_fingerprint(&self, id: &ProviderId) -> Result<Option<u64>, StoreError> {
+        use std::hash::{Hash, Hasher};
+        let stored: Option<String> = self
+            .lock()
+            .query_row(
+                "SELECT api_key FROM providers WHERE id = ?1",
+                [&id.0],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?
+            .flatten();
+        Ok(stored.map(|ciphertext| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            ciphertext.hash(&mut hasher);
+            hasher.finish()
+        }))
+    }
+
+    fn set_provider_api_key(
+        &self,
+        id: &ProviderId,
+        api_key: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let sealed = match api_key.map(str::trim).filter(|k| !k.is_empty()) {
+            Some(key) => Some(self.seal(key)?),
+            None => None,
+        };
+        let changed = self
+            .lock()
+            .execute(
+                "UPDATE providers SET api_key = ?2 WHERE id = ?1",
+                params![id.0, sealed],
+            )
+            .map_err(backend)?;
+        if changed == 0 {
+            return Err(StoreError::Backend(
+                format!("unknown provider: {}", id.0).into(),
+            ));
+        }
         Ok(())
     }
 
@@ -430,7 +491,7 @@ fn provider_from_row(row: &Row) -> rusqlite::Result<Provider> {
             }
         },
         base_url: row.get(2)?,
-        api_key_env: row.get(3)?,
+        has_api_key: row.get(3)?,
     })
 }
 

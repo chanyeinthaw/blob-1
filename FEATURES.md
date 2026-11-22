@@ -77,7 +77,7 @@ Background workers spawned by the chat.
 - Compaction model: `agent model compaction <provider>/<model> [--reasoning]`
 - Utility model: `agent model utility <provider>/<model> [--reasoning] | off`
 - Per model: `agent model map`, `agent model context`, `agent model input <provider/model|provider> <text|image>`
-- Providers: `agent provider add | list | remove`, `agent models refresh | list`
+- Providers: `agent provider add [--no-key] | key set | key clear | list | remove`, `agent models refresh | list`
 - Tables: `providers`, `models`, `model_reasoning`, `model_images`, `settings`, `utility_model`
 
 ## Utility model
@@ -152,7 +152,7 @@ Blob-1 is an MCP client: chat and background tasks can call tools, read resource
 - Code: `crates/storage-sqlite/src/crypto.rs`; `SqliteStorage::open`/`open_shared` take `Option<AppKey>`
 - `BLOB_1_APP_KEY` is any non-empty passphrase; `serve` requires it. Argon2id derives the 256-bit key once per open over a random 16-byte salt stored in `app_key (id=1)`, whose `canary` decrypts to a fixed value — a wrong key fails with `BLOB_1_APP_KEY does not match this database`. Secret reads and writes without a key fail with `set BLOB_1_APP_KEY`
 - Values are XChaCha20-Poly1305 with a random 24-byte nonce, stored as `enc:v1:<base64(nonce‖ciphertext)>`; encryption stays inside the storage layer so callers keep plain types. Plaintext rows seal idempotently on the first keyed open; key rotation is not supported yet
-- Encrypted columns: `mcp_servers.env`, `mcp_servers.headers`, `mcp_tokens.credentials`, `mcp_tokens.registration`, `mcp_oauth_states.state`, `messenger_tokens.token` (empty JSON maps stay plaintext). Web password/session hashes and provider `api_key_env` names are not encrypted
+- Encrypted columns: `providers.api_key`, `mcp_servers.env`, `mcp_servers.headers`, `mcp_tokens.credentials`, `mcp_tokens.registration`, `mcp_oauth_states.state`, `messenger_tokens.token` (empty JSON maps stay plaintext). Web password/session hashes are not encrypted
 - Tables: `app_key`, `secret_scrub` (set while freed plaintext may still sit in the WAL; every keyed open retries a truncating checkpoint until it succeeds)
 
 ## Releases and self-update

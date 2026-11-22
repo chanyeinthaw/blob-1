@@ -416,7 +416,16 @@ fn providers_reply(store: &SqliteStorage) -> crate::Result<Value> {
     let mut result = Vec::new();
     for p in store.providers()? {
         let count = store.models(&p.id)?.len();
-        result.push(json!({"id":p.id.0,"api":match p.api { storage::ProviderApi::OpenAiResponses => "responses", storage::ProviderApi::OpenAiCompletions => "completions" },"baseUrl":p.base_url,"keyEnv":p.api_key_env,"modelCount":count}));
+        result.push(json!({
+            "id": p.id.0,
+            "api": match p.api {
+                storage::ProviderApi::OpenAiResponses => "responses",
+                storage::ProviderApi::OpenAiCompletions => "completions",
+            },
+            "baseUrl": p.base_url,
+            "apiKey": if p.has_api_key { "set" } else { "missing" },
+            "modelCount": count,
+        }));
     }
     Ok(json!(result))
 }
@@ -704,30 +713,61 @@ async fn dispatch(
             }
             "providers.list" => providers_reply(store),
             "providers.add" => {
-                let id = get("id")?;
-                let base_url = get("baseUrl")?;
-                let key_env = get("keyEnv")?;
+                let id = get("id")?.trim();
+                let base_url = get("baseUrl")?.trim();
+                let api_key = match payload.get("apiKey") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(s)) => {
+                        let trimmed = s.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed)
+                        }
+                    }
+                    Some(_) => return Err(invalid().into()),
+                };
                 let api = match get("api")? {
-                    "responses" => crate::Api::Responses,
-                    "completions" => crate::Api::Completions,
+                    "responses" => storage::ProviderApi::OpenAiResponses,
+                    "completions" => storage::ProviderApi::OpenAiCompletions,
                     _ => return Err(invalid().into()),
                 };
-                if [id, base_url, key_env].iter().any(|s| s.trim().is_empty()) {
-                    return Err("All fields are required".into());
+                if id.is_empty() || base_url.is_empty() {
+                    return Err("ID and base URL are required".into());
+                }
+                if id.contains('/') {
+                    return Err("Provider ID cannot contain '/'".into());
                 }
                 if store.providers()?.iter().any(|p| p.id.0 == id) {
                     return Err(format!("Provider {id} already exists").into());
                 }
                 url::Url::parse(base_url).map_err(|_| "Base URL is not a valid URL")?;
-                crate::provider(
-                    store,
-                    crate::ProviderCommand::Add {
-                        id: id.into(),
+                store.save_provider(
+                    storage::Provider {
+                        id: storage::ProviderId(id.into()),
                         api,
                         base_url: base_url.into(),
-                        key_env: key_env.into(),
+                        has_api_key: api_key.is_some(),
                     },
+                    api_key,
                 )?;
+                providers_reply(store)
+            }
+            "providers.setKey" => {
+                let id = get("id")?;
+                let api_key = match payload.get("apiKey") {
+                    Some(Value::Null) => None,
+                    Some(Value::String(s)) => {
+                        let trimmed = s.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed)
+                        }
+                    }
+                    _ => return Err(invalid().into()),
+                };
+                store.set_provider_api_key(&storage::ProviderId(id.into()), api_key)?;
                 providers_reply(store)
             }
             "providers.remove" | "providers.refresh" => {

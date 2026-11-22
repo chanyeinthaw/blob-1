@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS providers (
     id TEXT PRIMARY KEY,
     api TEXT NOT NULL CHECK (api IN ('openai-responses', 'openai-completions')),
     base_url TEXT NOT NULL,
-    api_key_env TEXT NOT NULL
+    api_key TEXT
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS models (
@@ -297,6 +297,7 @@ impl SqliteStorage {
             Some(app_key) => Some(crypto::setup(&connection, &app_key)?),
             None => None,
         };
+        ensure_providers_api_key(&mut connection, key.as_ref(), has_exclusive)?;
         if let Some(cipher) = &key {
             crypto::migrate(&connection, cipher)?;
         }
@@ -551,4 +552,227 @@ fn ensure_access_entries(
     .map_err(backend)?;
     tx.commit().map_err(backend)?;
     Ok(())
+}
+
+/// One-time migration from `providers.api_key_env` to encrypted `providers.api_key`.
+/// Runs only on an exclusive open (`serve` / `chat`, where the runtime environment
+/// holds the legacy env vars) so a read-only CLI command cannot drop `api_key_env`
+/// references before the server migrates them. Keeps all foreign keys (`models`,
+/// `settings`, `utility_model`) untouched via `ALTER TABLE ... ADD/DROP COLUMN`.
+fn ensure_providers_api_key(
+    connection: &mut Connection,
+    cipher: Option<&XChaCha20Poly1305>,
+    has_exclusive: bool,
+) -> Result<(), StoreError> {
+    ensure_providers_api_key_with_env(connection, cipher, has_exclusive, |name| {
+        std::env::var(name).ok()
+    })
+}
+
+fn ensure_providers_api_key_with_env(
+    connection: &mut Connection,
+    cipher: Option<&XChaCha20Poly1305>,
+    has_exclusive: bool,
+    mut lookup_env: impl FnMut(&str) -> Option<String>,
+) -> Result<(), StoreError> {
+    let has_column = |conn: &Connection, name: &str| -> Result<bool, StoreError> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('providers') WHERE name = ?1)",
+            [name],
+            |row| row.get(0),
+        )
+        .map_err(backend)
+    };
+    if !has_column(connection, "api_key_env")? {
+        return Ok(());
+    }
+    if !has_exclusive {
+        return Err(StoreError::Backend(
+            "this database needs an upgrade: run blob-1 serve once with BLOB_1_APP_KEY and legacy provider env vars set"
+                .into(),
+        ));
+    }
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    if !has_column(&tx, "api_key_env")? {
+        tx.commit().map_err(backend)?;
+        return Ok(());
+    }
+    let existing: Vec<(String, String)> = {
+        let mut stmt = tx
+            .prepare("SELECT id, api_key_env FROM providers")
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(backend)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(backend)?
+    };
+    let mut sealed_rows: Vec<(String, String)> = Vec::new();
+    for (id, env_name) in existing {
+        if env_name.is_empty() {
+            continue;
+        }
+        let raw = lookup_env(&env_name)
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                StoreError::Backend(
+                    format!(
+                        "cannot migrate provider '{id}': environment variable {env_name} is not set"
+                    )
+                    .into(),
+                )
+            })?;
+        let cipher = cipher.ok_or_else(|| {
+            StoreError::Backend("set BLOB_1_APP_KEY to migrate provider API keys".into())
+        })?;
+        sealed_rows.push((id, crypto::seal_with(cipher, &raw)?));
+    }
+    if !has_column(&tx, "api_key")? {
+        tx.execute_batch("ALTER TABLE providers ADD COLUMN api_key TEXT;")
+            .map_err(backend)?;
+    }
+    for (id, sealed) in &sealed_rows {
+        tx.execute(
+            "UPDATE providers SET api_key = ?2 WHERE id = ?1",
+            rusqlite::params![id, sealed],
+        )
+        .map_err(backend)?;
+    }
+    tx.execute_batch("ALTER TABLE providers DROP COLUMN api_key_env;")
+        .map_err(backend)?;
+    tx.commit().map_err(backend)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod provider_key_tests {
+    use super::*;
+    use storage::{ConfigStore, Provider, ProviderApi, ProviderId};
+
+    fn temp_db(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "blob-1-provider-key-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("agent.db")
+    }
+
+    #[test]
+    fn provider_api_key_is_encrypted_at_rest_and_fingerprint_changes_on_rotation() {
+        let path = temp_db("enc");
+        let store = SqliteStorage::open(&path, Some(AppKey::new("test-key".into()))).unwrap();
+        let id = ProviderId("openai".into());
+        store
+            .save_provider(
+                Provider {
+                    id: id.clone(),
+                    api: ProviderApi::OpenAiResponses,
+                    base_url: "https://api.openai.com/v1".into(),
+                    has_api_key: true,
+                },
+                Some("sk-secret-123"),
+            )
+            .unwrap();
+        let raw: Option<String> = store
+            .lock()
+            .query_row("SELECT api_key FROM providers WHERE id = 'openai'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let raw = raw.expect("api_key stored");
+        assert!(raw.starts_with("enc:v1:"));
+        assert!(!raw.contains("sk-secret-123"));
+
+        let fp1 = store.provider_key_fingerprint(&id).unwrap();
+        assert!(fp1.is_some());
+        assert_eq!(
+            store.provider_api_key(&id).unwrap().as_deref(),
+            Some("sk-secret-123")
+        );
+        assert!(store.providers().unwrap()[0].has_api_key);
+
+        store.set_provider_api_key(&id, Some("sk-rotated")).unwrap();
+        let fp2 = store.provider_key_fingerprint(&id).unwrap();
+        assert_ne!(fp1, fp2);
+        assert_eq!(
+            store.provider_api_key(&id).unwrap().as_deref(),
+            Some("sk-rotated")
+        );
+
+        store.set_provider_api_key(&id, None).unwrap();
+        assert_eq!(store.provider_key_fingerprint(&id).unwrap(), None);
+        assert_eq!(store.provider_api_key(&id).unwrap(), None);
+        assert!(!store.providers().unwrap()[0].has_api_key);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn migrates_legacy_api_key_env_only_on_exclusive_open_and_preserves_models_fk() {
+        let path = temp_db("legacy");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE providers (
+                     id TEXT PRIMARY KEY,
+                     api TEXT NOT NULL CHECK (api IN ('openai-responses', 'openai-completions')),
+                     base_url TEXT NOT NULL,
+                     api_key_env TEXT NOT NULL
+                 ) STRICT;
+                 CREATE TABLE models (
+                     provider TEXT NOT NULL REFERENCES providers (id) ON DELETE CASCADE,
+                     id TEXT NOT NULL,
+                     context_window INTEGER,
+                     context_limit INTEGER CHECK (context_limit > 0),
+                     PRIMARY KEY (provider, id)
+                 ) STRICT;
+                 INSERT INTO providers VALUES ('cpa1', 'openai-responses', 'http://127.0.0.1:8320/v1', 'TEST_LEGACY_PROVIDER_KEY');
+                 INSERT INTO models VALUES ('cpa1', 'gpt-6-luna', 1000000, NULL);",
+            )
+            .unwrap();
+        }
+        // Shared open refuses to drop `api_key_env` without running exclusive serve first.
+        let shared_err = SqliteStorage::open_shared(&path, Some(AppKey::new("test-key".into())));
+        assert!(shared_err.is_err());
+
+        // Exclusive migration aborts cleanly if a legacy env var is missing, leaving api_key_env intact.
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            let cipher = crypto::setup(&conn, &AppKey::new("test-key".into())).unwrap();
+            let missing_err =
+                ensure_providers_api_key_with_env(&mut conn, Some(&cipher), true, |_| None)
+                    .unwrap_err()
+                    .to_string();
+            assert!(missing_err.contains("cpa1"));
+            assert!(missing_err.contains("TEST_LEGACY_PROVIDER_KEY"));
+            // Exclusive migration seals the injected env lookup without mutating process env.
+            ensure_providers_api_key_with_env(&mut conn, Some(&cipher), true, |name| {
+                (name == "TEST_LEGACY_PROVIDER_KEY").then(|| "sk-from-legacy-env".into())
+            })
+            .unwrap();
+        }
+
+        let store = SqliteStorage::open(&path, Some(AppKey::new("test-key".into()))).unwrap();
+        let providers = store.providers().unwrap();
+        assert_eq!(providers.len(), 1);
+        assert!(providers[0].has_api_key);
+        assert_eq!(
+            store
+                .provider_api_key(&ProviderId("cpa1".into()))
+                .unwrap()
+                .as_deref(),
+            Some("sk-from-legacy-env")
+        );
+        let models = store.models(&ProviderId("cpa1".into())).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gpt-6-luna");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 }

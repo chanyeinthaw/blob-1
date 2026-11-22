@@ -8,12 +8,19 @@ import {
 } from '@typeonce/effect-machine-react'
 import { Option } from 'effect'
 import { AsyncResult } from 'effect/reactivity'
-import { KeyRound, Link2, Plus, RefreshCw, Server, Trash2 } from 'lucide-react'
+import { KeyRound, Link2, Pencil, Plus, RefreshCw, Server, Trash2 } from 'lucide-react'
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 
 import { ConfirmDialog } from '~/components/ConfirmDialog'
 import { EmptyLine, FieldError, FieldRow, Page, PageError, Section } from '~/components/layout/Page'
 import { Button } from '~/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '~/components/ui/dialog'
 import { Input } from '~/components/ui/input'
 import {
   Select,
@@ -101,6 +108,7 @@ function ProvidersContent() {
         {() => null}
       </MachineState>
       <ProvidersList />
+      <EditKeyDialogHost />
     </Page>
   )
 }
@@ -119,7 +127,11 @@ function ProvidersList() {
                 key={provider.id}
                 provider={provider}
                 refreshingId={value.refreshingId}
-                removing={states.Remove.state.path === 'Remove.Working'}
+                busy={
+                  states.Action.state.path !== 'Action.Idle' ||
+                  states.KeyDialog.state.path === 'KeyDialog.Submitting' ||
+                  states.Add.state.path === 'Add.Submitting'
+                }
               />
             ))}
           </ul>
@@ -134,13 +146,20 @@ const modelCountLabel = (count: number): string => `${count} ${count === 1 ? 'mo
 interface DetailProps {
   readonly icon: ReactNode
   readonly text: string
+  readonly mono?: boolean
 }
 
 function Detail(props: DetailProps) {
   return (
     <span className="flex min-w-0 items-start gap-1.5">
       <span className="mt-0.5 shrink-0">{props.icon}</span>
-      <span className="min-w-0 break-words font-mono text-xs select-text [overflow-wrap:anywhere]">
+      <span
+        className={
+          props.mono === false
+            ? 'min-w-0 break-words text-xs [overflow-wrap:anywhere]'
+            : 'min-w-0 break-words font-mono text-xs select-text [overflow-wrap:anywhere]'
+        }
+      >
         {props.text}
       </span>
     </span>
@@ -150,13 +169,13 @@ function Detail(props: DetailProps) {
 interface ProviderRowProps {
   readonly provider: Provider
   readonly refreshingId: string | null
-  readonly removing: boolean
+  readonly busy: boolean
 }
 
 function ProviderRow(props: ProviderRowProps) {
   const machine = ProvidersOwner.useMachine()
   const send = useAtomSet(machine.send)
-  const { provider, refreshingId, removing } = props
+  const { provider, refreshingId, busy } = props
   const statusText =
     refreshingId === provider.id ? 'Refreshing…' : modelCountLabel(provider.modelCount)
   return (
@@ -178,7 +197,11 @@ function ProviderRow(props: ProviderRowProps) {
         </div>
         <div className="mt-1.5 flex min-w-0 flex-col gap-1 text-muted-foreground sm:mt-1 sm:flex-row sm:items-center sm:gap-4">
           <Detail icon={<Link2 className="size-3.5" />} text={provider.baseUrl} />
-          <Detail icon={<KeyRound className="size-3.5" />} text={provider.keyEnv} />
+          <Detail
+            icon={<KeyRound className="size-3.5" />}
+            text={provider.apiKey === 'set' ? 'API key set' : 'No API key'}
+            mono={false}
+          />
         </div>
       </div>
       <div className="flex shrink-0 items-center justify-between gap-3 sm:justify-end sm:gap-4">
@@ -190,10 +213,26 @@ function ProviderRow(props: ProviderRowProps) {
             <TooltipTrigger
               render={
                 <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label={`Update API key for ${provider.id}`}
+                  disabled={busy}
+                  onClick={() => send(ProvidersEvents.OpenKeyDialog({ id: provider.id }))}
+                >
+                  <Pencil />
+                </Button>
+              }
+            />
+            <TooltipContent>Update API key</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
                   variant="outline"
                   size="icon"
                   aria-label={`Refresh ${provider.id} models`}
-                  disabled={refreshingId !== null}
+                  disabled={busy}
                   onClick={() => send(ProvidersEvents.RefreshProvider({ id: provider.id }))}
                 >
                   <RefreshCw />
@@ -210,7 +249,7 @@ function ProviderRow(props: ProviderRowProps) {
                 size="icon"
                 aria-label={`Remove ${provider.id}`}
                 className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-                disabled={removing}
+                disabled={busy}
               >
                 <Trash2 />
               </Button>
@@ -223,6 +262,117 @@ function ProviderRow(props: ProviderRowProps) {
         </div>
       </div>
     </li>
+  )
+}
+
+function EditKeyDialogHost() {
+  const machine = ProvidersOwner.useMachine()
+  return (
+    <MachineState machine={machine} path="">
+      {({ value, states }) => {
+        const keyState = states.KeyDialog.state
+        const activeId =
+          keyState.path === 'KeyDialog.Editing' || keyState.path === 'KeyDialog.Submitting'
+            ? keyState.value.id
+            : null
+        const provider =
+          activeId === null ? null : (value.providers.find(p => p.id === activeId) ?? null)
+        const error = keyState.path === 'KeyDialog.Editing' ? keyState.value.error : null
+        const submitting = keyState.path === 'KeyDialog.Submitting'
+        return (
+          <EditKeyDialog
+            key={activeId === null ? 'closed' : `open:${activeId}`}
+            provider={provider}
+            submitting={submitting}
+            error={error}
+          />
+        )
+      }}
+    </MachineState>
+  )
+}
+
+interface EditKeyDialogProps {
+  readonly provider: Provider | null
+  readonly submitting: boolean
+  readonly error: string | null
+}
+
+function EditKeyDialog(props: EditKeyDialogProps) {
+  const machine = ProvidersOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  const [apiKey, setApiKey] = useState('')
+  const { provider, submitting, error } = props
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault()
+    if (provider === null) return
+    const trimmed = apiKey.trim()
+    if (trimmed === '') return
+    send(ProvidersEvents.SubmitKey({ id: provider.id, apiKey: trimmed }))
+  }
+
+  return (
+    <Dialog
+      open={provider !== null}
+      onOpenChange={open => {
+        if (!open && !submitting) send(ProvidersEvents.CloseKeyDialog())
+      }}
+    >
+      <DialogContent className="sm:max-w-md">
+        {provider === null ? null : (
+          <form onSubmit={submit} className="space-y-4">
+            <DialogHeader>
+              <DialogTitle>API key · {provider.id}</DialogTitle>
+            </DialogHeader>
+            <div className="space-y-2">
+              <Input
+                id="provider-edit-key"
+                type="password"
+                autoComplete="off"
+                className="font-mono"
+                placeholder="Paste new API key"
+                value={apiKey}
+                disabled={submitting}
+                aria-invalid={error !== null}
+                aria-describedby={error === null ? undefined : 'provider-edit-key-error'}
+                onChange={event => {
+                  setApiKey(event.target.value)
+                  if (error !== null) send(ProvidersEvents.ClearKeyError())
+                }}
+              />
+              {error === null ? null : (
+                <FieldError id="provider-edit-key-error">{error}</FieldError>
+              )}
+            </div>
+            <DialogFooter>
+              {provider.apiKey === 'set' ? (
+                <Button
+                  type="button"
+                  variant="destructive"
+                  disabled={submitting}
+                  className="sm:mr-auto"
+                  onClick={() => send(ProvidersEvents.SubmitKey({ id: provider.id, apiKey: null }))}
+                >
+                  Clear key
+                </Button>
+              ) : null}
+              <Button
+                type="button"
+                variant="ghost"
+                disabled={submitting}
+                onClick={() => send(ProvidersEvents.CloseKeyDialog())}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" disabled={submitting || apiKey.trim() === ''}>
+                {submitting ? 'Saving…' : 'Save'}
+              </Button>
+            </DialogFooter>
+          </form>
+        )}
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -241,16 +391,15 @@ interface AddDraft {
   readonly id: string
   readonly api: ProviderApi
   readonly baseUrl: string
-  readonly keyEnv: string
+  readonly apiKey: string
 }
 
-type RequiredField = 'id' | 'baseUrl' | 'keyEnv'
+type RequiredField = 'id' | 'baseUrl'
 type FieldErrors = Partial<Record<RequiredField, string>>
 
 const fieldElementIds = {
   id: 'provider-id',
   baseUrl: 'provider-base-url',
-  keyEnv: 'provider-key-env',
 } satisfies Record<RequiredField, string>
 
 const validateProviderDraft = (draft: AddDraft, existingIds: ReadonlyArray<string>) => {
@@ -258,6 +407,8 @@ const validateProviderDraft = (draft: AddDraft, existingIds: ReadonlyArray<strin
   const id = draft.id.trim()
   if (id === '') {
     errors.id = 'Required'
+  } else if (id.includes('/')) {
+    errors.id = "Provider ID cannot contain '/'."
   } else if (existingIds.includes(id)) {
     errors.id = 'A provider with this ID already exists.'
   }
@@ -267,10 +418,7 @@ const validateProviderDraft = (draft: AddDraft, existingIds: ReadonlyArray<strin
   } else if (!URL.canParse(baseUrl)) {
     errors.baseUrl = 'Enter a valid URL.'
   }
-  if (draft.keyEnv.trim() === '') {
-    errors.keyEnv = 'Required'
-  }
-  const order: ReadonlyArray<RequiredField> = ['id', 'baseUrl', 'keyEnv']
+  const order: ReadonlyArray<RequiredField> = ['id', 'baseUrl']
   const firstField = order.find(field => errors[field] !== undefined) ?? null
   return { errors, firstField }
 }
@@ -290,7 +438,7 @@ function AddForm(props: AddFormProps) {
     id: '',
     api: 'responses',
     baseUrl: '',
-    keyEnv: '',
+    apiKey: '',
   })
   const [errors, setErrors] = useState<FieldErrors>({})
   const isSubmitting = AsyncResult.getOrElse(
@@ -322,12 +470,13 @@ function AddForm(props: AddFormProps) {
       document.getElementById(fieldElementIds[validation.firstField])?.focus()
       return
     }
+    const trimmedKey = draft.apiKey.trim()
     send(
       ProvidersEvents.SubmitAdd({
         id: draft.id.trim(),
         api: draft.api,
         baseUrl: draft.baseUrl.trim(),
-        keyEnv: draft.keyEnv.trim(),
+        apiKey: trimmedKey === '' ? null : trimmedKey,
       }),
     )
   }
@@ -390,20 +539,20 @@ function AddForm(props: AddFormProps) {
           <FieldError id="provider-base-url-error">{errors.baseUrl}</FieldError>
         )}
       </FieldRow>
-      <FieldRow id="provider-key-env" label="Key env var">
+      <FieldRow id="provider-api-key" label="API key">
         <Input
-          id="provider-key-env"
+          id="provider-api-key"
+          type="password"
+          autoComplete="off"
           className="font-mono"
-          placeholder="OPENAI_API_KEY"
-          value={draft.keyEnv}
+          placeholder="Optional for local endpoints"
+          value={draft.apiKey}
           disabled={isSubmitting}
-          aria-invalid={errors.keyEnv !== undefined}
-          aria-describedby={errors.keyEnv === undefined ? undefined : 'provider-key-env-error'}
-          onChange={event => editField('keyEnv', event.target.value)}
+          onChange={event => {
+            setDraft(current => ({ ...current, apiKey: event.target.value }))
+            if (serverError != null) send(ProvidersEvents.ClearAddError())
+          }}
         />
-        {errors.keyEnv === undefined ? null : (
-          <FieldError id="provider-key-env-error">{errors.keyEnv}</FieldError>
-        )}
       </FieldRow>
       <div className="mt-3 flex flex-col items-start gap-2 md:pl-[120px]">
         <AddButtons />

@@ -201,7 +201,7 @@ pub struct Provider {
     pub id: ProviderId,
     pub api: ProviderApi,
     pub base_url: String,
-    pub api_key_env: String,
+    pub has_api_key: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -325,7 +325,15 @@ pub trait ConfigStore: Send + Sync {
     fn public_url(&self) -> Result<Option<String>, StoreError>;
     fn set_public_url(&self, url: Option<&str>) -> Result<(), StoreError>;
     fn providers(&self) -> Result<Vec<Provider>, StoreError>;
-    fn save_provider(&self, provider: Provider) -> Result<(), StoreError>;
+    fn save_provider(&self, provider: Provider, api_key: Option<&str>) -> Result<(), StoreError>;
+    fn provider_api_key(&self, id: &ProviderId) -> Result<Option<String>, StoreError>;
+    /// Non-secret fingerprint of the stored encrypted credential, used for cache invalidation.
+    fn provider_key_fingerprint(&self, id: &ProviderId) -> Result<Option<u64>, StoreError>;
+    fn set_provider_api_key(
+        &self,
+        id: &ProviderId,
+        api_key: Option<&str>,
+    ) -> Result<(), StoreError>;
     fn remove_provider(&self, id: &ProviderId) -> Result<(), StoreError>;
     fn models(&self, provider: &ProviderId) -> Result<Vec<Model>, StoreError>;
     fn set_images(

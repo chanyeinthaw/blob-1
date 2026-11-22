@@ -32,7 +32,7 @@ type ProviderRecord = Readonly<{
   id: string
   api: ProviderApi
   baseUrl: string
-  keyEnv: string
+  apiKey: string | null
   models: ReadonlyArray<ModelInfo>
 }>
 
@@ -71,7 +71,7 @@ const seedState = (): State => ({
       id: 'cpa1',
       api: 'responses',
       baseUrl: 'http://127.0.0.1:8320/v1',
-      keyEnv: 'CPA1_KEY',
+      apiKey: 'mock-cpa1-key',
       models: [
         { id: 'gpt-6.1-terra', context: 1050000, limit: 400000, images: true },
         { id: 'gpt-6-luna', context: 1050000, limit: null, images: true },
@@ -151,7 +151,7 @@ const providersReply = (state: State): ReadonlyArray<Provider> =>
     id: provider.id,
     api: provider.api,
     baseUrl: provider.baseUrl,
-    keyEnv: provider.keyEnv,
+    apiKey: provider.apiKey !== null ? 'set' : 'missing',
     modelCount: provider.models.length,
   }))
 
@@ -281,10 +281,16 @@ const addProvider = (
   payload: RequestPayload<'providers.add'>,
 ): Effect.Effect<State, string> =>
   Effect.gen(function* () {
-    const { id, api, baseUrl, keyEnv } = payload
+    const id = payload.id.trim()
+    const baseUrl = payload.baseUrl.trim()
+    const apiKey =
+      payload.apiKey === null || payload.apiKey.trim() === '' ? null : payload.apiKey.trim()
 
-    if ([id, baseUrl, keyEnv].some(value => value.trim() === '')) {
-      return yield* Effect.fail('All fields are required')
+    if (id === '' || baseUrl === '') {
+      return yield* Effect.fail('ID and base URL are required')
+    }
+    if (id.includes('/')) {
+      return yield* Effect.fail("Provider ID cannot contain '/'")
     }
     if (state.providers.some(provider => provider.id === id)) {
       return yield* Effect.fail(`Provider ${id} already exists`)
@@ -294,7 +300,25 @@ const addProvider = (
     }
 
     return Struct.evolve(state, {
-      providers: providers => Array.append(providers, { id, api, baseUrl, keyEnv, models: [] }),
+      providers: providers =>
+        Array.append(providers, { id, api: payload.api, baseUrl, apiKey, models: [] }),
+    })
+  })
+
+const setProviderKey = (
+  state: State,
+  payload: RequestPayload<'providers.setKey'>,
+): Effect.Effect<State, string> =>
+  Effect.gen(function* () {
+    const { id } = payload
+    const apiKey =
+      payload.apiKey === null || payload.apiKey.trim() === '' ? null : payload.apiKey.trim()
+    if (!state.providers.some(provider => provider.id === id)) {
+      return yield* Effect.fail(`Unknown provider ${id}`)
+    }
+    return Struct.evolve(state, {
+      providers: providers =>
+        providers.map(provider => (provider.id === id ? { ...provider, apiKey } : provider)),
     })
   })
 
@@ -713,6 +737,9 @@ const handlers: { readonly [K in RequestType]: Handler<K> } = {
 
   'providers.add': (payload, state) =>
     transition(state, current => addProvider(current, payload)).pipe(Effect.map(providersReply)),
+
+  'providers.setKey': (payload, state) =>
+    transition(state, current => setProviderKey(current, payload)).pipe(Effect.map(providersReply)),
 
   'providers.remove': ({ id }, state) =>
     transition(state, current => removeProvider(current, id)).pipe(Effect.map(providersReply)),
