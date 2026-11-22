@@ -793,8 +793,8 @@ async fn admit(
                 eprintln!("{error}");
             }
         });
-        messengers.live("discord", to, dest);
     }
+    messengers.live("discord", to, dest);
     Ok(Some((
         inbound.text,
         storage::Meta::Message {
@@ -1033,13 +1033,7 @@ pub async fn serve(
             }
         }
         for (_, meta) in &pending {
-            if let storage::Meta::Message {
-                messenger,
-                to,
-                unaddressed: false,
-                ..
-            } = meta
-            {
+            if let storage::Meta::Message { messenger, to, .. } = meta {
                 let (_, destination) = store.place(*to)?.ok_or("unknown destination")?;
                 messengers.live(messenger, *to, destination);
             }
