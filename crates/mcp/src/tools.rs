@@ -688,16 +688,17 @@ mod tests {
             ("s".into(), "t2".into(), "d2".into(), r#"{"b":2}"#.into()),
             ("s".into(), "t3".into(), "d3".into(), big_schema),
         ];
-        let notes = vec!["broken: ".to_string() + &"e".repeat(500)];
+        let notes = vec!["broken: timeout".to_string()];
 
         // Long description is trimmed before checking schema fit, so t1's small schema is kept,
         // and the full response including footer + server error stays strictly within max_bytes.
-        let budget = 400;
+        let budget = 380;
         let p1 = format_search_page(&entries, &notes, 0, 10, budget);
         assert!(p1.len() <= budget, "len {} > {budget}", p1.len());
         assert!(p1.contains("tool=t1"));
         assert!(p1.contains(r#"schema: {"a":1}"#));
         assert!(p1.contains("offset=1"));
+        assert!(p1.contains("broken: timeout"));
 
         // Oversized single schema at offset 2 is explicitly omitted within budget.
         let p3 = format_search_page(&entries, &notes, 2, 10, budget);
