@@ -4,7 +4,6 @@ mod tools;
 pub use tools::{Outcome, SessionTools};
 
 use std::{
-    borrow::Cow,
     collections::BTreeMap,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -13,7 +12,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use environment::ToolSpec;
 use rmcp::{
     serve_client,
     service::{Peer, RoleClient, RunningService},
@@ -35,7 +33,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(300);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_BACKOFF: Duration = Duration::from_secs(60);
 
-/// Server ids must stay unambiguous inside `server__tool` wire names.
+/// Server ids use lowercase ASCII letters, digits, and `-`.
 pub fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id
@@ -825,69 +823,5 @@ impl Mcp {
                 }
             }
         }
-    }
-
-    /// `server__tool` wire name for a tool; sanitizes and appends a hash
-    /// suffix only when two tools sanitize to the same wire name.
-    pub(crate) fn wire_names(
-        server: &str,
-        tools: &[rmcp::model::Tool],
-    ) -> BTreeMap<String, rmcp::model::Tool> {
-        fn sanitize(text: &str) -> String {
-            text.chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect()
-        }
-        let mut out = BTreeMap::new();
-        for tool in tools {
-            let mut wire = format!("{server}__{}", sanitize(&tool.name));
-            if out.contains_key(&wire) {
-                wire = format!(
-                    "{wire}-{:x}",
-                    tool.name.bytes().fold(0u32, |hash, byte| {
-                        hash.wrapping_mul(31).wrapping_add(byte as u32)
-                    })
-                );
-            }
-            out.insert(wire, tool.clone());
-        }
-        out
-    }
-
-    /// A server's current tools through the shared connection. `None` when
-    /// the server is unreachable, so callers keep their captured specs.
-    pub(crate) async fn tool_list(
-        &self,
-        server: &str,
-        timeout: Duration,
-    ) -> Option<Vec<rmcp::model::Tool>> {
-        self.request(server, timeout, |peer| async move {
-            peer.list_all_tools().await
-        })
-        .await
-        .ok()
-    }
-}
-
-/// ToolSpec for an rmcp Tool under its wire name.
-pub(crate) fn spec_for(wire: &str, tool: &rmcp::model::Tool) -> ToolSpec {
-    ToolSpec {
-        name: Cow::Owned(wire.to_string()),
-        description: Cow::Owned(
-            tool.description
-                .as_deref()
-                .or(tool.title.as_deref())
-                .unwrap_or_default()
-                .to_string(),
-        ),
-        input_schema: Cow::Owned(
-            serde_json::to_string(&tool.input_schema).unwrap_or_else(|_| "{}".to_string()),
-        ),
     }
 }

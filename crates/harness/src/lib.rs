@@ -21,3 +21,17 @@ pub use session::{
     CompactionConfig, EnvironmentPaths, HarnessConfig, HarnessError, MemoryTools, SessionHarness,
     Step,
 };
+
+/// Stable FNV-1a 64-bit hash used to build compact (<= 64 char) upstream
+/// `prompt_cache_key` values scoped per workspace / session.
+pub(crate) fn prompt_cache_key(scope: &str, workspace: &std::path::Path, extra: &str) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for chunk in [workspace.as_os_str().as_bytes(), b"\0", extra.as_bytes()] {
+        for &byte in chunk {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("blob-1:{scope}:{hash:016x}")
+}

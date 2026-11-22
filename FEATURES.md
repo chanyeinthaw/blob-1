@@ -15,7 +15,7 @@ Where each feature lives: code, CLI, model tools and storage.
 | `environment-local` | local implementation of the environment tools, skill sync |
 | `messenger` | `Messenger` and `Lookup` traits and neutral message types |
 | `messenger-discord` | Discord messenger over twilight |
-| `mcp` | MCP client manager: stdio and Streamable HTTP transports, OAuth, deferred tools |
+| `mcp` | MCP client manager: stdio and Streamable HTTP transports, OAuth, static `mcp_search`/`mcp_execute` tools |
 | `storage` | storage traits, `Meta`, XML rendering of model input |
 | `storage-sqlite` | SQLite implementation of every store |
 
@@ -41,7 +41,8 @@ The bot is one chat that never ends. It coordinates and talks; tasks do the work
 - Runs: a run ends when the agent is done. Task reports and reminders steer a live run or wake an idle agent (`resume`).
 - Input: every outside input is one XML element with escaped text: `<message>`, `<report>`, `<reminder>`, `<scheduled>`, `<checkin>`
 - Final reply `NO_UPDATES` ends a messenger turn silently.
-- Tools: `zoom`, `date`, `spawn`, `models`, `tasks`, `tell`, `stop`, `share` (creates public capability links in `public_files` for workspace files or inline Markdown/HTML under `workspace/shares/`; also available to background tasks), plus messenger, calendar, watch and MCP tools
+- Tools: `zoom`, `date`, `spawn`, `models`, `tasks`, `tell`, `stop`, `share` (creates public capability links in `public_files` for workspace files or inline Markdown/HTML under `workspace/shares/`; also available to background tasks), plus messenger, calendar, watch and static MCP (`mcp_search`, `mcp_execute`, `mcp_resources`, `mcp_read`, `mcp_prompts`, `mcp_prompt`) tools
+- Prompt caching: `ChatHarness` and `SessionHarness` pass a stable per-workspace/session `prompt_cache_key` on OpenAI Responses (`llm-rig`), and keeping MCP behind static `mcp_search` + `mcp_execute` avoids mutating the `tools` list mid-turn.
 - MCP tool results carrying png, jpg, gif or webp images reach the model as images when the main model accepts image input; the memory echo keeps the `[N image(s) omitted]` note
 - CLI: `agent chat <message>` (one message, then waits for its tasks to report)
 
@@ -139,10 +140,10 @@ Blob-1 is an MCP client: chat and background tasks can call tools, read resource
 - Code: `crates/mcp/src/{lib,oauth,tools}.rs`, `crates/storage-sqlite/src/mcp.rs`, `crates/agent/src/web.rs` (`/api/mcp/login`, `/api/mcp/callback`), `apps/web/src/features/mcp/`
 - Servers are stdio (command, args, env) or Streamable HTTP (url, static headers whose values are env var names); no legacy SSE
 - One shared `mcp::Mcp` per `serve` keeps one connection per server for chat and tasks; config changes apply without a restart
-- Server ids are lowercase letters, digits and `-` (no `_`: it separates `server__tool` wire names)
+- Server ids are lowercase letters, digits and `-`
 - Connect waits up to 30s; each MCP request times out at 60s (tool calls 5 min). A dead, timed-out or failed transport drops the connection so the next call reconnects; in-flight calls keep their own handle — disabling or removing a server lets running calls finish — and a dropped `tools/call` reports its outcome as unknown rather than retrying. The `mcp.list` status probe never drops a connection on timeout — it reports the last known tool count instead. Stdio servers run in their own process group, killed explicitly whenever the connection closes even if the leader already exited, so wrappers like `npx` can't strand grandchildren; `serve`/`chat`/`mcp tools` close and await them on exit
 - OAuth 2.1: protected-resource and authorization-server metadata, dynamic client registration, PKCE, refresh; `agent mcp login <id>` or the settings page opens the flow — fetching the `WWW-Authenticate` challenge with an initialize POST when no prior connect captured one — `GET /api/mcp/callback` finishes it; tokens and client registration (including the discovery challenge, used to rebuild the client for refresh) persist. Enable/disable keeps them; replacing a server's transport config clears its OAuth data; the registration travels with the pending login state so concurrent logins can't clobber each other
-- Tools: deferred discovery — `mcp_search` loads a server's tools into the session as `server__tool` (sanitized, hash suffix on collisions) and a loaded tool dispatches only once it has been advertised to a completion, `mcp_resources`, `mcp_read`, `mcp_prompts`, `mcp_prompt`; the client does not advertise sampling, roots or elicitation and ignores logging and progress notifications
+- Tools: static discovery and execution — `mcp_search` returns matching servers, tool names, descriptions and JSON input schemas without mutating the `tools` list (preserving prompt-cache prefixes), `mcp_execute` runs `server` + `tool` with a JSON `arguments` object, plus `mcp_resources`, `mcp_read`, `mcp_prompts`, `mcp_prompt`; the client does not advertise sampling, roots or elicitation and ignores logging and progress notifications
 - Servers connect on first use and are probed when added, enabled, or listed from Settings (`mcp.add`, `mcp.setEnabled`, `mcp.list`, obeying retry backoff); statuses are `connected`, `connecting` (a connect attempt is in flight), `idle` (Standby), `needs-login` (Needs sign-in), `error` (with text) and `disconnected` (disabled)
 - Web protocol: `mcp.list`, `mcp.add`, `mcp.remove`, `mcp.setEnabled`, `mcp.login`
 - CLI: `agent mcp list`, `agent mcp add <id> [--env K=V] -- <command> [args]`, `agent mcp add <id> --url <url> [--header 'Name: ENV_VAR']`, `agent mcp remove <id>`, `agent mcp enable | disable <id>`, `agent mcp login <id>` (prints the stored `--public-url` base when `serve` set one, else `--web`), `agent mcp tools <id>`

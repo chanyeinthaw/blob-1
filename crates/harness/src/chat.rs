@@ -218,7 +218,6 @@ pub(crate) struct Inner<E, S, M, F: Models> {
     pub share: Option<crate::ShareTools>,
     pub mcp: Option<mcp::Mcp>,
     pub mcp_session: Option<Arc<mcp::SessionTools>>,
-    pub mcp_view_generation: Mutex<u64>,
     pub pulses: Mutex<Vec<(u64, tokio::task::Id)>>,
     pub schedule_gate: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
@@ -321,7 +320,6 @@ where
                 share: None,
                 mcp: None,
                 mcp_session: None,
-                mcp_view_generation: Mutex::new(0),
                 pulses: Mutex::new(Vec::new()),
                 schedule_gate: None,
             }),
@@ -391,22 +389,6 @@ where
         self.run_message(text.to_owned(), None).await
     }
 
-    fn refresh_mcp_session(&self) {
-        let Some(mcp) = &self.inner.mcp_session else {
-            return;
-        };
-        let generation = self.inner.memory.chat_generation();
-        let mut seen = self
-            .inner
-            .mcp_view_generation
-            .lock()
-            .expect("mcp view generation mutex poisoned");
-        if *seen != generation {
-            *seen = generation;
-            mcp.clear();
-        }
-    }
-
     pub async fn run_message(
         &self,
         text: String,
@@ -415,7 +397,6 @@ where
         let _guard = self.turn.lock().await;
         self.inner.memory.settle(self.inner.memory.count()?).await?;
         let view = self.inner.memory.view()?;
-        self.refresh_mcp_session();
         let text = self.append_user(&text, meta.as_ref())?;
         let answer = self.turn(&text, view).await?;
         self.resume_loop(vec![answer]).await
@@ -472,7 +453,6 @@ where
             if let Some((text, meta)) = steering {
                 self.inner.memory.settle(self.inner.memory.count()?).await?;
                 let view = self.inner.memory.view()?;
-                self.refresh_mcp_session();
                 let text = self.append_user(&text, meta.as_ref())?;
                 self.inner
                     .state
@@ -485,7 +465,6 @@ where
             if let Some(report) = report {
                 self.inner.memory.settle(self.inner.memory.count()?).await?;
                 let view = self.inner.memory.view()?;
-                self.refresh_mcp_session();
                 self.inner
                     .memory
                     .append(Kind::Work, &report.text, Some(&report.meta))?;
@@ -577,6 +556,10 @@ where
         if self.inner.share.is_some() {
             tools.push(crate::share::TOOL);
         }
+        if let Some(mcp) = &self.inner.mcp_session {
+            tools.extend(mcp.specs());
+        }
+        let cache_key = crate::prompt_cache_key("chat", &self.inner.paths.workspace, "");
         loop {
             loop {
                 let next = self
@@ -613,15 +596,12 @@ where
                 self.live_for(&report.meta);
                 messages.push(Message::User(report.meta.render(0, &report.text)));
             }
-            let mut request_tools = tools.clone();
-            if let Some(mcp) = &self.inner.mcp_session {
-                request_tools.extend(mcp.specs().await);
-            }
             let response = llm
                 .complete(CompletionRequest {
                     system: &system,
                     messages: &messages,
-                    tools: &request_tools,
+                    tools: &tools,
+                    cache_key: Some(&cache_key),
                 })
                 .await?;
             if self.inner.messengers.is_some()
@@ -666,13 +646,17 @@ where
                     }
                     echo
                 };
-                let clip = !matches!(call.name.as_str(), "zoom" | "history" | "search");
-                let content = if clip {
+                let clip_live = !matches!(
+                    call.name.as_str(),
+                    "zoom" | "history" | "search" | "mcp_search"
+                );
+                let clip_echo = !matches!(call.name.as_str(), "zoom" | "history" | "search");
+                let content = if clip_live {
                     memory::clip_tool_output(&content)
                 } else {
                     content
                 };
-                let echo = if clip {
+                let echo = if clip_echo {
                     memory::clip_tool_output(&echo)
                 } else {
                     echo

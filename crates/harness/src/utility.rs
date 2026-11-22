@@ -21,6 +21,7 @@ impl Utility {
                 system,
                 messages: &messages,
                 tools: &[],
+                cache_key: None,
             })
             .await?;
         Ok(response.text.trim().to_owned())

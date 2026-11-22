@@ -130,8 +130,8 @@ where
         self
     }
 
-    /// MCP session tools: `mcp_*` built-ins plus per-session tools loaded by
-    /// `mcp_search`, scoped to this session's lifetime.
+    /// Static `mcp_*` tools (`mcp_search`, `mcp_execute`, resources, prompts)
+    /// exposed to this session when at least one MCP server is enabled.
     pub fn with_mcp_tools(mut self, tools: Arc<SessionTools>) -> Self {
         self.mcp_tools = Some(tools);
         self
@@ -206,6 +206,10 @@ where
         if self.share_tools.is_some() {
             tools.push(crate::share::TOOL);
         }
+        if let Some(mcp) = &self.mcp_tools {
+            tools.extend(mcp.specs());
+        }
+        let cache_key = crate::prompt_cache_key("task", &self.paths.workspace, &id.0);
 
         if let Some(user_message) = user_message {
             session.push(Message::User(user_message));
@@ -242,14 +246,11 @@ where
                     }
                 }
             }
-            let mut request_tools = tools.clone();
-            if let Some(mcp) = &self.mcp_tools {
-                request_tools.extend(mcp.specs().await);
-            }
             let response = match self.llm.complete(CompletionRequest {
                 system: &system,
                 messages: &view,
-                tools: &request_tools,
+                tools: &tools,
+                cache_key: Some(&cache_key),
             }).await {
                 Ok(response) => response,
                 Err(LlmError::ContextOverflow(_)) if !overflow_retried => {

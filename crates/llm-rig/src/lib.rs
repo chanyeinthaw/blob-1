@@ -213,15 +213,37 @@ impl Llm for RigLlm {
         &self,
         request: CompletionRequest<'_>,
     ) -> Result<CompletionResponse, LlmError> {
+        let cache_key = request.cache_key;
         let mut request = to_rig_request(request)?;
-        request = match &self.reasoning {
-            Some(ReasoningSetting::Typed(reasoning)) => request.reasoning(*reasoning),
-            Some(ReasoningSetting::Raw(value)) => request.additional_params(match self.api {
-                ProviderApi::OpenAiResponses => serde_json::json!({"reasoning": {"effort": value}}),
-                ProviderApi::OpenAiCompletions => serde_json::json!({"reasoning_effort": value}),
-            }),
-            None => request,
-        };
+        let mut extra = serde_json::Map::new();
+        match &self.reasoning {
+            Some(ReasoningSetting::Typed(reasoning)) => {
+                request = request.reasoning(*reasoning);
+            }
+            Some(ReasoningSetting::Raw(value)) => match self.api {
+                ProviderApi::OpenAiResponses => {
+                    extra.insert("reasoning".into(), serde_json::json!({"effort": value}));
+                }
+                ProviderApi::OpenAiCompletions => {
+                    extra.insert(
+                        "reasoning_effort".into(),
+                        serde_json::Value::String(value.clone()),
+                    );
+                }
+            },
+            None => {}
+        }
+        if self.api == ProviderApi::OpenAiResponses {
+            if let Some(key) = cache_key {
+                extra.insert(
+                    "prompt_cache_key".into(),
+                    serde_json::Value::String(key.to_owned()),
+                );
+            }
+        }
+        if !extra.is_empty() {
+            request = request.additional_params(serde_json::Value::Object(extra));
+        }
         let mut attempt = 0;
         let response = loop {
             loop {

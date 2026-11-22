@@ -52,7 +52,7 @@ fn mcp_section(mcp: &[(String, String)]) -> Option<String> {
         .map(|(id, description)| format!("- {id}: {description}"))
         .collect::<Vec<_>>()
         .join("\n");
-    Some(format!("MCP servers provide extra tools, resources and prompts. Call mcp_search {{query}} to find a server's tools and load them into this session, then call them by name. mcp_resources {{server?, query?}} and mcp_read {{server, uri}} cover resources; mcp_prompts {{server?, query?}} and mcp_prompt {{server, name, arguments?}} cover prompts.\n\n{servers}"))
+    Some(format!("MCP servers provide extra tools, resources and prompts. Call mcp_search {{server?, query?}} to find a server's tools and their JSON schemas, then call mcp_execute {{server, tool, arguments?}} to run them. mcp_resources {{server?, query?}} and mcp_read {{server, uri}} cover resources; mcp_prompts {{server?, query?}} and mcp_prompt {{server, name, arguments?}} cover prompts.\n\n{servers}"))
 }
 
 pub fn build(workspace: &Path, skills: &[SkillEntry], mcp: &[(String, String)]) -> String {

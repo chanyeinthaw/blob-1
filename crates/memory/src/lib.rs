@@ -644,6 +644,7 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
                     system: COMPACTION_PROMPT,
                     messages: &messages,
                     tools: &[],
+                    cache_key: None,
                 })
                 .await?;
             let answer = response.text.trim();

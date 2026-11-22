@@ -1,16 +1,19 @@
-use std::{collections::BTreeMap, sync::Mutex};
-
 use base64::Engine;
 use environment::{Image, ToolSpec};
 use rmcp::model::*;
+use serde::Deserialize;
 
-use crate::{spec_for, Mcp, REQUEST_TIMEOUT};
+use crate::{Mcp, REQUEST_TIMEOUT};
 
-/// One model-visible MCP tool loaded into a session by `mcp_search`.
-struct Loaded {
-    server: String,
-    tool: String,
-    spec: ToolSpec,
+const SEARCH_PAGE_SIZE: usize = 10;
+const SEARCH_PAGE_MAX_BYTES: usize = 32 * 1024;
+
+#[derive(Deserialize)]
+struct SearchArgs {
+    server: Option<String>,
+    query: Option<String>,
+    #[serde(default)]
+    offset: usize,
 }
 
 /// Result of an MCP call converted to the harness's text-plus-images shape.
@@ -28,20 +31,23 @@ impl Outcome {
     }
 }
 
-/// Per-session tool set: the `mcp_*` built-ins plus tools loaded by
-/// `mcp_search`. A fresh SessionTools per session is what scopes loaded
-/// tools to the chat compaction boundary or task lifetime.
+/// Static MCP tool interface (`mcp_search`, `mcp_execute`, resources, and
+/// prompts). Keeping the tool catalog static preserves prompt-cache prefixes
+/// across turns and tool calls instead of mutating the `tools` array mid-turn.
 pub struct SessionTools {
     mcp: Mcp,
-    loaded: Mutex<BTreeMap<String, Loaded>>,
-    advertised: Mutex<BTreeMap<String, (String, String)>>,
 }
 
 const BUILTINS: &[ToolSpec] = &[
     ToolSpec::new(
         "mcp_search",
-        "Search tools provided by the configured MCP servers. Matches are returned as server__tool with a description and their full schemas are loaded into this session; afterwards call them by that name.",
-        r#"{"type":"object","properties":{"query":{"type":"string","description":"Keywords matched against tool names and descriptions"}},"required":["query"]}"#,
+        "Search tools provided by enabled MCP servers. Returns up to 10 matching tools per page with server, tool name, description, and JSON input schema (use offset to view additional pages); call tools with mcp_execute.",
+        r#"{"type":"object","properties":{"server":{"type":"string","description":"MCP server id; omit to search all enabled servers"},"query":{"type":"string","description":"Keywords matched against tool names and descriptions; omit to list tools"},"offset":{"type":"integer","minimum":0,"description":"Zero-based match offset for pagination (default 0)"}}}"#,
+    ),
+    ToolSpec::new(
+        "mcp_execute",
+        "Execute a tool exposed by an enabled MCP server. Use mcp_search first to discover server id, tool name, and required arguments.",
+        r#"{"type":"object","properties":{"server":{"type":"string","description":"MCP server id"},"tool":{"type":"string","description":"Exact MCP tool name from mcp_search"},"arguments":{"type":"object","description":"Tool input arguments as a JSON object"}},"required":["server","tool"]}"#,
     ),
     ToolSpec::new(
         "mcp_resources",
@@ -188,133 +194,49 @@ fn outcome_of(result: &CallToolResult) -> Outcome {
 
 impl SessionTools {
     pub fn new(mcp: Mcp) -> Self {
-        Self {
-            mcp,
-            loaded: Mutex::new(BTreeMap::new()),
-            advertised: Mutex::new(BTreeMap::new()),
-        }
+        Self { mcp }
     }
 
     pub fn mcp(&self) -> &Mcp {
         &self.mcp
     }
 
-    /// Drop every loaded tool; called when the session's context resets.
-    pub fn clear(&self) {
-        self.loaded.lock().expect("loaded tools").clear();
-        self.advertised.lock().expect("advertised tools").clear();
+    /// Static `mcp_*` built-ins when at least one MCP server is enabled.
+    pub fn specs(&self) -> Vec<ToolSpec> {
+        if self.mcp.any_enabled() {
+            BUILTINS.to_vec()
+        } else {
+            Vec::new()
+        }
     }
 
-    /// Built-ins (when at least one server is enabled) plus every tool
-    /// loaded via mcp_search, with schemas refreshed from the server. A
-    /// wire name never changes once assigned; tools the server dropped are
-    /// unloaded here. One tools/list per server per refresh, refreshed
-    /// concurrently with a per-server deadline covering connection.
-    pub async fn specs(&self) -> Vec<ToolSpec> {
-        if !self.mcp.any_enabled() {
-            self.advertised.lock().expect("advertised tools").clear();
-            return Vec::new();
-        }
-        let enabled = self.mcp.enabled_ids().await;
-        let mut specs: Vec<ToolSpec> = BUILTINS.to_vec();
-        let mut by_server: BTreeMap<String, Vec<(String, String, ToolSpec)>> = BTreeMap::new();
-        {
-            let loaded = self.loaded.lock().expect("loaded tools");
-            for (wire, l) in loaded.iter() {
-                by_server.entry(l.server.clone()).or_default().push((
-                    wire.clone(),
-                    l.tool.clone(),
-                    l.spec.clone(),
-                ));
-            }
-        }
-        let mut join = tokio::task::JoinSet::new();
-        let mut dropped = Vec::new();
-        for (server, tools) in by_server {
-            if !enabled.iter().any(|id| id == &server) {
-                dropped.extend(tools.into_iter().map(|(wire, _, _)| wire));
-                continue;
-            }
-            let mcp = self.mcp.clone();
-            join.spawn(async move {
-                let refreshed = mcp.tool_list(&server, REQUEST_TIMEOUT).await;
-                (server, tools, refreshed)
-            });
-        }
-        let mut refreshed_servers = Vec::new();
-        while let Some(Ok(result)) = join.join_next().await {
-            refreshed_servers.push(result);
-        }
-        refreshed_servers.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut advertised = BTreeMap::new();
-        for (server, tools, refreshed) in refreshed_servers {
-            match refreshed {
-                Some(list) => {
-                    for (wire, tool, _) in tools {
-                        match list
-                            .iter()
-                            .find(|candidate| candidate.name.as_ref() == tool)
-                        {
-                            Some(found) => {
-                                specs.push(spec_for(&wire, found));
-                                advertised.insert(wire, (server.clone(), tool));
-                            }
-                            None => dropped.push(wire),
-                        }
-                    }
-                }
-                None => {
-                    for (wire, tool, fallback) in tools {
-                        specs.push(fallback);
-                        advertised.insert(wire, (server.clone(), tool));
-                    }
-                }
-            }
-        }
-        if !dropped.is_empty() {
-            let mut loaded = self.loaded.lock().expect("loaded tools");
-            for wire in dropped {
-                loaded.remove(&wire);
-            }
-        }
-        *self.advertised.lock().expect("advertised tools") = advertised;
-        specs
-    }
-
-    /// Dispatch a tool call; `None` means the name isn't ours and the caller
-    /// should try the environment tools.
+    /// Dispatch an `mcp_*` tool call; `None` means the name isn't ours and the
+    /// caller should try the other tools.
     pub async fn execute(&self, name: &str, arguments: &str) -> Option<Result<Outcome, String>> {
+        if !matches!(
+            name,
+            "mcp_search"
+                | "mcp_execute"
+                | "mcp_resources"
+                | "mcp_read"
+                | "mcp_prompts"
+                | "mcp_prompt"
+        ) {
+            return None;
+        }
         let parsed: serde_json::Value = match serde_json::from_str(arguments) {
             Ok(value) => value,
             Err(error) => return Some(Err(format!("arguments must be JSON: {error}"))),
         };
-        match name {
-            "mcp_search" => Some(self.search(&parsed).await),
-            "mcp_resources" => Some(self.resources(&parsed).await),
-            "mcp_read" => Some(self.read(&parsed).await),
-            "mcp_prompts" => Some(self.prompts(&parsed).await),
-            "mcp_prompt" => Some(self.prompt(&parsed).await),
-            _ => {
-                let target = self
-                    .advertised
-                    .lock()
-                    .expect("advertised tools")
-                    .get(name)
-                    .cloned();
-                match target {
-                    Some((server, tool)) => {
-                        match self.mcp.call_tool(&server, &tool, arguments).await {
-                            Ok(result) if result.is_error == Some(true) => {
-                                Some(Err(outcome_of(&result).content))
-                            }
-                            Ok(result) => Some(Ok(outcome_of(&result))),
-                            Err(error) => Some(Err(error)),
-                        }
-                    }
-                    None => None,
-                }
-            }
-        }
+        Some(match name {
+            "mcp_search" => self.search(&parsed).await,
+            "mcp_execute" => self.call(&parsed).await,
+            "mcp_resources" => self.resources(&parsed).await,
+            "mcp_read" => self.read(&parsed).await,
+            "mcp_prompts" => self.prompts(&parsed).await,
+            "mcp_prompt" => self.prompt(&parsed).await,
+            _ => unreachable!(),
+        })
     }
 
     async fn enabled_ids(&self) -> Vec<String> {
@@ -322,14 +244,15 @@ impl SessionTools {
     }
 
     async fn search(&self, arguments: &serde_json::Value) -> Result<Outcome, String> {
-        let query = match required(arguments, "query") {
-            Ok(query) => query,
-            Err(error) => return Err(error),
+        let args = parse_search_args(arguments)?;
+        let terms = terms(args.query.as_deref().unwrap_or_default());
+        let ids: Vec<String> = match args.server {
+            Some(id) => vec![id],
+            None => self.enabled_ids().await,
         };
-        let terms = terms(query);
-        let mut scored: Vec<(usize, String, String, Tool)> = Vec::new();
+        let mut scored: Vec<(usize, String, Tool)> = Vec::new();
         let mut notes = Vec::new();
-        for id in self.enabled_ids().await {
+        for id in ids {
             match self
                 .mcp
                 .request(&id, REQUEST_TIMEOUT, |peer| async move {
@@ -338,9 +261,10 @@ impl SessionTools {
                 .await
             {
                 Ok(tools) => {
-                    for (wire, tool) in Mcp::wire_names(&id, &tools) {
+                    for tool in tools {
                         let text = format!(
-                            "{} {}",
+                            "{} {} {}",
+                            id,
                             tool.name,
                             tool.description.as_deref().unwrap_or_default()
                         )
@@ -350,41 +274,57 @@ impl SessionTools {
                             .filter(|term| text.contains(term.as_str()))
                             .count();
                         if score > 0 || terms.is_empty() {
-                            scored.push((score, id.clone(), wire, tool));
+                            scored.push((score, id.clone(), tool));
                         }
                     }
                 }
                 Err(error) => notes.push(format!("{id}: {error}")),
             }
         }
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(&b.2)));
-        scored.truncate(10);
-        let mut lines = Vec::new();
-        {
-            let mut loaded = self.loaded.lock().expect("loaded tools");
-            for (_, server, wire, tool) in scored {
-                lines.push(format!(
-                    "{wire} — {}",
-                    tool.description.as_deref().unwrap_or("(no description)")
-                ));
-                loaded.insert(
-                    wire.clone(),
-                    Loaded {
-                        server,
-                        tool: tool.name.to_string(),
-                        spec: spec_for(&wire, &tool),
-                    },
-                );
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.name.cmp(&b.2.name))
+        });
+        let entries: Vec<(String, String, String, String)> = scored
+            .into_iter()
+            .map(|(_, server, tool)| {
+                let desc = tool
+                    .description
+                    .as_deref()
+                    .or(tool.title.as_deref())
+                    .unwrap_or("(no description)")
+                    .to_string();
+                let schema =
+                    serde_json::to_string(&tool.input_schema).unwrap_or_else(|_| "{}".to_string());
+                (server, tool.name.to_string(), desc, schema)
+            })
+            .collect();
+        let output = format_search_page(
+            &entries,
+            &notes,
+            args.offset,
+            SEARCH_PAGE_SIZE,
+            SEARCH_PAGE_MAX_BYTES,
+        );
+        Ok(Outcome::text(output))
+    }
+
+    async fn call(&self, arguments: &serde_json::Value) -> Result<Outcome, String> {
+        let server = required(arguments, "server")?;
+        let tool = required(arguments, "tool")?;
+        let args_json = match arguments.get("arguments") {
+            None | Some(serde_json::Value::Null) => "{}".to_string(),
+            Some(value @ serde_json::Value::Object(_)) => {
+                serde_json::to_string(value).map_err(|error| error.to_string())?
             }
+            Some(_) => return Err("'arguments' must be a JSON object".to_string()),
+        };
+        match self.mcp.call_tool(server, tool, &args_json).await {
+            Ok(result) if result.is_error == Some(true) => Err(outcome_of(&result).content),
+            Ok(result) => Ok(outcome_of(&result)),
+            Err(error) => Err(error),
         }
-        lines.extend(notes);
-        if lines.is_empty() {
-            lines.push("no matching tools".to_string());
-        }
-        Ok(Outcome::text(format!(
-            "loaded tools:\n{}",
-            lines.join("\n")
-        )))
     }
 
     async fn resources(&self, arguments: &serde_json::Value) -> Result<Outcome, String> {
@@ -587,5 +527,182 @@ impl SessionTools {
             content: text.join("\n"),
             images,
         })
+    }
+}
+
+fn parse_search_args(arguments: &serde_json::Value) -> Result<SearchArgs, String> {
+    let Some(obj) = arguments.as_object() else {
+        return Err("invalid mcp_search arguments: expected a JSON object".to_string());
+    };
+    if matches!(obj.get("server"), Some(serde_json::Value::Null)) {
+        return Err("'server' must be a non-empty string".to_string());
+    }
+    let args: SearchArgs = serde_json::from_value(arguments.clone())
+        .map_err(|error| format!("invalid mcp_search arguments: {error}"))?;
+    if let Some(server) = args.server.as_deref() {
+        if server.is_empty() {
+            return Err("'server' must not be empty".to_string());
+        }
+    }
+    Ok(args)
+}
+
+fn clip_utf8(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Formats one page of `mcp_search` results (entries, pagination footer, and
+/// server error notes) strictly within `max_bytes`, keeping each returned tool
+/// schema intact and omitting any single schema that exceeds the remaining
+/// entry budget.
+fn format_search_page(
+    entries: &[(String, String, String, String)],
+    notes: &[String],
+    offset: usize,
+    page_size: usize,
+    max_bytes: usize,
+) -> String {
+    let total = entries.len();
+    let max_footer_len = format!(
+        "showing {total}..={total} of {total} matching tools ({total} more; call mcp_search with offset={total} for the next page)"
+    )
+    .len()
+    .max(format!("no more matching tools (offset={offset}, total={total})").len());
+
+    // Cap server error notes to at most a quarter of the page budget (and <= 2 KiB).
+    let notes_cap = (max_bytes / 4).min(2048);
+    let mut note_lines = Vec::new();
+    let mut notes_bytes = 0usize;
+    for note in notes {
+        let clipped = clip_utf8(note, 256);
+        let sep = usize::from(!note_lines.is_empty());
+        if notes_bytes + sep + clipped.len() > notes_cap {
+            let omitted = notes.len() - note_lines.len();
+            let suffix = format!("({omitted} more server error(s) omitted)");
+            let sep = usize::from(!note_lines.is_empty());
+            if notes_bytes + sep + suffix.len() <= notes_cap {
+                notes_bytes += sep + suffix.len();
+                note_lines.push(suffix);
+            }
+            break;
+        }
+        notes_bytes += sep + clipped.len();
+        note_lines.push(clipped.to_string());
+    }
+
+    let footer_reserve = if total > 0 { max_footer_len + 1 } else { 0 };
+    let notes_reserve = if note_lines.is_empty() {
+        0
+    } else {
+        notes_bytes + 1
+    };
+    let entry_budget = max_bytes.saturating_sub(footer_reserve + notes_reserve);
+
+    let mut lines = Vec::new();
+    let mut used_bytes = 0usize;
+    let mut shown = 0usize;
+    for (server, tool, desc, schema) in entries.iter().skip(offset).take(page_size) {
+        // Shorten the description first so a verbose description never causes a
+        // small schema to be omitted.
+        let short_desc: String = desc.chars().take(200).collect();
+        let full = format!("server={server} tool={tool} — {short_desc}\n  schema: {schema}");
+        let line = if full.len() > entry_budget {
+            let fallback = format!(
+                "server={server} tool={tool} — {short_desc}\n  schema: (omitted: {} bytes exceeds {entry_budget}-byte search budget)",
+                schema.len()
+            );
+            if fallback.len() > entry_budget {
+                clip_utf8(&fallback, entry_budget).to_string()
+            } else {
+                fallback
+            }
+        } else {
+            full
+        };
+        let sep = usize::from(!lines.is_empty());
+        if !lines.is_empty() && used_bytes + sep + line.len() > entry_budget {
+            break;
+        }
+        if lines.is_empty() && line.len() > entry_budget {
+            break;
+        }
+        used_bytes += sep + line.len();
+        lines.push(line);
+        shown += 1;
+    }
+
+    if total > 0 && shown == 0 {
+        lines.push(format!(
+            "no more matching tools (offset={offset}, total={total})"
+        ));
+    } else if offset + shown < total {
+        let next_offset = offset + shown;
+        let remaining = total - next_offset;
+        lines.push(format!(
+            "showing {}..={} of {total} matching tools ({remaining} more; call mcp_search with offset={next_offset} for the next page)",
+            offset + 1,
+            next_offset
+        ));
+    }
+    lines.extend(note_lines);
+    if lines.is_empty() {
+        lines.push("no matching tools".to_string());
+    }
+    let output = lines.join("\n");
+    if output.len() > max_bytes {
+        clip_utf8(&output, max_bytes).to_string()
+    } else {
+        output
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_args_reject_malformed_and_null_server_filters() {
+        assert!(parse_search_args(&serde_json::json!(42)).is_err());
+        assert!(parse_search_args(&serde_json::json!({"server": 42})).is_err());
+        assert!(parse_search_args(&serde_json::json!({"server": null})).is_err());
+        assert!(parse_search_args(&serde_json::json!({"server": ""})).is_err());
+        assert!(parse_search_args(&serde_json::json!({"offset": -1})).is_err());
+        let ok = parse_search_args(&serde_json::json!({"server": "linear", "offset": 10})).unwrap();
+        assert_eq!(ok.server.as_deref(), Some("linear"));
+        assert_eq!(ok.offset, 10);
+    }
+
+    #[test]
+    fn format_search_page_enforces_total_budget_and_preserves_small_schemas() {
+        let long_desc = "d".repeat(1000);
+        let big_schema = "x".repeat(800);
+        let entries = vec![
+            ("s".into(), "t1".into(), long_desc, r#"{"a":1}"#.into()),
+            ("s".into(), "t2".into(), "d2".into(), r#"{"b":2}"#.into()),
+            ("s".into(), "t3".into(), "d3".into(), big_schema),
+        ];
+        let notes = vec!["broken: ".to_string() + &"e".repeat(500)];
+
+        // Long description is trimmed before checking schema fit, so t1's small schema is kept,
+        // and the full response including footer + server error stays strictly within max_bytes.
+        let budget = 400;
+        let p1 = format_search_page(&entries, &notes, 0, 10, budget);
+        assert!(p1.len() <= budget, "len {} > {budget}", p1.len());
+        assert!(p1.contains("tool=t1"));
+        assert!(p1.contains(r#"schema: {"a":1}"#));
+        assert!(p1.contains("offset=1"));
+
+        // Oversized single schema at offset 2 is explicitly omitted within budget.
+        let p3 = format_search_page(&entries, &notes, 2, 10, budget);
+        assert!(p3.len() <= budget, "len {} > {budget}", p3.len());
+        assert!(p3.contains("tool=t3"));
+        assert!(p3.contains("omitted: 800 bytes exceeds"));
     }
 }

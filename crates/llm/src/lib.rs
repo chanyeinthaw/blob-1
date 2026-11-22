@@ -6,6 +6,9 @@ pub struct CompletionRequest<'a> {
     pub system: &'a str,
     pub messages: &'a [Message],
     pub tools: &'a [ToolSpec],
+    /// Optional stable routing key for upstream prompt caching (sent as
+    /// `prompt_cache_key` on OpenAI Responses).
+    pub cache_key: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

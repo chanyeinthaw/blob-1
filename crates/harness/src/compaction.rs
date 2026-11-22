@@ -230,6 +230,7 @@ async fn summarize<L: Llm>(
                 system: SYSTEM,
                 messages: &[Message::User(prompt)],
                 tools: &[],
+                cache_key: None,
             })
             .await
         {
