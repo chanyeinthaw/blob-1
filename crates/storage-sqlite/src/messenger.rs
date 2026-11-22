@@ -230,9 +230,19 @@ impl MessengerStore for SqliteStorage {
     }
 
     fn mark_pending_thread(&self, destination: u64) -> Result<(), StoreError> {
+        // Skip inserting if the thread was already recorded in `seen_threads`
+        // (e.g. gateway `ThreadCreate` arrived during the reply-mode decision).
         self.lock()
             .execute(
-                "INSERT OR IGNORE INTO pending_threads (destination_id) VALUES (?1)",
+                "INSERT OR IGNORE INTO pending_threads (destination_id)
+                 SELECT id FROM destinations
+                 WHERE id = ?1 AND thread != ''
+                   AND NOT EXISTS (
+                     SELECT 1 FROM seen_threads s
+                     WHERE s.messenger = destinations.messenger
+                       AND s.channel = destinations.channel
+                       AND s.thread = destinations.thread
+                   )",
                 [destination as i64],
             )
             .map_err(backend)?;
@@ -240,12 +250,22 @@ impl MessengerStore for SqliteStorage {
     }
 
     fn clear_pending_thread(&self, destination: u64) -> Result<(), StoreError> {
-        self.lock()
-            .execute(
-                "DELETE FROM pending_threads WHERE destination_id = ?1",
-                [destination as i64],
-            )
+        let mut connection = self.lock();
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(backend)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO seen_threads (messenger, channel, thread)
+             SELECT messenger, channel, thread FROM destinations WHERE id = ?1 AND thread != ''",
+            [destination as i64],
+        )
+        .map_err(backend)?;
+        tx.execute(
+            "DELETE FROM pending_threads WHERE destination_id = ?1",
+            [destination as i64],
+        )
+        .map_err(backend)?;
+        tx.commit().map_err(backend)?;
         Ok(())
     }
 
@@ -255,12 +275,23 @@ impl MessengerStore for SqliteStorage {
         channel: &str,
         thread: &str,
     ) -> Result<(), StoreError> {
-        self.lock()
-            .execute(
-                "DELETE FROM pending_threads WHERE destination_id IN (SELECT id FROM destinations WHERE messenger = ?1 AND channel = ?2 AND thread = ?3)",
-                params![messenger, channel, thread],
-            )
+        let mut connection = self.lock();
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(backend)?;
+        // Record in `seen_threads` without creating a `destinations` row for
+        // threads where the agent has never admitted a message.
+        tx.execute(
+            "INSERT OR IGNORE INTO seen_threads (messenger, channel, thread) VALUES (?1, ?2, ?3)",
+            params![messenger, channel, thread],
+        )
+        .map_err(backend)?;
+        tx.execute(
+            "DELETE FROM pending_threads WHERE destination_id IN (SELECT id FROM destinations WHERE messenger = ?1 AND channel = ?2 AND thread = ?3)",
+            params![messenger, channel, thread],
+        )
+        .map_err(backend)?;
+        tx.commit().map_err(backend)?;
         Ok(())
     }
 
@@ -563,11 +594,32 @@ mod tests {
         assert!(store.is_pending_thread(dest).unwrap());
         store.clear_pending_thread(dest).unwrap();
         assert!(!store.is_pending_thread(dest).unwrap());
+        // Once seen, a later `mark_pending_thread` cannot re-arm pending state.
         store.mark_pending_thread(dest).unwrap();
-        store
-            .clear_pending_thread_by_place("discord", "c2", "m1")
-            .unwrap();
         assert!(!store.is_pending_thread(dest).unwrap());
+
+        // Observing a thread before its destination exists does NOT create a
+        // `destinations` row, yet still blocks a later `mark_pending_thread`.
+        store
+            .clear_pending_thread_by_place("discord", "c2", "m_raced")
+            .unwrap();
+        let dest_count: i64 = store
+            .lock()
+            .query_row("SELECT COUNT(*) FROM destinations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(dest_count, 1);
+        let raced = store
+            .destination(
+                "discord",
+                &Place {
+                    channel: "c2".into(),
+                    thread: Some("m_raced".into()),
+                    dm: false,
+                },
+            )
+            .unwrap();
+        store.mark_pending_thread(raced).unwrap();
+        assert!(!store.is_pending_thread(raced).unwrap());
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

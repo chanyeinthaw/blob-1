@@ -21,8 +21,6 @@ mod web_auth;
 pub use crypto::AppKey;
 
 const SCHEMA: &str = "
-PRAGMA foreign_keys = ON;
-
 CREATE TABLE IF NOT EXISTS web_password (id INTEGER PRIMARY KEY CHECK (id = 1), hash TEXT NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS web_sessions (hash BLOB PRIMARY KEY, expires INTEGER NOT NULL, renewed INTEGER NOT NULL) STRICT;
 
@@ -66,7 +64,7 @@ CREATE TABLE IF NOT EXISTS destinations (id INTEGER PRIMARY KEY, messenger TEXT 
 CREATE TABLE IF NOT EXISTS allowed_users (messenger TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (messenger, user_id)) STRICT;
 CREATE TABLE IF NOT EXISTS interaction_modes (messenger TEXT NOT NULL, scope TEXT NOT NULL CHECK (scope IN ('channel', 'user')), guild_id TEXT NOT NULL DEFAULT '', target_id TEXT NOT NULL, mode TEXT NOT NULL CHECK (mode IN ('mention-only', 'always')), CHECK ((scope = 'channel' AND guild_id = '') OR scope = 'user'), PRIMARY KEY (messenger, scope, guild_id, target_id)) STRICT;
 CREATE TABLE IF NOT EXISTS reply_modes (messenger TEXT NOT NULL, channel_id TEXT NOT NULL, mode TEXT NOT NULL CHECK (mode IN ('decision', 'thread', 'direct')), PRIMARY KEY (messenger, channel_id)) STRICT;
-CREATE TABLE IF NOT EXISTS pending_threads (destination_id INTEGER PRIMARY KEY REFERENCES destinations (id) ON DELETE CASCADE) STRICT;
+CREATE TABLE IF NOT EXISTS seen_threads (messenger TEXT NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, PRIMARY KEY (messenger, channel, thread)) STRICT;
 
 CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK (id = 1), text TEXT NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS public_url (id INTEGER PRIMARY KEY CHECK (id = 1), url TEXT NOT NULL) STRICT;
@@ -205,32 +203,20 @@ impl SqliteStorage {
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(backend)?;
-        let had_destinations: bool = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'destinations')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(backend)?;
-        let had_pending_threads: bool = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pending_threads')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(backend)?;
-        if had_destinations && !had_pending_threads && owner.is_none() {
-            return Err(StoreError::Backend(
-                "this database needs an upgrade: restart blob-1 serve or run an exclusive command once".into(),
-            ));
-        }
         connection
             .pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))
             .map_err(backend)?;
         connection
             .pragma_update(None, "synchronous", "NORMAL")
             .map_err(backend)?;
-        connection.execute_batch(SCHEMA).map_err(backend)?;
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .map_err(backend)?;
+        // Initialize schema + `pending_threads` atomically inside one immediate
+        // transaction when `pending_threads` is absent, so a concurrent shared
+        // open on a fresh DB can never observe `destinations` without
+        // `pending_threads`, and an interrupted legacy backfill rolls back cleanly.
+        init_schema_and_pending_threads(&mut connection, owner.is_some())?;
         for table in ["destinations", "allowed_users"] {
             let old_column: bool = connection
                 .query_row(
@@ -286,9 +272,6 @@ impl SqliteStorage {
             .map_err(backend)?;
             tx.commit().map_err(backend)?;
         }
-        if had_destinations && !had_pending_threads {
-            backfill_pending_threads(&mut connection)?;
-        }
         let key = match app_key {
             Some(app_key) => Some(crypto::setup(&connection, &app_key)?),
             None => None,
@@ -327,16 +310,54 @@ fn backend(error: rusqlite::Error) -> StoreError {
     StoreError::Backend(Box::new(error))
 }
 
-/// One-time upgrade backfill for pre-`pending_threads` databases: recovers
-/// pending markers only where `memory_messages` provably establishes a
-/// synthesized plain-channel thread destination that was never observed as a
-/// thread and never targeted by a `send` tool call. Ambiguous legacy
-/// destinations remain non-pending.
-fn backfill_pending_threads(connection: &mut Connection) -> Result<(), StoreError> {
+/// Initializes `SCHEMA` and `pending_threads` atomically inside one immediate
+/// transaction when `pending_threads` does not yet exist. On a fresh database,
+/// `destinations` and `pending_threads` become visible together so concurrent
+/// opens never collide or misclassify the DB as needing an exclusive upgrade.
+/// On a legacy database that already has `destinations`, requires exclusive
+/// ownership and runs the one-time backfill in the same transaction.
+fn init_schema_and_pending_threads(
+    connection: &mut Connection,
+    exclusive: bool,
+) -> Result<(), StoreError> {
     use std::collections::{HashMap, HashSet};
+    let table_exists = |conn: &Connection, name: &str| -> Result<bool, StoreError> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |row| row.get(0),
+        )
+        .map_err(backend)
+    };
+    if table_exists(connection, "pending_threads")? {
+        connection.execute_batch(SCHEMA).map_err(backend)?;
+        return Ok(());
+    }
     let tx = connection
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(backend)?;
+    if table_exists(&tx, "pending_threads")? {
+        tx.execute_batch(SCHEMA).map_err(backend)?;
+        tx.commit().map_err(backend)?;
+        return Ok(());
+    }
+    let had_destinations = table_exists(&tx, "destinations")?;
+    if had_destinations && !exclusive {
+        return Err(StoreError::Backend(
+            "this database needs an upgrade: restart blob-1 serve or run an exclusive command once".into(),
+        ));
+    }
+    tx.execute_batch(SCHEMA).map_err(backend)?;
+    tx.execute_batch(
+        "CREATE TABLE pending_threads (
+             destination_id INTEGER PRIMARY KEY REFERENCES destinations (id) ON DELETE CASCADE
+         ) STRICT;",
+    )
+    .map_err(backend)?;
+    if !had_destinations {
+        tx.commit().map_err(backend)?;
+        return Ok(());
+    }
     let destinations: HashMap<u64, (String, String)> = {
         let mut stmt = tx
             .prepare("SELECT id, channel, thread FROM destinations WHERE thread != '' AND dm = 0")
