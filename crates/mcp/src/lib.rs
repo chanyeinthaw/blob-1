@@ -566,6 +566,47 @@ impl Mcp {
         })
     }
 
+    /// Attempts to connect a single configured server so Settings shows live
+    /// status (`connected`, `needs-login`, or `error`) immediately after adding
+    /// or enabling it.
+    pub async fn probe(&self, id: &str) {
+        if self.sync().await.is_ok() {
+            let _ = self.peer(id).await;
+        }
+    }
+
+    /// Probes enabled servers that are not yet connected (in parallel, obeying
+    /// `RETRY_BACKOFF` so dead servers don't stall repeated status checks).
+    pub async fn probe_enabled(&self) {
+        if self.sync().await.is_err() {
+            return;
+        }
+        let entries: Vec<Arc<Entry>> = self
+            .inner
+            .servers
+            .lock()
+            .await
+            .values()
+            .filter(|entry| entry.config.enabled)
+            .cloned()
+            .collect();
+        let mut join = tokio::task::JoinSet::new();
+        for entry in entries {
+            let should_probe = entry
+                .state
+                .try_lock()
+                .is_ok_and(|state| state.conn.is_none() && !state.needs_login);
+            if should_probe {
+                let mcp = self.clone();
+                let id = entry.config.id.clone();
+                join.spawn(async move {
+                    let _ = mcp.peer(&id).await;
+                });
+            }
+        }
+        while join.join_next().await.is_some() {}
+    }
+
     /// Servers configured in storage, with live status for `mcp.list`.
     pub async fn server_statuses(&self) -> Vec<ServerStatus> {
         if self.sync().await.is_err() {

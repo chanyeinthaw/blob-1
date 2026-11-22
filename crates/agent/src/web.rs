@@ -806,7 +806,10 @@ async fn dispatch(
                     json!({"guilds":guilds.into_iter().map(|(id,name)| json!({"id":id,"name":name})).collect::<Vec<_>>(),"channels":channels.into_iter().map(|(id,name,server,is_thread)| json!({"id":id,"name":name,"server":server,"kind":if is_thread { "thread" } else { "channel" }})).collect::<Vec<_>>(),"people":people.into_iter().map(|(p,g)| json!({"id":p.id,"name":p.name,"guilds":g})).collect::<Vec<_>>() }),
                 )
             }
-            "mcp.list" => Ok(mcp_reply(&ctx.mcp).await?),
+            "mcp.list" => {
+                ctx.mcp.probe_enabled().await;
+                Ok(mcp_reply(&ctx.mcp).await?)
+            }
             "mcp.add" => {
                 let id = get("id")?;
                 if !mcp::valid_id(id) {
@@ -838,6 +841,7 @@ async fn dispatch(
                     transport,
                     enabled: true,
                 })?;
+                ctx.mcp.probe(id).await;
                 Ok(mcp_reply(&ctx.mcp).await?)
             }
             "mcp.remove" => {
@@ -858,6 +862,9 @@ async fn dispatch(
                     .ok_or_else(|| format!("no MCP server '{id}'"))?;
                 server.enabled = enabled;
                 store.save_mcp_server(&server)?;
+                if enabled {
+                    ctx.mcp.probe(id).await;
+                }
                 Ok(mcp_reply(&ctx.mcp).await?)
             }
             "mcp.login" => {

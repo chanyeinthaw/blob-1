@@ -189,9 +189,9 @@ function statusBadge(server: McpServer, togglingThis: boolean) {
     case 'connecting':
       return <Chip className="text-muted-foreground">Connecting…</Chip>
     case 'idle':
-      return <Chip className="text-muted-foreground">Not connected yet</Chip>
+      return <Chip className="text-muted-foreground">Standby</Chip>
     case 'needs-login':
-      return <Chip className="text-destructive">Needs login</Chip>
+      return <Chip className="text-destructive">Needs sign-in</Chip>
     case 'error':
       return <Chip className="text-destructive">Error</Chip>
   }
@@ -205,8 +205,7 @@ const serverDetail = (server: McpServer): string =>
 const needsOauth = (server: McpServer): boolean =>
   server.enabled &&
   server.transport === 'http' &&
-  server.auth !== 'headers' &&
-  server.status !== 'connected'
+  (server.status === 'needs-login' || (server.auth === 'oauth' && server.status !== 'connected'))
 
 interface ServerRowProps {
   readonly server: McpServer
@@ -264,7 +263,7 @@ function ServerRow(props: ServerRowProps) {
             disabled={loggingIn}
             onClick={() => send(McpEvents.Login({ id: server.id }))}
           >
-            {loggingInThis ? 'Connecting…' : 'Connect'}
+            {loggingInThis ? 'Signing in…' : 'Sign in'}
             {loggingInThis ? null : <ExternalLink data-icon="inline-end" className="size-3.5" />}
           </Button>
         ) : null}
