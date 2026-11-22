@@ -6,6 +6,12 @@ export const Identity = Schema.Struct({
 })
 export type Identity = typeof Identity.Type
 
+export const GeneralSettings = Schema.Struct({
+  autoRespond: Schema.Boolean,
+  hasUtilityModel: Schema.Boolean,
+})
+export type GeneralSettings = typeof GeneralSettings.Type
+
 export const Reasoning = Schema.Literals(['off', 'low', 'medium', 'high', 'xhigh', 'max'])
 export type Reasoning = typeof Reasoning.Type
 
@@ -248,6 +254,11 @@ export const ScheduleState = Schema.Struct({
 export type ScheduleState = typeof ScheduleState.Type
 
 export const requests = {
+  'general.get': { payload: NoPayload, reply: GeneralSettings },
+  'general.setAutoRespond': {
+    payload: Schema.Struct({ enabled: Schema.Boolean }),
+    reply: GeneralSettings,
+  },
   'identity.get': { payload: NoPayload, reply: Identity },
   'identity.set': {
     payload: Schema.Struct({ text: Schema.String }),

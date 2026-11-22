@@ -621,14 +621,14 @@ async fn decide_inline(
     utility.generate("Decide how a team chat bot should answer this message. Reply 'inline' for a quick question, greeting or short answer; reply 'thread' if it will need work, several messages, files or a longer discussion. Reply with one word.", &prompt).await.is_ok_and(|answer| harness::parse_inline(&answer))
 }
 
-/// The effective interaction mode for an inbound message: a thread-level
-/// channel override, then the channel, then the guild-scoped author override,
-/// default mention-only.
-fn effective_mode(
+/// Returns any explicit interaction mode override matching `inbound`
+/// (thread override -> parent channel override -> guild-scoped author override),
+/// or `None` when the bot-wide default applies.
+fn explicit_interaction_mode(
     overrides: &[storage::InteractionOverride],
     inbound: &messenger::Inbound,
-) -> storage::InteractionMode {
-    use storage::{InteractionMode, InteractionScope};
+) -> Option<storage::InteractionMode> {
+    use storage::InteractionScope;
     let find_channel = |target: &str| {
         overrides
             .iter()
@@ -647,17 +647,26 @@ fn effective_mode(
     };
     if let Some(thread) = inbound.place.thread.as_deref() {
         if let Some(mode) = find_channel(thread) {
-            return mode;
+            return Some(mode);
         }
     }
-    find_channel(&inbound.place.channel)
-        .or_else(|| {
-            inbound
-                .guild
-                .as_deref()
-                .and_then(|guild| find_user(guild, &inbound.author.id))
-        })
-        .unwrap_or(InteractionMode::MentionOnly)
+    find_channel(&inbound.place.channel).or_else(|| {
+        inbound
+            .guild
+            .as_deref()
+            .and_then(|guild| find_user(guild, &inbound.author.id))
+    })
+}
+
+/// The effective interaction mode for an inbound message: a thread-level
+/// channel override, then the channel, then the guild-scoped author override,
+/// default mention-only.
+#[cfg(test)]
+fn effective_mode(
+    overrides: &[storage::InteractionOverride],
+    inbound: &messenger::Inbound,
+) -> storage::InteractionMode {
+    explicit_interaction_mode(overrides, inbound).unwrap_or(storage::InteractionMode::MentionOnly)
 }
 
 /// Evaluates whether `author` is permitted to talk to the bot under the active
@@ -710,6 +719,7 @@ fn pre_filter_decision(
     thread: Option<&str>,
     addressed: bool,
     channel_known: bool,
+    auto_respond: bool,
 ) -> messenger_discord::PreFilterDecision {
     use messenger_discord::PreFilterDecision;
     use storage::{AccessList, AccessMode, AccessScope, InteractionMode, InteractionScope};
@@ -767,41 +777,45 @@ fn pre_filter_decision(
                 InteractionMode::MentionOnly => PreFilterDecision::Reject,
             }
         } else {
-            let user_mode = guild
-                .and_then(|g| {
-                    overrides
-                        .iter()
-                        .find(|o| {
-                            o.scope == InteractionScope::User
-                                && o.guild_id.as_deref() == Some(g)
-                                && o.target_id == author
-                        })
-                        .map(|o| o.mode)
-                })
-                .unwrap_or(InteractionMode::MentionOnly);
+            let user_override = guild.and_then(|g| {
+                overrides
+                    .iter()
+                    .find(|o| {
+                        o.scope == InteractionScope::User
+                            && o.guild_id.as_deref() == Some(g)
+                            && o.target_id == author
+                    })
+                    .map(|o| o.mode)
+            });
+            // Without an explicit user override, `auto_respond` lets unaddressed
+            // messages reach the shared utility-model response gate in `admit`.
+            let default_allow = match user_override {
+                Some(InteractionMode::Always) => true,
+                Some(InteractionMode::MentionOnly) => false,
+                None => auto_respond,
+            };
             if !channel_known {
-                let could_flip = match user_mode {
-                    InteractionMode::MentionOnly => overrides.iter().any(|o| {
-                        o.scope == InteractionScope::Channel && o.mode == InteractionMode::Always
-                    }),
-                    InteractionMode::Always => overrides.iter().any(|o| {
+                let could_flip = if default_allow {
+                    overrides.iter().any(|o| {
                         o.scope == InteractionScope::Channel
                             && o.mode == InteractionMode::MentionOnly
-                    }),
+                    })
+                } else {
+                    overrides.iter().any(|o| {
+                        o.scope == InteractionScope::Channel && o.mode == InteractionMode::Always
+                    })
                 };
                 if could_flip {
                     PreFilterDecision::NeedParent
+                } else if default_allow {
+                    PreFilterDecision::Allow
                 } else {
-                    match user_mode {
-                        InteractionMode::Always => PreFilterDecision::Allow,
-                        InteractionMode::MentionOnly => PreFilterDecision::Reject,
-                    }
+                    PreFilterDecision::Reject
                 }
+            } else if default_allow {
+                PreFilterDecision::Allow
             } else {
-                match user_mode {
-                    InteractionMode::Always => PreFilterDecision::Allow,
-                    InteractionMode::MentionOnly => PreFilterDecision::Reject,
-                }
+                PreFilterDecision::Reject
             }
         }
     };
@@ -817,7 +831,19 @@ fn pre_filter_decision(
     }
 }
 
-fn admitted(store: &SqliteStorage, inbound: &messenger::Inbound) -> Result<bool> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionPolicy {
+    Deny,
+    AdmitDirect,
+    AutoRespondCheck,
+}
+
+/// Evaluates deterministic access + interaction admission policy for `inbound`.
+/// Shared by `admit` and tests so policy checks cannot drift.
+fn admission_policy(
+    store: &SqliteStorage,
+    inbound: &messenger::Inbound,
+) -> Result<AdmissionPolicy> {
     let mode = store.access_mode("discord")?;
     let entries = store.access_entries("discord")?;
     if !access_allowed(
@@ -829,14 +855,16 @@ fn admitted(store: &SqliteStorage, inbound: &messenger::Inbound) -> Result<bool>
         inbound.place.thread.as_deref(),
         inbound.place.dm,
     ) {
-        return Ok(false);
+        return Ok(AdmissionPolicy::Deny);
     }
-    Ok(
-        match effective_mode(&store.interaction_modes("discord")?, inbound) {
-            storage::InteractionMode::Always => true,
-            storage::InteractionMode::MentionOnly => inbound.addressed,
-        },
-    )
+    if inbound.addressed {
+        return Ok(AdmissionPolicy::AdmitDirect);
+    }
+    match explicit_interaction_mode(&store.interaction_modes("discord")?, inbound) {
+        Some(storage::InteractionMode::Always) => Ok(AdmissionPolicy::AdmitDirect),
+        Some(storage::InteractionMode::MentionOnly) => Ok(AdmissionPolicy::Deny),
+        None => Ok(AdmissionPolicy::AutoRespondCheck),
+    }
 }
 
 /// The effective reply mode for a plain-channel message: a channel override
@@ -858,8 +886,47 @@ async fn admit(
     inbound: messenger::Inbound,
     utility: Option<&harness::Utility>,
 ) -> Result<Option<(String, storage::Meta)>> {
-    if !admitted(store, &inbound)? {
-        return Ok(None);
+    let mut prefetched_history: Option<Vec<messenger::Fetched>> = None;
+    let mut auto_responded = false;
+    match admission_policy(store, &inbound)? {
+        AdmissionPolicy::Deny => return Ok(None),
+        AdmissionPolicy::AdmitDirect => {}
+        AdmissionPolicy::AutoRespondCheck => {
+            // Shared pre-messenger response gate: when auto-respond is on and a
+            // utility model is configured, fetch recent history and ask the
+            // utility model whether this unaddressed message is meant for us.
+            let auto_respond = store.auto_respond()?;
+            let Some(utility) = utility.filter(|_| auto_respond) else {
+                return Ok(None);
+            };
+            let identity = store
+                .identity()?
+                .or_else(|| Some(harness::DEFAULT_IDENTITY.into()));
+            let bot_id = discord.self_id();
+            let decision = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let history = discord
+                    .history(&inbound.place, Some(&inbound.message), 10)
+                    .await
+                    .ok()?;
+                let respond = harness::decide_respond(
+                    utility,
+                    identity.as_deref(),
+                    bot_id.as_deref(),
+                    &history,
+                    &inbound,
+                )
+                .await;
+                Some((respond, history))
+            })
+            .await;
+            match decision {
+                Ok(Some((true, history))) => {
+                    prefetched_history = Some(history);
+                    auto_responded = true;
+                }
+                _ => return Ok(None),
+            }
+        }
     }
     let inline = if inbound.place.thread.is_none() && !inbound.place.dm {
         match effective_reply_mode(&store.reply_modes("discord")?, &inbound.place.channel) {
@@ -868,11 +935,18 @@ async fn admit(
             storage::ReplyMode::Decision => {
                 if let Some(utility) = utility {
                     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                        let history = discord
-                            .history(&inbound.place, Some(&inbound.message), 5)
-                            .await
-                            .ok()?;
-                        Some(decide_inline(utility, &history, &inbound).await)
+                        let fetched;
+                        let slice: &[messenger::Fetched] = match prefetched_history.as_deref() {
+                            Some(h) => &h[h.len().saturating_sub(5)..],
+                            None => {
+                                fetched = discord
+                                    .history(&inbound.place, Some(&inbound.message), 5)
+                                    .await
+                                    .ok()?;
+                                &fetched
+                            }
+                        };
+                        Some(decide_inline(utility, slice, &inbound).await)
                     })
                     .await
                     .ok()
@@ -920,7 +994,9 @@ async fn admit(
             author: inbound.author,
             to,
             inline,
-            unaddressed: !inbound.addressed,
+            // Auto-respond approvals already passed the utility-model gate, so
+            // only explicit `always` overrides ask the main model to re-judge.
+            unaddressed: !inbound.addressed && !auto_responded,
             location: inbound.location,
             earlier: inbound.earlier,
             quote: inbound.quote,
@@ -1000,6 +1076,21 @@ pub async fn serve(
                         return PreFilterDecision::Reject;
                     }
                 };
+                let auto_respond_enabled = match filter_store.auto_respond() {
+                    Ok(enabled) => enabled,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        false
+                    }
+                };
+                let has_utility = match filter_store.utility_model() {
+                    Ok(model) => model.is_some(),
+                    Err(error) => {
+                        eprintln!("{error}");
+                        false
+                    }
+                };
+                let auto_respond = auto_respond_enabled && has_utility;
                 pre_filter_decision(
                     access_mode,
                     &access_entries,
@@ -1010,6 +1101,7 @@ pub async fn serve(
                     thread,
                     addressed,
                     channel_known,
+                    auto_respond,
                 )
             },
         ));
@@ -1078,30 +1170,59 @@ pub async fn serve(
     let admission_messengers = messengers.clone();
     let admission_models = models.clone();
     let admission = tokio::spawn(async move {
-        while let Some(inbound) = rx.recv().await {
-            let utility = admission_models
-                .current()
-                .ok()
-                .and_then(|current| current.utility);
-            match admit(
-                &admission_store,
-                admission_discord.clone(),
-                &admission_messengers,
-                inbound,
-                utility.as_ref(),
-            )
-            .await
-            {
-                Ok(Some(next)) => {
-                    if admitted_tx.send(Ok(next)).await.is_err() {
+        const MAX_INFLIGHT_ADMISSIONS: usize = 64;
+        let limit = Arc::new(tokio::sync::Semaphore::new(8));
+        let mut inflight = tokio::task::JoinSet::new();
+        // Per-conversation FIFO chain: preserves arrival order within each
+        // channel/thread/DM while letting separate conversations admit concurrently.
+        let mut place_tail: std::collections::HashMap<
+            storage::Place,
+            tokio::sync::oneshot::Receiver<()>,
+        > = std::collections::HashMap::new();
+        loop {
+            tokio::select! {
+                inbound = rx.recv(), if inflight.len() < MAX_INFLIGHT_ADMISSIONS => match inbound {
+                    Some(inbound) => {
+                        place_tail.retain(|_, rx| {
+                            !matches!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed))
+                        });
+                        let prev = place_tail.remove(&inbound.place);
+                        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                        place_tail.insert(inbound.place.clone(), done_rx);
+                        let limit = limit.clone();
+                        let store = admission_store.clone();
+                        let discord = admission_discord.clone();
+                        let messengers = admission_messengers.clone();
+                        let utility = admission_models
+                            .current()
+                            .ok()
+                            .and_then(|current| current.utility);
+                        let tx = admitted_tx.clone();
+                        inflight.spawn(async move {
+                            let _done = done_tx;
+                            if let Some(prev) = prev {
+                                let _ = prev.await;
+                            }
+                            let Ok(_permit) = limit.acquire_owned().await else {
+                                return;
+                            };
+                            match admit(&store, discord, &messengers, inbound, utility.as_ref()).await {
+                                Ok(Some(next)) => {
+                                    let _ = tx.send(Ok(next)).await;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    let _ = tx.send(Err(error)).await;
+                                }
+                            }
+                        });
+                    }
+                    None => {
+                        while inflight.join_next().await.is_some() {}
                         return;
                     }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let _ = admitted_tx.send(Err(error)).await;
-                    return;
-                }
+                },
+                Some(_) = inflight.join_next(), if !inflight.is_empty() => {}
             }
         }
     });
@@ -1320,7 +1441,8 @@ mod tests {
                 "c2",
                 None,
                 false,
-                true
+                true,
+                false
             ),
             PreFilterDecision::Allow
         );
@@ -1334,9 +1456,58 @@ mod tests {
                 "c2",
                 None,
                 false,
+                true,
+                false
+            ),
+            PreFilterDecision::Reject
+        );
+        // With auto_respond enabled, unaddressed messages without overrides pass to the shared gate.
+        assert_eq!(
+            pre_filter_decision(
+                AccessMode::Whitelist,
+                &access,
+                &overrides,
+                "u1",
+                Some("g2"),
+                "c2",
+                None,
+                false,
+                true,
+                true
+            ),
+            PreFilterDecision::Allow
+        );
+        // Explicit mention-only thread still rejects even when auto_respond is on.
+        assert_eq!(
+            pre_filter_decision(
+                AccessMode::Whitelist,
+                &access,
+                &overrides,
+                "u1",
+                Some("g2"),
+                "t1",
+                None,
+                false,
+                false,
                 true
             ),
             PreFilterDecision::Reject
+        );
+        // With auto_respond on and an uncached thread, a mention-only channel override triggers NeedParent.
+        assert_eq!(
+            pre_filter_decision(
+                AccessMode::Whitelist,
+                &access,
+                &overrides,
+                "u1",
+                Some("g2"),
+                "t_unknown",
+                None,
+                false,
+                false,
+                true
+            ),
+            PreFilterDecision::NeedParent
         );
         // Thread explicitly set to mention-only rejects even before parent lookup.
         assert_eq!(
@@ -1348,6 +1519,7 @@ mod tests {
                 Some("g1"),
                 "t1",
                 None,
+                false,
                 false,
                 false
             ),
@@ -1364,7 +1536,8 @@ mod tests {
                 "c1",
                 Some("t2"),
                 false,
-                true
+                true,
+                false
             ),
             PreFilterDecision::Allow
         );
@@ -1378,6 +1551,7 @@ mod tests {
                 Some("g1"),
                 "t2",
                 None,
+                false,
                 false,
                 false
             ),
@@ -1394,6 +1568,7 @@ mod tests {
                 "t2",
                 None,
                 true,
+                false,
                 false
             ),
             PreFilterDecision::NeedParent
@@ -1409,7 +1584,8 @@ mod tests {
                 "t2",
                 None,
                 true,
-                false
+                false,
+                true
             ),
             PreFilterDecision::Reject
         );
@@ -1430,6 +1606,7 @@ mod tests {
                 "t2",
                 None,
                 true,
+                false,
                 false
             ),
             PreFilterDecision::NeedParent
@@ -1444,7 +1621,8 @@ mod tests {
                 "c1",
                 Some("t2"),
                 true,
-                true
+                true,
+                false
             ),
             PreFilterDecision::Reject
         );
@@ -1524,19 +1702,30 @@ mod tests {
         let store = SqliteStorage::open(dir.join("agent.db"), None).unwrap();
         store.allow_user("discord", "u1").unwrap();
 
-        // With no overrides, only addressed messages are admitted.
-        assert!(admitted(&store, &inbound(channel("c1", None), Some("g1"), "u1", true)).unwrap());
-        assert!(!admitted(&store, &inbound(channel("c1", None), Some("g1"), "u1", false)).unwrap());
+        // With no overrides, addressed messages admit directly and unaddressed go to AutoRespondCheck.
+        assert_eq!(
+            admission_policy(&store, &inbound(channel("c1", None), Some("g1"), "u1", true))
+                .unwrap(),
+            AdmissionPolicy::AdmitDirect
+        );
+        assert_eq!(
+            admission_policy(&store, &inbound(channel("c1", None), Some("g1"), "u1", false))
+                .unwrap(),
+            AdmissionPolicy::AutoRespondCheck
+        );
         // DMs count as addressed.
         let dm = Place {
             channel: "dm1".into(),
             thread: None,
             dm: true,
         };
-        assert!(admitted(&store, &inbound(dm, None, "u1", true)).unwrap());
+        assert_eq!(
+            admission_policy(&store, &inbound(dm, None, "u1", true)).unwrap(),
+            AdmissionPolicy::AdmitDirect
+        );
 
-        // An `always` channel override admits unaddressed messages, but the
-        // allowlist still gates unallowlisted authors.
+        // An `always` channel override admits unaddressed messages directly, while the
+        // allowlist still denies unallowlisted authors.
         store
             .set_interaction_mode(
                 "discord",
@@ -1546,8 +1735,16 @@ mod tests {
                 InteractionMode::Always,
             )
             .unwrap();
-        assert!(admitted(&store, &inbound(channel("c1", None), Some("g1"), "u1", false)).unwrap());
-        assert!(!admitted(&store, &inbound(channel("c1", None), Some("g1"), "u9", false)).unwrap());
+        assert_eq!(
+            admission_policy(&store, &inbound(channel("c1", None), Some("g1"), "u1", false))
+                .unwrap(),
+            AdmissionPolicy::AdmitDirect
+        );
+        assert_eq!(
+            admission_policy(&store, &inbound(channel("c1", None), Some("g1"), "u9", false))
+                .unwrap(),
+            AdmissionPolicy::Deny
+        );
 
         // A mention-only thread override wins over the channel's `always`.
         store
@@ -1559,11 +1756,16 @@ mod tests {
                 InteractionMode::MentionOnly,
             )
             .unwrap();
-        assert!(
-            !admitted(&store, &inbound(channel("c1", Some("t1")), Some("g1"), "u1", false)).unwrap()
+        assert_eq!(
+            admission_policy(
+                &store,
+                &inbound(channel("c1", Some("t1")), Some("g1"), "u1", false)
+            )
+            .unwrap(),
+            AdmissionPolicy::Deny
         );
 
-        // A guild-scoped `always` user override admits the user in that guild
+        // A guild-scoped `always` user override admits the user directly in that guild
         // only, not in other guilds.
         store
             .set_interaction_mode(
@@ -1574,8 +1776,16 @@ mod tests {
                 InteractionMode::Always,
             )
             .unwrap();
-        assert!(admitted(&store, &inbound(channel("c9", None), Some("g1"), "u1", false)).unwrap());
-        assert!(!admitted(&store, &inbound(channel("c9", None), Some("g2"), "u1", false)).unwrap());
+        assert_eq!(
+            admission_policy(&store, &inbound(channel("c9", None), Some("g1"), "u1", false))
+                .unwrap(),
+            AdmissionPolicy::AdmitDirect
+        );
+        assert_eq!(
+            admission_policy(&store, &inbound(channel("c9", None), Some("g2"), "u1", false))
+                .unwrap(),
+            AdmissionPolicy::AutoRespondCheck
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1601,5 +1811,310 @@ mod tests {
         assert_eq!(effective_reply_mode(&overrides, "c2"), ReplyMode::Thread);
         assert_eq!(effective_reply_mode(&overrides, "c3"), ReplyMode::Decision);
         assert_eq!(effective_reply_mode(&overrides, "c9"), ReplyMode::Decision);
+    }
+
+    #[tokio::test]
+    async fn admit_auto_respond_gate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use storage::{ConfigStore, InteractionMode, InteractionScope, MessengerStore, Place};
+
+        struct StubLlm {
+            reply: &'static str,
+            calls: Arc<AtomicUsize>,
+            last_prompt: Arc<Mutex<String>>,
+        }
+        #[async_trait::async_trait]
+        impl harness::Llm for StubLlm {
+            async fn complete(
+                &self,
+                request: harness::CompletionRequest<'_>,
+            ) -> std::result::Result<harness::CompletionResponse, harness::LlmError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(storage::Message::User(text)) = request.messages.first() {
+                    *self.last_prompt.lock().unwrap() = text.clone();
+                }
+                Ok(harness::CompletionResponse {
+                    text: self.reply.into(),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                })
+            }
+        }
+
+        struct StubMessenger {
+            fail_history: bool,
+        }
+        #[async_trait::async_trait]
+        impl messenger::Lookup for StubMessenger {
+            fn name(&self) -> &'static str {
+                "discord"
+            }
+            fn self_id(&self) -> Option<String> {
+                Some("bot42".into())
+            }
+            async fn message(
+                &self,
+                _place: &Place,
+                _id: &str,
+            ) -> std::result::Result<messenger::Fetched, messenger::MessengerError> {
+                Err(messenger::MessengerError::Unsupported("stub".into()))
+            }
+            fn parse_link(&self, _link: &str) -> Option<(Place, String)> {
+                None
+            }
+            async fn history(
+                &self,
+                _place: &Place,
+                _before: Option<&str>,
+                _limit: u32,
+            ) -> std::result::Result<Vec<messenger::Fetched>, messenger::MessengerError> {
+                if self.fail_history {
+                    return Err(messenger::MessengerError::Unsupported("history failed".into()));
+                }
+                Ok(vec![messenger::Fetched {
+                    message: "m0".into(),
+                    author: storage::Person {
+                        id: "bot42".into(),
+                        name: "SupportBot".into(),
+                    },
+                    text: "Try restarting the service.".into(),
+                    date: "2026-11-22".into(),
+                    attachments: Vec::new(),
+                }])
+            }
+            async fn search(
+                &self,
+                _scope: &messenger::Scope,
+                _query: &str,
+                _limit: u32,
+            ) -> std::result::Result<Vec<messenger::Fetched>, messenger::MessengerError> {
+                Ok(Vec::new())
+            }
+            async fn participants(
+                &self,
+                _scope: &messenger::Scope,
+                _query: Option<&str>,
+            ) -> std::result::Result<Vec<storage::Person>, messenger::MessengerError> {
+                Ok(Vec::new())
+            }
+        }
+        #[async_trait::async_trait]
+        impl messenger::Messenger for StubMessenger {
+            async fn direct(
+                &self,
+                _user: &str,
+            ) -> std::result::Result<Place, messenger::MessengerError> {
+                Err(messenger::MessengerError::Unsupported("stub".into()))
+            }
+            async fn listen(
+                &self,
+                _inbound: tokio::sync::mpsc::Sender<messenger::Inbound>,
+            ) -> std::result::Result<(), messenger::MessengerError> {
+                Ok(())
+            }
+            async fn react(
+                &self,
+                _place: &Place,
+                _message: &str,
+                _mark: messenger::Mark,
+            ) -> std::result::Result<(), messenger::MessengerError> {
+                Ok(())
+            }
+            async fn unreact(
+                &self,
+                _place: &Place,
+                _message: &str,
+                _mark: messenger::Mark,
+            ) -> std::result::Result<(), messenger::MessengerError> {
+                Ok(())
+            }
+            async fn typing(
+                &self,
+                _place: &Place,
+            ) -> std::result::Result<(), messenger::MessengerError> {
+                Ok(())
+            }
+            async fn send(
+                &self,
+                _outbound: messenger::Outbound,
+            ) -> std::result::Result<messenger::Sent, messenger::MessengerError> {
+                Ok(messenger::Sent {
+                    created_thread: false,
+                    used_thread: false,
+                })
+            }
+            async fn rename(
+                &self,
+                _place: &Place,
+                _name: &str,
+            ) -> std::result::Result<(), messenger::MessengerError> {
+                Ok(())
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "blob-1-admit-auto-respond-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(SqliteStorage::open(dir.join("agent.db"), None).unwrap());
+        store.allow_user("discord", "u1").unwrap();
+        let stub: Arc<dyn messenger::Messenger> = Arc::new(StubMessenger { fail_history: false });
+        let failing_stub: Arc<dyn messenger::Messenger> =
+            Arc::new(StubMessenger { fail_history: true });
+        let messengers = harness::Messengers::new(vec![stub.clone()], store.clone());
+
+        let msg = |channel: &str, addressed: bool| messenger::Inbound {
+            place: Place {
+                channel: channel.into(),
+                thread: Some("t1".into()),
+                dm: false,
+            },
+            guild: Some("g1".into()),
+            message: "m1".into(),
+            author: storage::Person {
+                id: "u1".into(),
+                name: "Chan".into(),
+            },
+            text: "that worked, what next?".into(),
+            quote: None,
+            attachments: Vec::new(),
+            location: "#general".into(),
+            earlier: None,
+            addressed,
+        };
+
+        // Utility returns RESPOND -> admitted with unaddressed=false and [assistant] history label.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let last_prompt = Arc::new(Mutex::new(String::new()));
+        let respond_utility = harness::Utility::new(StubLlm {
+            reply: "RESPOND",
+            calls: calls.clone(),
+            last_prompt: last_prompt.clone(),
+        });
+        let (_, meta) = admit(
+            &store,
+            stub.clone(),
+            &messengers,
+            msg("c1", false),
+            Some(&respond_utility),
+        )
+        .await
+        .unwrap()
+        .expect("admitted by auto-respond");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(last_prompt
+            .lock()
+            .unwrap()
+            .contains("[assistant] SupportBot: Try restarting the service."));
+        assert!(matches!(
+            meta,
+            storage::Meta::Message {
+                unaddressed: false,
+                ..
+            }
+        ));
+
+        // History failure drops the message cleanly without waking the utility model.
+        assert!(admit(
+            &store,
+            failing_stub,
+            &messengers,
+            msg("c1", false),
+            Some(&respond_utility)
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Explicit Always channel override admits with unaddressed=true and skips utility.
+        store
+            .set_interaction_mode(
+                "discord",
+                InteractionScope::Channel,
+                None,
+                "c3",
+                InteractionMode::Always,
+            )
+            .unwrap();
+        let (_, always_meta) = admit(
+            &store,
+            stub.clone(),
+            &messengers,
+            msg("c3", false),
+            Some(&respond_utility),
+        )
+        .await
+        .unwrap()
+        .expect("admitted by always override");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            always_meta,
+            storage::Meta::Message {
+                unaddressed: true,
+                ..
+            }
+        ));
+
+        // Utility returns IGNORE -> silently dropped.
+        let ignore_calls = Arc::new(AtomicUsize::new(0));
+        let ignore_utility = harness::Utility::new(StubLlm {
+            reply: "IGNORE",
+            calls: ignore_calls.clone(),
+            last_prompt: Arc::new(Mutex::new(String::new())),
+        });
+        assert!(admit(
+            &store,
+            stub.clone(),
+            &messengers,
+            msg("c1", false),
+            Some(&ignore_utility)
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert_eq!(ignore_calls.load(Ordering::SeqCst), 1);
+
+        // Explicit MentionOnly channel override skips utility completely.
+        store
+            .set_interaction_mode(
+                "discord",
+                InteractionScope::Channel,
+                None,
+                "c2",
+                InteractionMode::MentionOnly,
+            )
+            .unwrap();
+        assert!(admit(
+            &store,
+            stub.clone(),
+            &messengers,
+            msg("c2", false),
+            Some(&respond_utility)
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Disabling auto_respond skips utility completely.
+        store.set_auto_respond(false).unwrap();
+        assert!(admit(
+            &store,
+            stub.clone(),
+            &messengers,
+            msg("c1", false),
+            Some(&respond_utility)
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        drop(messengers);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

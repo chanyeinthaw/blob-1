@@ -117,6 +117,7 @@ async fn run(
         match event {
             Some(Ok(Event::Ready(ready))) => {
                 bot = Some(ready.user.id);
+                let _ = inner.user.set(ready.user.id);
                 inner
                     .ready
                     .store(true, std::sync::atomic::Ordering::Relaxed);

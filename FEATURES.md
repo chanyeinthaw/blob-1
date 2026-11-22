@@ -84,8 +84,8 @@ Background workers spawned by the chat.
 
 One-shot generation: one request, no tools, no memory, no session.
 
-- Code: `crates/harness/src/utility.rs` (`Utility::generate`, `parse_inline`)
-- Used by the reply-mode gate and thread titles; without it, both are off
+- Code: `crates/harness/src/utility.rs` (`Utility::generate`, `decide_respond`, `parse_respond`, `parse_inline`)
+- Used by the shared pre-messenger **Auto-respond** gate (`settings.auto_respond`, default ON when a utility model is configured; toggled on the **General** tab at `/settings/general` or via `agent auto-respond show | on | off`; conservative in channels, more responsive in threads, silently drops `IGNORE` before typing/reactions; explicit per-channel/per-user `mention-only` and `always` overrides take precedence), the reply-mode gate, and thread titles; without a utility model, all three are off
 
 ## Messengers (Discord)
 

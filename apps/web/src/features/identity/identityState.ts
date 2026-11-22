@@ -1,6 +1,12 @@
 import { request } from '@blob-1/client/api'
+import { Effect } from 'effect'
 
 import { AppRuntime } from '~/lib/runtime'
 
-/** Loads the saved identity each time the page mounts. */
-export const identityPageAtom = AppRuntime.atom(request('identity.get', {}))
+/** Loads bot-wide General settings and identity each time the page mounts. */
+export const generalPageAtom = AppRuntime.atom(
+  Effect.all({
+    identity: request('identity.get', {}),
+    general: request('general.get', {}),
+  }),
+)

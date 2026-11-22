@@ -73,6 +73,10 @@ pub enum MessengerError {
 #[async_trait::async_trait]
 pub trait Lookup: Send + Sync {
     fn name(&self) -> &'static str;
+    /// Connected bot user ID when known, so shared triage can distinguish assistant turns.
+    fn self_id(&self) -> Option<String> {
+        None
+    }
     async fn message(&self, place: &Place, id: &str) -> Result<Fetched, MessengerError>;
     fn parse_link(&self, link: &str) -> Option<(Place, String)>;
     async fn history(

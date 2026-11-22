@@ -23,6 +23,6 @@ export async function requireSession() {
 /** Route guard: skips the sign-in screen for a signed-in browser. */
 export async function skipSignInWhenSignedIn() {
   if ((await Effect.runPromise(sessionState)) === 'signedIn') {
-    throw redirect({ to: '/settings/identity', replace: true })
+    throw redirect({ to: '/settings/general', replace: true })
   }
 }

@@ -466,6 +466,12 @@ impl Lookup for Discord {
         "discord"
     }
 
+    fn self_id(&self) -> Option<String> {
+        self.current()
+            .ok()
+            .and_then(|inner| inner.user.get().map(ToString::to_string))
+    }
+
     async fn message(&self, place: &Place, message: &str) -> Result<Fetched, MessengerError> {
         let message = self
             .current()?

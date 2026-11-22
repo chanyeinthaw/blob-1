@@ -322,6 +322,8 @@ pub trait ConfigStore: Send + Sync {
     fn set_home(&self, home: Option<&Home>) -> Result<(), StoreError>;
     fn identity(&self) -> Result<Option<String>, StoreError>;
     fn set_identity(&self, text: Option<&str>) -> Result<(), StoreError>;
+    fn auto_respond(&self) -> Result<bool, StoreError>;
+    fn set_auto_respond(&self, enabled: bool) -> Result<(), StoreError>;
     fn public_url(&self) -> Result<Option<String>, StoreError>;
     fn set_public_url(&self, url: Option<&str>) -> Result<(), StoreError>;
     fn providers(&self) -> Result<Vec<Provider>, StoreError>;

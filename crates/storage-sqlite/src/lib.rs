@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS settings (
     compaction_provider TEXT,
     compaction_model TEXT,
     compaction_reasoning TEXT CHECK (compaction_reasoning IN ('off', 'low', 'medium', 'high', 'xhigh', 'max')),
+    auto_respond INTEGER NOT NULL DEFAULT 1 CHECK (auto_respond IN (0, 1)),
     FOREIGN KEY (default_provider, default_model) REFERENCES models (provider, id) ON DELETE SET NULL,
     FOREIGN KEY (compaction_provider, compaction_model) REFERENCES models (provider, id) ON DELETE SET NULL
 ) STRICT;
@@ -292,6 +293,7 @@ impl SqliteStorage {
             tx.commit().map_err(backend)?;
         }
         ensure_access_entries(&mut connection, &mut require_exclusive)?;
+        ensure_settings_auto_respond(&mut connection, &mut require_exclusive)?;
         drop(upgrade_owner);
         let key = match app_key {
             Some(app_key) => Some(crypto::setup(&connection, &app_key)?),
@@ -550,6 +552,39 @@ fn ensure_access_entries(
          SELECT messenger, 'whitelist', 'global', '', user_id FROM allowed_users;",
     )
     .map_err(backend)?;
+    tx.commit().map_err(backend)?;
+    Ok(())
+}
+
+/// Adds `settings.auto_respond` (default `1` = enabled when a utility model is
+/// configured) to existing databases.
+fn ensure_settings_auto_respond(
+    connection: &mut Connection,
+    require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let has_column = |conn: &Connection| -> Result<bool, StoreError> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('settings') WHERE name = 'auto_respond')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(backend)
+    };
+    if has_column(connection)? {
+        return Ok(());
+    }
+    require_exclusive(
+        "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
+    )?;
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    if !has_column(&tx)? {
+        tx.execute_batch(
+            "ALTER TABLE settings ADD COLUMN auto_respond INTEGER NOT NULL DEFAULT 1 CHECK (auto_respond IN (0, 1));",
+        )
+        .map_err(backend)?;
+    }
     tx.commit().map_err(backend)?;
     Ok(())
 }

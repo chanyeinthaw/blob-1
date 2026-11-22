@@ -96,7 +96,7 @@ function SignInForm() {
         {error === null ? null : <FieldError id="signin-error">{error}</FieldError>}
       </div>
       <MachineState machine={machine} path="SignedIn" inactive={null}>
-        {() => <Navigate to="/settings/identity" replace />}
+        {() => <Navigate to="/settings/general" replace />}
       </MachineState>
       <Button type="submit" disabled={isSubmitting || password === ''}>
         {isSubmitting ? 'Signing in…' : 'Sign in'}

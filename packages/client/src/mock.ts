@@ -8,6 +8,7 @@ import {
   type DiscordAccessMode,
   type DiscordInteractionOverride,
   type DiscordReplyOverride,
+  type GeneralSettings,
   Home,
   Identity,
   McpServer,
@@ -38,6 +39,7 @@ type ProviderRecord = Readonly<{
 
 type State = Readonly<{
   identity: string
+  autoRespond: boolean
   main: Slot
   compaction: Slot | null
   utility: Slot | null
@@ -63,6 +65,7 @@ const NUMERIC_ID = /^\d+$/
 
 const seedState = (): State => ({
   identity: DEFAULT_IDENTITY,
+  autoRespond: true,
   main: { provider: 'cpa1', model: 'gpt-6.1-terra', reasoning: 'medium' },
   compaction: { provider: 'cpa1', model: 'gpt-6-luna', reasoning: 'medium' },
   utility: { provider: 'cpa1', model: 'gpt-6-luna', reasoning: 'low' },
@@ -129,6 +132,11 @@ const seedState = (): State => ({
     },
   ],
   nextWatchId: 2,
+})
+
+const generalReply = (state: State): GeneralSettings => ({
+  autoRespond: state.autoRespond,
+  hasUtilityModel: state.utility !== null,
 })
 
 const identityReply = (state: State): Identity => ({
@@ -642,6 +650,13 @@ type Handler<K extends RequestType> = (
 
 // oxlint-disable-next-line anti-slop/no-known-value-widening -- the mapped type keeps each handler tied to its request type for generic dispatch
 const handlers: { readonly [K in RequestType]: Handler<K> } = {
+  'general.get': (_payload, state) => Ref.get(state).pipe(Effect.map(generalReply)),
+
+  'general.setAutoRespond': ({ enabled }, state) =>
+    transition(state, current =>
+      Effect.succeed(Struct.evolve(current, { autoRespond: () => enabled })),
+    ).pipe(Effect.map(generalReply)),
+
   'identity.get': (_payload, state) => Ref.get(state).pipe(Effect.map(identityReply)),
 
   'identity.set': ({ text }, state) =>

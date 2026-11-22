@@ -15,6 +15,7 @@ import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as SettingsIndexRouteImport } from './routes/settings.index'
 import { Route as SettingsChatRouteImport } from './routes/settings.chat'
 import { Route as SettingsDiscordRouteImport } from './routes/settings.discord'
+import { Route as SettingsGeneralRouteImport } from './routes/settings.general'
 import { Route as SettingsIdentityRouteImport } from './routes/settings.identity'
 import { Route as SettingsMcpRouteImport } from './routes/settings.mcp'
 import { Route as SettingsModelsRouteImport } from './routes/settings.models'
@@ -51,6 +52,11 @@ const SettingsChatRoute = SettingsChatRouteImport.update({
 const SettingsDiscordRoute = SettingsDiscordRouteImport.update({
   id: '/discord',
   path: '/discord',
+  getParentRoute: () => SettingsRoute,
+} as any)
+const SettingsGeneralRoute = SettingsGeneralRouteImport.update({
+  id: '/general',
+  path: '/general',
   getParentRoute: () => SettingsRoute,
 } as any)
 const SettingsIdentityRoute = SettingsIdentityRouteImport.update({
@@ -95,6 +101,7 @@ export interface FileRoutesByFullPath {
   '/settings': typeof SettingsRouteWithChildren
   '/settings/chat': typeof SettingsChatRouteWithChildren
   '/settings/discord': typeof SettingsDiscordRoute
+  '/settings/general': typeof SettingsGeneralRoute
   '/settings/identity': typeof SettingsIdentityRoute
   '/settings/mcp': typeof SettingsMcpRoute
   '/settings/models': typeof SettingsModelsRoute
@@ -108,6 +115,7 @@ export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/settings/discord': typeof SettingsDiscordRoute
+  '/settings/general': typeof SettingsGeneralRoute
   '/settings/identity': typeof SettingsIdentityRoute
   '/settings/mcp': typeof SettingsMcpRoute
   '/settings/models': typeof SettingsModelsRoute
@@ -124,6 +132,7 @@ export interface FileRoutesById {
   '/settings': typeof SettingsRouteWithChildren
   '/settings/chat': typeof SettingsChatRouteWithChildren
   '/settings/discord': typeof SettingsDiscordRoute
+  '/settings/general': typeof SettingsGeneralRoute
   '/settings/identity': typeof SettingsIdentityRoute
   '/settings/mcp': typeof SettingsMcpRoute
   '/settings/models': typeof SettingsModelsRoute
@@ -141,6 +150,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/settings/chat'
     | '/settings/discord'
+    | '/settings/general'
     | '/settings/identity'
     | '/settings/mcp'
     | '/settings/models'
@@ -154,6 +164,7 @@ export interface FileRouteTypes {
     | '/'
     | '/login'
     | '/settings/discord'
+    | '/settings/general'
     | '/settings/identity'
     | '/settings/mcp'
     | '/settings/models'
@@ -169,6 +180,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/settings/chat'
     | '/settings/discord'
+    | '/settings/general'
     | '/settings/identity'
     | '/settings/mcp'
     | '/settings/models'
@@ -227,6 +239,13 @@ declare module '@tanstack/react-router' {
       path: '/discord'
       fullPath: '/settings/discord'
       preLoaderRoute: typeof SettingsDiscordRouteImport
+      parentRoute: typeof SettingsRoute
+    }
+    '/settings/general': {
+      id: '/settings/general'
+      path: '/general'
+      fullPath: '/settings/general'
+      preLoaderRoute: typeof SettingsGeneralRouteImport
       parentRoute: typeof SettingsRoute
     }
     '/settings/identity': {
@@ -298,6 +317,7 @@ const SettingsChatRouteWithChildren = SettingsChatRoute._addFileChildren(
 interface SettingsRouteChildren {
   SettingsChatRoute: typeof SettingsChatRouteWithChildren
   SettingsDiscordRoute: typeof SettingsDiscordRoute
+  SettingsGeneralRoute: typeof SettingsGeneralRoute
   SettingsIdentityRoute: typeof SettingsIdentityRoute
   SettingsMcpRoute: typeof SettingsMcpRoute
   SettingsModelsRoute: typeof SettingsModelsRoute
@@ -309,6 +329,7 @@ interface SettingsRouteChildren {
 const SettingsRouteChildren: SettingsRouteChildren = {
   SettingsChatRoute: SettingsChatRouteWithChildren,
   SettingsDiscordRoute: SettingsDiscordRoute,
+  SettingsGeneralRoute: SettingsGeneralRoute,
   SettingsIdentityRoute: SettingsIdentityRoute,
   SettingsMcpRoute: SettingsMcpRoute,
   SettingsModelsRoute: SettingsModelsRoute,

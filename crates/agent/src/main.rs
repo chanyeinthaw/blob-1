@@ -75,6 +75,10 @@ enum Command {
         #[command(subcommand)]
         command: IdentityCommand,
     },
+    AutoRespond {
+        #[command(subcommand)]
+        command: AutoRespondCommand,
+    },
     Mcp {
         #[command(subcommand)]
         command: McpCommand,
@@ -237,6 +241,13 @@ enum HomeCommand {
     Show,
     Set { messenger: String, target: String },
     Clear,
+}
+
+#[derive(Subcommand)]
+enum AutoRespondCommand {
+    Show,
+    On,
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -634,6 +645,7 @@ async fn main() -> Result<()> {
                 | Command::Messenger { .. }
                 | Command::Mcp { .. }
                 | Command::Identity { .. }
+                | Command::AutoRespond { .. }
                 | Command::Timezone { .. }
                 | Command::Home { .. }
                 | Command::Schedule { .. }
@@ -720,6 +732,24 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Identity { command } => identity(&store, command),
+        Command::AutoRespond { command } => {
+            match command {
+                AutoRespondCommand::Show => {
+                    let enabled = store.auto_respond()?;
+                    let has_utility = store.utility_model()?.is_some();
+                    if !enabled {
+                        println!("off");
+                    } else if has_utility {
+                        println!("on");
+                    } else {
+                        println!("on (inactive: no utility model configured)");
+                    }
+                }
+                AutoRespondCommand::On => store.set_auto_respond(true)?,
+                AutoRespondCommand::Off => store.set_auto_respond(false)?,
+            }
+            Ok(())
+        }
         Command::Messenger { command } => messenger(&store, command).await,
         Command::Mcp { command } => mcp_command(&store, command).await,
         Command::Web {

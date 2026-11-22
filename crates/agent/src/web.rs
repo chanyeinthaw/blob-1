@@ -381,6 +381,13 @@ fn str_map(payload: &Value, key: &str) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+fn general_reply(store: &SqliteStorage) -> crate::Result<Value> {
+    Ok(json!({
+        "autoRespond": store.auto_respond()?,
+        "hasUtilityModel": store.utility_model()?.is_some(),
+    }))
+}
+
 fn identity_reply(store: &SqliteStorage) -> crate::Result<Value> {
     let identity = store.identity()?;
     Ok(
@@ -606,6 +613,15 @@ async fn dispatch(
         let invalid = || format!("Invalid {request_type} payload");
         let get = |key| field(payload, key).map_err(|_| invalid());
         match request_type {
+            "general.get" => general_reply(store),
+            "general.setAutoRespond" => {
+                let enabled = payload
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(invalid)?;
+                store.set_auto_respond(enabled)?;
+                general_reply(store)
+            }
             "identity.get" => identity_reply(store),
             "identity.set" => {
                 let text = get("text")?;

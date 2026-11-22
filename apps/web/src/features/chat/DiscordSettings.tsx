@@ -777,7 +777,7 @@ function InteractionModeSection() {
           return (
             <>
               {value.discord.interactionModes.length === 0 ? (
-                <EmptyLine>Mention-only everywhere.</EmptyLine>
+                <EmptyLine>Using General default everywhere.</EmptyLine>
               ) : (
                 <ul className="flex flex-col divide-y">
                   {value.discord.interactionModes.map(override => (

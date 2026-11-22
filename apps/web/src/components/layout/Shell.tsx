@@ -7,8 +7,8 @@ import {
   LogOut,
   MessageCircle,
   Server,
+  Settings,
   SlidersHorizontal,
-  User,
   type LucideIcon,
 } from 'lucide-react'
 import type { ReactNode } from 'react'
@@ -30,7 +30,7 @@ interface NavItem {
 }
 
 const navItems: ReadonlyArray<NavItem> = [
-  { label: 'Identity', mobileLabel: 'Identity', to: '/settings/identity', icon: User },
+  { label: 'General', mobileLabel: 'General', to: '/settings/general', icon: Settings },
   { label: 'Schedules', mobileLabel: 'Schedules', to: '/settings/schedules', icon: CalendarClock },
   { label: 'Chat platforms', mobileLabel: 'Chat', to: '/settings/chat', icon: MessageCircle },
   { label: 'MCP', mobileLabel: 'MCP', to: '/settings/mcp', icon: LinkIcon },

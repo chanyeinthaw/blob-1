@@ -1,7 +1,7 @@
-import { createFileRoute } from '@tanstack/react-router'
-
-import { IdentityPage } from '~/features/identity/IdentityPage'
+import { createFileRoute, redirect } from '@tanstack/react-router'
 
 export const Route = createFileRoute('/settings/identity')({
-  component: IdentityPage,
+  beforeLoad: () => {
+    throw redirect({ to: '/settings/general', replace: true })
+  },
 })

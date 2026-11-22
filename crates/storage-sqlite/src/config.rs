@@ -71,6 +71,26 @@ impl ConfigStore for SqliteStorage {
         Ok(())
     }
 
+    fn auto_respond(&self) -> Result<bool, StoreError> {
+        let value: i64 = self
+            .lock()
+            .query_row("SELECT auto_respond FROM settings WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .map_err(backend)?;
+        Ok(value != 0)
+    }
+
+    fn set_auto_respond(&self, enabled: bool) -> Result<(), StoreError> {
+        self.lock()
+            .execute(
+                "UPDATE settings SET auto_respond = ?1 WHERE id = 1",
+                [i64::from(enabled)],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
     fn public_url(&self) -> Result<Option<String>, StoreError> {
         self.lock()
             .query_row("SELECT url FROM public_url WHERE id = 1", [], |row| {

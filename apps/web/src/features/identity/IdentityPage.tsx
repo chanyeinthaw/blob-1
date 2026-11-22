@@ -1,5 +1,5 @@
 import { useAtomRefresh, useAtomSet, useAtomValue } from '@effect/atom-react'
-import { useBlocker } from '@tanstack/react-router'
+import { Link, useBlocker } from '@tanstack/react-router'
 import { AtomMachine } from '@typeonce/effect-machine/reactivity'
 import {
   createMachineContext,
@@ -12,7 +12,7 @@ import { Undo2 } from 'lucide-react'
 import { useEffect } from 'react'
 
 import { ConfirmDialog } from '~/components/ConfirmDialog'
-import { EmptyLine, Page, PageError } from '~/components/layout/Page'
+import { EmptyLine, Page, PageError, Section } from '~/components/layout/Page'
 import {
   AlertDialog,
   AlertDialogCancel,
@@ -23,11 +23,17 @@ import {
   AlertDialogTitle,
 } from '~/components/ui/alert-dialog'
 import { Button } from '~/components/ui/button'
+import { Switch } from '~/components/ui/switch'
 import { MachineAtoms } from '~/lib/runtime'
 import { cn } from '~/lib/utils'
 
+import { GeneralEvents, type GeneralInput, GeneralMachine } from './generalMachine'
 import { IdentityEvents, type IdentityInput, IdentityMachine } from './identityMachine'
-import { identityPageAtom } from './identityState'
+import { generalPageAtom } from './identityState'
+
+const GeneralOwner = createMachineContext(({ input }: { input: GeneralInput }) =>
+  MachineAtoms.make(GeneralMachine, input),
+)
 
 const IdentityOwner = createMachineContext(({ input }: { input: IdentityInput }) =>
   MachineAtoms.make(IdentityMachine, input),
@@ -38,30 +44,74 @@ const resetAllowed = AtomMachine.can(IdentityEvents.Reset())
 const textClassName =
   'col-start-1 row-start-1 min-h-56 w-full px-3.5 py-3 whitespace-pre-wrap break-words text-base leading-relaxed text-foreground md:text-sm'
 
-/** The identity settings page: autosaving textarea with a reset-to-default action. */
-export function IdentityPage() {
-  const result = useAtomValue(identityPageAtom)
-  const retry = useAtomRefresh(identityPageAtom)
+/** The General settings page: bot-wide Auto-respond gate and autosaving Identity editor. */
+export function GeneralPage() {
+  const result = useAtomValue(generalPageAtom)
+  const retry = useAtomRefresh(generalPageAtom)
   return AsyncResult.match(result, {
     onInitial: () => (
-      <Page title="Identity">
+      <Page title="General">
         <EmptyLine>Loading…</EmptyLine>
       </Page>
     ),
     onFailure: failure => (
-      <Page title="Identity">
+      <Page title="General">
         <PageError cause={failure.cause} onRetry={retry} />
       </Page>
     ),
     onSuccess: ({ value }) => (
-      <IdentityOwner.Provider input={value}>
-        <Page title="Identity" actions={<IdentityActions />}>
-          <IdentityEditor />
-          <UnsavedGuard />
-        </Page>
-      </IdentityOwner.Provider>
+      <GeneralOwner.Provider input={value.general}>
+        <IdentityOwner.Provider input={value.identity}>
+          <Page title="General">
+            <div className="space-y-8">
+              <AutoRespondSection />
+              <Section title="Identity" action={<IdentityActions />}>
+                <IdentityEditor />
+              </Section>
+            </div>
+            <UnsavedGuard />
+          </Page>
+        </IdentityOwner.Provider>
+      </GeneralOwner.Provider>
     ),
   })
+}
+
+function AutoRespondSection() {
+  const machine = GeneralOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  const isSaving = AsyncResult.getOrElse(
+    useMachineResult(AtomMachine.matches(machine, 'Saving')),
+    () => false,
+  )
+  return (
+    <MachineState machine={machine} path="">
+      {({ value }) => (
+        <div className="flex items-center justify-between gap-4 rounded-2xl border border-border bg-card px-4 py-3.5 shadow-xs">
+          <div className="min-w-0">
+            <p className="text-sm font-medium text-foreground">Auto-respond</p>
+            {value.hasUtilityModel ? null : (
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                Requires a utility model.{' '}
+                <Link
+                  to="/settings/models"
+                  className="font-medium text-foreground underline underline-offset-2"
+                >
+                  Configure in Models
+                </Link>
+              </p>
+            )}
+          </div>
+          <Switch
+            aria-label="Auto-respond without @mention"
+            checked={value.autoRespond}
+            disabled={isSaving}
+            onCheckedChange={enabled => send(GeneralEvents.SetAutoRespond({ enabled }))}
+          />
+        </div>
+      )}
+    </MachineState>
+  )
 }
 
 function IdentityActions() {
@@ -73,7 +123,7 @@ function IdentityActions() {
     onSuccess: ({ value }) => value,
   })
   return (
-    <>
+    <div className="flex items-center gap-1">
       <span
         aria-live="polite"
         className="mr-1 hidden text-xs text-muted-foreground empty:sr-only md:inline"
@@ -98,7 +148,7 @@ function IdentityActions() {
               trigger={
                 <Button
                   variant="ghost"
-                  size="icon"
+                  size="icon-sm"
                   aria-label="Reset to default"
                   disabled={!canReset}
                 >
@@ -113,7 +163,7 @@ function IdentityActions() {
           )
         }
       </MachineState>
-    </>
+    </div>
   )
 }
 
