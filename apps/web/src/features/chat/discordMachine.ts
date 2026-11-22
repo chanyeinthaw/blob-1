@@ -149,8 +149,6 @@ export const DiscordStates = Machine.state({
     tokenGeneration: Schema.Finite,
     /** Transient home type chosen before picking a destination; null follows `discord.home.kind`. */
     pendingHomeKind: Schema.NullOr(HomeKind),
-    /** Which list (`whitelist` or `blacklist`) is being edited, independent of active `accessMode`. */
-    accessList: DiscordAccessList,
     /** Access add-entry form draft. */
     accessScope: DiscordAccessScope,
     accessScopeId: Schema.String,
@@ -261,7 +259,6 @@ export const DiscordEvents = Machine.events({
   ClearTokenError: {},
   SubmitToken: { token: Schema.String },
   RemoveToken: {},
-  SelectAccessList: { list: DiscordAccessList },
   SelectAccessScope: { scope: DiscordAccessScope },
   SelectAccessScopeId: { scopeId: Schema.String },
   SelectAccessUser: { userId: Schema.String },
@@ -325,7 +322,6 @@ export const DiscordMachine = Machine.make({
     ...input,
     tokenGeneration: 0,
     pendingHomeKind: null,
-    accessList: input.discord.accessMode === 'blacklist' ? 'blacklist' : 'whitelist',
     accessScope: 'global',
     accessScopeId: '',
     accessUser: '',
@@ -476,14 +472,6 @@ export const DiscordMachine = Machine.make({
       states: {
         Idle: {
           on: {
-            SelectAccessList: {
-              target: 'Access.Idle',
-              update: 'root',
-              data: ({ event, root, state }) => ({
-                target: { ...state, error: null },
-                update: { ...root, accessList: event.list, accessUser: '' },
-              }),
-            },
             SelectAccessScope: {
               target: 'Access.Idle',
               update: 'root',
@@ -562,8 +550,6 @@ export const DiscordMachine = Machine.make({
                     accessMode: output.accessMode,
                     accessEntries: output.accessEntries,
                   },
-                  accessList:
-                    output.accessMode === 'allow-all' ? root.accessList : output.accessMode,
                   accessUser: '',
                 },
               }),
@@ -602,7 +588,7 @@ export const DiscordMachine = Machine.make({
                       ? mergeDirectoryChannels(root.directory, output.directory)
                       : root.directory,
                   accessUser:
-                    state.list === root.accessList &&
+                    state.list === root.discord.accessMode &&
                     state.scope === root.accessScope &&
                     (state.scope === 'global' || state.scopeId === root.accessScopeId) &&
                     state.userId === root.accessUser

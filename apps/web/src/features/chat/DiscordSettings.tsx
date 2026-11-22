@@ -360,17 +360,8 @@ const accessScopes: ReadonlyArray<{ readonly scope: DiscordAccessScope; readonly
     { scope: 'channel', label: 'Channel' },
   ]
 
-const accessLists: ReadonlyArray<{ readonly list: DiscordAccessList; readonly label: string }> = [
-  { list: 'whitelist', label: 'Whitelist' },
-  { list: 'blacklist', label: 'Blacklist' },
-]
-
 function isAccessMode(value: string | undefined): value is DiscordAccessMode {
   return value === 'allow-all' || value === 'whitelist' || value === 'blacklist'
-}
-
-function isAccessList(value: string | undefined): value is DiscordAccessList {
-  return value === 'whitelist' || value === 'blacklist'
 }
 
 function isAccessScope(value: string | undefined): value is DiscordAccessScope {
@@ -402,8 +393,10 @@ function AccessSection() {
           const accessState = states.Access.state
           const error = accessState.path === 'Access.Idle' ? accessState.value.error : null
           const mode = value.discord.accessMode
-          const editingList = value.accessList
-          const entries = value.discord.accessEntries.filter(entry => entry.list === editingList)
+          const entries =
+            mode === 'allow-all'
+              ? []
+              : value.discord.accessEntries.filter(entry => entry.list === mode)
           return (
             <div>
               <FieldRow labelId="discord-access-mode-label" label="Mode">
@@ -431,50 +424,36 @@ function AccessSection() {
                   ))}
                 </ToggleGroup>
               </FieldRow>
-              <FieldRow labelId="discord-access-list-label" label="Edit list">
-                <ToggleGroup
-                  aria-labelledby="discord-access-list-label"
-                  spacing={1}
-                  disabled={!isIdle}
-                  value={[editingList]}
-                  onValueChange={values => {
-                    const next = values[0]
-                    if (isAccessList(next) && next !== editingList) {
-                      send(DiscordEvents.SelectAccessList({ list: next }))
-                    }
-                  }}
-                  className="h-10 rounded-full bg-muted p-[3px] md:h-8"
-                >
-                  {accessLists.map(item => (
-                    <ToggleGroupItem
-                      key={item.list}
-                      value={item.list}
-                      className={modeToggleItemClassName}
-                    >
-                      {item.label}
-                    </ToggleGroupItem>
-                  ))}
-                </ToggleGroup>
-              </FieldRow>
-              {entries.length === 0 ? (
-                <EmptyLine>
-                  {editingList === 'whitelist'
-                    ? 'Nobody is whitelisted yet.'
-                    : 'Nobody is blacklisted.'}
-                </EmptyLine>
+              {mode === 'allow-all' ? (
+                <>
+                  <EmptyLine>Anyone can talk to Blob-1.</EmptyLine>
+                  {error === null ? null : (
+                    <FieldError id="discord-access-error">{error}</FieldError>
+                  )}
+                </>
               ) : (
-                <ul className="mt-2 flex flex-col divide-y">
-                  {entries.map(entry => (
-                    <AccessRow
-                      key={`${entry.list}:${entry.scope}:${entry.scopeId ?? ''}:${entry.userId}`}
-                      entry={entry}
-                      directory={value.directory}
-                      disabled={!isIdle}
-                    />
-                  ))}
-                </ul>
+                <>
+                  {entries.length === 0 ? (
+                    <EmptyLine>
+                      {mode === 'whitelist'
+                        ? 'Nobody is whitelisted yet.'
+                        : 'Nobody is blacklisted.'}
+                    </EmptyLine>
+                  ) : (
+                    <ul className="mt-2 flex flex-col divide-y">
+                      {entries.map(entry => (
+                        <AccessRow
+                          key={`${entry.list}:${entry.scope}:${entry.scopeId ?? ''}:${entry.userId}`}
+                          entry={entry}
+                          directory={value.directory}
+                          disabled={!isIdle}
+                        />
+                      ))}
+                    </ul>
+                  )}
+                  <AccessForm list={mode} isIdle={isIdle} error={error} />
+                </>
               )}
-              <AccessForm list={editingList} isIdle={isIdle} error={error} />
             </div>
           )
         }}
