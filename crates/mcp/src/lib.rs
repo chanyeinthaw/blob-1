@@ -142,18 +142,22 @@ struct Group(std::sync::atomic::AtomicU32);
 impl Group {
     fn watch(pgid: u32) -> Arc<Self> {
         let group = Arc::new(Self(std::sync::atomic::AtomicU32::new(pgid)));
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pgid as libc::pid_t, 0) };
-        if fd >= 0 {
-            let fd =
-                unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd as i32) };
-            if let Ok(fd) = unsafe { tokio::io::unix::AsyncFd::register(fd) } {
-                let watched = Arc::downgrade(&group);
-                tokio::spawn(async move {
-                    let _ = fd.readable().await;
-                    if let Some(group) = watched.upgrade() {
-                        group.kill();
-                    }
-                });
+        #[cfg(target_os = "linux")]
+        {
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pgid as libc::pid_t, 0) };
+            if fd >= 0 {
+                let fd = unsafe {
+                    <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd as i32)
+                };
+                if let Ok(fd) = unsafe { tokio::io::unix::AsyncFd::register(fd) } {
+                    let watched = Arc::downgrade(&group);
+                    tokio::spawn(async move {
+                        let _ = fd.readable().await;
+                        if let Some(group) = watched.upgrade() {
+                            group.kill();
+                        }
+                    });
+                }
             }
         }
         group
