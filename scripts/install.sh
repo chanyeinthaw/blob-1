@@ -190,12 +190,12 @@ version="${version#v}"
 if [ -z "$version" ]; then
   if [ "$channel" = stable ]; then
     version="$(release_tags \
-      | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+      | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
       | semver_key | sort -r | head -n 1 | cut -d' ' -f2)"
     [ -n "$version" ] || fail "could not find a stable release; set BLOB_1_VERSION or authenticate with gh"
   else
     version="$(release_tags \
-      | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-latest\.[0-9]{8}\.[0-9]{4}$' \
+      | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-latest\.[0-9]{8}\.[0-9]{4}$' \
       | semver_key | sort -r | head -n 1 | cut -d' ' -f2)"
     [ -n "$version" ] || fail "could not find a latest-channel release; set BLOB_1_VERSION or authenticate with gh"
   fi
@@ -204,10 +204,17 @@ fi
 case "$version" in
   '' | *[!0-9A-Za-z.-]* | .* | */* | *..*) fail "invalid version '${version}'" ;;
 esac
+printf '%s\n' "$version" | grep -qE '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$' \
+  || fail "invalid version '${version}'"
 
 archive="blob-1-${version}-${platform}-${arch}.tar.gz"
 versions_dir="${blob_home}/runtime/versions"
 target_dir="${versions_dir}/${version}"
+
+state_file="${blob_home}/runtime/service-state.json"
+if [ -f "$state_file" ]; then
+  fail "Blob-1 is managed by a launcher (${state_file}); use \`blob-1 update ${version}\` to change versions safely"
+fi
 
 staging=
 if [ -f "${target_dir}/.install-complete" ] && [ "$(cat "${target_dir}/.install-complete")" = "$version" ]; then
@@ -258,12 +265,22 @@ lock_file="${versions_dir}/.lock"
 # kernel flock shared with the Rust updater/launcher (works on Linux & macOS).
 publish_and_activate_cmd='
 set -eu
+if [ -f "$6" ]; then
+  [ -z "$1" ] || rm -rf "$1"
+  printf "\nblob-1 install: Blob-1 is managed by a launcher (%s); use \`blob-1 update %s\` instead\n" "$6" "$3" >&2
+  exit 1
+fi
 if [ -n "$1" ]; then
   if [ -f "$2/.install-complete" ] && [ "$(cat "$2/.install-complete")" = "$3" ]; then
     rm -rf "$1"
   else
     rm -rf "$2"
     mv "$1" "$2"
+  fi
+else
+  if [ ! -f "$2/.install-complete" ] || [ "$(cat "$2/.install-complete")" != "$3" ] || [ ! -x "$2/blob-1" ]; then
+    printf "\nblob-1 install: cached version %s was removed concurrently; re-run the installer\n" "$3" >&2
+    exit 1
   fi
 fi
 ln -sfn "$2/blob-1" "$4/blob-1"
@@ -274,7 +291,7 @@ launchers="${blob_home}/runtime/launchers"
 if command -v flock >/dev/null 2>&1; then
   (
     flock -x 9
-    sh -c "$publish_and_activate_cmd" -- "$staging" "$target_dir" "$version" "$bin_dir" "$launchers"
+    sh -c "$publish_and_activate_cmd" -- "$staging" "$target_dir" "$version" "$bin_dir" "$launchers" "$state_file"
   ) 9>"$lock_file"
 elif command -v python3 >/dev/null 2>&1; then
   python3 -c '
@@ -282,7 +299,7 @@ import fcntl, subprocess, sys
 with open(sys.argv[1], "a+") as f:
     fcntl.flock(f, fcntl.LOCK_EX)
     sys.exit(subprocess.call(["sh", "-c", sys.argv[2], "--", *sys.argv[3:]]))
-' "$lock_file" "$publish_and_activate_cmd" "$staging" "$target_dir" "$version" "$bin_dir" "$launchers"
+' "$lock_file" "$publish_and_activate_cmd" "$staging" "$target_dir" "$version" "$bin_dir" "$launchers" "$state_file"
 else
   fail "flock or python3 is required to safely publish and activate Blob-1"
 fi

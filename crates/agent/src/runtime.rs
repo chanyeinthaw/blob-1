@@ -79,6 +79,32 @@ fn versions_lock_path(root: &Path) -> PathBuf {
     versions_dir(root).join(".lock")
 }
 
+fn pin_path(root: &Path) -> PathBuf {
+    versions_dir(root).join(".pin")
+}
+
+/// Pin a target version under `versions/.lock` while probing it before
+/// `pending` state is persisted so concurrent pruning cannot delete it.
+struct VersionPin(PathBuf);
+
+impl VersionPin {
+    fn acquire(root: &Path, version: &str) -> Result<Self> {
+        let _lock = lock_versions(root)?;
+        if !installed(root, version) {
+            return Err("target version is not installed".into());
+        }
+        let path = pin_path(root);
+        std::fs::write(&path, format!("{version}\n"))?;
+        Ok(VersionPin(path))
+    }
+}
+
+impl Drop for VersionPin {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Acquire the blocking exclusive lock shared with `install.sh` (`versions/.lock`)
 /// to serialize version publication, launcher repointing, and pruning.
 fn lock_versions(root: &Path) -> Result<std::fs::File> {
@@ -194,11 +220,18 @@ impl Version {
             }
             None => (raw, ""),
         };
+        let parse_core = |part: Option<&str>| -> Result<u64> {
+            let part = part.ok_or_else(invalid)?;
+            if part.len() > 1 && part.starts_with('0') {
+                return Err(invalid().into());
+            }
+            part.parse::<u64>().map_err(|_| invalid().into())
+        };
         let mut parts = core.split('.');
         let (major, minor, patch) = (
-            parts.next().ok_or_else(invalid)?.parse()?,
-            parts.next().ok_or_else(invalid)?.parse()?,
-            parts.next().ok_or_else(invalid)?.parse()?,
+            parse_core(parts.next())?,
+            parse_core(parts.next())?,
+            parse_core(parts.next())?,
         );
         if parts.next().is_some() {
             return Err(invalid().into());
@@ -472,7 +505,8 @@ fn now_ms() -> u128 {
 /// Stage into `versions/.staging-*`, then acquire `versions/.lock` ONCE to
 /// atomically publish `versions/<version>` and run `register` (queueing or
 /// repointing) before releasing the lock so concurrent pruning can never delete
-/// a freshly published version before it is referenced.
+/// a freshly published version before it is referenced. Re-validates cached
+/// installs under the lock and downloads if a concurrent prune removed them.
 async fn ensure_installed_and_register<F, T>(
     client: &reqwest::Client,
     root: &Path,
@@ -483,42 +517,51 @@ where
     F: FnOnce(&std::fs::File) -> Result<T>,
 {
     Version::parse(version)?;
-    let staging = if installed(root, version) {
-        None
-    } else {
-        let versions = versions_dir(root);
-        std::fs::create_dir_all(&versions)?;
-        let dir = staging_dir(&versions)?;
-        if let Err(error) = install_into(client, &dir, version).await {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(error);
-        }
-        Some(dir)
-    };
-    let lock = lock_versions(root)?;
-    let fresh = if let Some(staging) = staging {
-        if installed(root, version) {
-            let _ = std::fs::remove_dir_all(&staging);
-            false
+    let mut attempt = 0;
+    loop {
+        let staging = if attempt == 0 && installed(root, version) {
+            None
         } else {
-            let target = version_dir(root, version);
-            if target.exists() {
-                if let Err(error) = std::fs::remove_dir_all(&target) {
+            let versions = versions_dir(root);
+            std::fs::create_dir_all(&versions)?;
+            let dir = staging_dir(&versions)?;
+            if let Err(error) = install_into(client, &dir, version).await {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(error);
+            }
+            Some(dir)
+        };
+        let lock = lock_versions(root)?;
+        let fresh = if let Some(staging) = staging {
+            if installed(root, version) {
+                let _ = std::fs::remove_dir_all(&staging);
+                false
+            } else {
+                let target = version_dir(root, version);
+                if target.exists() {
+                    if let Err(error) = std::fs::remove_dir_all(&target) {
+                        let _ = std::fs::remove_dir_all(&staging);
+                        return Err(error.into());
+                    }
+                }
+                if let Err(error) = std::fs::rename(&staging, &target) {
                     let _ = std::fs::remove_dir_all(&staging);
                     return Err(error.into());
                 }
+                true
             }
-            if let Err(error) = std::fs::rename(&staging, &target) {
-                let _ = std::fs::remove_dir_all(&staging);
-                return Err(error.into());
-            }
-            true
-        }
-    } else {
-        false
-    };
-    let out = register(&lock)?;
-    Ok((fresh, out))
+        } else if installed(root, version) {
+            false
+        } else {
+            // A concurrent prune removed the cached version before we acquired
+            // the lock; drop the lock and download it cleanly.
+            drop(lock);
+            attempt += 1;
+            continue;
+        };
+        let out = register(&lock)?;
+        return Ok((fresh, out));
+    }
 }
 
 // --- Launchers and version pruning ------------------------------------------
@@ -622,6 +665,12 @@ fn prune_versions_locked(_lock: &std::fs::File, root: &Path, keep: &BTreeSet<Str
     keep.extend(referenced_versions(root));
     if let Ok(Some(queued)) = peek_queued_update(root) {
         keep.insert(queued.target_version);
+    }
+    if let Ok(pinned) = std::fs::read_to_string(pin_path(root)) {
+        let pinned = pinned.trim();
+        if !pinned.is_empty() {
+            keep.insert(pinned.to_owned());
+        }
     }
     if let Ok(Some(state)) = load_state(root) {
         if !state.active_version.is_empty() {
@@ -806,6 +855,8 @@ struct ServiceState {
     protocol: u32,
     active_version: String,
     update: Option<UpdateRecord>,
+    #[serde(default)]
+    last_committed_at_ms: u128,
 }
 
 impl Default for ServiceState {
@@ -814,6 +865,7 @@ impl Default for ServiceState {
             protocol: 1,
             active_version: String::new(),
             update: None,
+            last_committed_at_ms: 0,
         }
     }
 }
@@ -836,6 +888,7 @@ fn peek_queued_update(root: &Path) -> Result<Option<QueuedUpdate>> {
     }
 }
 
+#[cfg(test)]
 fn take_queued_update(root: &Path) -> Result<Option<QueuedUpdate>> {
     let _lock = lock_versions(root)?;
     let Some(queued) = peek_queued_update(root)? else {
@@ -886,6 +939,8 @@ struct UpdateRecord {
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claimed_queue: Option<QueuedUpdate>,
 }
 
 fn load_state(root: &Path) -> Result<Option<ServiceState>> {
@@ -1148,9 +1203,15 @@ impl Supervisor {
         self.child = None;
     }
 
-    /// One `{"type":"apply-update",...}` request: validate, persist pending,
-    /// stop the child, snapshot the db, trial the target, commit or roll back.
-    async fn apply_update(&mut self, target: &str, allow_downgrade: bool) -> Value {
+    /// One `{"type":"apply-update",...}` request: validate, pin target under
+    /// `versions/.lock`, probe `--version`, persist pending, stop child,
+    /// snapshot db, trial target, commit or roll back.
+    async fn apply_update(
+        &mut self,
+        target: &str,
+        allow_downgrade: bool,
+        claimed_queue: Option<QueuedUpdate>,
+    ) -> Value {
         let from = self.state.active_version.clone();
         let reject = |reason: &str| json!({"status": "rejected", "reason": reason});
         if self
@@ -1164,22 +1225,31 @@ impl Supervisor {
         let (Ok(current), Ok(target_v)) = (Version::parse(&from), Version::parse(target)) else {
             return reject("unparseable version");
         };
-        if !installed(&self.root, target) {
-            return reject("target version is not installed");
-        }
         if !upgrade_allowed(&current, &target_v, allow_downgrade) {
             return reject("downgrade requires --allow-downgrade");
         }
+        let _pin = match VersionPin::acquire(&self.root, target) {
+            Ok(pin) => pin,
+            Err(_) => return reject("target version is not installed"),
+        };
         // Pre-self-update releases (such as v0.0.0) lack `--version` and
-        // `BLOB_1_READY_FILE`, so reject them before stopping the running service.
+        // `BLOB_1_READY_FILE`, so reject them before stopping the running
+        // service. Use an async, cancellable, bounded subprocess so SIGTERM
+        // can interrupt a hung probe immediately.
         let target_bin = version_dir(&self.root, target).join("blob-1");
-        let supports_supervised = std::process::Command::new(&target_bin)
+        let supports_supervised = match Command::new(&target_bin)
             .arg("--version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(mut probe) => matches!(
+                tokio::time::timeout(Duration::from_secs(10), probe.wait()).await,
+                Ok(Ok(status)) if status.success()
+            ),
+            Err(_) => false,
+        };
         if !supports_supervised {
             return reject("target release does not support supervised updates");
         }
@@ -1199,6 +1269,7 @@ impl Supervisor {
             db_path: self.db_path.clone(),
             status: "pending".to_owned(),
             reason: None,
+            claimed_queue,
         });
         if let Err(error) = save_state(&self.root, &self.state) {
             self.state.update = None;
@@ -1218,29 +1289,34 @@ impl Supervisor {
                 keep.insert(from);
                 let mut next = self.state.clone();
                 next.active_version = target.to_owned();
+                next.last_committed_at_ms = next.last_committed_at_ms.max(started_at_ms);
                 if let Some(record) = next.update.as_mut() {
                     record.status = "committed".to_owned();
                     record.reason = None;
                 }
-                if let Err(error) = save_state(&self.root, &next) {
-                    // Check whether rename already published `committed` before
-                    // a post-rename directory sync failed; keep disk and memory
-                    // consistent either way.
-                    let disk_committed = load_state(&self.root)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|s| {
-                            s.active_version == target
-                                && s.update.as_ref().is_some_and(|u| {
-                                    u.id == id && u.status == "committed"
-                                })
-                        });
-                    if !disk_committed {
-                        self.stop_child().await;
-                        return json!({"status": "failed", "reason": format!("could not persist committed state (trial stopped, backup preserved): {error}")});
+                let state_synced = match save_state(&self.root, &next) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        // Check whether rename already published `committed`
+                        // before a post-rename directory sync failed; if so,
+                        // keep the backup until a future durable sync succeeds.
+                        let disk_committed = load_state(&self.root)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|s| {
+                                s.active_version == target
+                                    && s.update.as_ref().is_some_and(|u| {
+                                        u.id == id && u.status == "committed"
+                                    })
+                            });
+                        if !disk_committed {
+                            self.stop_child().await;
+                            return json!({"status": "failed", "reason": format!("could not persist committed state (trial stopped, backup preserved): {error}")});
+                        }
+                        eprintln!("warning: committed state renamed but directory sync failed (backup preserved): {error}");
+                        false
                     }
-                    eprintln!("warning: committed state renamed but directory sync failed: {error}");
-                }
+                };
                 self.state = next;
                 match lock_versions(&self.root) {
                     Ok(lock) => {
@@ -1261,7 +1337,9 @@ impl Supervisor {
                         eprintln!("warning: could not lock versions for activation/pruning: {error}");
                     }
                 }
-                let _ = std::fs::remove_dir_all(&backup);
+                if state_synced {
+                    let _ = std::fs::remove_dir_all(&backup);
+                }
                 json!({"status": "committed", "version": target})
             }
             Err(error) => self.rollback(&from, &id, error.to_string()).await,
@@ -1286,24 +1364,36 @@ impl Supervisor {
             record.status = "rolled-back".to_owned();
             record.reason = Some(reason.clone());
         }
-        if let Err(error) = save_state(&self.root, &next) {
-            let disk_rolled_back = load_state(&self.root)
-                .ok()
-                .flatten()
-                .is_some_and(|s| {
-                    s.active_version == from
-                        && s.update.as_ref().is_some_and(|u| {
-                            u.id == id && u.status == "rolled-back"
-                        })
-                });
-            if !disk_rolled_back {
-                let msg = format!("{reason}; could not persist rollback state (recovery still pending, backup preserved): {error}");
-                return json!({"status": "failed", "reason": msg});
+        let state_synced = match save_state(&self.root, &next) {
+            Ok(()) => true,
+            Err(error) => {
+                let disk_rolled_back = load_state(&self.root)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|s| {
+                        s.active_version == from
+                            && s.update.as_ref().is_some_and(|u| {
+                                u.id == id && u.status == "rolled-back"
+                            })
+                    });
+                if !disk_rolled_back {
+                    let msg = format!("{reason}; could not persist rollback state (recovery still pending, backup preserved): {error}");
+                    return json!({"status": "failed", "reason": msg});
+                }
+                eprintln!("warning: rollback state renamed but directory sync failed (backup preserved): {error}");
+                false
             }
-            eprintln!("warning: rollback state renamed but directory sync failed: {error}");
-        }
+        };
         self.state = next;
-        if backup.exists() {
+        if let Some(claimed) = self
+            .state
+            .update
+            .as_ref()
+            .and_then(|u| u.claimed_queue.as_ref())
+        {
+            clear_matching_queued_update(&self.root, claimed);
+        }
+        if state_synced && backup.exists() {
             let _ = std::fs::remove_dir_all(&backup);
         }
         if let Err(error) = self.start(from).await {
@@ -1346,7 +1436,7 @@ impl Supervisor {
                     if target.is_empty() {
                         json!({"status": "rejected", "reason": "missing targetVersion"})
                     } else {
-                        self.apply_update(target, allow).await
+                        self.apply_update(target, allow, None).await
                     }
                 }
                 Ok(value) if value["type"] == "status" => json!({
@@ -1401,6 +1491,7 @@ fn recover_pending(root: &Path, state: &mut ServiceState) -> Result<bool> {
     let from = record.from_version.clone();
     let db = record.db_path.clone();
     let id = record.id.clone();
+    let claimed_queue = record.claimed_queue.clone();
     if backup.exists() {
         restore_db(&backup, &db)?;
     }
@@ -1410,6 +1501,9 @@ fn recover_pending(root: &Path, state: &mut ServiceState) -> Result<bool> {
         record.reason = Some(format!("launcher restarted while update {id} was pending"));
     }
     save_state(root, state)?;
+    if let Some(claimed) = claimed_queue {
+        clear_matching_queued_update(root, &claimed);
+    }
     if backup.exists() {
         let _ = std::fs::remove_dir_all(&backup);
     }
@@ -1420,19 +1514,30 @@ fn recover_pending(root: &Path, state: &mut ServiceState) -> Result<bool> {
 pub async fn launch(opts: LauncherOpts) -> Result<()> {
     let root = runtime_dir()?;
     let _launcher_lock = lock_launcher(&root)?;
+    let _ = std::fs::remove_file(pin_path(&root));
     let mut interrupt =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     std::fs::create_dir_all(versions_dir(&root))?;
     std::fs::create_dir_all(backups_dir(&root))?;
-    let mut state = load_state(&root)?.unwrap_or_else(|| ServiceState {
-        active_version: opts.current.to_owned(),
-        ..ServiceState::default()
-    });
-    if !recover_pending(&root, &mut state)? {
-        save_state(&root, &state)?;
-    }
+    // Initialize `service-state.json` under `versions/.lock` so `install.sh`
+    // sees managed status atomically before repointing symlinks.
+    let mut state = {
+        let _lock = lock_versions(&root)?;
+        match load_state(&root)? {
+            Some(state) => state,
+            None => {
+                let state = ServiceState {
+                    active_version: opts.current.to_owned(),
+                    ..ServiceState::default()
+                };
+                save_state(&root, &state)?;
+                state
+            }
+        }
+    };
+    recover_pending(&root, &mut state)?;
 
     let mut child_args = vec![
         "--data-dir".into(),
@@ -1448,7 +1553,26 @@ pub async fn launch(opts: LauncherOpts) -> Result<()> {
     if let Some(url) = &opts.public_url {
         child_args.extend(["--public-url".into(), url.clone()]);
     }
-    let queued = take_queued_update(&root)?;
+    // Peek queued update without removing it yet so `prune_versions_locked`
+    // keeps its target version alive until `pending` state takes over. Discard
+    // any entry superseded by an already-committed update, already active, or
+    // matching the claimed queue entry of a rolled-back/failed update.
+    let claimed_terminal = state
+        .update
+        .as_ref()
+        .filter(|u| matches!(u.status.as_str(), "rolled-back" | "failed"))
+        .and_then(|u| u.claimed_queue.as_ref());
+    let queued = match peek_queued_update(&root)? {
+        Some(entry)
+            if entry.created_at_ms <= state.last_committed_at_ms
+                || entry.target_version == state.active_version
+                || claimed_terminal == Some(&entry) =>
+        {
+            clear_matching_queued_update(&root, &entry);
+            None
+        }
+        other => other,
+    };
     let mut supervisor = Supervisor {
         root: root.clone(),
         db_path: opts.data_dir.join("agent.db"),
@@ -1462,8 +1586,13 @@ pub async fn launch(opts: LauncherOpts) -> Result<()> {
         res = async {
             if let Some(queued) = queued {
                 let reply = supervisor
-                    .apply_update(&queued.target_version, queued.allow_downgrade)
+                    .apply_update(
+                        &queued.target_version,
+                        queued.allow_downgrade,
+                        Some(queued.clone()),
+                    )
                     .await;
+                clear_matching_queued_update(&root, &queued);
                 if reply["status"] == "rejected" {
                     eprintln!(
                         "queued update to {} rejected: {}",
@@ -1583,6 +1712,8 @@ mod tests {
         assert!(v("0.0.0-latest.20261122.2") < v("0.0.0-latest.20261122.10"));
         assert_eq!(v("v0.1.0"), v("0.1.0"));
         assert!(Version::parse("0.0").is_err());
+        assert!(Version::parse("1.010.0").is_err());
+        assert!(Version::parse("01.0.0").is_err());
         assert!(Version::parse("0.0.0-latest..1").is_err());
         assert!(Version::parse("0.0.0-a_b").is_err());
         assert!(Version::parse("0.0.0+../../evil").is_err());
@@ -1748,7 +1879,7 @@ mod tests {
         let mut sup = supervisor(&root, &data, "0.0.0");
         sup.start("0.0.0").await.unwrap();
         let first_pid = sup.child.as_ref().unwrap().id();
-        let reply = sup.apply_update("1.0.0", false).await;
+        let reply = sup.apply_update("1.0.0", false, None).await;
         assert_eq!(reply["status"], "committed");
         assert_eq!(sup.state.active_version, "1.0.0");
         assert_ne!(sup.child.as_ref().unwrap().id(), first_pid);
@@ -1770,7 +1901,7 @@ mod tests {
         std::fs::write(data.join("agent.db"), b"original").unwrap();
         let mut sup = supervisor(&root, &data, "0.0.0");
         sup.start("0.0.0").await.unwrap();
-        let reply = sup.apply_update("1.0.0", false).await;
+        let reply = sup.apply_update("1.0.0", false, None).await;
         assert_eq!(reply["status"], "rolled-back");
         assert_eq!(sup.state.active_version, "0.0.0");
         // The db snapshot was restored and the old version is running again.
@@ -1797,6 +1928,12 @@ mod tests {
         std::fs::create_dir_all(&stale_staging).unwrap();
         std::fs::write(&db, b"trial").unwrap();
         std::fs::write(suffixed(&db, "-shm"), b"leftover").unwrap();
+        let claimed = QueuedUpdate {
+            target_version: "1.0.0".into(),
+            allow_downgrade: false,
+            created_at_ms: 42,
+        };
+        save_json(&queued_update_path(&root), &claimed).unwrap();
         let state = ServiceState {
             active_version: "1.0.0".into(),
             update: Some(UpdateRecord {
@@ -1806,6 +1943,7 @@ mod tests {
                 db_path: db.clone(),
                 status: "pending".into(),
                 reason: None,
+                claimed_queue: Some(claimed),
             }),
             ..ServiceState::default()
         };
@@ -1818,7 +1956,8 @@ mod tests {
         assert!(backup.exists());
         assert_eq!(std::fs::read(&db).unwrap(), b"trial");
         lock.unlock().unwrap();
-        // Once the lock is released, recovery restores the DB and cleans up.
+        // Once the lock is released, recovery restores the DB, clears the
+        // claimed queued update so it isn't retried, and cleans up.
         assert!(recover_pending(&root, &mut loaded).unwrap());
         assert_eq!(loaded.active_version, "0.0.0");
         assert_eq!(loaded.update.as_ref().unwrap().status, "rolled-back");
@@ -1826,6 +1965,7 @@ mod tests {
         assert!(!suffixed(&db, "-shm").exists());
         assert!(!backup.exists());
         assert!(!stale_staging.exists());
+        assert!(peek_queued_update(&root).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&data);
     }
@@ -1916,7 +2056,7 @@ mod tests {
         let mut sup = supervisor(&root, &data, "1.0.0");
         sup.start("1.0.0").await.unwrap();
         let first_pid = sup.child.as_ref().unwrap().id();
-        let reply = sup.apply_update("0.0.0", true).await;
+        let reply = sup.apply_update("0.0.0", true, None).await;
         assert_eq!(reply["status"], "rejected");
         assert_eq!(sup.child.as_ref().unwrap().id(), first_pid);
         sup.stop_child().await;
@@ -1957,7 +2097,7 @@ mod tests {
         .unwrap();
         let mut sup = supervisor(&root, &data, "1.0.0");
         sup.start("1.0.0").await.unwrap();
-        let reply = sup.apply_update("2.0.0", false).await;
+        let reply = sup.apply_update("2.0.0", false, None).await;
         assert_eq!(reply["status"], "committed");
         assert!(peek_queued_update(&root).unwrap().is_none());
         sup.stop_child().await;
