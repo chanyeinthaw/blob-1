@@ -64,10 +64,8 @@ CREATE TABLE IF NOT EXISTS skills (name TEXT PRIMARY KEY, description TEXT NOT N
 CREATE TABLE IF NOT EXISTS skill_files (skill TEXT NOT NULL REFERENCES skills (name) ON DELETE CASCADE, path TEXT NOT NULL, mode INTEGER NOT NULL, content BLOB NOT NULL, PRIMARY KEY (skill, path)) STRICT;
 
 CREATE TABLE IF NOT EXISTS destinations (id INTEGER PRIMARY KEY, messenger TEXT NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, dm INTEGER NOT NULL CHECK (dm IN (0,1)), UNIQUE (messenger, channel, thread)) STRICT;
-CREATE TABLE IF NOT EXISTS allowed_users (messenger TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (messenger, user_id)) STRICT;
-CREATE TABLE IF NOT EXISTS access_modes (messenger TEXT PRIMARY KEY, mode TEXT NOT NULL CHECK (mode IN ('allow-all', 'whitelist', 'blacklist'))) STRICT;
-CREATE TABLE IF NOT EXISTS channel_access_modes (messenger TEXT PRIMARY KEY, mode TEXT NOT NULL CHECK (mode IN ('allow-all', 'whitelist', 'blacklist'))) STRICT;
-CREATE TABLE IF NOT EXISTS channel_access_entries (messenger TEXT NOT NULL, list TEXT NOT NULL CHECK (list IN ('whitelist', 'blacklist')), scope TEXT NOT NULL CHECK (scope IN ('server', 'channel')), target_id TEXT NOT NULL, PRIMARY KEY (messenger, list, scope, target_id)) STRICT;
+CREATE TABLE IF NOT EXISTS access_defaults (messenger TEXT PRIMARY KEY, effect TEXT NOT NULL CHECK (effect IN ('allow', 'block'))) STRICT;
+CREATE TABLE IF NOT EXISTS access_rules (messenger TEXT NOT NULL, user_id TEXT NOT NULL DEFAULT '', scope TEXT NOT NULL CHECK (scope IN ('global', 'server', 'channel')), scope_id TEXT NOT NULL DEFAULT '', effect TEXT NOT NULL CHECK (effect IN ('allow', 'block')), CHECK ((scope = 'global' AND scope_id = '' AND user_id != '') OR (scope IN ('server', 'channel') AND scope_id != '')), PRIMARY KEY (messenger, user_id, scope, scope_id)) STRICT;
 CREATE TABLE IF NOT EXISTS interaction_modes (messenger TEXT NOT NULL, scope TEXT NOT NULL CHECK (scope IN ('channel', 'user', 'server')), guild_id TEXT NOT NULL DEFAULT '', target_id TEXT NOT NULL, mode TEXT NOT NULL CHECK (mode IN ('mention-only', 'always', 'auto')), CHECK ((scope IN ('channel', 'server') AND guild_id = '') OR scope = 'user'), PRIMARY KEY (messenger, scope, guild_id, target_id)) STRICT;
 CREATE TABLE IF NOT EXISTS reply_modes (messenger TEXT NOT NULL, scope TEXT NOT NULL CHECK (scope IN ('channel', 'server')), target_id TEXT NOT NULL, mode TEXT NOT NULL CHECK (mode IN ('auto', 'thread', 'direct')), PRIMARY KEY (messenger, scope, target_id)) STRICT;
 CREATE TABLE IF NOT EXISTS messenger_defaults (messenger TEXT PRIMARY KEY, interaction_mode TEXT NOT NULL CHECK (interaction_mode IN ('mention-only', 'always', 'auto')), reply_mode TEXT NOT NULL CHECK (reply_mode IN ('auto', 'thread', 'direct'))) STRICT;
@@ -329,7 +327,7 @@ impl SqliteStorage {
         }
         ensure_interaction_modes_v3(&mut connection, &mut require_exclusive)?;
         ensure_reply_modes_v2(&mut connection, &mut require_exclusive)?;
-        ensure_access_entries(&mut connection, &mut require_exclusive)?;
+        ensure_unified_access(&mut connection, &mut require_exclusive)?;
         ensure_settings_auto_respond(&mut connection, &mut require_exclusive)?;
         migrate_identity_to_instructions(&mut connection, &mut require_exclusive)?;
         drop(upgrade_owner);
@@ -404,7 +402,6 @@ fn init_schema_and_pending_threads(
         return Ok(());
     }
     let had_destinations = table_exists(&tx, "destinations")?;
-    let had_allowed_users = table_exists(&tx, "allowed_users")?;
     if had_destinations {
         require_exclusive(
             "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
@@ -418,20 +415,6 @@ fn init_schema_and_pending_threads(
     )
     .map_err(backend)?;
     if !had_destinations {
-        if !had_allowed_users {
-            tx.execute_batch(
-                "CREATE TABLE IF NOT EXISTS access_entries (
-                     messenger TEXT NOT NULL,
-                     list TEXT NOT NULL CHECK (list IN ('whitelist', 'blacklist')),
-                     scope TEXT NOT NULL CHECK (scope IN ('global', 'guild', 'channel')),
-                     scope_id TEXT NOT NULL DEFAULT '',
-                     user_id TEXT NOT NULL,
-                     CHECK ((scope = 'global' AND scope_id = '') OR (scope IN ('guild', 'channel') AND scope_id != '')),
-                     PRIMARY KEY (messenger, list, scope, scope_id, user_id)
-                 ) STRICT;",
-            )
-            .map_err(backend)?;
-        }
         tx.commit().map_err(backend)?;
         return Ok(());
     }
@@ -681,15 +664,25 @@ fn ensure_reply_modes_v2(
     Ok(())
 }
 
-/// Creates `access_entries` on legacy databases (where it wasn't created during
-/// fresh-DB initialization) and migrates any existing `allowed_users` rows into
-/// the global whitelist inside one atomic immediate transaction. Always requires
-/// the exclusive owner lock (even if `allowed_users` is empty) so an older
-/// running server cannot write legacy rows that miss migration.
-fn ensure_access_entries(
+/// Migrates any legacy access tables (`allowed_users`, `access_modes`,
+/// `access_entries`, `channel_access_modes`, `channel_access_entries`) into
+/// unified `access_defaults` + `access_rules` and drops the legacy tables
+/// inside one atomic immediate transaction. Always requires the exclusive owner
+/// lock when any legacy table exists so an older running server cannot race
+/// with migration.
+fn ensure_unified_access(
     connection: &mut Connection,
     require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
+    use rusqlite::OptionalExtension;
+    use std::collections::BTreeSet;
+    const LEGACY_TABLES: [&str; 5] = [
+        "access_modes",
+        "access_entries",
+        "channel_access_modes",
+        "channel_access_entries",
+        "allowed_users",
+    ];
     let table_exists = |conn: &Connection, name: &str| -> Result<bool, StoreError> {
         conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
@@ -698,31 +691,271 @@ fn ensure_access_entries(
         )
         .map_err(backend)
     };
-    if table_exists(connection, "access_entries")? {
-        return Ok(());
-    }
-    let tx = connection
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(backend)?;
-    if table_exists(&tx, "access_entries")? {
-        tx.commit().map_err(backend)?;
+    let has_any_legacy = |conn: &Connection| -> Result<bool, StoreError> {
+        for name in LEGACY_TABLES {
+            if table_exists(conn, name)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    if !has_any_legacy(connection)? {
         return Ok(());
     }
     require_exclusive(
         "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
     )?;
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    if !has_any_legacy(&tx)? {
+        tx.commit().map_err(backend)?;
+        return Ok(());
+    }
+
+    let has_access_modes = table_exists(&tx, "access_modes")?;
+    let has_access_entries = table_exists(&tx, "access_entries")?;
+    let has_channel_modes = table_exists(&tx, "channel_access_modes")?;
+    let has_channel_entries = table_exists(&tx, "channel_access_entries")?;
+    let has_allowed_users = table_exists(&tx, "allowed_users")?;
+
+    let mut messengers = BTreeSet::new();
+    for (present, table) in [
+        (has_access_modes, "access_modes"),
+        (has_access_entries, "access_entries"),
+        (has_channel_modes, "channel_access_modes"),
+        (has_channel_entries, "channel_access_entries"),
+        (has_allowed_users, "allowed_users"),
+    ] {
+        if !present {
+            continue;
+        }
+        let mut stmt = tx
+            .prepare(&format!("SELECT DISTINCT messenger FROM {table}"))
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(backend)?;
+        for row in rows {
+            messengers.insert(row.map_err(backend)?);
+        }
+    }
+
+    for messenger in messengers {
+        let people_mode: String = if has_access_modes {
+            tx.query_row(
+                "SELECT mode FROM access_modes WHERE messenger = ?1",
+                [&messenger],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?
+            .unwrap_or_else(|| "whitelist".into())
+        } else {
+            "whitelist".into()
+        };
+        let channel_mode: String = if has_channel_modes {
+            tx.query_row(
+                "SELECT mode FROM channel_access_modes WHERE messenger = ?1",
+                [&messenger],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?
+            .unwrap_or_else(|| "allow-all".into())
+        } else {
+            "allow-all".into()
+        };
+        let default_effect = if people_mode == "whitelist" || channel_mode == "whitelist" {
+            "block"
+        } else {
+            "allow"
+        };
+        tx.execute(
+            "INSERT OR IGNORE INTO access_defaults (messenger, effect) VALUES (?1, ?2)",
+            rusqlite::params![messenger, default_effect],
+        )
+        .map_err(backend)?;
+
+        // Collect active channel/server entries when present so dual-gate
+        // combinations never widen access beyond the legacy AND semantics.
+        let active_channel_entries: Vec<(String, String)> =
+            if has_channel_entries && (channel_mode == "whitelist" || channel_mode == "blacklist") {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT scope, target_id FROM channel_access_entries WHERE messenger = ?1 AND list = ?2",
+                    )
+                    .map_err(backend)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![&messenger, &channel_mode], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(backend)?;
+                rows.collect::<Result<_, _>>().map_err(backend)?
+            } else {
+                Vec::new()
+            };
+
+        if people_mode == "whitelist" && channel_mode == "whitelist" {
+            eprintln!(
+                "storage migration ({messenger}): migrated dual people+channel whitelists fail-closed to default block; DMs and cross-scope entries require explicit Access rules."
+            );
+            // Dual-whitelist intersection (fail-closed; never emits `everyone = allow`
+            // or global user `allow` that would widen access to unlisted users/channels).
+            let whitelisted_users: Vec<(String, String, String)> = if has_access_entries {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT user_id, CASE scope WHEN 'guild' THEN 'server' ELSE scope END, scope_id
+                         FROM access_entries WHERE messenger = ?1 AND list = 'whitelist' AND user_id != ''",
+                    )
+                    .map_err(backend)?;
+                let rows = stmt
+                    .query_map([&messenger], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .map_err(backend)?;
+                rows.collect::<Result<_, _>>().map_err(backend)?
+            } else if has_allowed_users {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT user_id FROM allowed_users WHERE messenger = ?1 AND user_id != ''",
+                    )
+                    .map_err(backend)?;
+                let rows = stmt
+                    .query_map([&messenger], |row| {
+                        Ok((row.get::<_, String>(0)?, "global".to_owned(), String::new()))
+                    })
+                    .map_err(backend)?;
+                rows.collect::<Result<_, _>>().map_err(backend)?
+            } else {
+                Vec::new()
+            };
+            for (uid, u_scope, u_sid) in &whitelisted_users {
+                for (c_scope, c_tid) in &active_channel_entries {
+                    let target = match (u_scope.as_str(), c_scope.as_str()) {
+                        ("global", _) => Some((c_scope.as_str(), c_tid.as_str())),
+                        ("server", "server") if u_sid == c_tid => Some(("server", c_tid.as_str())),
+                        ("channel", "channel") if u_sid == c_tid => {
+                            Some(("channel", c_tid.as_str()))
+                        }
+                        // Cannot statically prove channel ∈ server without guild metadata;
+                        // skip rather than widening across servers.
+                        _ => None,
+                    };
+                    if let Some((scope, sid)) = target {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO access_rules (messenger, user_id, scope, scope_id, effect)
+                             VALUES (?1, ?2, ?3, ?4, 'allow')",
+                            rusqlite::params![&messenger, uid, scope, sid],
+                        )
+                        .map_err(backend)?;
+                    }
+                }
+            }
+        } else {
+            let has_blacklisted_channels =
+                channel_mode == "blacklist" && !active_channel_entries.is_empty();
+            if people_mode == "whitelist" {
+                if has_access_entries {
+                    // When a legacy channel/server blacklist is also active, suppress
+                    // narrower `channel`-scoped user allows whose guild/parent ancestry
+                    // is unknown in SQLite so a channel/thread allow can never override
+                    // a blacklisted server or parent channel.
+                    let sql = if has_blacklisted_channels {
+                        "INSERT OR IGNORE INTO access_rules (messenger, user_id, scope, scope_id, effect)
+                         SELECT messenger, user_id, CASE scope WHEN 'guild' THEN 'server' ELSE scope END, scope_id, 'allow'
+                         FROM access_entries WHERE messenger = ?1 AND list = 'whitelist' AND user_id != '' AND scope != 'channel'"
+                    } else {
+                        "INSERT OR IGNORE INTO access_rules (messenger, user_id, scope, scope_id, effect)
+                         SELECT messenger, user_id, CASE scope WHEN 'guild' THEN 'server' ELSE scope END, scope_id, 'allow'
+                         FROM access_entries WHERE messenger = ?1 AND list = 'whitelist' AND user_id != ''"
+                    };
+                    tx.execute(sql, [&messenger]).map_err(backend)?;
+                    if has_blacklisted_channels {
+                        eprintln!(
+                            "storage migration ({messenger}): unified access suppressed channel-scoped user allows alongside legacy channel/server blacklist (fail-closed); review Access rules in Settings."
+                        );
+                    }
+                } else if has_allowed_users {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO access_rules (messenger, user_id, scope, scope_id, effect)
+                         SELECT messenger, user_id, 'global', '', 'allow'
+                         FROM allowed_users WHERE messenger = ?1 AND user_id != ''",
+                        [&messenger],
+                    )
+                    .map_err(backend)?;
+                }
+            } else if people_mode == "blacklist" && has_access_entries {
+                tx.execute(
+                    "INSERT OR IGNORE INTO access_rules (messenger, user_id, scope, scope_id, effect)
+                     SELECT messenger, user_id, CASE scope WHEN 'guild' THEN 'server' ELSE scope END, scope_id, 'block'
+                     FROM access_entries WHERE messenger = ?1 AND list = 'blacklist' AND user_id != ''",
+                    [&messenger],
+                )
+                .map_err(backend)?;
+            }
+
+            if channel_mode == "whitelist" {
+                eprintln!(
+                    "storage migration ({messenger}): migrated legacy channel whitelist to default block; DMs now require a Global allow person rule."
+                );
+            }
+
+            if !active_channel_entries.is_empty() {
+                let chan_effect = if channel_mode == "whitelist" {
+                    "allow"
+                } else {
+                    "block"
+                };
+                for (c_scope, c_tid) in &active_channel_entries {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO access_rules (messenger, user_id, scope, scope_id, effect)
+                         VALUES (?1, '', ?2, ?3, ?4)",
+                        rusqlite::params![&messenger, c_scope, c_tid, chan_effect],
+                    )
+                    .map_err(backend)?;
+                }
+                // When people=whitelist & channel=blacklist, add per-user block rules
+                // for whitelisted users so step 2/3 blocks beat their step 3/4 allow.
+                if people_mode == "whitelist" && channel_mode == "blacklist" {
+                    let whitelisted_uids: Vec<String> = {
+                        let mut stmt = tx
+                            .prepare(
+                                "SELECT DISTINCT user_id FROM access_rules
+                                 WHERE messenger = ?1 AND user_id != '' AND effect = 'allow'",
+                            )
+                            .map_err(backend)?;
+                        let rows = stmt
+                            .query_map([&messenger], |row| row.get(0))
+                            .map_err(backend)?;
+                        rows.collect::<Result<_, _>>().map_err(backend)?
+                    };
+                    for uid in &whitelisted_uids {
+                        for (c_scope, c_tid) in &active_channel_entries {
+                            tx.execute(
+                                "INSERT INTO access_rules (messenger, user_id, scope, scope_id, effect)
+                                 VALUES (?1, ?2, ?3, ?4, 'block')
+                                 ON CONFLICT (messenger, user_id, scope, scope_id) DO UPDATE SET effect = 'block'",
+                                rusqlite::params![&messenger, uid, c_scope, c_tid],
+                            )
+                            .map_err(backend)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     tx.execute_batch(
-        "CREATE TABLE access_entries (
-             messenger TEXT NOT NULL,
-             list TEXT NOT NULL CHECK (list IN ('whitelist', 'blacklist')),
-             scope TEXT NOT NULL CHECK (scope IN ('global', 'guild', 'channel')),
-             scope_id TEXT NOT NULL DEFAULT '',
-             user_id TEXT NOT NULL,
-             CHECK ((scope = 'global' AND scope_id = '') OR (scope IN ('guild', 'channel') AND scope_id != '')),
-             PRIMARY KEY (messenger, list, scope, scope_id, user_id)
-         ) STRICT;
-         INSERT OR IGNORE INTO access_entries (messenger, list, scope, scope_id, user_id)
-         SELECT messenger, 'whitelist', 'global', '', user_id FROM allowed_users;",
+        "DROP TABLE IF EXISTS access_modes;
+         DROP TABLE IF EXISTS access_entries;
+         DROP TABLE IF EXISTS channel_access_modes;
+         DROP TABLE IF EXISTS channel_access_entries;
+         DROP TABLE IF EXISTS allowed_users;",
     )
     .map_err(backend)?;
     tx.commit().map_err(backend)?;

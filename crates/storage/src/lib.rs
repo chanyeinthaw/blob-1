@@ -903,60 +903,37 @@ impl Default for MessengerDefaults {
     }
 }
 
-/// Who can talk to the bot on a messenger: everyone (`allow-all`), only listed
-/// users (`whitelist`, the default), or everyone except listed users (`blacklist`).
+/// Outcome of an access rule or the messenger-wide default (`block` or `allow`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccessMode {
-    AllowAll,
-    Whitelist,
-    Blacklist,
+pub enum AccessEffect {
+    Allow,
+    Block,
 }
 
-impl AccessMode {
+impl AccessEffect {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::AllowAll => "allow-all",
-            Self::Whitelist => "whitelist",
-            Self::Blacklist => "blacklist",
+            Self::Allow => "allow",
+            Self::Block => "block",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|mode| mode.as_str() == s)
-    }
-
-    const ALL: [Self; 3] = [Self::AllowAll, Self::Whitelist, Self::Blacklist];
-}
-
-/// Which access list an entry belongs to. Whitelist and blacklist entries are
-/// stored separately so switching modes never flips trusted users into banned ones.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccessList {
-    Whitelist,
-    Blacklist,
-}
-
-impl AccessList {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Whitelist => "whitelist",
-            Self::Blacklist => "blacklist",
+        match s {
+            "allow" => Some(Self::Allow),
+            "block" => Some(Self::Block),
+            _ => None,
         }
     }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|list| list.as_str() == s)
-    }
-
-    const ALL: [Self; 2] = [Self::Whitelist, Self::Blacklist];
 }
 
-/// Where an access entry applies: globally (including DMs), in a specific
-/// Discord server (guild), or in a specific channel/thread.
+/// Where an access rule applies: globally (all servers + DMs; person-only),
+/// in a specific Discord server (guild channels/threads, never DMs), or in a
+/// specific channel/thread (channel + its threads, never DMs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessScope {
     Global,
-    Guild,
+    Server,
     Channel,
 }
 
@@ -964,37 +941,6 @@ impl AccessScope {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Global => "global",
-            Self::Guild => "guild",
-            Self::Channel => "channel",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|scope| scope.as_str() == s)
-    }
-
-    const ALL: [Self; 3] = [Self::Global, Self::Guild, Self::Channel];
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AccessEntry {
-    pub list: AccessList,
-    pub scope: AccessScope,
-    /// Server (guild) id for `Guild`, channel/thread id for `Channel`, `None` for `Global`.
-    pub scope_id: Option<String>,
-    pub user_id: String,
-}
-
-/// Scope for channel/server allowlist & blacklist entries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChannelAccessScope {
-    Server,
-    Channel,
-}
-
-impl ChannelAccessScope {
-    pub fn as_str(self) -> &'static str {
-        match self {
             Self::Server => "server",
             Self::Channel => "channel",
         }
@@ -1002,6 +948,7 @@ impl ChannelAccessScope {
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
+            "global" => Some(Self::Global),
             "server" => Some(Self::Server),
             "channel" => Some(Self::Channel),
             _ => None,
@@ -1009,12 +956,15 @@ impl ChannelAccessScope {
     }
 }
 
+/// One unified access rule `(who, where, effect)` unique per `(user_id, scope, scope_id)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChannelAccessEntry {
-    pub list: AccessList,
-    pub scope: ChannelAccessScope,
-    /// Discord server (guild) id for `Server`, channel/thread id for `Channel`.
-    pub target_id: String,
+pub struct AccessRule {
+    /// Specific Discord user id, or `None` for everyone (`server`/`channel` only).
+    pub user_id: Option<String>,
+    pub scope: AccessScope,
+    /// Server (guild) id for `Server`, channel/thread id for `Channel`, `None` for `Global`.
+    pub scope_id: Option<String>,
+    pub effect: AccessEffect,
 }
 
 pub trait MessengerStore: Send + Sync {
@@ -1023,46 +973,25 @@ pub trait MessengerStore: Send + Sync {
     fn allowed_users(&self, messenger: &str) -> Result<Vec<String>, StoreError>;
     fn allow_user(&self, messenger: &str, user: &str) -> Result<(), StoreError>;
     fn disallow_user(&self, messenger: &str, user: &str) -> Result<bool, StoreError>;
-    /// Access policy for a messenger; defaults to `AccessMode::Whitelist`.
-    fn access_mode(&self, messenger: &str) -> Result<AccessMode, StoreError>;
-    fn set_access_mode(&self, messenger: &str, mode: AccessMode) -> Result<(), StoreError>;
-    /// Whitelist and blacklist entries, ordered by list, scope, scope id, then user id.
-    fn access_entries(&self, messenger: &str) -> Result<Vec<AccessEntry>, StoreError>;
-    fn add_access_entry(
+    /// Default access decision for a messenger when no rule matches; defaults to `AccessEffect::Block`.
+    fn default_access(&self, messenger: &str) -> Result<AccessEffect, StoreError>;
+    fn set_default_access(&self, messenger: &str, effect: AccessEffect) -> Result<(), StoreError>;
+    /// Unified access rules, ordered by user (people first or everyone), scope, then scope id.
+    fn access_rules(&self, messenger: &str) -> Result<Vec<AccessRule>, StoreError>;
+    fn set_access_rule(
         &self,
         messenger: &str,
-        list: AccessList,
+        user_id: Option<&str>,
         scope: AccessScope,
         scope_id: Option<&str>,
-        user_id: &str,
+        effect: AccessEffect,
     ) -> Result<(), StoreError>;
-    fn remove_access_entry(
+    fn remove_access_rule(
         &self,
         messenger: &str,
-        list: AccessList,
+        user_id: Option<&str>,
         scope: AccessScope,
         scope_id: Option<&str>,
-        user_id: &str,
-    ) -> Result<bool, StoreError>;
-    /// Channel/server access policy for a messenger; defaults to `AccessMode::AllowAll`.
-    fn channel_access_mode(&self, messenger: &str) -> Result<AccessMode, StoreError>;
-    fn set_channel_access_mode(&self, messenger: &str, mode: AccessMode) -> Result<(), StoreError>;
-    /// Channel/server whitelist and blacklist entries, ordered by list, scope, then target id.
-    fn channel_access_entries(&self, messenger: &str)
-        -> Result<Vec<ChannelAccessEntry>, StoreError>;
-    fn add_channel_access_entry(
-        &self,
-        messenger: &str,
-        list: AccessList,
-        scope: ChannelAccessScope,
-        target_id: &str,
-    ) -> Result<(), StoreError>;
-    fn remove_channel_access_entry(
-        &self,
-        messenger: &str,
-        list: AccessList,
-        scope: ChannelAccessScope,
-        target_id: &str,
     ) -> Result<bool, StoreError>;
     /// The bot token for a chat platform (e.g. `discord`); stored encrypted.
     fn messenger_token(&self, messenger: &str) -> Result<Option<String>, StoreError>;
@@ -1139,64 +1068,33 @@ impl<T: MessengerStore + ?Sized> MessengerStore for std::sync::Arc<T> {
     fn disallow_user(&self, messenger: &str, user: &str) -> Result<bool, StoreError> {
         (**self).disallow_user(messenger, user)
     }
-    fn access_mode(&self, messenger: &str) -> Result<AccessMode, StoreError> {
-        (**self).access_mode(messenger)
+    fn default_access(&self, messenger: &str) -> Result<AccessEffect, StoreError> {
+        (**self).default_access(messenger)
     }
-    fn set_access_mode(&self, messenger: &str, mode: AccessMode) -> Result<(), StoreError> {
-        (**self).set_access_mode(messenger, mode)
+    fn set_default_access(&self, messenger: &str, effect: AccessEffect) -> Result<(), StoreError> {
+        (**self).set_default_access(messenger, effect)
     }
-    fn access_entries(&self, messenger: &str) -> Result<Vec<AccessEntry>, StoreError> {
-        (**self).access_entries(messenger)
+    fn access_rules(&self, messenger: &str) -> Result<Vec<AccessRule>, StoreError> {
+        (**self).access_rules(messenger)
     }
-    fn add_access_entry(
+    fn set_access_rule(
         &self,
         messenger: &str,
-        list: AccessList,
+        user_id: Option<&str>,
         scope: AccessScope,
         scope_id: Option<&str>,
-        user_id: &str,
+        effect: AccessEffect,
     ) -> Result<(), StoreError> {
-        (**self).add_access_entry(messenger, list, scope, scope_id, user_id)
+        (**self).set_access_rule(messenger, user_id, scope, scope_id, effect)
     }
-    fn remove_access_entry(
+    fn remove_access_rule(
         &self,
         messenger: &str,
-        list: AccessList,
+        user_id: Option<&str>,
         scope: AccessScope,
         scope_id: Option<&str>,
-        user_id: &str,
     ) -> Result<bool, StoreError> {
-        (**self).remove_access_entry(messenger, list, scope, scope_id, user_id)
-    }
-    fn channel_access_mode(&self, messenger: &str) -> Result<AccessMode, StoreError> {
-        (**self).channel_access_mode(messenger)
-    }
-    fn set_channel_access_mode(&self, messenger: &str, mode: AccessMode) -> Result<(), StoreError> {
-        (**self).set_channel_access_mode(messenger, mode)
-    }
-    fn channel_access_entries(
-        &self,
-        messenger: &str,
-    ) -> Result<Vec<ChannelAccessEntry>, StoreError> {
-        (**self).channel_access_entries(messenger)
-    }
-    fn add_channel_access_entry(
-        &self,
-        messenger: &str,
-        list: AccessList,
-        scope: ChannelAccessScope,
-        target_id: &str,
-    ) -> Result<(), StoreError> {
-        (**self).add_channel_access_entry(messenger, list, scope, target_id)
-    }
-    fn remove_channel_access_entry(
-        &self,
-        messenger: &str,
-        list: AccessList,
-        scope: ChannelAccessScope,
-        target_id: &str,
-    ) -> Result<bool, StoreError> {
-        (**self).remove_channel_access_entry(messenger, list, scope, target_id)
+        (**self).remove_access_rule(messenger, user_id, scope, scope_id)
     }
     fn messenger_token(&self, messenger: &str) -> Result<Option<String>, StoreError> {
         (**self).messenger_token(messenger)

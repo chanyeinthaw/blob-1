@@ -162,39 +162,24 @@ export const DiscordReplyOverride = Schema.Struct({
 })
 export type DiscordReplyOverride = typeof DiscordReplyOverride.Type
 
-export const DiscordAccessMode = Schema.Literals(['allow-all', 'whitelist', 'blacklist'])
-export type DiscordAccessMode = typeof DiscordAccessMode.Type
+export const DiscordAccessEffect = Schema.Literals(['allow', 'block'])
+export type DiscordAccessEffect = typeof DiscordAccessEffect.Type
 
-export const DiscordAccessList = Schema.Literals(['whitelist', 'blacklist'])
-export type DiscordAccessList = typeof DiscordAccessList.Type
-
-export const DiscordAccessScope = Schema.Literals(['global', 'guild', 'channel'])
+export const DiscordAccessScope = Schema.Literals(['global', 'server', 'channel'])
 export type DiscordAccessScope = typeof DiscordAccessScope.Type
 
-export const DiscordAccessEntry = Schema.Struct({
-  list: DiscordAccessList,
+export const DiscordAccessRule = Schema.Struct({
+  userId: Schema.NullOr(Schema.String),
   scope: DiscordAccessScope,
   scopeId: Schema.NullOr(Schema.String),
-  userId: Schema.String,
+  effect: DiscordAccessEffect,
 })
-export type DiscordAccessEntry = typeof DiscordAccessEntry.Type
-
-export const DiscordChannelAccessScope = Schema.Literals(['server', 'channel'])
-export type DiscordChannelAccessScope = typeof DiscordChannelAccessScope.Type
-
-export const DiscordChannelAccessEntry = Schema.Struct({
-  list: DiscordAccessList,
-  scope: DiscordChannelAccessScope,
-  targetId: Schema.String,
-})
-export type DiscordChannelAccessEntry = typeof DiscordChannelAccessEntry.Type
+export type DiscordAccessRule = typeof DiscordAccessRule.Type
 
 export const Discord = Schema.Struct({
   allowed: Schema.Array(Schema.String),
-  accessMode: DiscordAccessMode,
-  accessEntries: Schema.Array(DiscordAccessEntry),
-  channelAccessMode: DiscordAccessMode,
-  channelAccessEntries: Schema.Array(DiscordChannelAccessEntry),
+  defaultAccess: DiscordAccessEffect,
+  accessRules: Schema.Array(DiscordAccessRule),
   home: Home,
   token: Schema.Literals(['set', 'missing']),
   connection: DiscordConnection,
@@ -468,49 +453,26 @@ export const requests = {
     }),
     reply: Discord,
   },
-  'discord.setAccessMode': {
+  'discord.setDefaultAccess': {
     payload: Schema.Struct({
-      mode: DiscordAccessMode,
+      effect: DiscordAccessEffect,
     }),
     reply: Discord,
   },
-  'discord.addAccessEntry': {
+  'discord.setAccessRule': {
     payload: Schema.Struct({
-      list: DiscordAccessList,
+      userId: Schema.NullOr(Schema.String),
       scope: DiscordAccessScope,
       scopeId: Schema.NullOr(Schema.String),
-      userId: Schema.String,
+      effect: DiscordAccessEffect,
     }),
     reply: Discord,
   },
-  'discord.removeAccessEntry': {
+  'discord.removeAccessRule': {
     payload: Schema.Struct({
-      list: DiscordAccessList,
+      userId: Schema.NullOr(Schema.String),
       scope: DiscordAccessScope,
       scopeId: Schema.NullOr(Schema.String),
-      userId: Schema.String,
-    }),
-    reply: Discord,
-  },
-  'discord.setChannelAccessMode': {
-    payload: Schema.Struct({
-      mode: DiscordAccessMode,
-    }),
-    reply: Discord,
-  },
-  'discord.addChannelAccessEntry': {
-    payload: Schema.Struct({
-      list: DiscordAccessList,
-      scope: DiscordChannelAccessScope,
-      targetId: Schema.String,
-    }),
-    reply: Discord,
-  },
-  'discord.removeChannelAccessEntry': {
-    payload: Schema.Struct({
-      list: DiscordAccessList,
-      scope: DiscordChannelAccessScope,
-      targetId: Schema.String,
     }),
     reply: Discord,
   },

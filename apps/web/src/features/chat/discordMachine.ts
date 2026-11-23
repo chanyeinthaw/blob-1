@@ -1,10 +1,8 @@
 import { Api } from '@blob-1/client/api'
 import {
   Discord,
-  DiscordAccessList,
-  DiscordAccessMode,
+  DiscordAccessEffect,
   DiscordAccessScope,
-  DiscordChannelAccessScope,
   DiscordDirectory,
   DiscordInteractionMode,
   DiscordInteractionScope,
@@ -37,26 +35,26 @@ const saveToken = Effect.fn('DiscordSettings.saveToken')(function* (token: strin
 
 const removeToken = Effect.flatMap(Api, api => api.request('discord.clearToken', {}))
 
-const setAccessMode = Effect.fn('DiscordSettings.setAccessMode')(function* (
-  mode: DiscordAccessMode,
+const setDefaultAccess = Effect.fn('DiscordSettings.setDefaultAccess')(function* (
+  effect: DiscordAccessEffect,
 ) {
   const api = yield* Api
-  return yield* api.request('discord.setAccessMode', { mode })
+  return yield* api.request('discord.setDefaultAccess', { effect })
 })
 
-const addAccessEntry = Effect.fn('DiscordSettings.addAccessEntry')(function* (input: {
-  readonly list: DiscordAccessList
+const setAccessRule = Effect.fn('DiscordSettings.setAccessRule')(function* (input: {
+  readonly userId: string | null
   readonly scope: DiscordAccessScope
   readonly scopeId: string | null
-  readonly userId: string
+  readonly effect: DiscordAccessEffect
   readonly refreshDirectory: boolean
 }) {
   const api = yield* Api
-  const discord = yield* api.request('discord.addAccessEntry', {
-    list: input.list,
+  const discord = yield* api.request('discord.setAccessRule', {
+    userId: input.userId,
     scope: input.scope,
     scopeId: input.scopeId,
-    userId: input.userId,
+    effect: input.effect,
   })
   const directory =
     input.refreshDirectory && discord.connection.state === 'online'
@@ -65,52 +63,14 @@ const addAccessEntry = Effect.fn('DiscordSettings.addAccessEntry')(function* (in
   return { discord, directory }
 })
 
-const removeAccessEntry = Effect.fn('DiscordSettings.removeAccessEntry')(function* (input: {
-  readonly list: DiscordAccessList
+const removeAccessRule = Effect.fn('DiscordSettings.removeAccessRule')(function* (input: {
+  readonly userId: string | null
   readonly scope: DiscordAccessScope
   readonly scopeId: string | null
-  readonly userId: string
 }) {
   const api = yield* Api
-  return yield* api.request('discord.removeAccessEntry', input)
+  return yield* api.request('discord.removeAccessRule', input)
 })
-
-const setChannelAccessMode = Effect.fn('DiscordSettings.setChannelAccessMode')(function* (
-  mode: DiscordAccessMode,
-) {
-  const api = yield* Api
-  return yield* api.request('discord.setChannelAccessMode', { mode })
-})
-
-const addChannelAccessEntry = Effect.fn('DiscordSettings.addChannelAccessEntry')(function* (input: {
-  readonly list: DiscordAccessList
-  readonly scope: DiscordChannelAccessScope
-  readonly targetId: string
-  readonly refreshDirectory: boolean
-}) {
-  const api = yield* Api
-  const discord = yield* api.request('discord.addChannelAccessEntry', {
-    list: input.list,
-    scope: input.scope,
-    targetId: input.targetId,
-  })
-  const directory =
-    input.refreshDirectory && discord.connection.state === 'online'
-      ? yield* api.request('discord.directory', {}).pipe(Effect.orElseSucceed(() => null))
-      : null
-  return { discord, directory }
-})
-
-const removeChannelAccessEntry = Effect.fn('DiscordSettings.removeChannelAccessEntry')(
-  function* (input: {
-    readonly list: DiscordAccessList
-    readonly scope: DiscordChannelAccessScope
-    readonly targetId: string
-  }) {
-    const api = yield* Api
-    return yield* api.request('discord.removeChannelAccessEntry', input)
-  },
-)
 
 const setHome = Effect.fn('DiscordSettings.setHome')(function* (home: Home) {
   const api = yield* Api
@@ -210,6 +170,7 @@ export const DiscordInput = Schema.Struct({
 export type DiscordInput = typeof DiscordInput.Type
 
 const ErrorMessage = Schema.NullOr(Schema.String)
+const AccessTargetKind = Schema.Literals(['person', 'channel', 'server'])
 const HomeKind = Schema.Literals(['none', 'channel', 'dm'])
 
 export const DiscordStates = Machine.state({
@@ -218,27 +179,22 @@ export const DiscordStates = Machine.state({
     discord: Discord,
     directory: DiscordDirectory,
     general: GeneralSettings,
-    serverAccessMode: DiscordAccessMode,
-    pendingAccessMode: Schema.NullOr(DiscordAccessMode),
-    inFlightAccessMode: Schema.NullOr(DiscordAccessMode),
-    serverChannelAccessMode: DiscordAccessMode,
-    pendingChannelAccessMode: Schema.NullOr(DiscordAccessMode),
-    inFlightChannelAccessMode: Schema.NullOr(DiscordAccessMode),
+    serverDefaultAccess: DiscordAccessEffect,
+    pendingDefaultAccess: Schema.NullOr(DiscordAccessEffect),
+    inFlightDefaultAccess: Schema.NullOr(DiscordAccessEffect),
     inFlightWrites: Schema.Finite,
     mutationSeq: Schema.Finite,
     /** Bumped on every token save or removal; a connection watch started earlier is stale. */
     tokenGeneration: Schema.Finite,
     /** Transient home type chosen before picking a destination; null follows `discord.home.kind`. */
     pendingHomeKind: Schema.NullOr(HomeKind),
-    /** Access add-entry dialog + form draft. */
+    /** Unified Access add-rule dialog + form draft. */
     accessDialogOpen: Schema.Boolean,
+    accessKind: AccessTargetKind,
     accessScope: DiscordAccessScope,
     accessScopeId: Schema.String,
     accessUser: Schema.String,
-    /** Channel/server access add-entry dialog + form draft. */
-    channelAccessDialogOpen: Schema.Boolean,
-    channelAccessScope: DiscordChannelAccessScope,
-    channelAccessTarget: Schema.String,
+    accessEffect: DiscordAccessEffect,
     /** Interaction mode dialog + form draft; root fields so busy states can't lose it. */
     modeDialogOpen: Schema.Boolean,
     modeScope: DiscordInteractionScope,
@@ -275,45 +231,23 @@ export const DiscordStates = Machine.state({
     Access: {
       states: {
         Idle: { fields: { error: ErrorMessage } },
-        SettingMode: { fields: { mode: DiscordAccessMode } },
-        Adding: {
+        SettingDefault: { fields: { effect: DiscordAccessEffect } },
+        SavingRule: {
           fields: {
-            list: DiscordAccessList,
+            userId: Schema.NullOr(Schema.String),
             scope: DiscordAccessScope,
             scopeId: Schema.NullOr(Schema.String),
-            userId: Schema.String,
+            effect: DiscordAccessEffect,
             refreshDirectory: Schema.Boolean,
             tokenGeneration: Schema.Finite,
+            closeDialog: Schema.Boolean,
           },
         },
-        Removing: {
+        RemovingRule: {
           fields: {
-            list: DiscordAccessList,
+            userId: Schema.NullOr(Schema.String),
             scope: DiscordAccessScope,
             scopeId: Schema.NullOr(Schema.String),
-            userId: Schema.String,
-          },
-        },
-      },
-    },
-    ChannelAccess: {
-      states: {
-        Idle: { fields: { error: ErrorMessage } },
-        SettingMode: { fields: { mode: DiscordAccessMode } },
-        Adding: {
-          fields: {
-            list: DiscordAccessList,
-            scope: DiscordChannelAccessScope,
-            targetId: Schema.String,
-            refreshDirectory: Schema.Boolean,
-            tokenGeneration: Schema.Finite,
-          },
-        },
-        Removing: {
-          fields: {
-            list: DiscordAccessList,
-            scope: DiscordChannelAccessScope,
-            targetId: Schema.String,
           },
         },
       },
@@ -387,21 +321,23 @@ export const DiscordEvents = Machine.events({
   RemoveToken: {},
   OpenAccessDialog: {},
   CloseAccessDialog: {},
+  SelectAccessKind: { kind: AccessTargetKind },
   SelectAccessScope: { scope: DiscordAccessScope },
   SelectAccessScopeId: { scopeId: Schema.String },
   SelectAccessUser: { userId: Schema.String },
-  SetAccessMode: { mode: DiscordAccessMode },
-  AddAccessEntry: {
-    list: DiscordAccessList,
+  SelectAccessEffect: { effect: DiscordAccessEffect },
+  SetDefaultAccess: { effect: DiscordAccessEffect },
+  SetAccessRule: {
+    userId: Schema.NullOr(Schema.String),
     scope: DiscordAccessScope,
     scopeId: Schema.NullOr(Schema.String),
-    userId: Schema.String,
+    effect: DiscordAccessEffect,
+    closeDialog: Schema.Boolean,
   },
-  RemoveAccessEntry: {
-    list: DiscordAccessList,
+  RemoveAccessRule: {
+    userId: Schema.NullOr(Schema.String),
     scope: DiscordAccessScope,
     scopeId: Schema.NullOr(Schema.String),
-    userId: Schema.String,
   },
   SelectHomeKind: { kind: HomeKind },
   SetHome: { home: Home },
@@ -435,21 +371,6 @@ export const DiscordEvents = Machine.events({
   },
   SetDefaultReplyMode: { mode: DiscordReplyMode },
   ClearReplyMode: { scope: DiscordReplyScope, targetId: Schema.String },
-  OpenChannelAccessDialog: {},
-  CloseChannelAccessDialog: {},
-  SelectChannelAccessScope: { scope: DiscordChannelAccessScope },
-  SelectChannelAccessTarget: { targetId: Schema.String },
-  SetChannelAccessMode: { mode: DiscordAccessMode },
-  AddChannelAccessEntry: {
-    list: DiscordAccessList,
-    scope: DiscordChannelAccessScope,
-    targetId: Schema.String,
-  },
-  RemoveChannelAccessEntry: {
-    list: DiscordAccessList,
-    scope: DiscordChannelAccessScope,
-    targetId: Schema.String,
-  },
 })
 
 /** The Discord settings page: token, live connection status, allowlist, overrides and home channel. */
@@ -463,12 +384,9 @@ export const DiscordMachine = Machine.make({
     saveToken,
     removeToken,
     watchConnection,
-    setAccessMode,
-    addAccessEntry,
-    removeAccessEntry,
-    setChannelAccessMode,
-    addChannelAccessEntry,
-    removeChannelAccessEntry,
+    setDefaultAccess,
+    setAccessRule,
+    removeAccessRule,
     setHome,
     setInteractionMode,
     clearInteractionMode,
@@ -480,23 +398,19 @@ export const DiscordMachine = Machine.make({
 }).handle({
   root: ({ input }) => ({
     ...input,
-    serverAccessMode: input.discord.accessMode,
-    pendingAccessMode: null,
-    inFlightAccessMode: null,
-    serverChannelAccessMode: input.discord.channelAccessMode,
-    pendingChannelAccessMode: null,
-    inFlightChannelAccessMode: null,
+    serverDefaultAccess: input.discord.defaultAccess,
+    pendingDefaultAccess: null,
+    inFlightDefaultAccess: null,
     inFlightWrites: 0,
     mutationSeq: 0,
     tokenGeneration: 0,
     pendingHomeKind: null,
     accessDialogOpen: false,
+    accessKind: 'person',
     accessScope: 'global',
     accessScopeId: '',
     accessUser: '',
-    channelAccessDialogOpen: false,
-    channelAccessScope: 'channel',
-    channelAccessTarget: '',
+    accessEffect: input.discord.defaultAccess === 'block' ? 'allow' : 'block',
     modeDialogOpen: false,
     modeScope: 'channel',
     modeGuild: input.directory.guilds.length === 1 ? (input.directory.guilds[0]?.id ?? '') : '',
@@ -508,28 +422,16 @@ export const DiscordMachine = Machine.make({
     replySetting: 'direct',
   }),
   on: {
-    SetAccessMode: {
+    SetDefaultAccess: {
       update: 'root',
       data: ({ root, event }) => ({
         ...root,
-        pendingAccessMode:
-          root.inFlightAccessMode === null && event.mode === root.serverAccessMode
+        pendingDefaultAccess:
+          root.inFlightDefaultAccess === null && event.effect === root.serverDefaultAccess
             ? null
-            : event.mode,
+            : event.effect,
         mutationSeq: root.mutationSeq + 1,
-        discord: { ...root.discord, accessMode: event.mode },
-      }),
-    },
-    SetChannelAccessMode: {
-      update: 'root',
-      data: ({ root, event }) => ({
-        ...root,
-        pendingChannelAccessMode:
-          root.inFlightChannelAccessMode === null && event.mode === root.serverChannelAccessMode
-            ? null
-            : event.mode,
-        mutationSeq: root.mutationSeq + 1,
-        discord: { ...root.discord, channelAccessMode: event.mode },
+        discord: { ...root.discord, defaultAccess: event.effect },
       }),
     },
   },
@@ -556,10 +458,8 @@ export const DiscordMachine = Machine.make({
                   output === null ||
                   state.mutationSeq !== root.mutationSeq ||
                   root.inFlightWrites > 0 ||
-                  root.inFlightAccessMode !== null ||
-                  root.pendingAccessMode !== null ||
-                  root.inFlightChannelAccessMode !== null ||
-                  root.pendingChannelAccessMode !== null
+                  root.inFlightDefaultAccess !== null ||
+                  root.pendingDefaultAccess !== null
                 ) {
                   return { target: undefined, update: root }
                 }
@@ -567,8 +467,7 @@ export const DiscordMachine = Machine.make({
                   target: undefined,
                   update: {
                     ...root,
-                    serverAccessMode: output.discord.accessMode,
-                    serverChannelAccessMode: output.discord.channelAccessMode,
+                    serverDefaultAccess: output.discord.defaultAccess,
                     discord: output.discord,
                     general: output.general,
                     directory:
@@ -745,7 +644,7 @@ export const DiscordMachine = Machine.make({
                         discord: { ...root.discord, connection: output.discord.connection },
                         directory: mergeDirectoryChannels(output.directory, root.directory),
                         accessScopeId:
-                          root.accessScope === 'guild' &&
+                          root.accessScope === 'server' &&
                           root.accessScopeId === '' &&
                           output.directory.guilds.length === 1
                             ? (output.directory.guilds[0]?.id ?? '')
@@ -769,17 +668,18 @@ export const DiscordMachine = Machine.make({
         Idle: {
           always: {
             guard: ({ root }) =>
-              root.pendingAccessMode !== null && root.pendingAccessMode !== root.serverAccessMode,
-            target: 'Access.SettingMode',
+              root.pendingDefaultAccess !== null &&
+              root.pendingDefaultAccess !== root.serverDefaultAccess,
+            target: 'Access.SettingDefault',
             update: 'root',
             data: ({ root }) => {
-              const mode = root.pendingAccessMode ?? root.serverAccessMode
+              const effect = root.pendingDefaultAccess ?? root.serverDefaultAccess
               return {
-                target: { mode },
+                target: { effect },
                 update: {
                   ...root,
-                  pendingAccessMode: null,
-                  inFlightAccessMode: mode,
+                  pendingDefaultAccess: null,
+                  inFlightDefaultAccess: effect,
                   mutationSeq: root.mutationSeq + 1,
                 },
               }
@@ -794,9 +694,11 @@ export const DiscordMachine = Machine.make({
                 update: {
                   ...root,
                   accessDialogOpen: true,
+                  accessKind: 'person',
                   accessScope: 'global',
                   accessScopeId: '',
                   accessUser: '',
+                  accessEffect: root.discord.defaultAccess === 'block' ? 'allow' : 'block',
                 },
               }),
             },
@@ -805,7 +707,29 @@ export const DiscordMachine = Machine.make({
               update: 'root',
               data: ({ root }) => ({
                 target: { error: null },
-                update: { ...root, accessDialogOpen: false, accessUser: '' },
+                update: { ...root, accessDialogOpen: false, accessUser: '', accessScopeId: '' },
+              }),
+            },
+            SelectAccessKind: {
+              target: 'Access.Idle',
+              update: 'root',
+              data: ({ event, root, state }) => ({
+                target: { ...state, error: null },
+                update: {
+                  ...root,
+                  accessKind: event.kind,
+                  accessScope:
+                    event.kind === 'person'
+                      ? 'global'
+                      : event.kind === 'server'
+                        ? 'server'
+                        : 'channel',
+                  accessScopeId:
+                    event.kind === 'server' && root.directory.guilds.length === 1
+                      ? (root.directory.guilds[0]?.id ?? '')
+                      : '',
+                  accessUser: '',
+                },
               }),
             },
             SelectAccessScope: {
@@ -817,7 +741,7 @@ export const DiscordMachine = Machine.make({
                   ...root,
                   accessScope: event.scope,
                   accessScopeId:
-                    event.scope === 'guild' && root.directory.guilds.length === 1
+                    event.scope === 'server' && root.directory.guilds.length === 1
                       ? (root.directory.guilds[0]?.id ?? '')
                       : '',
                   accessUser: '',
@@ -840,20 +764,29 @@ export const DiscordMachine = Machine.make({
                 update: { ...root, accessUser: event.userId },
               }),
             },
-            AddAccessEntry: {
-              target: 'Access.Adding',
+            SelectAccessEffect: {
+              target: 'Access.Idle',
+              update: 'root',
+              data: ({ event, root, state }) => ({
+                target: { ...state, error: null },
+                update: { ...root, accessEffect: event.effect },
+              }),
+            },
+            SetAccessRule: {
+              target: 'Access.SavingRule',
               update: 'root',
               data: ({ event, root }) => ({
                 target: {
-                  list: event.list,
+                  userId: event.userId,
                   scope: event.scope,
                   scopeId: event.scopeId,
-                  userId: event.userId,
+                  effect: event.effect,
                   refreshDirectory:
                     event.scope === 'channel' &&
                     event.scopeId !== null &&
                     !root.directory.channels.some(channel => channel.id === event.scopeId),
                   tokenGeneration: root.tokenGeneration,
+                  closeDialog: event.closeDialog,
                 },
                 update: {
                   ...root,
@@ -862,15 +795,14 @@ export const DiscordMachine = Machine.make({
                 },
               }),
             },
-            RemoveAccessEntry: {
-              target: 'Access.Removing',
+            RemoveAccessRule: {
+              target: 'Access.RemovingRule',
               update: 'root',
               data: ({ event, root }) => ({
                 target: {
-                  list: event.list,
+                  userId: event.userId,
                   scope: event.scope,
                   scopeId: event.scopeId,
-                  userId: event.userId,
                 },
                 update: {
                   ...root,
@@ -881,31 +813,32 @@ export const DiscordMachine = Machine.make({
             },
           },
         },
-        SettingMode: {
+        SettingDefault: {
           invoke: {
-            src: 'setAccessMode',
-            input: ({ state }) => state.mode,
+            src: 'setDefaultAccess',
+            input: ({ state }) => state.effect,
             onDone: {
               target: 'Access.Idle',
               update: 'root',
               data: ({ root, output }) => {
                 const nextPending =
-                  root.pendingAccessMode === output.accessMode ? null : root.pendingAccessMode
+                  root.pendingDefaultAccess === output.defaultAccess
+                    ? null
+                    : root.pendingDefaultAccess
                 return {
                   target: { error: null },
                   update: {
                     ...root,
-                    serverAccessMode: output.accessMode,
-                    pendingAccessMode: nextPending,
-                    inFlightAccessMode: null,
+                    serverDefaultAccess: output.defaultAccess,
+                    pendingDefaultAccess: nextPending,
+                    inFlightDefaultAccess: null,
                     mutationSeq: root.mutationSeq + 1,
                     discord: {
                       ...root.discord,
                       allowed: output.allowed,
-                      accessMode: nextPending ?? output.accessMode,
-                      accessEntries: output.accessEntries,
+                      defaultAccess: nextPending ?? output.defaultAccess,
+                      accessRules: output.accessRules,
                     },
-                    accessUser: '',
                   },
                 }
               },
@@ -915,20 +848,20 @@ export const DiscordMachine = Machine.make({
               update: 'root',
               data: ({ root, state, error }) => {
                 const nextPending =
-                  root.pendingAccessMode === state.mode ||
-                  root.pendingAccessMode === root.serverAccessMode
+                  root.pendingDefaultAccess === state.effect ||
+                  root.pendingDefaultAccess === root.serverDefaultAccess
                     ? null
-                    : root.pendingAccessMode
+                    : root.pendingDefaultAccess
                 return {
                   target: { error: error.message },
                   update: {
                     ...root,
-                    pendingAccessMode: nextPending,
-                    inFlightAccessMode: null,
+                    pendingDefaultAccess: nextPending,
+                    inFlightDefaultAccess: null,
                     mutationSeq: root.mutationSeq + 1,
                     discord: {
                       ...root.discord,
-                      accessMode: nextPending ?? root.serverAccessMode,
+                      defaultAccess: nextPending ?? root.serverDefaultAccess,
                     },
                   },
                 }
@@ -936,14 +869,14 @@ export const DiscordMachine = Machine.make({
             },
           },
         },
-        Adding: {
+        SavingRule: {
           invoke: {
-            src: 'addAccessEntry',
+            src: 'setAccessRule',
             input: ({ state }) => ({
-              list: state.list,
+              userId: state.userId,
               scope: state.scope,
               scopeId: state.scopeId,
-              userId: state.userId,
+              effect: state.effect,
               refreshDirectory: state.refreshDirectory,
             }),
             onDone: {
@@ -951,29 +884,30 @@ export const DiscordMachine = Machine.make({
               update: 'root',
               data: ({ root, state, output }) => {
                 const nextPending =
-                  root.pendingAccessMode === output.discord.accessMode
+                  root.pendingDefaultAccess === output.discord.defaultAccess
                     ? null
-                    : root.pendingAccessMode
+                    : root.pendingDefaultAccess
                 return {
                   target: { error: null },
                   update: {
                     ...root,
                     inFlightWrites: Math.max(0, root.inFlightWrites - 1),
-                    serverAccessMode: output.discord.accessMode,
-                    pendingAccessMode: nextPending,
+                    serverDefaultAccess: output.discord.defaultAccess,
+                    pendingDefaultAccess: nextPending,
                     mutationSeq: root.mutationSeq + 1,
                     discord: {
                       ...root.discord,
                       allowed: output.discord.allowed,
-                      accessMode: nextPending ?? output.discord.accessMode,
-                      accessEntries: output.discord.accessEntries,
+                      defaultAccess: nextPending ?? output.discord.defaultAccess,
+                      accessRules: output.discord.accessRules,
                     },
                     directory:
                       state.tokenGeneration === root.tokenGeneration
                         ? mergeDirectoryChannels(root.directory, output.directory)
                         : root.directory,
-                    accessDialogOpen: false,
-                    accessUser: '',
+                    accessDialogOpen: state.closeDialog ? false : root.accessDialogOpen,
+                    accessUser: state.closeDialog ? '' : root.accessUser,
+                    accessScopeId: state.closeDialog ? '' : root.accessScopeId,
                   },
                 }
               },
@@ -992,34 +926,35 @@ export const DiscordMachine = Machine.make({
             },
           },
         },
-        Removing: {
+        RemovingRule: {
           invoke: {
-            src: 'removeAccessEntry',
+            src: 'removeAccessRule',
             input: ({ state }) => ({
-              list: state.list,
+              userId: state.userId,
               scope: state.scope,
               scopeId: state.scopeId,
-              userId: state.userId,
             }),
             onDone: {
               target: 'Access.Idle',
               update: 'root',
               data: ({ root, output }) => {
                 const nextPending =
-                  root.pendingAccessMode === output.accessMode ? null : root.pendingAccessMode
+                  root.pendingDefaultAccess === output.defaultAccess
+                    ? null
+                    : root.pendingDefaultAccess
                 return {
                   target: { error: null },
                   update: {
                     ...root,
                     inFlightWrites: Math.max(0, root.inFlightWrites - 1),
-                    serverAccessMode: output.accessMode,
-                    pendingAccessMode: nextPending,
+                    serverDefaultAccess: output.defaultAccess,
+                    pendingDefaultAccess: nextPending,
                     mutationSeq: root.mutationSeq + 1,
                     discord: {
                       ...root.discord,
                       allowed: output.allowed,
-                      accessMode: nextPending ?? output.accessMode,
-                      accessEntries: output.accessEntries,
+                      defaultAccess: nextPending ?? output.defaultAccess,
+                      accessRules: output.accessRules,
                     },
                   },
                 }
@@ -1027,268 +962,6 @@ export const DiscordMachine = Machine.make({
             },
             onFailure: {
               target: 'Access.Idle',
-              update: 'root',
-              data: ({ root, error }) => ({
-                target: { error: error.message },
-                update: {
-                  ...root,
-                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
-                  mutationSeq: root.mutationSeq + 1,
-                },
-              }),
-            },
-          },
-        },
-      },
-    },
-    ChannelAccess: {
-      initial: { target: 'ChannelAccess.Idle', data: { error: null } },
-      states: {
-        Idle: {
-          always: {
-            target: 'ChannelAccess.SettingMode',
-            guard: ({ root }) => root.pendingChannelAccessMode !== null,
-            update: 'root',
-            data: ({ root }) => {
-              const mode = root.pendingChannelAccessMode ?? root.serverChannelAccessMode
-              return {
-                target: { mode },
-                update: {
-                  ...root,
-                  inFlightChannelAccessMode: mode,
-                  mutationSeq: root.mutationSeq + 1,
-                },
-              }
-            },
-          },
-          on: {
-            OpenChannelAccessDialog: {
-              target: 'ChannelAccess.Idle',
-              update: 'root',
-              data: ({ root }) => ({
-                target: { error: null },
-                update: {
-                  ...root,
-                  channelAccessDialogOpen: true,
-                  channelAccessScope: 'channel',
-                  channelAccessTarget: '',
-                },
-              }),
-            },
-            CloseChannelAccessDialog: {
-              target: 'ChannelAccess.Idle',
-              update: 'root',
-              data: ({ root }) => ({
-                target: { error: null },
-                update: { ...root, channelAccessDialogOpen: false, channelAccessTarget: '' },
-              }),
-            },
-            SelectChannelAccessScope: {
-              target: 'ChannelAccess.Idle',
-              update: 'root',
-              data: ({ event, root, state }) => ({
-                target: { ...state, error: null },
-                update: {
-                  ...root,
-                  channelAccessScope: event.scope,
-                  channelAccessTarget:
-                    event.scope === 'server' && root.directory.guilds.length === 1
-                      ? (root.directory.guilds[0]?.id ?? '')
-                      : '',
-                },
-              }),
-            },
-            SelectChannelAccessTarget: {
-              target: 'ChannelAccess.Idle',
-              update: 'root',
-              data: ({ event, root, state }) => ({
-                target: { ...state, error: null },
-                update: { ...root, channelAccessTarget: event.targetId },
-              }),
-            },
-            AddChannelAccessEntry: {
-              target: 'ChannelAccess.Adding',
-              update: 'root',
-              data: ({ event, root }) => ({
-                target: {
-                  list: event.list,
-                  scope: event.scope,
-                  targetId: event.targetId,
-                  refreshDirectory:
-                    event.scope === 'channel' &&
-                    !root.directory.channels.some(channel => channel.id === event.targetId),
-                  tokenGeneration: root.tokenGeneration,
-                },
-                update: {
-                  ...root,
-                  inFlightWrites: root.inFlightWrites + 1,
-                  mutationSeq: root.mutationSeq + 1,
-                },
-              }),
-            },
-            RemoveChannelAccessEntry: {
-              target: 'ChannelAccess.Removing',
-              update: 'root',
-              data: ({ event, root }) => ({
-                target: {
-                  list: event.list,
-                  scope: event.scope,
-                  targetId: event.targetId,
-                },
-                update: {
-                  ...root,
-                  inFlightWrites: root.inFlightWrites + 1,
-                  mutationSeq: root.mutationSeq + 1,
-                },
-              }),
-            },
-          },
-        },
-        SettingMode: {
-          invoke: {
-            src: 'setChannelAccessMode',
-            input: ({ state }) => state.mode,
-            onDone: {
-              target: 'ChannelAccess.Idle',
-              update: 'root',
-              data: ({ root, output }) => {
-                const nextPending =
-                  root.pendingChannelAccessMode === output.channelAccessMode
-                    ? null
-                    : root.pendingChannelAccessMode
-                return {
-                  target: { error: null },
-                  update: {
-                    ...root,
-                    serverChannelAccessMode: output.channelAccessMode,
-                    pendingChannelAccessMode: nextPending,
-                    inFlightChannelAccessMode: null,
-                    mutationSeq: root.mutationSeq + 1,
-                    discord: {
-                      ...root.discord,
-                      channelAccessMode: nextPending ?? output.channelAccessMode,
-                      channelAccessEntries: output.channelAccessEntries,
-                    },
-                    channelAccessTarget: '',
-                  },
-                }
-              },
-            },
-            onFailure: {
-              target: 'ChannelAccess.Idle',
-              update: 'root',
-              data: ({ root, state, error }) => {
-                const nextPending =
-                  root.pendingChannelAccessMode === state.mode ||
-                  root.pendingChannelAccessMode === root.serverChannelAccessMode
-                    ? null
-                    : root.pendingChannelAccessMode
-                return {
-                  target: { error: error.message },
-                  update: {
-                    ...root,
-                    pendingChannelAccessMode: nextPending,
-                    inFlightChannelAccessMode: null,
-                    mutationSeq: root.mutationSeq + 1,
-                    discord: {
-                      ...root.discord,
-                      channelAccessMode: nextPending ?? root.serverChannelAccessMode,
-                    },
-                  },
-                }
-              },
-            },
-          },
-        },
-        Adding: {
-          invoke: {
-            src: 'addChannelAccessEntry',
-            input: ({ state }) => ({
-              list: state.list,
-              scope: state.scope,
-              targetId: state.targetId,
-              refreshDirectory: state.refreshDirectory,
-            }),
-            onDone: {
-              target: 'ChannelAccess.Idle',
-              update: 'root',
-              data: ({ root, state, output }) => {
-                const nextPending =
-                  root.pendingChannelAccessMode === output.discord.channelAccessMode
-                    ? null
-                    : root.pendingChannelAccessMode
-                return {
-                  target: { error: null },
-                  update: {
-                    ...root,
-                    inFlightWrites: Math.max(0, root.inFlightWrites - 1),
-                    serverChannelAccessMode: output.discord.channelAccessMode,
-                    pendingChannelAccessMode: nextPending,
-                    mutationSeq: root.mutationSeq + 1,
-                    discord: {
-                      ...root.discord,
-                      channelAccessMode: nextPending ?? output.discord.channelAccessMode,
-                      channelAccessEntries: output.discord.channelAccessEntries,
-                    },
-                    directory:
-                      state.tokenGeneration === root.tokenGeneration
-                        ? mergeDirectoryChannels(root.directory, output.directory)
-                        : root.directory,
-                    channelAccessDialogOpen: false,
-                    channelAccessTarget: '',
-                  },
-                }
-              },
-            },
-            onFailure: {
-              target: 'ChannelAccess.Idle',
-              update: 'root',
-              data: ({ root, error }) => ({
-                target: { error: error.message },
-                update: {
-                  ...root,
-                  inFlightWrites: Math.max(0, root.inFlightWrites - 1),
-                  mutationSeq: root.mutationSeq + 1,
-                },
-              }),
-            },
-          },
-        },
-        Removing: {
-          invoke: {
-            src: 'removeChannelAccessEntry',
-            input: ({ state }) => ({
-              list: state.list,
-              scope: state.scope,
-              targetId: state.targetId,
-            }),
-            onDone: {
-              target: 'ChannelAccess.Idle',
-              update: 'root',
-              data: ({ root, output }) => {
-                const nextPending =
-                  root.pendingChannelAccessMode === output.channelAccessMode
-                    ? null
-                    : root.pendingChannelAccessMode
-                return {
-                  target: { error: null },
-                  update: {
-                    ...root,
-                    inFlightWrites: Math.max(0, root.inFlightWrites - 1),
-                    serverChannelAccessMode: output.channelAccessMode,
-                    pendingChannelAccessMode: nextPending,
-                    mutationSeq: root.mutationSeq + 1,
-                    discord: {
-                      ...root.discord,
-                      channelAccessMode: nextPending ?? output.channelAccessMode,
-                      channelAccessEntries: output.channelAccessEntries,
-                    },
-                  },
-                }
-              },
-            },
-            onFailure: {
-              target: 'ChannelAccess.Idle',
               update: 'root',
               data: ({ root, error }) => ({
                 target: { error: error.message },

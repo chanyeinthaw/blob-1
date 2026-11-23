@@ -257,7 +257,10 @@ function InstructionsEditor() {
                 : 'border-destructive',
             )}
           >
-            <div aria-hidden="true" className={cn(textClassName, 'invisible')}>
+            <div
+              aria-hidden="true"
+              className={cn(textClassName, 'invisible max-h-[32rem] overflow-hidden')}
+            >
               {value.draftText}{' '}
             </div>
             <textarea
@@ -266,7 +269,7 @@ function InstructionsEditor() {
               aria-describedby={value.error === null ? undefined : 'instructions-error'}
               className={cn(
                 textClassName,
-                'h-full resize-none overflow-hidden bg-transparent caret-foreground outline-none disabled:cursor-not-allowed disabled:opacity-50',
+                'h-full max-h-[32rem] resize-none overflow-y-auto bg-transparent caret-foreground outline-none disabled:cursor-not-allowed disabled:opacity-50',
               )}
               value={value.draftText}
               disabled={isResetting}
