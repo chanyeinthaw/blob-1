@@ -286,6 +286,35 @@ enum MessengerCommand {
         #[command(subcommand)]
         command: MessengerAccessCommand,
     },
+    Channels {
+        #[command(subcommand)]
+        command: MessengerChannelsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum MessengerChannelsCommand {
+    /// Show the channel/server access mode and all whitelist/blacklist entries.
+    Show { messenger: String },
+    /// Set the channel/server access mode (`allow-all`, `whitelist`, or `blacklist`).
+    Mode {
+        messenger: String,
+        mode: AccessModeSetting,
+    },
+    /// Add a server or channel/thread to the whitelist or blacklist.
+    Add {
+        messenger: String,
+        list: AccessListSetting,
+        scope: ReplyScopeSetting,
+        id: String,
+    },
+    /// Remove a server or channel/thread from the whitelist or blacklist.
+    Remove {
+        messenger: String,
+        list: AccessListSetting,
+        scope: ReplyScopeSetting,
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1515,6 +1544,72 @@ async fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<(
                     _ => return Err("scope ID cannot be empty".into()),
                 };
                 store.remove_access_entry(&messenger, list.into(), scope, scope_id, &user_id)?;
+            }
+        },
+        MessengerCommand::Channels { command } => match command {
+            MessengerChannelsCommand::Show { messenger } => {
+                if messenger != "discord" {
+                    return Err(format!("unknown messenger: {messenger}").into());
+                }
+                println!("mode {}", store.channel_access_mode(&messenger)?.as_str());
+                for entry in store.channel_access_entries(&messenger)? {
+                    println!(
+                        "{} {} {}",
+                        entry.list.as_str(),
+                        entry.scope.as_str(),
+                        entry.target_id
+                    );
+                }
+            }
+            MessengerChannelsCommand::Mode { messenger, mode } => {
+                if messenger != "discord" {
+                    return Err(format!("unknown messenger: {messenger}").into());
+                }
+                store.set_channel_access_mode(&messenger, mode.into())?;
+            }
+            MessengerChannelsCommand::Add {
+                messenger,
+                list,
+                scope,
+                id,
+            } => {
+                if messenger != "discord" {
+                    return Err(format!("unknown messenger: {messenger}").into());
+                }
+                let scope = match scope {
+                    ReplyScopeSetting::Server => storage::ChannelAccessScope::Server,
+                    ReplyScopeSetting::Channel => storage::ChannelAccessScope::Channel,
+                };
+                if !valid_discord_id(&id) {
+                    return Err(match scope {
+                        storage::ChannelAccessScope::Server => {
+                            "Discord server IDs must be 17–20 digits"
+                        }
+                        storage::ChannelAccessScope::Channel => {
+                            "Discord channel IDs must be 17–20 digits"
+                        }
+                    }
+                    .into());
+                }
+                store.add_channel_access_entry(&messenger, list.into(), scope, &id)?;
+            }
+            MessengerChannelsCommand::Remove {
+                messenger,
+                list,
+                scope,
+                id,
+            } => {
+                if messenger != "discord" {
+                    return Err(format!("unknown messenger: {messenger}").into());
+                }
+                if id.is_empty() {
+                    return Err("target ID cannot be empty".into());
+                }
+                let scope = match scope {
+                    ReplyScopeSetting::Server => storage::ChannelAccessScope::Server,
+                    ReplyScopeSetting::Channel => storage::ChannelAccessScope::Channel,
+                };
+                store.remove_channel_access_entry(&messenger, list.into(), scope, &id)?;
             }
         },
     }

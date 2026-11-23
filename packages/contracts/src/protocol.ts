@@ -179,10 +179,22 @@ export const DiscordAccessEntry = Schema.Struct({
 })
 export type DiscordAccessEntry = typeof DiscordAccessEntry.Type
 
+export const DiscordChannelAccessScope = Schema.Literals(['server', 'channel'])
+export type DiscordChannelAccessScope = typeof DiscordChannelAccessScope.Type
+
+export const DiscordChannelAccessEntry = Schema.Struct({
+  list: DiscordAccessList,
+  scope: DiscordChannelAccessScope,
+  targetId: Schema.String,
+})
+export type DiscordChannelAccessEntry = typeof DiscordChannelAccessEntry.Type
+
 export const Discord = Schema.Struct({
   allowed: Schema.Array(Schema.String),
   accessMode: DiscordAccessMode,
   accessEntries: Schema.Array(DiscordAccessEntry),
+  channelAccessMode: DiscordAccessMode,
+  channelAccessEntries: Schema.Array(DiscordChannelAccessEntry),
   home: Home,
   token: Schema.Literals(['set', 'missing']),
   connection: DiscordConnection,
@@ -477,6 +489,28 @@ export const requests = {
       scope: DiscordAccessScope,
       scopeId: Schema.NullOr(Schema.String),
       userId: Schema.String,
+    }),
+    reply: Discord,
+  },
+  'discord.setChannelAccessMode': {
+    payload: Schema.Struct({
+      mode: DiscordAccessMode,
+    }),
+    reply: Discord,
+  },
+  'discord.addChannelAccessEntry': {
+    payload: Schema.Struct({
+      list: DiscordAccessList,
+      scope: DiscordChannelAccessScope,
+      targetId: Schema.String,
+    }),
+    reply: Discord,
+  },
+  'discord.removeChannelAccessEntry': {
+    payload: Schema.Struct({
+      list: DiscordAccessList,
+      scope: DiscordChannelAccessScope,
+      targetId: Schema.String,
     }),
     reply: Discord,
   },

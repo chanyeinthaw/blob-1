@@ -45,6 +45,7 @@ const matchesOption = (option: PickerOption, query: string): boolean => {
   const needle = query.trim().toLowerCase()
   if (needle === '') return true
   return (
+    option.value.toLowerCase() === needle ||
     option.label.toLowerCase().includes(needle) ||
     (option.hint !== null && option.hint.toLowerCase().includes(needle)) ||
     (option.group !== undefined &&

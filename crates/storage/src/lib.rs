@@ -985,6 +985,38 @@ pub struct AccessEntry {
     pub user_id: String,
 }
 
+/// Scope for channel/server allowlist & blacklist entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelAccessScope {
+    Server,
+    Channel,
+}
+
+impl ChannelAccessScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::Channel => "channel",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "server" => Some(Self::Server),
+            "channel" => Some(Self::Channel),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelAccessEntry {
+    pub list: AccessList,
+    pub scope: ChannelAccessScope,
+    /// Discord server (guild) id for `Server`, channel/thread id for `Channel`.
+    pub target_id: String,
+}
+
 pub trait MessengerStore: Send + Sync {
     fn destination(&self, messenger: &str, place: &Place) -> Result<u64, StoreError>;
     fn place(&self, id: u64) -> Result<Option<(String, Place)>, StoreError>;
@@ -1011,6 +1043,26 @@ pub trait MessengerStore: Send + Sync {
         scope: AccessScope,
         scope_id: Option<&str>,
         user_id: &str,
+    ) -> Result<bool, StoreError>;
+    /// Channel/server access policy for a messenger; defaults to `AccessMode::AllowAll`.
+    fn channel_access_mode(&self, messenger: &str) -> Result<AccessMode, StoreError>;
+    fn set_channel_access_mode(&self, messenger: &str, mode: AccessMode) -> Result<(), StoreError>;
+    /// Channel/server whitelist and blacklist entries, ordered by list, scope, then target id.
+    fn channel_access_entries(&self, messenger: &str)
+        -> Result<Vec<ChannelAccessEntry>, StoreError>;
+    fn add_channel_access_entry(
+        &self,
+        messenger: &str,
+        list: AccessList,
+        scope: ChannelAccessScope,
+        target_id: &str,
+    ) -> Result<(), StoreError>;
+    fn remove_channel_access_entry(
+        &self,
+        messenger: &str,
+        list: AccessList,
+        scope: ChannelAccessScope,
+        target_id: &str,
     ) -> Result<bool, StoreError>;
     /// The bot token for a chat platform (e.g. `discord`); stored encrypted.
     fn messenger_token(&self, messenger: &str) -> Result<Option<String>, StoreError>;
@@ -1115,6 +1167,36 @@ impl<T: MessengerStore + ?Sized> MessengerStore for std::sync::Arc<T> {
         user_id: &str,
     ) -> Result<bool, StoreError> {
         (**self).remove_access_entry(messenger, list, scope, scope_id, user_id)
+    }
+    fn channel_access_mode(&self, messenger: &str) -> Result<AccessMode, StoreError> {
+        (**self).channel_access_mode(messenger)
+    }
+    fn set_channel_access_mode(&self, messenger: &str, mode: AccessMode) -> Result<(), StoreError> {
+        (**self).set_channel_access_mode(messenger, mode)
+    }
+    fn channel_access_entries(
+        &self,
+        messenger: &str,
+    ) -> Result<Vec<ChannelAccessEntry>, StoreError> {
+        (**self).channel_access_entries(messenger)
+    }
+    fn add_channel_access_entry(
+        &self,
+        messenger: &str,
+        list: AccessList,
+        scope: ChannelAccessScope,
+        target_id: &str,
+    ) -> Result<(), StoreError> {
+        (**self).add_channel_access_entry(messenger, list, scope, target_id)
+    }
+    fn remove_channel_access_entry(
+        &self,
+        messenger: &str,
+        list: AccessList,
+        scope: ChannelAccessScope,
+        target_id: &str,
+    ) -> Result<bool, StoreError> {
+        (**self).remove_channel_access_entry(messenger, list, scope, target_id)
     }
     fn messenger_token(&self, messenger: &str) -> Result<Option<String>, StoreError> {
         (**self).messenger_token(messenger)

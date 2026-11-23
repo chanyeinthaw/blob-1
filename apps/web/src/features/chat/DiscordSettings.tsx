@@ -4,6 +4,8 @@ import type {
   DiscordAccessList,
   DiscordAccessMode,
   DiscordAccessScope,
+  DiscordChannelAccessEntry,
+  DiscordChannelAccessScope,
   DiscordConnection,
   DiscordDirectory,
   DiscordInteractionMode,
@@ -162,6 +164,7 @@ export function DiscordSettings() {
     <div>
       <TokenSection />
       <AccessSection />
+      <ChannelAccessSection />
       <InteractionModeSection />
       <ReplyModeSection />
       <HomeSection />
@@ -428,7 +431,7 @@ function AccessSection() {
             </Button>
           )
         return (
-          <Section title="Access" action={addButton}>
+          <Section title="People access" action={addButton}>
             <div className="mb-2">
               <ToggleGroup
                 aria-label="Access mode"
@@ -486,6 +489,314 @@ function AccessSection() {
         )
       }}
     </MachineState>
+  )
+}
+
+function isChannelAccessScope(value: string | undefined): value is DiscordChannelAccessScope {
+  return value === 'channel' || value === 'server'
+}
+
+const channelAccessScopes = [
+  { scope: 'channel', label: 'Channel' },
+  { scope: 'server', label: 'Server' },
+] as const satisfies ReadonlyArray<{ scope: DiscordChannelAccessScope; label: string }>
+
+const channelAccessHelp: ReadonlyArray<ModeHelpItem> = [
+  { term: 'DMs', description: 'always follow People access.' },
+  { term: 'Threads', description: 'inherit their parent channel unless listed separately.' },
+]
+
+function ChannelAccessSection() {
+  const machine = DiscordOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  const isIdle = AsyncResult.getOrElse(
+    useMachineResult(AtomMachine.matches(machine, 'ChannelAccess.Idle')),
+    () => false,
+  )
+  return (
+    <MachineState machine={machine} path="">
+      {({ value, states }) => {
+        const channelState = states.ChannelAccess.state
+        const error = channelState.path === 'ChannelAccess.Idle' ? channelState.value.error : null
+        const mode = value.discord.channelAccessMode
+        const entries =
+          mode === 'allow-all'
+            ? []
+            : value.discord.channelAccessEntries.filter(entry => entry.list === mode)
+        const addButton =
+          mode === 'allow-all' ? null : (
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={!isIdle}
+              onClick={() => send(DiscordEvents.OpenChannelAccessDialog())}
+            >
+              <Plus data-icon="inline-start" className="size-3.5" />
+              {mode === 'whitelist' ? 'Allow' : 'Block'}
+            </Button>
+          )
+        return (
+          <Section
+            title="Channel & server access"
+            titleExtra={
+              <ModeHelp label="About channel and server access" items={channelAccessHelp} />
+            }
+            action={addButton}
+          >
+            <div className="mb-2">
+              <ToggleGroup
+                aria-label="Channel access mode"
+                spacing={1}
+                value={[mode]}
+                onValueChange={values => {
+                  const next = values[0]
+                  if (isAccessMode(next) && next !== mode) {
+                    send(DiscordEvents.SetChannelAccessMode({ mode: next }))
+                  }
+                }}
+                className="h-10 rounded-full bg-muted p-[3px] md:h-8"
+              >
+                {accessModes.map(item => (
+                  <ToggleGroupItem
+                    key={item.mode}
+                    value={item.mode}
+                    className={modeToggleItemClassName}
+                  >
+                    {item.label}
+                  </ToggleGroupItem>
+                ))}
+              </ToggleGroup>
+            </div>
+            {mode === 'allow-all' ? (
+              <EmptyLine>All channels and servers are allowed.</EmptyLine>
+            ) : entries.length === 0 ? (
+              <EmptyLine>
+                {mode === 'whitelist'
+                  ? 'No channels or servers are whitelisted yet.'
+                  : 'No channels or servers are blacklisted.'}
+              </EmptyLine>
+            ) : (
+              <ul className="flex flex-col divide-y">
+                {entries.map(entry => (
+                  <ChannelAccessRow
+                    key={`${entry.list}:${entry.scope}:${entry.targetId}`}
+                    entry={entry}
+                    directory={value.directory}
+                    disabled={!isIdle}
+                  />
+                ))}
+              </ul>
+            )}
+            {!value.channelAccessDialogOpen && error !== null ? (
+              <FieldError id="discord-channel-access-error">{error}</FieldError>
+            ) : null}
+            {mode === 'allow-all' ? null : (
+              <ChannelAccessAddDialog
+                list={mode}
+                open={value.channelAccessDialogOpen}
+                isIdle={isIdle}
+                error={error}
+              />
+            )}
+          </Section>
+        )
+      }}
+    </MachineState>
+  )
+}
+
+interface ChannelAccessRowProps {
+  readonly entry: DiscordChannelAccessEntry
+  readonly directory: DiscordDirectory
+  readonly disabled: boolean
+}
+
+function ChannelAccessRow(props: ChannelAccessRowProps) {
+  const machine = DiscordOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  const { entry, directory, disabled } = props
+  const { label, guildLabel, accessibleTarget, confirmDetail } = describeOverride(
+    { scope: entry.scope, guildId: null, targetId: entry.targetId },
+    directory,
+  )
+  const listName = entry.list === 'whitelist' ? 'whitelist' : 'blacklist'
+  return (
+    <li className="flex min-h-12 items-center gap-3 py-2">
+      <span
+        aria-hidden="true"
+        className="grid size-7 shrink-0 place-items-center rounded-full bg-muted text-[11px] font-semibold text-muted-foreground"
+      >
+        {entry.scope === 'server' ? <Server className="size-3.5" /> : <Hash className="size-3.5" />}
+      </span>
+      <div className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span className="break-words text-sm [overflow-wrap:anywhere]">{label}</span>
+        {guildLabel === null ? null : (
+          <span className="break-words text-xs text-muted-foreground [overflow-wrap:anywhere]">
+            {guildLabel}
+          </span>
+        )}
+      </div>
+      <ConfirmDialog
+        tooltip={`Remove from ${listName}`}
+        trigger={
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label={`Remove ${accessibleTarget} from ${listName}`}
+            disabled={disabled}
+            className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+          >
+            <Trash2 />
+          </Button>
+        }
+        title={`Remove from ${listName}?`}
+        detail={confirmDetail}
+        confirmLabel="Remove"
+        onConfirm={() => send(DiscordEvents.RemoveChannelAccessEntry(entry))}
+      />
+    </li>
+  )
+}
+
+interface ChannelAccessAddDialogProps {
+  readonly list: DiscordAccessList
+  readonly open: boolean
+  readonly isIdle: boolean
+  readonly error: string | null
+}
+
+function ChannelAccessAddDialog(props: ChannelAccessAddDialogProps) {
+  const machine = DiscordOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  const verb = props.list === 'whitelist' ? 'Allow' : 'Block'
+  const listName = props.list === 'whitelist' ? 'whitelist' : 'blacklist'
+  return (
+    <Dialog
+      open={props.open}
+      onOpenChange={open => {
+        if (!open && props.isIdle) send(DiscordEvents.CloseChannelAccessDialog())
+      }}
+    >
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Add to channel {listName}</DialogTitle>
+        </DialogHeader>
+        <MachineState machine={machine} path="">
+          {({ value }) => {
+            const scope = value.channelAccessScope
+            const alreadyListed = (targetId: string) =>
+              value.discord.channelAccessEntries.some(
+                entry =>
+                  entry.list === props.list && entry.scope === scope && entry.targetId === targetId,
+              )
+            const options =
+              scope === 'server'
+                ? value.directory.guilds
+                    .filter(guild => !alreadyListed(guild.id))
+                    .map(guild => ({ value: guild.id, label: guild.name, hint: guild.id }))
+                : value.directory.channels
+                    .filter(channel => !alreadyListed(channel.id))
+                    .toSorted(
+                      (a, b) => a.server.localeCompare(b.server) || a.name.localeCompare(b.name),
+                    )
+                    .map(channel => ({
+                      value: channel.id,
+                      label: channel.kind === 'thread' ? channel.name : `#${channel.name}`,
+                      hint: channel.kind === 'thread' ? 'thread' : null,
+                      group: channel.server,
+                    }))
+            const targetValid =
+              SNOWFLAKE.test(value.channelAccessTarget) && !alreadyListed(value.channelAccessTarget)
+            return (
+              <div className="space-y-1">
+                <FieldRow labelId="discord-channel-access-scope-label" label="Type">
+                  <ToggleGroup
+                    aria-labelledby="discord-channel-access-scope-label"
+                    spacing={1}
+                    disabled={!props.isIdle}
+                    value={[scope]}
+                    onValueChange={values => {
+                      const next = values[0]
+                      if (isChannelAccessScope(next) && next !== scope) {
+                        send(DiscordEvents.SelectChannelAccessScope({ scope: next }))
+                      }
+                    }}
+                    className="h-10 rounded-full bg-muted p-[3px] md:h-8"
+                  >
+                    {channelAccessScopes.map(item => (
+                      <ToggleGroupItem
+                        key={item.scope}
+                        value={item.scope}
+                        className={modeToggleItemClassName}
+                      >
+                        {item.label}
+                      </ToggleGroupItem>
+                    ))}
+                  </ToggleGroup>
+                </FieldRow>
+                <FieldRow
+                  id="discord-channel-access-target"
+                  label={scope === 'server' ? 'Server' : 'Channel'}
+                >
+                  <Picker
+                    id="discord-channel-access-target"
+                    placeholder={
+                      scope === 'server'
+                        ? 'Choose a server or paste ID'
+                        : 'Choose a channel or paste ID'
+                    }
+                    value={value.channelAccessTarget}
+                    disabled={!props.isIdle}
+                    clearOnEdit
+                    options={options}
+                    customOption={raw => {
+                      const id = raw.trim()
+                      if (!SNOWFLAKE.test(id) || alreadyListed(id)) return null
+                      return {
+                        value: id,
+                        label: scope === 'server' ? `Server ${id}` : `Channel ${id}`,
+                        hint: 'custom ID',
+                      }
+                    }}
+                    onChange={targetId =>
+                      send(DiscordEvents.SelectChannelAccessTarget({ targetId }))
+                    }
+                  />
+                </FieldRow>
+                {props.error !== null ? (
+                  <FieldError id="discord-channel-access-dialog-error">{props.error}</FieldError>
+                ) : null}
+                <DialogFooter className="pt-3">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={!props.isIdle}
+                    onClick={() => send(DiscordEvents.CloseChannelAccessDialog())}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    type="button"
+                    disabled={!props.isIdle || !targetValid}
+                    onClick={() =>
+                      send(
+                        DiscordEvents.AddChannelAccessEntry({
+                          list: props.list,
+                          scope,
+                          targetId: value.channelAccessTarget,
+                        }),
+                      )
+                    }
+                  >
+                    {verb}
+                  </Button>
+                </DialogFooter>
+              </div>
+            )
+          }}
+        </MachineState>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -767,6 +1078,8 @@ interface DefaultModeRowProps {
   readonly label: string
   /** Short muted note after the label, e.g. why Auto cannot take effect. */
   readonly status: string | null
+  /** Match override rows' trailing delete button width when override rows are present. */
+  readonly reserveDeleteSpace: boolean
   readonly children: React.ReactNode
 }
 
@@ -790,7 +1103,9 @@ function DefaultModeRow(props: DefaultModeRowProps) {
       </div>
       <div className="ml-auto flex items-center gap-1">
         {props.children}
-        <span aria-hidden="true" className="size-10 shrink-0 md:size-8" />
+        {props.reserveDeleteSpace ? (
+          <span aria-hidden="true" className="size-10 shrink-0 md:size-8" />
+        ) : null}
       </div>
     </li>
   )
@@ -930,6 +1245,7 @@ function InteractionModeSection() {
                         : 'Inactive: Auto-respond is off'
                       : null
                   }
+                  reserveDeleteSpace={value.discord.interactionModes.length > 0}
                 >
                   <ToggleGroup
                     aria-labelledby="discord-default-mode-label"
@@ -1392,6 +1708,7 @@ function ReplyModeSection() {
                   labelId="discord-default-reply-label"
                   label="All channels"
                   status={null}
+                  reserveDeleteSpace={value.discord.replyModes.length > 0}
                 >
                   <ToggleGroup
                     aria-labelledby="discord-default-reply-label"

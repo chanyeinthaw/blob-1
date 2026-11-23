@@ -6,6 +6,7 @@ import {
   Discord,
   type DiscordAccessEntry,
   type DiscordAccessMode,
+  type DiscordChannelAccessEntry,
   type DiscordInteractionMode,
   type DiscordInteractionOverride,
   type DiscordReplyMode,
@@ -52,6 +53,8 @@ type State = Readonly<{
   providers: ReadonlyArray<ProviderRecord>
   accessMode: DiscordAccessMode
   accessEntries: ReadonlyArray<DiscordAccessEntry>
+  channelAccessMode: DiscordAccessMode
+  channelAccessEntries: ReadonlyArray<DiscordChannelAccessEntry>
   home: Home
   hasToken: boolean
   interactionModes: ReadonlyArray<DiscordInteractionOverride>
@@ -99,6 +102,8 @@ const seedState = (): State => ({
   accessEntries: [
     { list: 'whitelist', scope: 'global', scopeId: null, userId: '435482941515104257' },
   ],
+  channelAccessMode: 'allow-all',
+  channelAccessEntries: [],
   home: { kind: 'none' },
   hasToken: true,
   interactionModes: [],
@@ -376,6 +381,8 @@ const discordReply = (state: State): Discord => ({
     .map(entry => entry.userId),
   accessMode: state.accessMode,
   accessEntries: state.accessEntries,
+  channelAccessMode: state.channelAccessMode,
+  channelAccessEntries: state.channelAccessEntries,
   home: state.home,
   token: state.hasToken ? 'set' : 'missing',
   connection: state.hasToken ? { state: 'online', bot: 'Blob-1' } : { state: 'off' },
@@ -1005,6 +1012,54 @@ const handlers: { readonly [K in RequestType]: Handler<K> } = {
     transition(state, current => removeAccessEntry(current, payload)).pipe(
       Effect.map(discordReply),
     ),
+
+  'discord.setChannelAccessMode': ({ mode }, state) =>
+    transition(state, current =>
+      Effect.succeed(Struct.evolve(current, { channelAccessMode: () => mode })),
+    ).pipe(Effect.map(discordReply)),
+
+  'discord.addChannelAccessEntry': (payload, state) =>
+    transition(state, current => {
+      if (!SNOWFLAKE.test(payload.targetId)) {
+        return Effect.fail(
+          payload.scope === 'server'
+            ? 'Server IDs must be 17–20 digits'
+            : 'Channel IDs must be 17–20 digits',
+        )
+      }
+      const exists = current.channelAccessEntries.some(
+        entry =>
+          entry.list === payload.list &&
+          entry.scope === payload.scope &&
+          entry.targetId === payload.targetId,
+      )
+      if (exists) return Effect.succeed(current)
+      return Effect.succeed(
+        Struct.evolve(current, {
+          channelAccessEntries: entries => [
+            ...entries,
+            { list: payload.list, scope: payload.scope, targetId: payload.targetId },
+          ],
+        }),
+      )
+    }).pipe(Effect.map(discordReply)),
+
+  'discord.removeChannelAccessEntry': (payload, state) =>
+    transition(state, current =>
+      Effect.succeed(
+        Struct.evolve(current, {
+          channelAccessEntries: entries =>
+            entries.filter(
+              entry =>
+                !(
+                  entry.list === payload.list &&
+                  entry.scope === payload.scope &&
+                  entry.targetId === payload.targetId
+                ),
+            ),
+        }),
+      ),
+    ).pipe(Effect.map(discordReply)),
 
   'mcp.list': (_payload, state) => Ref.get(state).pipe(Effect.map(current => current.mcpServers)),
 

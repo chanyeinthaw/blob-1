@@ -604,6 +604,8 @@ fn discord_reply(ctx: &Context) -> crate::Result<Value> {
         "allowed": store.allowed_users("discord")?,
         "accessMode": store.access_mode("discord")?.as_str(),
         "accessEntries": store.access_entries("discord")?.into_iter().map(|e| json!({"list":e.list.as_str(),"scope":e.scope.as_str(),"scopeId":e.scope_id,"userId":e.user_id})).collect::<Vec<_>>(),
+        "channelAccessMode": store.channel_access_mode("discord")?.as_str(),
+        "channelAccessEntries": store.channel_access_entries("discord")?.into_iter().map(|e| json!({"list":e.list.as_str(),"scope":e.scope.as_str(),"targetId":e.target_id})).collect::<Vec<_>>(),
         "home": home,
         "token": if store.messenger_token("discord")?.is_some() { "set" } else { "missing" },
         "connection": connection,
@@ -1072,6 +1074,49 @@ async fn dispatch(
                 }
                 discord_reply(ctx)
             }
+            "discord.setChannelAccessMode" => {
+                let mode = match get("mode")? {
+                    "allow-all" => storage::AccessMode::AllowAll,
+                    "whitelist" => storage::AccessMode::Whitelist,
+                    "blacklist" => storage::AccessMode::Blacklist,
+                    _ => return Err(invalid().into()),
+                };
+                store.set_channel_access_mode("discord", mode)?;
+                discord_reply(ctx)
+            }
+            "discord.addChannelAccessEntry" | "discord.removeChannelAccessEntry" => {
+                let list = match get("list")? {
+                    "whitelist" => storage::AccessList::Whitelist,
+                    "blacklist" => storage::AccessList::Blacklist,
+                    _ => return Err(invalid().into()),
+                };
+                let scope = match get("scope")? {
+                    "server" => storage::ChannelAccessScope::Server,
+                    "channel" => storage::ChannelAccessScope::Channel,
+                    _ => return Err(invalid().into()),
+                };
+                let target_id = get("targetId")?;
+                if request_type == "discord.addChannelAccessEntry" {
+                    if !crate::valid_discord_id(target_id) {
+                        return Err(match scope {
+                            storage::ChannelAccessScope::Server => {
+                                "Server IDs must be 17–20 digits"
+                            }
+                            storage::ChannelAccessScope::Channel => {
+                                "Channel IDs must be 17–20 digits"
+                            }
+                        }
+                        .into());
+                    }
+                    store.add_channel_access_entry("discord", list, scope, target_id)?;
+                } else {
+                    if target_id.is_empty() {
+                        return Err(invalid().into());
+                    }
+                    store.remove_channel_access_entry("discord", list, scope, target_id)?;
+                }
+                discord_reply(ctx)
+            }
             "discord.directory" => {
                 let (guilds, mut channels, people) = match ctx.discord.directory().await {
                     Ok(result) => result,
@@ -1106,6 +1151,14 @@ async fn dispatch(
                             .into_iter()
                             .filter(|e| e.scope == storage::AccessScope::Channel)
                             .filter_map(|e| e.scope_id),
+                    );
+                }
+                if let Ok(entries) = store.channel_access_entries("discord") {
+                    extra_ids.extend(
+                        entries
+                            .into_iter()
+                            .filter(|e| e.scope == storage::ChannelAccessScope::Channel)
+                            .map(|e| e.target_id),
                     );
                 }
                 for cid in extra_ids {

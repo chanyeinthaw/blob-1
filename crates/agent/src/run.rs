@@ -862,15 +862,52 @@ fn access_allowed(
     }
 }
 
-/// Evaluates the gateway pre-filter decision for a message given its access
-/// policy, interaction overrides, Discord-wide `default_mode`, and known
-/// guild/channel/thread identity (`thread == Some(t)` when `channel` is the
-/// resolved parent channel; `thread == None` when `channel` is a known
-/// top-level channel or an uncached channel/thread).
+/// Evaluates whether a server channel or thread is permitted under the active
+/// channel access mode (`allow-all`, `whitelist`, or `blacklist`). DMs bypass
+/// channel access (they remain governed by People access). Threads inherit
+/// their parent channel's entry and may also be listed directly.
+fn channel_access_allowed(
+    mode: storage::AccessMode,
+    entries: &[storage::ChannelAccessEntry],
+    guild: Option<&str>,
+    channel: &str,
+    thread: Option<&str>,
+    dm: bool,
+) -> bool {
+    use storage::{AccessList, AccessMode, ChannelAccessScope};
+    if dm {
+        return true;
+    }
+    let matches_list = |list: AccessList| {
+        entries.iter().any(|e| {
+            e.list == list
+                && match e.scope {
+                    ChannelAccessScope::Server => guild.is_some_and(|g| g == e.target_id),
+                    ChannelAccessScope::Channel => {
+                        e.target_id == channel || thread.is_some_and(|t| t == e.target_id)
+                    }
+                }
+        })
+    };
+    match mode {
+        AccessMode::AllowAll => true,
+        AccessMode::Whitelist => matches_list(AccessList::Whitelist),
+        AccessMode::Blacklist => !matches_list(AccessList::Blacklist),
+    }
+}
+
+/// Evaluates the gateway pre-filter decision for a message given its people
+/// access policy, channel/server access policy, interaction overrides,
+/// Discord-wide `default_mode`, and known guild/channel/thread identity
+/// (`thread == Some(t)` when `channel` is the resolved parent channel;
+/// `thread == None` when `channel` is a known top-level channel or an uncached
+/// channel/thread).
 #[allow(clippy::too_many_arguments)]
-fn pre_filter_decision(
+fn pre_filter_with_channels(
     access_mode: storage::AccessMode,
     access_entries: &[storage::AccessEntry],
+    channel_access_mode: storage::AccessMode,
+    channel_access_entries: &[storage::ChannelAccessEntry],
     overrides: &[storage::InteractionOverride],
     author: &str,
     guild: Option<&str>,
@@ -882,9 +919,11 @@ fn pre_filter_decision(
     auto_respond: bool,
 ) -> messenger_discord::PreFilterDecision {
     use messenger_discord::PreFilterDecision;
-    use storage::{AccessList, AccessMode, AccessScope, InteractionMode, InteractionScope};
+    use storage::{
+        AccessList, AccessMode, AccessScope, ChannelAccessScope, InteractionMode, InteractionScope,
+    };
     let dm = guild.is_none();
-    let access_decision = match access_mode {
+    let people_decision = match access_mode {
         AccessMode::AllowAll => PreFilterDecision::Allow,
         AccessMode::Whitelist => {
             if access_allowed(
@@ -935,9 +974,64 @@ fn pre_filter_decision(
             }
         }
     };
-    if access_decision == PreFilterDecision::Reject {
+    if people_decision == PreFilterDecision::Reject {
         return PreFilterDecision::Reject;
     }
+    let channel_decision = match channel_access_mode {
+        AccessMode::AllowAll => PreFilterDecision::Allow,
+        AccessMode::Whitelist => {
+            if channel_access_allowed(
+                channel_access_mode,
+                channel_access_entries,
+                guild,
+                channel,
+                thread,
+                dm,
+            ) {
+                PreFilterDecision::Allow
+            } else if !channel_known
+                && !dm
+                && channel_access_entries
+                    .iter()
+                    .any(|e| e.list == AccessList::Whitelist && e.scope == ChannelAccessScope::Channel)
+            {
+                PreFilterDecision::NeedParent
+            } else {
+                PreFilterDecision::Reject
+            }
+        }
+        AccessMode::Blacklist => {
+            if !channel_access_allowed(
+                channel_access_mode,
+                channel_access_entries,
+                guild,
+                channel,
+                thread,
+                dm,
+            ) {
+                PreFilterDecision::Reject
+            } else if !channel_known
+                && !dm
+                && channel_access_entries
+                    .iter()
+                    .any(|e| e.list == AccessList::Blacklist && e.scope == ChannelAccessScope::Channel)
+            {
+                PreFilterDecision::NeedParent
+            } else {
+                PreFilterDecision::Allow
+            }
+        }
+    };
+    if channel_decision == PreFilterDecision::Reject {
+        return PreFilterDecision::Reject;
+    }
+    let access_decision = if people_decision == PreFilterDecision::NeedParent
+        || channel_decision == PreFilterDecision::NeedParent
+    {
+        PreFilterDecision::NeedParent
+    } else {
+        PreFilterDecision::Allow
+    };
     let interaction_decision = if addressed {
         PreFilterDecision::Allow
     } else {
@@ -985,6 +1079,38 @@ fn pre_filter_decision(
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn pre_filter_decision(
+    access_mode: storage::AccessMode,
+    access_entries: &[storage::AccessEntry],
+    overrides: &[storage::InteractionOverride],
+    author: &str,
+    guild: Option<&str>,
+    channel: &str,
+    thread: Option<&str>,
+    addressed: bool,
+    channel_known: bool,
+    default_mode: storage::InteractionMode,
+    auto_respond: bool,
+) -> messenger_discord::PreFilterDecision {
+    pre_filter_with_channels(
+        access_mode,
+        access_entries,
+        storage::AccessMode::AllowAll,
+        &[],
+        overrides,
+        author,
+        guild,
+        channel,
+        thread,
+        addressed,
+        channel_known,
+        default_mode,
+        auto_respond,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdmissionPolicy {
     Deny,
@@ -1004,6 +1130,18 @@ fn admission_policy(
         mode,
         &entries,
         &inbound.author.id,
+        inbound.guild.as_deref(),
+        &inbound.place.channel,
+        inbound.place.thread.as_deref(),
+        inbound.place.dm,
+    ) {
+        return Ok(AdmissionPolicy::Deny);
+    }
+    let channel_mode = store.channel_access_mode("discord")?;
+    let channel_entries = store.channel_access_entries("discord")?;
+    if !channel_access_allowed(
+        channel_mode,
+        &channel_entries,
         inbound.guild.as_deref(),
         &inbound.place.channel,
         inbound.place.thread.as_deref(),
@@ -1148,6 +1286,17 @@ async fn admit_approved(
                                 &fetched
                             }
                         };
+                        // Re-verify access & policy after history fetch before calling utility model.
+                        let still_allowed = match admission_policy(store, &inbound) {
+                            Ok(AdmissionPolicy::AdmitDirect) => true,
+                            Ok(AdmissionPolicy::AutoRespondCheck) => {
+                                auto_responded && store.auto_respond().unwrap_or(false)
+                            }
+                            _ => false,
+                        };
+                        if !still_allowed {
+                            return None;
+                        }
                         Some(decide_inline(utility, slice, &inbound).await)
                     })
                     .await
@@ -1268,7 +1417,8 @@ async fn admit_batch(
         }
     }
 
-    let mut triage_approved = false;
+    let mut approved_triage_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     // Reuse triage's prefetched history ONLY for the exact message whose cutoff it
     // was fetched for; other items in the burst read the live cache (or REST fallback).
     let mut triage_prefetched: Option<(String, Vec<messenger::Fetched>)> = None;
@@ -1306,18 +1456,50 @@ async fn admit_batch(
                         (before_first, Some(latest), complete)
                     }
                 };
+                // Re-verify access & Auto-respond after history fetch before calling utility model.
+                if !store.auto_respond().unwrap_or(false) {
+                    return None;
+                }
+                let live_snapshot: Vec<messenger::Inbound> = triage_snapshot
+                    .iter()
+                    .filter(|item| {
+                        matches!(
+                            admission_policy(store, item),
+                            Ok(AdmissionPolicy::AutoRespondCheck)
+                        )
+                    })
+                    .cloned()
+                    .collect();
+                if live_snapshot.is_empty() {
+                    return None;
+                }
                 let respond = harness::decide_respond(
                     utility,
                     identity.as_deref(),
                     bot_id.as_deref(),
                     &prompt_history,
-                    &triage_snapshot,
+                    &live_snapshot,
                 )
                 .await;
-                Some((respond, prompt_history, seed_snapshot, complete_from_start))
+                let evaluated_ids: Vec<String> =
+                    live_snapshot.iter().map(|m| m.message.clone()).collect();
+                Some((
+                    respond,
+                    evaluated_ids,
+                    prompt_history,
+                    seed_snapshot,
+                    complete_from_start,
+                ))
             })
             .await;
-            if let Ok(Some((true, prompt_history, seed_snapshot, complete_from_start))) = decision {
+            if let Ok(Some((
+                true,
+                evaluated_ids,
+                prompt_history,
+                seed_snapshot,
+                complete_from_start,
+            ))) = decision
+            {
                 match (seed_snapshot, &warm_hold) {
                     (Some(latest), Some(hold)) => {
                         // Seed solely from the fresh REST snapshot bound to `hold.token`
@@ -1328,15 +1510,15 @@ async fn admit_batch(
                         discord.touch_history(&place);
                     }
                 }
-                triage_approved = true;
+                approved_triage_ids.extend(evaluated_ids);
                 triage_prefetched = Some((first_msg_id, prompt_history));
             }
             drop(warm_hold);
         }
     }
 
-    for (inbound, policy) in ordered {
-        match policy {
+    for (inbound, _) in ordered {
+        match admission_policy(store, &inbound)? {
             AdmissionPolicy::AdmitDirect => {
                 if let Some(item) =
                     admit_approved(store, &discord, messengers, inbound, utility, None, false)
@@ -1345,7 +1527,9 @@ async fn admit_batch(
                     let _ = tx.send(Ok(item)).await;
                 }
             }
-            AdmissionPolicy::AutoRespondCheck if triage_approved => {
+            AdmissionPolicy::AutoRespondCheck
+                if approved_triage_ids.contains(&inbound.message) =>
+            {
                 let prefetched = triage_prefetched
                     .as_ref()
                     .and_then(|(id, h)| (*id == inbound.message).then_some(h.as_slice()));
@@ -1434,6 +1618,20 @@ pub async fn serve(
                         return PreFilterDecision::Reject;
                     }
                 };
+                let channel_access_mode = match filter_store.channel_access_mode("discord") {
+                    Ok(mode) => mode,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        return PreFilterDecision::Reject;
+                    }
+                };
+                let channel_access_entries = match filter_store.channel_access_entries("discord") {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        return PreFilterDecision::Reject;
+                    }
+                };
                 let overrides = match filter_store.interaction_modes("discord") {
                     Ok(overrides) => overrides,
                     Err(error) => {
@@ -1463,9 +1661,11 @@ pub async fn serve(
                     }
                 };
                 let auto_respond = auto_respond_enabled && has_utility;
-                pre_filter_decision(
+                pre_filter_with_channels(
                     access_mode,
                     &access_entries,
+                    channel_access_mode,
+                    &channel_access_entries,
                     &overrides,
                     author,
                     guild,
@@ -3202,5 +3402,217 @@ mod tests {
         drop(messengers);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn channel_access_whitelist_blacklist_threads_servers_and_dms() {
+        use messenger_discord::PreFilterDecision;
+        use storage::{
+            AccessEntry, AccessList, AccessMode, AccessScope, ChannelAccessEntry,
+            ChannelAccessScope,
+        };
+
+        let people = vec![AccessEntry {
+            list: AccessList::Whitelist,
+            scope: AccessScope::Global,
+            scope_id: None,
+            user_id: "u1".into(),
+        }];
+        let wl = vec![
+            ChannelAccessEntry {
+                list: AccessList::Whitelist,
+                scope: ChannelAccessScope::Server,
+                target_id: "g_ok".into(),
+            },
+            ChannelAccessEntry {
+                list: AccessList::Whitelist,
+                scope: ChannelAccessScope::Channel,
+                target_id: "c_ok".into(),
+            },
+        ];
+
+        // Whitelist: server entry allows any channel in g_ok.
+        assert_eq!(
+            pre_filter_with_channels(
+                AccessMode::Whitelist,
+                &people,
+                AccessMode::Whitelist,
+                &wl,
+                &[],
+                "u1",
+                Some("g_ok"),
+                "c_any",
+                None,
+                true,
+                true,
+                InteractionMode::MentionOnly,
+                false,
+            ),
+            PreFilterDecision::Allow
+        );
+        // Whitelist: channel entry allows c_ok and child threads under c_ok.
+        assert_eq!(
+            pre_filter_with_channels(
+                AccessMode::Whitelist,
+                &people,
+                AccessMode::Whitelist,
+                &wl,
+                &[],
+                "u1",
+                Some("g_other"),
+                "c_ok",
+                Some("t_child"),
+                true,
+                true,
+                InteractionMode::MentionOnly,
+                false,
+            ),
+            PreFilterDecision::Allow
+        );
+        // Whitelist: uncached thread in another server triggers NeedParent when channel entries exist.
+        assert_eq!(
+            pre_filter_with_channels(
+                AccessMode::Whitelist,
+                &people,
+                AccessMode::Whitelist,
+                &wl,
+                &[],
+                "u1",
+                Some("g_other"),
+                "t_unknown",
+                None,
+                true,
+                false,
+                InteractionMode::MentionOnly,
+                false,
+            ),
+            PreFilterDecision::NeedParent
+        );
+        // Whitelist: known non-whitelisted channel is rejected even when addressed.
+        assert_eq!(
+            pre_filter_with_channels(
+                AccessMode::Whitelist,
+                &people,
+                AccessMode::Whitelist,
+                &wl,
+                &[],
+                "u1",
+                Some("g_other"),
+                "c_other",
+                None,
+                true,
+                true,
+                InteractionMode::MentionOnly,
+                false,
+            ),
+            PreFilterDecision::Reject
+        );
+        // Whitelist: DMs bypass channel access and follow People access.
+        assert_eq!(
+            pre_filter_with_channels(
+                AccessMode::Whitelist,
+                &people,
+                AccessMode::Whitelist,
+                &wl,
+                &[],
+                "u1",
+                None,
+                "dm1",
+                None,
+                true,
+                true,
+                InteractionMode::MentionOnly,
+                false,
+            ),
+            PreFilterDecision::Allow
+        );
+
+        let bl = vec![
+            ChannelAccessEntry {
+                list: AccessList::Blacklist,
+                scope: ChannelAccessScope::Server,
+                target_id: "g_bad".into(),
+            },
+            ChannelAccessEntry {
+                list: AccessList::Blacklist,
+                scope: ChannelAccessScope::Channel,
+                target_id: "c_bad".into(),
+            },
+        ];
+        // Blacklist: blocks server, channel, and child threads under blacklisted channel even for globally whitelisted u1.
+        assert_eq!(
+            pre_filter_with_channels(
+                AccessMode::Whitelist,
+                &people,
+                AccessMode::Blacklist,
+                &bl,
+                &[],
+                "u1",
+                Some("g_bad"),
+                "c_any",
+                None,
+                true,
+                true,
+                InteractionMode::MentionOnly,
+                false,
+            ),
+            PreFilterDecision::Reject
+        );
+        assert_eq!(
+            pre_filter_with_channels(
+                AccessMode::Whitelist,
+                &people,
+                AccessMode::Blacklist,
+                &bl,
+                &[],
+                "u1",
+                Some("g_ok"),
+                "c_bad",
+                Some("t_child"),
+                true,
+                true,
+                InteractionMode::MentionOnly,
+                false,
+            ),
+            PreFilterDecision::Reject
+        );
+        // Blacklist: uncached thread triggers NeedParent when channel blacklist entries exist.
+        assert_eq!(
+            pre_filter_with_channels(
+                AccessMode::Whitelist,
+                &people,
+                AccessMode::Blacklist,
+                &bl,
+                &[],
+                "u1",
+                Some("g_ok"),
+                "t_unknown",
+                None,
+                true,
+                false,
+                InteractionMode::MentionOnly,
+                false,
+            ),
+            PreFilterDecision::NeedParent
+        );
+        // Blacklist: DMs bypass channel blacklist.
+        assert_eq!(
+            pre_filter_with_channels(
+                AccessMode::Whitelist,
+                &people,
+                AccessMode::Blacklist,
+                &bl,
+                &[],
+                "u1",
+                None,
+                "dm1",
+                None,
+                true,
+                true,
+                InteractionMode::MentionOnly,
+                false,
+            ),
+            PreFilterDecision::Allow
+        );
     }
 }

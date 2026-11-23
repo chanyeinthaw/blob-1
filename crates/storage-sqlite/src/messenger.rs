@@ -1,8 +1,8 @@
 use rusqlite::{params, OptionalExtension};
 use storage::{
-    AccessEntry, AccessList, AccessMode, AccessScope, InteractionMode, InteractionOverride,
-    InteractionScope, MessengerDefaults, MessengerStore, Place, ReplyMode, ReplyOverride,
-    ReplyScope, StoreError,
+    AccessEntry, AccessList, AccessMode, AccessScope, ChannelAccessEntry, ChannelAccessScope,
+    InteractionMode, InteractionOverride, InteractionScope, MessengerDefaults, MessengerStore,
+    Place, ReplyMode, ReplyOverride, ReplyScope, StoreError,
 };
 
 use crate::{backend, SqliteStorage};
@@ -172,6 +172,105 @@ impl MessengerStore for SqliteStorage {
             .execute(
                 "DELETE FROM access_entries WHERE messenger = ?1 AND list = ?2 AND scope = ?3 AND scope_id = ?4 AND user_id = ?5",
                 params![messenger, list.as_str(), scope.as_str(), sid, user_id],
+            )
+            .map(|n| n > 0)
+            .map_err(backend)
+    }
+
+    fn channel_access_mode(&self, messenger: &str) -> Result<AccessMode, StoreError> {
+        let stored: Option<String> = self
+            .lock()
+            .query_row(
+                "SELECT mode FROM channel_access_modes WHERE messenger = ?1",
+                [messenger],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        match stored {
+            None => Ok(AccessMode::AllowAll),
+            Some(value) => AccessMode::parse(&value).ok_or_else(|| {
+                StoreError::Backend(format!("invalid channel access mode: {value}").into())
+            }),
+        }
+    }
+
+    fn set_channel_access_mode(&self, messenger: &str, mode: AccessMode) -> Result<(), StoreError> {
+        self.lock()
+            .execute(
+                "INSERT INTO channel_access_modes (messenger, mode) VALUES (?1, ?2) ON CONFLICT (messenger) DO UPDATE SET mode = excluded.mode",
+                params![messenger, mode.as_str()],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn channel_access_entries(
+        &self,
+        messenger: &str,
+    ) -> Result<Vec<ChannelAccessEntry>, StoreError> {
+        let connection = self.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT list, scope, target_id FROM channel_access_entries WHERE messenger = ?1 ORDER BY list, scope, target_id",
+            )
+            .map_err(backend)?;
+        let rows = statement
+            .query_map([messenger], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(backend)?;
+        rows.map(|row| {
+            let (list, scope, target_id) = row.map_err(backend)?;
+            let invalid = |kind: &str, value: &str| {
+                StoreError::Backend(
+                    format!("invalid {kind} in channel_access_entries: {value}").into(),
+                )
+            };
+            Ok(ChannelAccessEntry {
+                list: AccessList::parse(&list).ok_or_else(|| invalid("list", &list))?,
+                scope: ChannelAccessScope::parse(&scope)
+                    .ok_or_else(|| invalid("scope", &scope))?,
+                target_id,
+            })
+        })
+        .collect()
+    }
+
+    fn add_channel_access_entry(
+        &self,
+        messenger: &str,
+        list: AccessList,
+        scope: ChannelAccessScope,
+        target_id: &str,
+    ) -> Result<(), StoreError> {
+        if target_id.is_empty() {
+            return Err(StoreError::Backend("target id must not be empty".into()));
+        }
+        self.lock()
+            .execute(
+                "INSERT OR IGNORE INTO channel_access_entries (messenger, list, scope, target_id) VALUES (?1, ?2, ?3, ?4)",
+                params![messenger, list.as_str(), scope.as_str(), target_id],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn remove_channel_access_entry(
+        &self,
+        messenger: &str,
+        list: AccessList,
+        scope: ChannelAccessScope,
+        target_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.lock()
+            .execute(
+                "DELETE FROM channel_access_entries WHERE messenger = ?1 AND list = ?2 AND scope = ?3 AND target_id = ?4",
+                params![messenger, list.as_str(), scope.as_str(), target_id],
             )
             .map(|n| n > 0)
             .map_err(backend)
