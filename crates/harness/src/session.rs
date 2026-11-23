@@ -251,6 +251,7 @@ where
                 messages: &view,
                 tools: &tools,
                 cache_key: Some(&cache_key),
+                kind: Some(storage::UsageKind::Task),
             }).await {
                 Ok(response) => response,
                 Err(LlmError::ContextOverflow(_)) if !overflow_retried => {

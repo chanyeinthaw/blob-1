@@ -22,6 +22,7 @@ impl Utility {
                 messages: &messages,
                 tools: &[],
                 cache_key: None,
+                kind: Some(storage::UsageKind::Utility),
             })
             .await?;
         Ok(response.text.trim().to_owned())

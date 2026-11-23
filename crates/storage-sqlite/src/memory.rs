@@ -28,6 +28,44 @@ fn view_name(name: ViewName) -> &'static str {
     }
 }
 
+fn parse_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryMessage> {
+    let kind: String = row.get(1)?;
+    let kind = match kind.as_str() {
+        "user" => MemoryKind::User,
+        "assistant" => MemoryKind::Assistant,
+        "tool" => MemoryKind::Tool,
+        "echo" => MemoryKind::Echo,
+        "work" => MemoryKind::Work,
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                format!("invalid memory kind: {kind}").into(),
+            ));
+        }
+    };
+    Ok(MemoryMessage {
+        i: unsigned(row, 0)?,
+        kind,
+        meta: row
+            .get::<_, Option<String>>(6)?
+            .map(|value| {
+                serde_json::from_str(&value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            })
+            .transpose()?,
+        text: row.get(2)?,
+        size: unsigned(row, 3)?,
+        date: row.get(4)?,
+        more: row.get(5)?,
+    })
+}
+
 impl MemoryStore for SqliteStorage {
     fn append_messages(
         &self,
@@ -64,43 +102,7 @@ impl MemoryStore for SqliteStorage {
             .query_row(
                 "SELECT i, kind, text, size, date, more, meta FROM memory_messages WHERE i = ?1",
                 [sql_integer(i)?],
-                |row| {
-                    let kind: String = row.get(1)?;
-                    let kind = match kind.as_str() {
-                        "user" => MemoryKind::User,
-                        "assistant" => MemoryKind::Assistant,
-                        "tool" => MemoryKind::Tool,
-                        "echo" => MemoryKind::Echo,
-                        "work" => MemoryKind::Work,
-                        _ => {
-                            return Err(rusqlite::Error::FromSqlConversionFailure(
-                                1,
-                                rusqlite::types::Type::Text,
-                                format!("invalid memory kind: {kind}").into(),
-                            ));
-                        }
-                    };
-                    Ok(MemoryMessage {
-                        i: unsigned(row, 0)?,
-                        kind,
-                        meta: row
-                            .get::<_, Option<String>>(6)?
-                            .map(|value| {
-                                serde_json::from_str(&value).map_err(|error| {
-                                    rusqlite::Error::FromSqlConversionFailure(
-                                        6,
-                                        rusqlite::types::Type::Text,
-                                        Box::new(error),
-                                    )
-                                })
-                            })
-                            .transpose()?,
-                        text: row.get(2)?,
-                        size: unsigned(row, 3)?,
-                        date: row.get(4)?,
-                        more: row.get(5)?,
-                    })
-                },
+                parse_memory_row,
             )
             .optional()
             .map_err(backend)

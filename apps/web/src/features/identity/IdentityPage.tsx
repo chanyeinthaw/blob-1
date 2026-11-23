@@ -28,6 +28,7 @@ import { cn } from '~/lib/utils'
 import { GeneralEvents, type GeneralInput, GeneralMachine } from './generalMachine'
 import { IdentityEvents, type IdentityInput, IdentityMachine } from './identityMachine'
 import { generalPageAtom } from './identityState'
+import { UsageSection } from './UsageSection'
 
 const GeneralOwner = createPersistentMachineContext(
   'general',
@@ -64,10 +65,11 @@ export function GeneralPage() {
         <IdentityOwner.Provider input={value.identity}>
           <Page title="General">
             <div className="space-y-8">
-              <AutoRespondSection />
               <Section title="Identity" action={<IdentityActions />}>
                 <IdentityEditor />
               </Section>
+              <AutoRespondSection />
+              <UsageSection />
             </div>
             <UnsavedGuard />
           </Page>
@@ -245,8 +247,10 @@ function IdentityEditor() {
         <div className="flex flex-col">
           <div
             className={cn(
-              'grid grid-cols-1 rounded-2xl border bg-background focus-within:ring-3 focus-within:ring-inset focus-within:ring-ring/50',
-              value.error === null ? 'border-input focus-within:border-ring' : 'border-destructive',
+              'grid grid-cols-1 rounded-2xl border bg-card shadow-xs transition-colors',
+              value.error === null
+                ? 'border-border focus-within:border-foreground/35'
+                : 'border-destructive',
             )}
           >
             <div aria-hidden="true" className={cn(textClassName, 'invisible')}>

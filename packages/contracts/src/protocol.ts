@@ -12,6 +12,70 @@ export const GeneralSettings = Schema.Struct({
 })
 export type GeneralSettings = typeof GeneralSettings.Type
 
+export const UsageKind = Schema.Literals(['chat', 'task', 'utility', 'compaction'])
+export type UsageKind = typeof UsageKind.Type
+
+export const UsageTotals = Schema.Struct({
+  calls: Schema.Finite,
+  inputTokens: Schema.Finite,
+  cachedTokens: Schema.Finite,
+  outputTokens: Schema.Finite,
+})
+export type UsageTotals = typeof UsageTotals.Type
+
+export const UsageKindBucket = Schema.Struct({
+  kind: UsageKind,
+  calls: Schema.Finite,
+  inputTokens: Schema.Finite,
+  cachedTokens: Schema.Finite,
+  outputTokens: Schema.Finite,
+})
+export type UsageKindBucket = typeof UsageKindBucket.Type
+
+export const UsageModelBucket = Schema.Struct({
+  provider: Schema.String,
+  model: Schema.String,
+  calls: Schema.Finite,
+  inputTokens: Schema.Finite,
+  cachedTokens: Schema.Finite,
+  outputTokens: Schema.Finite,
+})
+export type UsageModelBucket = typeof UsageModelBucket.Type
+
+export const UsageDayBucket = Schema.Struct({
+  day: Schema.String,
+  calls: Schema.Finite,
+  inputTokens: Schema.Finite,
+  cachedTokens: Schema.Finite,
+  outputTokens: Schema.Finite,
+})
+export type UsageDayBucket = typeof UsageDayBucket.Type
+
+export const UsageSummary = Schema.Struct({
+  days: Schema.Finite,
+  totals: UsageTotals,
+  byKind: Schema.Array(UsageKindBucket),
+  byModel: Schema.Array(UsageModelBucket),
+  daily: Schema.Array(UsageDayBucket),
+})
+export type UsageSummary = typeof UsageSummary.Type
+
+export const Webhook = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  token: Schema.String,
+  enabled: Schema.Boolean,
+  createdAt: Schema.Finite,
+  lastTriggeredAt: Schema.NullOr(Schema.Finite),
+})
+export type Webhook = typeof Webhook.Type
+
+export const WebhooksPayload = Schema.Struct({
+  publicUrl: Schema.NullOr(Schema.String),
+  webhooks: Schema.Array(Webhook),
+})
+export type WebhooksPayload = typeof WebhooksPayload.Type
+
 export const Reasoning = Schema.Literals(['off', 'low', 'medium', 'high', 'xhigh', 'max'])
 export type Reasoning = typeof Reasoning.Type
 
@@ -471,6 +535,26 @@ export const requests = {
   'watch.remove': {
     payload: Schema.Struct({ id: Schema.String }),
     reply: ScheduleState,
+  },
+  'usage.get': {
+    payload: Schema.Struct({ days: Schema.Finite }),
+    reply: UsageSummary,
+  },
+  'webhooks.list': {
+    payload: NoPayload,
+    reply: WebhooksPayload,
+  },
+  'webhooks.create': {
+    payload: Schema.Struct({ name: Schema.String }),
+    reply: WebhooksPayload,
+  },
+  'webhooks.setEnabled': {
+    payload: Schema.Struct({ id: Schema.String, enabled: Schema.Boolean }),
+    reply: WebhooksPayload,
+  },
+  'webhooks.remove': {
+    payload: Schema.Struct({ id: Schema.String }),
+    reply: WebhooksPayload,
   },
 }
 

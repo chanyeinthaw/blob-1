@@ -3,6 +3,7 @@ use messenger::{MessengerError, Outbound, Sent, Target};
 use twilight_http::{api_error::ApiError, error::ErrorType};
 use twilight_model::{
     channel::message::AllowedMentions,
+    http::attachment::Attachment,
     id::{
         marker::{ChannelMarker, MessageMarker, UserMarker},
         Id,
@@ -49,6 +50,26 @@ async fn thread(
     };
     discord.notify_thread_seen(&parent.to_string(), &message.to_string());
     Ok(created)
+}
+
+/// Sanitizes an attachment filename to the character set `twilight-validate`
+/// accepts (`[A-Za-z0-9._-]`), avoiding validation errors on spaces or unicode.
+fn sanitize_attachment_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "file".to_owned()
+    } else {
+        sanitized
+    }
 }
 
 enum MissingThreadAction {
@@ -147,12 +168,25 @@ pub async fn send(
     };
     let prefix: String = mentions.iter().map(|m| format!("<@{m}> ")).collect();
     let text = format!("{prefix}{}", outbound.text);
+    let attachments: Vec<Attachment> = outbound
+        .files
+        .into_iter()
+        .enumerate()
+        .map(|(idx, file)| {
+            Attachment::from_bytes(sanitize_attachment_name(&file.name), file.data, idx as u64)
+        })
+        .collect();
     let post = |dest: Id<ChannelMarker>| {
-        let request = inner
+        let mut request = inner
             .http
             .create_message(dest)
-            .content(&text)
             .allowed_mentions(Some(&allowed));
+        if !text.is_empty() {
+            request = request.content(&text);
+        }
+        if !attachments.is_empty() {
+            request = request.attachments(&attachments);
+        }
         if let Some(message) = reference {
             request.reply(message).fail_if_not_exists(false)
         } else {

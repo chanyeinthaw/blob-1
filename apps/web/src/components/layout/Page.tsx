@@ -6,7 +6,7 @@ import { Button } from '~/components/ui/button'
 import { cn } from '~/lib/utils'
 
 export const focusRingClassName =
-  'outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-inset focus-visible:ring-ring/50'
+  'outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring/40'
 
 export const panelClassName =
   'flex min-h-0 flex-1 bg-background md:relative md:z-10 md:overflow-hidden md:rounded-l-2xl md:shadow-[0_1px_4px_rgb(0_0_0/0.06),0_8px_28px_rgb(0_0_0/0.10)]'

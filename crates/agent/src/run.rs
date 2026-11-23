@@ -5,7 +5,10 @@ use environment::{Environment, SkillBundle};
 use environment_local::LocalEnvironment;
 use harness::{ChatHarness, EnvironmentPaths, Models};
 use messenger::Messenger;
-use storage::{ConfigStore, McpStore, MessengerStore, Provider, ReasoningLevel, SkillStore};
+use storage::{
+    ConfigStore, McpStore, MessengerStore, Provider, ReasoningLevel, SkillStore, UsageEvent,
+    UsageKind, UsageStore,
+};
 use storage_sqlite::SqliteStorage;
 use tokio::signal::unix::{signal, SignalKind};
 
@@ -27,7 +30,7 @@ struct Cache {
     main: Option<Working>,
     summarizer: Option<Option<(Model, Option<u32>)>>,
     compactor: Option<Model>,
-    utility: Option<Option<llm_rig::RigLlm>>,
+    utility: Option<Option<RecordedLlm>>,
     main_error: Option<String>,
 }
 
@@ -170,17 +173,28 @@ impl harness::Models for ModelFactory {
                 };
                 let reasoning = reasoning.unwrap_or(main.selection.reasoning);
                 if reasoning == main.selection.reasoning {
-                    return Ok((Model::Main(main.llm), main.context, main.selection));
+                    return Ok((
+                        Model::main(
+                            main.llm,
+                            self.store.clone(),
+                            UsageKind::Chat,
+                            &main.selection.provider,
+                            &main.selection.model,
+                        ),
+                        main.context,
+                        main.selection,
+                    ));
                 }
                 let key = api_key(&self.store, &main.provider)
                     .map_err(|error| harness::HarnessError::Compaction(error.to_string()))?;
                 return Ok((
-                    Model::Main(llm_rig::connect(
-                        &main.provider,
-                        &key,
-                        &main.model,
-                        reasoning,
-                    )),
+                    Model::main(
+                        llm_rig::connect(&main.provider, &key, &main.model, reasoning),
+                        self.store.clone(),
+                        UsageKind::Chat,
+                        &main.selection.provider,
+                        &main.selection.model,
+                    ),
                     main.context,
                     harness::ModelSelection {
                         reasoning,
@@ -206,7 +220,13 @@ impl harness::Models for ModelFactory {
         let key = api_key(&self.store, &provider)
             .map_err(|error| harness::HarnessError::Compaction(error.to_string()))?;
         Ok((
-            Model::Main(llm_rig::connect(&provider, &key, &model, reasoning)),
+            Model::main(
+                llm_rig::connect(&provider, &key, &model, reasoning),
+                self.store.clone(),
+                UsageKind::Chat,
+                &provider_id,
+                &model_id,
+            ),
             model.effective_context(),
             harness::ModelSelection {
                 images: model.images,
@@ -264,21 +284,100 @@ impl harness::Models for ModelFactory {
             )
         })?;
         Ok(harness::Current {
-            main: Model::Main(main.llm.clone()),
+            main: Model::main(
+                main.llm.clone(),
+                self.store.clone(),
+                UsageKind::Chat,
+                &main.selection.provider,
+                &main.selection.model,
+            ),
             summarizer: cache.summarizer.clone().flatten(),
-            compactor: cache
-                .compactor
-                .clone()
-                .unwrap_or_else(|| Model::Main(main.llm.clone())),
+            compactor: cache.compactor.clone().unwrap_or_else(|| {
+                Model::main(
+                    main.llm.clone(),
+                    self.store.clone(),
+                    UsageKind::Compaction,
+                    &main.selection.provider,
+                    &main.selection.model,
+                )
+            }),
             utility: cache.utility.clone().flatten().map(harness::Utility::new),
         })
     }
 }
 
+/// Wraps a `RigLlm` to persist per-call token and cache telemetry into SQLite.
+#[derive(Clone)]
+struct RecordedLlm {
+    inner: llm_rig::RigLlm,
+    store: Arc<SqliteStorage>,
+    kind: UsageKind,
+    provider: Arc<str>,
+    model: Arc<str>,
+}
+
+impl RecordedLlm {
+    fn new(
+        inner: llm_rig::RigLlm,
+        store: Arc<SqliteStorage>,
+        kind: UsageKind,
+        provider: &str,
+        model: &str,
+    ) -> Self {
+        Self {
+            inner,
+            store,
+            kind,
+            provider: Arc::from(provider),
+            model: Arc::from(model),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl llm::Llm for RecordedLlm {
+    async fn complete(
+        &self,
+        request: llm::CompletionRequest<'_>,
+    ) -> std::result::Result<llm::CompletionResponse, llm::LlmError> {
+        let kind = request.kind.unwrap_or(self.kind);
+        let response = self.inner.complete(request).await?;
+        let usage = response.usage.unwrap_or_default();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if let Err(error) = self.store.record_usage(&UsageEvent {
+            ts,
+            kind,
+            provider: self.provider.to_string(),
+            model: self.model.to_string(),
+            input_tokens: usage.input,
+            cached_tokens: usage.cache_read,
+            output_tokens: usage.output,
+        }) {
+            eprintln!("usage telemetry write failed: {error}");
+        }
+        Ok(response)
+    }
+}
+
 #[derive(Clone)]
 enum Model {
-    Main(llm_rig::RigLlm),
-    Fallback(Arc<llm::Fallback<llm_rig::RigLlm, llm_rig::RigLlm>>),
+    Main(RecordedLlm),
+    Fallback(Arc<llm::Fallback<RecordedLlm, RecordedLlm>>),
+}
+
+impl Model {
+    fn main(
+        inner: llm_rig::RigLlm,
+        store: Arc<SqliteStorage>,
+        kind: UsageKind,
+        provider: &str,
+        model: &str,
+    ) -> Self {
+        Self::Main(RecordedLlm::new(inner, store, kind, provider, model))
+    }
 }
 
 #[async_trait::async_trait]
@@ -291,6 +390,31 @@ impl llm::Llm for Model {
             Self::Main(model) => model.complete(request).await,
             Self::Fallback(model) => model.complete(request).await,
         }
+    }
+}
+
+/// Shared handle to the running `ChatHarness` used by inbound webhooks.
+#[derive(Clone, Default)]
+pub struct LiveChat {
+    inner: Arc<std::sync::RwLock<Option<(Arc<Chat>, ModelFactory)>>>,
+}
+
+impl LiveChat {
+    fn set(&self, harness: Arc<Chat>, models: ModelFactory) {
+        *self.inner.write().expect("live chat lock poisoned") = Some((harness, models));
+    }
+
+    fn get(&self) -> Option<(Arc<Chat>, ModelFactory)> {
+        self.inner.read().expect("live chat lock poisoned").clone()
+    }
+
+    pub fn inject(&self, text: String, meta: Option<storage::Meta>) -> Result<()> {
+        let Some((chat, models)) = self.get() else {
+            return Err("agent is still starting".into());
+        };
+        models.current()?;
+        chat.steer_message(text, meta);
+        Ok(())
     }
 }
 
@@ -318,7 +442,7 @@ struct Attempt {
     main: Resolve<Working>,
     summarizer: Resolve<Option<(Model, Option<u32>)>>,
     compactor: Resolve<Model>,
-    utility: Resolve<Option<llm_rig::RigLlm>>,
+    utility: Resolve<Option<RecordedLlm>>,
 }
 
 fn check_base_url(provider: &Provider) -> Resolve<()> {
@@ -388,7 +512,7 @@ fn resolve_main(store: &SqliteStorage, settings: &storage::Settings) -> Resolve<
 }
 
 fn resolve_summarizer(
-    store: &SqliteStorage,
+    store: &Arc<SqliteStorage>,
     settings: &storage::Settings,
     main: &Resolve<Working>,
     cached: Option<&Working>,
@@ -398,11 +522,17 @@ fn resolve_summarizer(
     };
     let (provider, stored) = resolve_model(store, selected)?;
     let key = api_key(store, &provider).map_err(|error| error.to_string())?;
-    let llm = llm_rig::connect(
-        &provider,
-        &key,
-        &stored,
-        settings.compaction_reasoning.unwrap_or(settings.reasoning),
+    let llm = RecordedLlm::new(
+        llm_rig::connect(
+            &provider,
+            &key,
+            &stored,
+            settings.compaction_reasoning.unwrap_or(settings.reasoning),
+        ),
+        store.clone(),
+        UsageKind::Compaction,
+        &provider.id.0,
+        &stored.id,
     );
     if settings.default_model.as_ref() == Some(selected) {
         return Ok(Some((Model::Main(llm), stored.effective_context())));
@@ -414,27 +544,42 @@ fn resolve_summarizer(
         (compaction, main) => compaction.or(main),
     };
     let model = match fallback {
-        Some(main) => Model::Fallback(Arc::new(llm::Fallback::new(llm, main.llm.clone()))),
+        Some(main) => {
+            let secondary = RecordedLlm::new(
+                main.llm.clone(),
+                store.clone(),
+                UsageKind::Compaction,
+                &main.selection.provider,
+                &main.selection.model,
+            );
+            Model::Fallback(Arc::new(llm::Fallback::new(llm, secondary)))
+        }
         None => Model::Main(llm),
     };
     Ok(Some((model, window)))
 }
 
-fn resolve_compactor(store: &SqliteStorage, settings: &storage::Settings) -> Resolve<Model> {
+fn resolve_compactor(store: &Arc<SqliteStorage>, settings: &storage::Settings) -> Resolve<Model> {
     let Some(selected) = &settings.default_model else {
         return Err("no default model; run `agent model set <provider>/<model>`".into());
     };
     let (provider, stored) = resolve_model(store, selected)?;
     let key = api_key(store, &provider).map_err(|error| error.to_string())?;
-    Ok(Model::Main(llm_rig::connect(
-        &provider,
-        &key,
-        &stored,
-        settings.compaction_reasoning.unwrap_or(settings.reasoning),
-    )))
+    Ok(Model::main(
+        llm_rig::connect(
+            &provider,
+            &key,
+            &stored,
+            settings.compaction_reasoning.unwrap_or(settings.reasoning),
+        ),
+        store.clone(),
+        UsageKind::Compaction,
+        &provider.id.0,
+        &stored.id,
+    ))
 }
 
-fn resolve(store: &SqliteStorage, cached: Option<&Working>) -> Attempt {
+fn resolve(store: &Arc<SqliteStorage>, cached: Option<&Working>) -> Attempt {
     let settings = match store.settings() {
         Ok(settings) => settings,
         Err(error) => {
@@ -454,7 +599,7 @@ fn resolve(store: &SqliteStorage, cached: Option<&Working>) -> Attempt {
         Ok(None) => resolve_compactor(store, &settings),
         Err(error) => Err(error.clone()),
     };
-    let utility = (|| -> Resolve<Option<llm_rig::RigLlm>> {
+    let utility = (|| -> Resolve<Option<RecordedLlm>> {
         let Some((selected, reasoning)) =
             store.utility_model().map_err(|error| error.to_string())?
         else {
@@ -462,11 +607,17 @@ fn resolve(store: &SqliteStorage, cached: Option<&Working>) -> Attempt {
         };
         let (provider, model) = resolve_model(store, &selected)?;
         let key = api_key(store, &provider).map_err(|error| error.to_string())?;
-        Ok(Some(llm_rig::connect(
-            &provider,
-            &key,
-            &model,
-            reasoning.unwrap_or(ReasoningLevel::Low),
+        Ok(Some(RecordedLlm::new(
+            llm_rig::connect(
+                &provider,
+                &key,
+                &model,
+                reasoning.unwrap_or(ReasoningLevel::Low),
+            ),
+            store.clone(),
+            UsageKind::Utility,
+            &provider.id.0,
+            &model.id,
         )))
     })();
     Attempt {
@@ -1220,36 +1371,41 @@ pub async fn serve(
     discord: Arc<messenger_discord::Discord>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     mcp: mcp::Mcp,
+    live_chat: LiveChat,
 ) -> Result<()> {
     let models = ModelFactory::new(store.clone());
     let harness = chat_harness(
         store.clone(),
         workspace,
-        pinned_workspace,
+        pinned_workspace.clone(),
         skills_dir,
         models.clone(),
         mcp.clone(),
     )
     .await?;
     let outgoing: Arc<dyn messenger::Messenger> = discord.clone();
-    let messengers =
-        harness::Messengers::new(vec![outgoing.clone()], store.clone()).with_utility({
+    let messengers = harness::Messengers::new(vec![outgoing.clone()], store.clone())
+        .with_workspace(pinned_workspace)
+        .with_utility({
             let models = models.clone();
             move || models.current().ok().and_then(|current| current.utility)
         });
-    let harness = harness
-        .with_messengers(messengers.clone())
-        .with_schedule_gate({
-            let models = models.clone();
-            let discord = discord.clone();
-            move || {
-                models.current().is_ok()
-                    && matches!(
-                        discord.connection(),
-                        messenger_discord::Connection::Online { .. }
-                    )
-            }
-        });
+    let harness = Arc::new(
+        harness
+            .with_messengers(messengers.clone())
+            .with_schedule_gate({
+                let models = models.clone();
+                let discord = discord.clone();
+                move || {
+                    models.current().is_ok()
+                        && matches!(
+                            discord.connection(),
+                            messenger_discord::Connection::Online { .. }
+                        )
+                }
+            }),
+    );
+    live_chat.set(Arc::clone(&harness), models.clone());
     // The cheap per-message gate the gateway runs before any Discord REST
     // call: evaluate the access policy and exact channel/thread/user
     // interaction overrides, asking for parent resolution only when an
@@ -1748,7 +1904,7 @@ pub async fn serve(
             }
         }
     });
-    let mut pending = std::collections::VecDeque::<(String, storage::Meta)>::new();
+    let mut pending = std::collections::VecDeque::<(String, Option<storage::Meta>)>::new();
     let mut backoff = false;
     tokio::select! {
         result = async {
@@ -1758,7 +1914,7 @@ pub async fn serve(
         } else {
             tokio::select! {
                 value = admitted_rx.recv() => match value {
-                    Some(next) => Some(next?),
+                    Some(next) => { let (text, meta) = next?; Some((text, Some(meta))) },
                     None => return match listener.await? { Err(error) => Err(error.into()), Ok(()) => Err("discord listener stopped".into()) },
                 },
                 _ = async {
@@ -1773,13 +1929,13 @@ pub async fn serve(
         turn_active.store(true, std::sync::atomic::Ordering::Relaxed);
         let run = async {
             match next {
-                Some((text, meta)) => harness.run_message(text, Some(meta)).await,
+                Some((text, meta)) => harness.run_message(text, meta).await,
                 None => harness.resume().await,
             }
         };
         tokio::pin!(run);
         while let Some((text, meta)) = pending.pop_front() {
-            harness.steer_message(text, Some(meta));
+            harness.steer_message(text, meta);
         }
         loop {
             tokio::select! {
@@ -1802,12 +1958,10 @@ pub async fn serve(
         }
         messengers.quiet();
         for (text, meta) in harness.take_steering().into_iter().rev() {
-            if let Some(meta) = meta {
-                pending.push_front((text, meta));
-            }
+            pending.push_front((text, meta));
         }
         for (_, meta) in &pending {
-            if let storage::Meta::Message { messenger, to, .. } = meta {
+            if let Some(storage::Meta::Message { messenger, to, .. }) = meta {
                 let (_, destination) = store.place(*to)?.ok_or("unknown destination")?;
                 messengers.live(messenger, *to, destination);
             }

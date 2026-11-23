@@ -821,6 +821,8 @@ async fn main() -> Result<()> {
             std::fs::create_dir_all(&workspace)?;
             let pinned_workspace = harness::PinnedWorkspace::open(&workspace)?;
             let harness_workspace = pinned_workspace.clone();
+            let live_chat = run::LiveChat::default();
+            let harness_live_chat = live_chat.clone();
             let harness_task = tokio::spawn(async move {
                 let result = run::serve(
                     store,
@@ -830,6 +832,7 @@ async fn main() -> Result<()> {
                     discord,
                     harness_shutdown,
                     mcp,
+                    harness_live_chat,
                 )
                 .await;
                 let _ = stop.send(true);
@@ -848,6 +851,7 @@ async fn main() -> Result<()> {
                 shutdown_rx,
                 public_url,
                 pinned_workspace,
+                live_chat,
             )
             .await?;
             let result = match harness_task.await {

@@ -645,6 +645,7 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
                     messages: &messages,
                     tools: &[],
                     cache_key: None,
+                    kind: Some(storage::UsageKind::Compaction),
                 })
                 .await?;
             let answer = response.text.trim();

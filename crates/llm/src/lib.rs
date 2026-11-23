@@ -9,6 +9,9 @@ pub struct CompletionRequest<'a> {
     /// Optional stable routing key for upstream prompt caching (sent as
     /// `prompt_cache_key` on OpenAI Responses).
     pub cache_key: Option<&'a str>,
+    /// Explicit usage bucket (`chat`, `task`, `utility`, `compaction`) so
+    /// telemetry attributes fallback compaction calls accurately.
+    pub kind: Option<storage::UsageKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

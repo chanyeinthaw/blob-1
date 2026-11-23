@@ -16,8 +16,10 @@ mod public_file;
 mod schedule;
 mod session;
 mod skill;
+mod usage;
 mod watch;
 mod web_auth;
+mod webhook;
 
 pub use crypto::AppKey;
 
@@ -77,6 +79,28 @@ CREATE TABLE IF NOT EXISTS public_files (
     path TEXT NOT NULL,
     content_type TEXT NOT NULL,
     created_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS usage_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('chat', 'task', 'utility', 'compaction')),
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    cached_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS usage_events_ts_idx ON usage_events (ts);
+
+CREATE TABLE IF NOT EXISTS webhooks (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    token TEXT NOT NULL,
+    token_hash BLOB NOT NULL UNIQUE,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    created_at INTEGER NOT NULL,
+    last_triggered_at INTEGER
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS providers (

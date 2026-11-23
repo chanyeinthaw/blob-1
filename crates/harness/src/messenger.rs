@@ -1,20 +1,25 @@
+use std::io::Read;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{borrow::Cow, collections::HashMap};
 
 use environment::ToolSpec;
-use messenger::{Fetched, Mark, Messenger, Outbound, Place, Scope, Target};
+use messenger::{Fetched, Mark, Messenger, Outbound, OutboundFile, Place, Scope, Target};
 use serde::Deserialize;
 use storage::{MemoryStore, MessengerStore, Meta};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
 const SEND_LIMIT: usize = 300;
+const MAX_SEND_FILES: usize = 10;
+const MAX_SEND_FILE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_SEND_TOTAL_BYTES: u64 = 25 * 1024 * 1024;
 
 pub const SEND: ToolSpec = ToolSpec {
     name: Cow::Borrowed("send"),
-    description: Cow::Borrowed("Send a message to people on a messenger. Give exactly one of reply (an m-token from a <message> tag: answers that message) or to (a d-token: posts plainly in that conversation). At most 300 characters; split longer text into several sends. mention: user ids to mention; the system adds the mentions."),
-    input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"text":{"type":"string"},"reply":{"type":"string","description":"m-token of the message to reply to"},"to":{"type":"string","description":"d-token of the conversation"},"mention":{"type":"array","items":{"type":"string"},"description":"User ids to mention"},"thread":{"type":"boolean","description":"thread: true moves the conversation into a thread started from the message you reply to; use it when an inline exchange turns into real work"}},"required":["text"]}"#),
+    description: Cow::Borrowed("Send a message to people on a messenger. Give exactly one of reply (an m-token from a <message> tag: answers that message) or to (a d-token: posts plainly in that conversation), and text and/or files. At most 300 characters of text; split longer text into several sends. files: relative workspace file paths to attach (max 10 files, 10 MiB each, 25 MiB total). mention: user ids to mention; the system adds the mentions."),
+    input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"text":{"type":"string","description":"Message text (at most 300 characters; optional when files are attached)"},"reply":{"type":"string","description":"m-token of the message to reply to"},"to":{"type":"string","description":"d-token of the conversation"},"mention":{"type":"array","items":{"type":"string"},"description":"User ids to mention"},"thread":{"type":"boolean","description":"thread: true moves the conversation into a thread started from the message you reply to; use it when an inline exchange turns into real work"},"files":{"type":"array","items":{"type":"string"},"maxItems":10,"description":"Relative paths to workspace files to attach (max 10 files, 10 MiB per file, 25 MiB total)"}}}"#),
 };
 pub const LOOKUP: &[ToolSpec] = &[
     ToolSpec {
@@ -47,6 +52,7 @@ pub struct Messengers {
     messengers: Vec<Arc<dyn Messenger>>,
     store: Arc<dyn Store>,
     utility: Option<Arc<dyn Fn() -> Option<crate::Utility> + Send + Sync>>,
+    workspace: Option<crate::PinnedWorkspace>,
     live: Arc<LiveState>,
     answered: Arc<Mutex<std::collections::HashSet<u64>>>,
     moved: Arc<Mutex<std::collections::HashSet<u64>>>,
@@ -75,6 +81,7 @@ impl Drop for LiveState {
 
 #[derive(Deserialize)]
 struct SendArgs {
+    #[serde(default)]
     text: String,
     reply: Option<String>,
     to: Option<String>,
@@ -82,6 +89,8 @@ struct SendArgs {
     mention: Vec<String>,
     #[serde(default)]
     thread: bool,
+    #[serde(default)]
+    files: Vec<String>,
 }
 #[derive(Deserialize)]
 struct LookupArgs {
@@ -154,6 +163,71 @@ fn render_search(messages: Vec<Fetched>) -> String {
         more => format!("{}\n[{more} more matches not shown]", lines.join("\n")),
     }
 }
+/// Reads and validates workspace files to attach on an outbound send, running
+/// blocking file I/O off the async executor and bounding both per-file and
+/// total attachment sizes.
+async fn read_outbound_files(
+    workspace: crate::PinnedWorkspace,
+    paths: Vec<String>,
+) -> Result<Vec<OutboundFile>, Error> {
+    tokio::task::spawn_blocking(move || -> Result<Vec<OutboundFile>, Error> {
+        let mut out = Vec::with_capacity(paths.len());
+        let mut total_bytes: u64 = 0;
+        for raw_path in paths {
+            let file = workspace
+                .open_file_nofollow(&raw_path)
+                .map_err(|err| format!("cannot attach '{raw_path}': {err}"))?;
+            let meta_len = file
+                .metadata()
+                .map_err(|err| format!("cannot stat '{raw_path}': {err}"))?
+                .len();
+            if meta_len > MAX_SEND_FILE_BYTES {
+                return Err(format!(
+                    "file '{raw_path}' exceeds {} MiB limit",
+                    MAX_SEND_FILE_BYTES / (1024 * 1024)
+                )
+                .into());
+            }
+            if total_bytes.saturating_add(meta_len) > MAX_SEND_TOTAL_BYTES {
+                return Err(format!(
+                    "total attachment size exceeds {} MiB limit",
+                    MAX_SEND_TOTAL_BYTES / (1024 * 1024)
+                )
+                .into());
+            }
+            let read_limit = MAX_SEND_FILE_BYTES.min(MAX_SEND_TOTAL_BYTES - total_bytes);
+            let mut data = Vec::with_capacity(meta_len.min(read_limit) as usize);
+            file.take(read_limit + 1)
+                .read_to_end(&mut data)
+                .map_err(|err| format!("cannot read '{raw_path}': {err}"))?;
+            let actual_len = data.len() as u64;
+            if actual_len > MAX_SEND_FILE_BYTES {
+                return Err(format!(
+                    "file '{raw_path}' exceeds {} MiB limit",
+                    MAX_SEND_FILE_BYTES / (1024 * 1024)
+                )
+                .into());
+            }
+            if total_bytes.saturating_add(actual_len) > MAX_SEND_TOTAL_BYTES {
+                return Err(format!(
+                    "total attachment size exceeds {} MiB limit",
+                    MAX_SEND_TOTAL_BYTES / (1024 * 1024)
+                )
+                .into());
+            }
+            total_bytes += actual_len;
+            let name = Path::new(&raw_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| format!("invalid file name in '{raw_path}'"))?
+                .to_owned();
+            out.push(OutboundFile { name, data });
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|err| -> Error { format!("failed to read attachments: {err}").into() })?
+}
 impl Messengers {
     pub fn new<S: MessengerStore + MemoryStore + 'static>(
         messengers: Vec<Arc<dyn Messenger>>,
@@ -163,6 +237,7 @@ impl Messengers {
             messengers,
             store: Arc::new(store),
             utility: None,
+            workspace: None,
             live: Arc::default(),
             answered: Arc::default(),
             moved: Arc::default(),
@@ -198,6 +273,11 @@ impl Messengers {
         utility: impl Fn() -> Option<crate::Utility> + Send + Sync + 'static,
     ) -> Self {
         self.utility = Some(Arc::new(utility));
+        self
+    }
+    /// Pins the workspace root so `send` can attach workspace files safely.
+    pub fn with_workspace(mut self, workspace: crate::PinnedWorkspace) -> Self {
+        self.workspace = Some(workspace);
         self
     }
     pub fn mark(&self, reply: &str, add: &[Mark], remove: &[Mark]) {
@@ -374,8 +454,8 @@ impl Messengers {
 
     pub async fn send(&self, arguments: &str) -> Result<String, Error> {
         let args: SendArgs = serde_json::from_str(arguments)?;
-        if args.text.is_empty() {
-            return Err("text must not be empty".into());
+        if args.text.is_empty() && args.files.is_empty() {
+            return Err("text or files must be non-empty".into());
         }
         if args.text.chars().count() > SEND_LIMIT {
             return Err(format!(
@@ -383,6 +463,20 @@ impl Messengers {
             )
             .into());
         }
+        let attachment_workspace = if args.files.is_empty() {
+            None
+        } else {
+            if args.files.len() > MAX_SEND_FILES {
+                return Err(
+                    format!("at most {MAX_SEND_FILES} files can be attached per send").into(),
+                );
+            }
+            Some(
+                self.workspace
+                    .clone()
+                    .ok_or("workspace is not configured; cannot attach files")?,
+            )
+        };
         let mut answering = None;
         let mut title_prompt = None;
         let mut threading = false;
@@ -488,12 +582,17 @@ impl Messengers {
             }
             _ => return Err("exactly one of reply or to is required".into()),
         };
-        let sent = self
-            .find(&name)?
+        let messenger = self.find(&name)?;
+        let files = match attachment_workspace {
+            Some(workspace) => read_outbound_files(workspace, args.files).await?,
+            None => Vec::new(),
+        };
+        let sent = messenger
             .send(Outbound {
                 target,
                 text: args.text,
                 mention: args.mention,
+                files,
             })
             .await?;
         if sent.created_thread || sent.used_thread {

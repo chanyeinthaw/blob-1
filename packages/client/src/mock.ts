@@ -26,7 +26,11 @@ import {
   type ScheduleItem,
   type ScheduleState,
   Slot,
+  type UsageKindBucket,
+  type UsageSummary,
   type WatchItem,
+  type Webhook,
+  type WebhooksPayload,
   isRequestType,
   requests,
 } from '@blob-1/contracts'
@@ -61,6 +65,9 @@ type State = Readonly<{
   checkin: CheckinConfig | null
   watches: ReadonlyArray<WatchItem>
   nextWatchId: number
+  publicUrl: string | null
+  webhooks: ReadonlyArray<Webhook>
+  nextWebhookId: number
 }>
 
 const DEFAULT_IDENTITY = 'You are Blob-1.'
@@ -138,6 +145,26 @@ const seedState = (): State => ({
     },
   ],
   nextWatchId: 2,
+  publicUrl: 'https://blob.example.com',
+  webhooks: [
+    {
+      id: 'wh1',
+      name: 'GitHub deploys',
+      token: 'whk_8f3a9c2d1e4b7a6f0d5c8e2a9b1f4c7d',
+      enabled: true,
+      createdAt: Math.floor(Date.now() / 1000) - 86400 * 12,
+      lastTriggeredAt: Math.floor(Date.now() / 1000) - 1420,
+    },
+    {
+      id: 'wh2',
+      name: 'Linear triage',
+      token: 'whk_3e7b1d9f4a2c8e6b0f5a3d7c9e1b4f8a',
+      enabled: false,
+      createdAt: Math.floor(Date.now() / 1000) - 86400 * 4,
+      lastTriggeredAt: null,
+    },
+  ],
+  nextWebhookId: 3,
 })
 
 const generalReply = (state: State): GeneralSettings => ({
@@ -176,6 +203,97 @@ const scheduleReply = (state: State): ScheduleState => ({
   nextCheckin: state.checkin === null ? null : Math.floor(Date.now() / 1000) + state.checkin.every,
   watches: state.watches,
 })
+
+const webhooksReply = (state: State): WebhooksPayload => ({
+  publicUrl: state.publicUrl,
+  webhooks: state.webhooks,
+})
+
+const usageReply = (days: number): UsageSummary => {
+  const safeDays = Math.max(1, Math.min(90, Math.round(days)))
+  const scale = safeDays === 1 ? 1 : safeDays <= 7 ? 5.6 : safeDays * 0.72
+  const scaled = (value: number) => Math.max(1, Math.round(value * scale))
+
+  const chat: UsageKindBucket = {
+    kind: 'chat',
+    calls: scaled(14),
+    inputTokens: scaled(42_600),
+    cachedTokens: scaled(31_400),
+    outputTokens: scaled(6_200),
+  }
+  const task: UsageKindBucket = {
+    kind: 'task',
+    calls: scaled(9),
+    inputTokens: scaled(58_200),
+    cachedTokens: scaled(46_800),
+    outputTokens: scaled(7_900),
+  }
+  const utility: UsageKindBucket = {
+    kind: 'utility',
+    calls: scaled(11),
+    inputTokens: scaled(9_400),
+    cachedTokens: scaled(3_200),
+    outputTokens: scaled(1_350),
+  }
+  const compaction: UsageKindBucket = {
+    kind: 'compaction',
+    calls: scaled(2),
+    inputTokens: scaled(14_300),
+    cachedTokens: scaled(11_100),
+    outputTokens: scaled(1_850),
+  }
+  const byKind = [chat, task, utility, compaction]
+
+  const byModel = [
+    {
+      provider: 'cpa1',
+      model: 'gpt-6.1-terra',
+      calls: chat.calls + task.calls,
+      inputTokens: chat.inputTokens + task.inputTokens,
+      cachedTokens: chat.cachedTokens + task.cachedTokens,
+      outputTokens: chat.outputTokens + task.outputTokens,
+    },
+    {
+      provider: 'cpa1',
+      model: 'gpt-6-luna',
+      calls: utility.calls + compaction.calls,
+      inputTokens: utility.inputTokens + compaction.inputTokens,
+      cachedTokens: utility.cachedTokens + compaction.cachedTokens,
+      outputTokens: utility.outputTokens + compaction.outputTokens,
+    },
+  ]
+
+  const totals = byKind.reduce(
+    (acc, bucket) => ({
+      calls: acc.calls + bucket.calls,
+      inputTokens: acc.inputTokens + bucket.inputTokens,
+      cachedTokens: acc.cachedTokens + bucket.cachedTokens,
+      outputTokens: acc.outputTokens + bucket.outputTokens,
+    }),
+    { calls: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0 },
+  )
+
+  const dailyCount = Math.min(safeDays, 30)
+  const today = new Date()
+  const daily = Array.makeBy(dailyCount, index => {
+    const d = new Date(today)
+    d.setUTCDate(today.getUTCDate() - (dailyCount - 1 - index))
+    const weight = 0.75 + ((index * 17) % 10) / 20
+    const denom = dailyCount
+    return {
+      day: d.toISOString().slice(0, 10),
+      calls: Math.max(1, Math.round((totals.calls / denom) * weight)),
+      inputTokens: Math.round((totals.inputTokens / denom) * weight),
+      cachedTokens: Math.round((totals.cachedTokens / denom) * weight),
+      outputTokens: Math.round((totals.outputTokens / denom) * weight),
+    }
+  })
+
+  return { days: safeDays, totals, byKind, byModel, daily }
+}
+
+const makeWebhookToken = (seed: number): string =>
+  `whk_${crypto.randomUUID().replaceAll('-', '').slice(0, 28)}${String(seed).padStart(4, '0')}`
 
 const LOCAL_DATETIME = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})$/
 
@@ -1044,6 +1162,57 @@ const handlers: { readonly [K in RequestType]: Handler<K> } = {
         }),
       ),
     ).pipe(Effect.map(scheduleReply)),
+
+  'usage.get': ({ days }) => Effect.succeed(usageReply(days)),
+
+  'webhooks.list': (_payload, state) => Ref.get(state).pipe(Effect.map(webhooksReply)),
+
+  'webhooks.create': ({ name }, state) =>
+    transition(state, current => {
+      const trimmed = name.trim()
+      if (trimmed === '') {
+        return Effect.fail('Webhook name is required')
+      }
+      const webhook: Webhook = {
+        id: `wh${current.nextWebhookId}`,
+        name: trimmed,
+        token: makeWebhookToken(current.nextWebhookId),
+        enabled: true,
+        createdAt: Math.floor(Date.now() / 1000),
+        lastTriggeredAt: null,
+      }
+      return Effect.succeed(
+        Struct.evolve(current, {
+          webhooks: list => [...list, webhook],
+          nextWebhookId: n => n + 1,
+        }),
+      )
+    }).pipe(Effect.map(webhooksReply)),
+
+  'webhooks.setEnabled': ({ id, enabled }, state) =>
+    transition(state, current =>
+      current.webhooks.some(webhook => webhook.id === id)
+        ? Effect.succeed(
+            Struct.evolve(current, {
+              webhooks: list =>
+                list.map(webhook =>
+                  webhook.id === id ? Struct.evolve(webhook, { enabled: () => enabled }) : webhook,
+                ),
+            }),
+          )
+        : Effect.fail(`Unknown webhook ${id}`),
+    ).pipe(Effect.map(webhooksReply)),
+
+  'webhooks.remove': ({ id }, state) =>
+    transition(state, current =>
+      current.webhooks.some(webhook => webhook.id === id)
+        ? Effect.succeed(
+            Struct.evolve(current, {
+              webhooks: list => list.filter(webhook => webhook.id !== id),
+            }),
+          )
+        : Effect.fail(`Unknown webhook ${id}`),
+    ).pipe(Effect.map(webhooksReply)),
 }
 
 const replyOk = (id: string, payload: ReplyPayload<RequestType>): ReplyFrame => ({

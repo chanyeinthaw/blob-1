@@ -21,6 +21,7 @@ import { Route as SettingsMcpRouteImport } from './routes/settings.mcp'
 import { Route as SettingsModelsRouteImport } from './routes/settings.models'
 import { Route as SettingsProvidersRouteImport } from './routes/settings.providers'
 import { Route as SettingsSchedulesRouteImport } from './routes/settings.schedules'
+import { Route as SettingsWebhooksRouteImport } from './routes/settings.webhooks'
 import { Route as SettingsChatIndexRouteImport } from './routes/settings.chat.index'
 import { Route as SettingsChatDiscordRouteImport } from './routes/settings.chat.discord'
 
@@ -84,6 +85,11 @@ const SettingsSchedulesRoute = SettingsSchedulesRouteImport.update({
   path: '/schedules',
   getParentRoute: () => SettingsRoute,
 } as any)
+const SettingsWebhooksRoute = SettingsWebhooksRouteImport.update({
+  id: '/webhooks',
+  path: '/webhooks',
+  getParentRoute: () => SettingsRoute,
+} as any)
 const SettingsChatIndexRoute = SettingsChatIndexRouteImport.update({
   id: '/',
   path: '/',
@@ -107,6 +113,7 @@ export interface FileRoutesByFullPath {
   '/settings/models': typeof SettingsModelsRoute
   '/settings/providers': typeof SettingsProvidersRoute
   '/settings/schedules': typeof SettingsSchedulesRoute
+  '/settings/webhooks': typeof SettingsWebhooksRoute
   '/settings/': typeof SettingsIndexRoute
   '/settings/chat/discord': typeof SettingsChatDiscordRoute
   '/settings/chat/': typeof SettingsChatIndexRoute
@@ -121,6 +128,7 @@ export interface FileRoutesByTo {
   '/settings/models': typeof SettingsModelsRoute
   '/settings/providers': typeof SettingsProvidersRoute
   '/settings/schedules': typeof SettingsSchedulesRoute
+  '/settings/webhooks': typeof SettingsWebhooksRoute
   '/settings': typeof SettingsIndexRoute
   '/settings/chat/discord': typeof SettingsChatDiscordRoute
   '/settings/chat': typeof SettingsChatIndexRoute
@@ -138,6 +146,7 @@ export interface FileRoutesById {
   '/settings/models': typeof SettingsModelsRoute
   '/settings/providers': typeof SettingsProvidersRoute
   '/settings/schedules': typeof SettingsSchedulesRoute
+  '/settings/webhooks': typeof SettingsWebhooksRoute
   '/settings/': typeof SettingsIndexRoute
   '/settings/chat/discord': typeof SettingsChatDiscordRoute
   '/settings/chat/': typeof SettingsChatIndexRoute
@@ -156,6 +165,7 @@ export interface FileRouteTypes {
     | '/settings/models'
     | '/settings/providers'
     | '/settings/schedules'
+    | '/settings/webhooks'
     | '/settings/'
     | '/settings/chat/discord'
     | '/settings/chat/'
@@ -170,6 +180,7 @@ export interface FileRouteTypes {
     | '/settings/models'
     | '/settings/providers'
     | '/settings/schedules'
+    | '/settings/webhooks'
     | '/settings'
     | '/settings/chat/discord'
     | '/settings/chat'
@@ -186,6 +197,7 @@ export interface FileRouteTypes {
     | '/settings/models'
     | '/settings/providers'
     | '/settings/schedules'
+    | '/settings/webhooks'
     | '/settings/'
     | '/settings/chat/discord'
     | '/settings/chat/'
@@ -283,6 +295,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SettingsSchedulesRouteImport
       parentRoute: typeof SettingsRoute
     }
+    '/settings/webhooks': {
+      id: '/settings/webhooks'
+      path: '/webhooks'
+      fullPath: '/settings/webhooks'
+      preLoaderRoute: typeof SettingsWebhooksRouteImport
+      parentRoute: typeof SettingsRoute
+    }
     '/settings/chat/': {
       id: '/settings/chat/'
       path: '/'
@@ -323,6 +342,7 @@ interface SettingsRouteChildren {
   SettingsModelsRoute: typeof SettingsModelsRoute
   SettingsProvidersRoute: typeof SettingsProvidersRoute
   SettingsSchedulesRoute: typeof SettingsSchedulesRoute
+  SettingsWebhooksRoute: typeof SettingsWebhooksRoute
   SettingsIndexRoute: typeof SettingsIndexRoute
 }
 
@@ -335,6 +355,7 @@ const SettingsRouteChildren: SettingsRouteChildren = {
   SettingsModelsRoute: SettingsModelsRoute,
   SettingsProvidersRoute: SettingsProvidersRoute,
   SettingsSchedulesRoute: SettingsSchedulesRoute,
+  SettingsWebhooksRoute: SettingsWebhooksRoute,
   SettingsIndexRoute: SettingsIndexRoute,
 }
 

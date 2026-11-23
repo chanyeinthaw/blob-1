@@ -3,12 +3,13 @@ import { Link, type LinkProps, Navigate, useNavigate } from '@tanstack/react-rou
 import { AsyncResult } from 'effect/reactivity'
 import {
   CalendarClock,
-  Link as LinkIcon,
+  Cloud,
+  Cpu,
+  Home,
   LogOut,
-  MessageCircle,
-  Server,
-  Settings,
-  SlidersHorizontal,
+  MessagesSquare,
+  Plug,
+  Zap,
   type LucideIcon,
 } from 'lucide-react'
 import { type ReactNode, useEffect } from 'react'
@@ -19,11 +20,13 @@ import { ConfirmDialog } from '~/components/ConfirmDialog'
 import { Tooltip, TooltipContent, TooltipTrigger } from '~/components/ui/tooltip'
 import { discordPageAtom } from '~/features/chat/discordState'
 import { generalPageAtom } from '~/features/identity/identityState'
+import { usageAtomFor } from '~/features/identity/usageState'
 import { mcpPageAtom } from '~/features/mcp/mcpState'
 import { modelsPageAtom } from '~/features/models/modelsState'
 import { providersPageAtom } from '~/features/providers/providersState'
 import { schedulesPageAtom } from '~/features/schedules/schedulesState'
 import { connectionAtom, signOutAtom, unauthorizedAtom } from '~/features/session/connection'
+import { webhooksPageAtom } from '~/features/webhooks/webhooksState'
 import { clearSignedIn } from '~/lib/session'
 import { ShellMachinesProvider } from '~/lib/shellMachines'
 import { cn } from '~/lib/utils'
@@ -38,12 +41,13 @@ interface NavItem {
 }
 
 const navItems: ReadonlyArray<NavItem> = [
-  { label: 'General', mobileLabel: 'General', to: '/settings/general', icon: Settings },
+  { label: 'General', mobileLabel: 'General', to: '/settings/general', icon: Home },
   { label: 'Schedules', mobileLabel: 'Schedules', to: '/settings/schedules', icon: CalendarClock },
-  { label: 'Chat platforms', mobileLabel: 'Chat', to: '/settings/chat', icon: MessageCircle },
-  { label: 'MCP', mobileLabel: 'MCP', to: '/settings/mcp', icon: LinkIcon },
-  { label: 'Models', mobileLabel: 'Models', to: '/settings/models', icon: SlidersHorizontal },
-  { label: 'Providers', mobileLabel: 'Providers', to: '/settings/providers', icon: Server },
+  { label: 'Chat platforms', mobileLabel: 'Chat', to: '/settings/chat', icon: MessagesSquare },
+  { label: 'MCP', mobileLabel: 'MCP', to: '/settings/mcp', icon: Plug },
+  { label: 'Webhooks', mobileLabel: 'Webhooks', to: '/settings/webhooks', icon: Zap },
+  { label: 'Models', mobileLabel: 'Models', to: '/settings/models', icon: Cpu },
+  { label: 'Providers', mobileLabel: 'Providers', to: '/settings/providers', icon: Cloud },
 ]
 
 interface ConnectionInfo {
@@ -256,9 +260,11 @@ function MobileHeader() {
 
 function SettingsPrefetch() {
   useAtomMount(generalPageAtom)
+  useAtomMount(usageAtomFor(7))
   useAtomMount(schedulesPageAtom)
   useAtomMount(discordPageAtom)
   useAtomMount(mcpPageAtom)
+  useAtomMount(webhooksPageAtom)
   useAtomMount(modelsPageAtom)
   useAtomMount(providersPageAtom)
   return null

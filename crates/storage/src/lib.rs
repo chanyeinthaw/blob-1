@@ -456,6 +456,10 @@ pub enum Meta {
         #[serde(rename = "for")]
         for_message: Option<String>,
     },
+    Event {
+        source: String,
+        name: String,
+    },
     Message {
         #[serde(alias = "interface")]
         messenger: String,
@@ -569,6 +573,11 @@ impl Meta {
                 "<reminder task=\"{}\" running=\"{}\" last_activity=\"{}\"{}>\n{body}\n</reminder>",
                 attribute(task), attribute(running), attribute(last_activity), for_attribute(for_message)
             ),
+            Self::Event { source, name } => format!(
+                "<event source=\"{}\" name=\"{}\">\n{body}\n</event>",
+                attribute(source),
+                attribute(name)
+            ),
             Self::Message {
                 messenger,
                 author,
@@ -608,6 +617,7 @@ impl Meta {
             Self::Scheduled { id, .. } => format!("scheduled {id}"),
             Self::Report { task, status, .. } => format!("task {task}, {}", status.as_str()),
             Self::Reminder { task, .. } => format!("reminder for task {task}"),
+            Self::Event { source, name } => format!("{source} {name}"),
             Self::Message {
                 messenger,
                 author,
@@ -1398,5 +1408,156 @@ impl<T: PublicFileStore + ?Sized> PublicFileStore for Arc<T> {
 
     fn public_file(&self, id: &str) -> Result<Option<PublicFile>, StoreError> {
         (**self).public_file(id)
+    }
+}
+
+/// Role that issued an LLM completion, used for usage & cache telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageKind {
+    Chat,
+    Task,
+    Utility,
+    Compaction,
+}
+
+impl UsageKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Task => "task",
+            Self::Utility => "utility",
+            Self::Compaction => "compaction",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "chat" => Some(Self::Chat),
+            "task" => Some(Self::Task),
+            "utility" => Some(Self::Utility),
+            "compaction" => Some(Self::Compaction),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageEvent {
+    pub ts: i64,
+    pub kind: UsageKind,
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageTotals {
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageKindBucket {
+    pub kind: UsageKind,
+    pub totals: UsageTotals,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageModelBucket {
+    pub provider: String,
+    pub model: String,
+    pub totals: UsageTotals,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageDayBucket {
+    pub day: String,
+    pub totals: UsageTotals,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageSummary {
+    pub totals: UsageTotals,
+    pub by_kind: Vec<UsageKindBucket>,
+    pub by_model: Vec<UsageModelBucket>,
+    pub daily: Vec<UsageDayBucket>,
+}
+
+pub trait UsageStore: Send + Sync {
+    fn record_usage(&self, event: &UsageEvent) -> Result<(), StoreError>;
+    fn usage_summary(&self, since_ts: i64) -> Result<UsageSummary, StoreError>;
+}
+
+impl<T: UsageStore + ?Sized> UsageStore for Arc<T> {
+    fn record_usage(&self, event: &UsageEvent) -> Result<(), StoreError> {
+        (**self).record_usage(event)
+    }
+
+    fn usage_summary(&self, since_ts: i64) -> Result<UsageSummary, StoreError> {
+        (**self).usage_summary(since_ts)
+    }
+}
+
+/// An inbound webhook endpoint whose capability token wakes the agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Webhook {
+    pub id: String,
+    pub name: String,
+    pub token: String,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub last_triggered_at: Option<i64>,
+}
+
+pub trait WebhookStore: Send + Sync {
+    fn webhooks(&self) -> Result<Vec<Webhook>, StoreError>;
+    fn create_webhook(
+        &self,
+        id: &str,
+        name: &str,
+        token: &str,
+        token_hash: &[u8],
+        created_at: i64,
+    ) -> Result<Webhook, StoreError>;
+    fn set_webhook_enabled(&self, id: &str, enabled: bool) -> Result<bool, StoreError>;
+    fn remove_webhook(&self, id: &str) -> Result<bool, StoreError>;
+    fn webhook_by_token_hash(&self, token_hash: &[u8]) -> Result<Option<Webhook>, StoreError>;
+    fn touch_webhook(&self, id: &str, triggered_at: i64) -> Result<(), StoreError>;
+}
+
+impl<T: WebhookStore + ?Sized> WebhookStore for Arc<T> {
+    fn webhooks(&self) -> Result<Vec<Webhook>, StoreError> {
+        (**self).webhooks()
+    }
+
+    fn create_webhook(
+        &self,
+        id: &str,
+        name: &str,
+        token: &str,
+        token_hash: &[u8],
+        created_at: i64,
+    ) -> Result<Webhook, StoreError> {
+        (**self).create_webhook(id, name, token, token_hash, created_at)
+    }
+
+    fn set_webhook_enabled(&self, id: &str, enabled: bool) -> Result<bool, StoreError> {
+        (**self).set_webhook_enabled(id, enabled)
+    }
+
+    fn remove_webhook(&self, id: &str) -> Result<bool, StoreError> {
+        (**self).remove_webhook(id)
+    }
+
+    fn webhook_by_token_hash(&self, token_hash: &[u8]) -> Result<Option<Webhook>, StoreError> {
+        (**self).webhook_by_token_hash(token_hash)
+    }
+
+    fn touch_webhook(&self, id: &str, triggered_at: i64) -> Result<(), StoreError> {
+        (**self).touch_webhook(id, triggered_at)
     }
 }

@@ -231,6 +231,7 @@ async fn summarize<L: Llm>(
                 messages: &[Message::User(prompt)],
                 tools: &[],
                 cache_key: None,
+                kind: Some(storage::UsageKind::Compaction),
             })
             .await
         {

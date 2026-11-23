@@ -26,7 +26,8 @@ use std::{
 };
 use storage::{
     Checkin, CheckinStore, ConfigStore, McpServer, McpStore, McpTransport, MessengerStore,
-    PublicFileStore, ReasoningLevel, ScheduleStore, WatchStore, WebAuthStore,
+    PublicFileStore, ReasoningLevel, ScheduleStore, UsageStore, WatchStore, WebAuthStore,
+    WebhookStore,
 };
 use storage_sqlite::SqliteStorage;
 
@@ -39,6 +40,7 @@ struct WebContext {
     mcp: mcp::Mcp,
     public_url: Option<url::Url>,
     workspace: harness::PinnedWorkspace,
+    live_chat: crate::run::LiveChat,
 }
 impl WebContext {
     fn secure_cookie(&self) -> bool {
@@ -108,6 +110,7 @@ pub async fn serve(
     shutdown: tokio::sync::watch::Receiver<bool>,
     public_url: Option<url::Url>,
     workspace: harness::PinnedWorkspace,
+    live_chat: crate::run::LiveChat,
 ) -> crate::Result<()> {
     let store = Arc::new(WebContext {
         store,
@@ -116,6 +119,7 @@ pub async fn serve(
         mcp,
         public_url,
         workspace,
+        live_chat,
     });
     let app = Router::new()
         .route("/api/session", get(session))
@@ -126,6 +130,7 @@ pub async fn serve(
         .route("/ws", get(ws))
         .route("/p/{id}", get(public_file))
         .route("/p/{id}/{name}", get(public_file_named))
+        .route("/hooks/{token}", post(inbound_webhook))
         .fallback(assets)
         .with_state(store);
     axum::serve(listener, app)
@@ -1338,6 +1343,83 @@ async fn dispatch(
                 harness::watch::remove(store.as_ref(), get("id")?)?;
                 Ok(schedule_reply(store)?)
             }
+            "usage.get" => {
+                let days = payload
+                    .get("days")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(7)
+                    .clamp(1, 90);
+                let since = now().saturating_sub((days as i64) * 86_400);
+                let summary = store.usage_summary(since)?;
+                Ok(json!({
+                    "days": days,
+                    "totals": {
+                        "calls": summary.totals.calls,
+                        "inputTokens": summary.totals.input_tokens,
+                        "cachedTokens": summary.totals.cached_tokens,
+                        "outputTokens": summary.totals.output_tokens,
+                    },
+                    "byKind": summary.by_kind.into_iter().map(|bucket| json!({
+                        "kind": bucket.kind.as_str(),
+                        "calls": bucket.totals.calls,
+                        "inputTokens": bucket.totals.input_tokens,
+                        "cachedTokens": bucket.totals.cached_tokens,
+                        "outputTokens": bucket.totals.output_tokens,
+                    })).collect::<Vec<_>>(),
+                    "byModel": summary.by_model.into_iter().map(|bucket| json!({
+                        "provider": bucket.provider,
+                        "model": bucket.model,
+                        "calls": bucket.totals.calls,
+                        "inputTokens": bucket.totals.input_tokens,
+                        "cachedTokens": bucket.totals.cached_tokens,
+                        "outputTokens": bucket.totals.output_tokens,
+                    })).collect::<Vec<_>>(),
+                    "daily": summary.daily.into_iter().map(|bucket| json!({
+                        "day": bucket.day,
+                        "calls": bucket.totals.calls,
+                        "inputTokens": bucket.totals.input_tokens,
+                        "cachedTokens": bucket.totals.cached_tokens,
+                        "outputTokens": bucket.totals.output_tokens,
+                    })).collect::<Vec<_>>(),
+                }))
+            }
+            "webhooks.list" => Ok(webhooks_reply(ctx)?),
+            "webhooks.create" => {
+                let name = get("name")?.trim().to_string();
+                if name.is_empty() {
+                    return Err("Webhook name is required".into());
+                }
+                if name.chars().count() > 80 {
+                    return Err("Webhook name must be at most 80 characters".into());
+                }
+                let mut id_bytes = [0u8; 8];
+                let mut token_bytes = [0u8; 24];
+                OsRng.fill_bytes(&mut id_bytes);
+                OsRng.fill_bytes(&mut token_bytes);
+                let id = hex::encode(id_bytes);
+                let token = hex::encode(token_bytes);
+                let token_hash = Sha256::digest(token.as_bytes());
+                store.create_webhook(&id, &name, &token, &token_hash, now())?;
+                Ok(webhooks_reply(ctx)?)
+            }
+            "webhooks.setEnabled" => {
+                let id = get("id")?;
+                let enabled = payload
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(invalid)?;
+                if !store.set_webhook_enabled(id, enabled)? {
+                    return Err("Webhook not found".into());
+                }
+                Ok(webhooks_reply(ctx)?)
+            }
+            "webhooks.remove" => {
+                let id = get("id")?;
+                if !store.remove_webhook(id)? {
+                    return Err("Webhook not found".into());
+                }
+                Ok(webhooks_reply(ctx)?)
+            }
             _ => Err(format!("Unknown request: {request_type}").into()),
         }
     }
@@ -1504,9 +1586,80 @@ async fn serve_public_file(ctx: &WebContext, id: &str, head_only: bool) -> Respo
     response
 }
 
+const MAX_WEBHOOK_BODY_BYTES: usize = 64 * 1024;
+
+fn webhooks_reply(ctx: &WebContext) -> crate::Result<Value> {
+    let webhooks = ctx.store.webhooks()?;
+    let public_url = ctx
+        .public_url
+        .as_ref()
+        .map(|u| u.as_str().trim_end_matches('/').to_owned());
+    Ok(json!({
+        "publicUrl": public_url,
+        "webhooks": webhooks.into_iter().map(|hook| json!({
+            "id": hook.id,
+            "name": hook.name,
+            "token": hook.token,
+            "enabled": hook.enabled,
+            "createdAt": hook.created_at,
+            "lastTriggeredAt": hook.last_triggered_at,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+async fn inbound_webhook(
+    State(ctx): State<Context>,
+    AxumPath(token): AxumPath<String>,
+    body: Body,
+) -> Response {
+    let token_hash = Sha256::digest(token.as_bytes());
+    match ctx.store.webhook_by_token_hash(&token_hash) {
+        Ok(Some(hook)) if hook.enabled => {}
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    let bytes = match axum::body::to_bytes(body, MAX_WEBHOOK_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    // Revalidate token and enabled state after body upload before admitting.
+    let hook = match ctx.store.webhook_by_token_hash(&token_hash) {
+        Ok(Some(hook)) if hook.enabled => hook,
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let text = String::from_utf8_lossy(&bytes).trim().to_owned();
+    let payload = if text.is_empty() {
+        "(empty payload)".to_owned()
+    } else {
+        text
+    };
+    if let Err(error) = ctx.live_chat.inject(
+        payload,
+        Some(storage::Meta::Event {
+            source: "webhook".into(),
+            name: hook.name,
+        }),
+    ) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "ok": false, "error": error.to_string() })),
+        )
+            .into_response();
+    }
+    let _ = ctx.store.touch_webhook(&hook.id, now());
+    (StatusCode::ACCEPTED, Json(json!({ "ok": true }))).into_response()
+}
+
 async fn assets(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
-    if path == "api" || path.starts_with("api/") || path == "p" || path.starts_with("p/") {
+    if path == "api"
+        || path.starts_with("api/")
+        || path == "p"
+        || path.starts_with("p/")
+        || path == "hooks"
+        || path.starts_with("hooks/")
+    {
         return StatusCode::NOT_FOUND.into_response();
     }
     let (path, file) = match Assets::get(path) {
@@ -1610,6 +1763,7 @@ mod public_file_tests {
             mcp: mcp::Mcp::new(store.clone()),
             public_url: Some(public_url("https://blob-1.example.com").unwrap()),
             workspace: pinned,
+            live_chat: crate::run::LiveChat::default(),
         };
 
         let md_resp = serve_public_file(&ctx, &md_id, false).await;
@@ -1668,6 +1822,78 @@ mod public_file_tests {
             serve_public_file(&ctx, "other-ws-link", false).await.status(),
             StatusCode::NOT_FOUND
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn inbound_webhook_validates_token_enabled_and_body_limit() {
+        let dir =
+            std::env::temp_dir().join(format!("blob-1-web-hook-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let workspace = dir.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let key = storage_sqlite::AppKey::new("test-key".into());
+        let store = Arc::new(SqliteStorage::open(dir.join("agent.db"), Some(key)).unwrap());
+        let pinned = harness::PinnedWorkspace::open(&workspace).unwrap();
+
+        let token = "secret-hook-token";
+        let hash = Sha256::digest(token.as_bytes());
+        store
+            .create_webhook("h1", "ci", token, &hash, now())
+            .unwrap();
+
+        let ctx = Arc::new(WebContext {
+            store: store.clone(),
+            discord: Arc::new(messenger_discord::Discord::new()),
+            settings_lock: tokio::sync::Mutex::new(()),
+            mcp: mcp::Mcp::new(store.clone()),
+            public_url: Some(public_url("https://blob-1.example.com").unwrap()),
+            workspace: pinned,
+            live_chat: crate::run::LiveChat::default(),
+        });
+
+        // Unknown token -> 404.
+        let r = inbound_webhook(
+            State(ctx.clone()),
+            AxumPath("wrong".into()),
+            Body::from("hi"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+
+        // Oversized payload (> 64 KiB) -> 413.
+        let big = vec![b'a'; MAX_WEBHOOK_BODY_BYTES + 1];
+        let r = inbound_webhook(
+            State(ctx.clone()),
+            AxumPath(token.into()),
+            Body::from(big),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // Valid token when chat harness is not attached yet -> 503 and does not update last_triggered_at.
+        let r = inbound_webhook(
+            State(ctx.clone()),
+            AxumPath(token.into()),
+            Body::from(r#"{"event":"push"}"#),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            store.webhook_by_token_hash(&hash).unwrap().unwrap().last_triggered_at,
+            None
+        );
+
+        // Disabled webhook -> 404.
+        store.set_webhook_enabled("h1", false).unwrap();
+        let r = inbound_webhook(
+            State(ctx.clone()),
+            AxumPath(token.into()),
+            Body::from("hi"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

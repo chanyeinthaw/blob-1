@@ -35,10 +35,17 @@ pub enum Target {
 }
 
 #[derive(Debug, Clone)]
+pub struct OutboundFile {
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Outbound {
     pub target: Target,
     pub text: String,
     pub mention: Vec<String>,
+    pub files: Vec<OutboundFile>,
 }
 
 #[derive(Debug, Clone)]

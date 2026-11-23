@@ -239,7 +239,7 @@ function ProviderFilter(props: ProviderFilterProps) {
           <Button
             variant="outline"
             aria-label={`Provider: ${label}`}
-            className="min-w-0 flex-1 justify-between border-input shadow-xs sm:w-40 sm:flex-none md:w-44"
+            className="min-w-0 flex-1 justify-between sm:w-40 sm:flex-none md:w-44"
           >
             <span className="truncate">{label}</span>
             <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
@@ -284,11 +284,11 @@ function InUseToggle(props: InUseToggleProps) {
       aria-pressed={props.inUseOnly}
       onClick={props.onToggle}
       className={cn(
-        'inline-flex h-10 shrink-0 cursor-pointer items-center gap-1.5 rounded-full border px-3.5 text-sm font-medium shadow-xs transition-colors active:translate-y-px md:h-8',
+        'inline-flex h-10 shrink-0 cursor-pointer items-center gap-1.5 rounded-full border border-transparent px-3.5 text-sm font-medium transition-colors active:translate-y-px md:h-8',
         focusRingClassName,
         props.inUseOnly
-          ? 'border-primary bg-primary text-primary-foreground hover:bg-primary/90'
-          : 'border-input bg-background hover:bg-muted',
+          ? 'bg-primary text-primary-foreground hover:bg-primary/90'
+          : 'bg-secondary text-secondary-foreground hover:bg-border/70',
       )}
     >
       In use
@@ -652,9 +652,7 @@ function ContextInput(props: ContextInputProps) {
           onBlur={flush}
           className={cn(
             'h-10 w-[120px] px-2.5 text-right font-mono text-base tabular-nums sm:h-7 sm:w-[116px] sm:px-3 sm:text-sm',
-            value === ''
-              ? 'border-dashed border-input bg-transparent shadow-none'
-              : 'border-input bg-background shadow-xs',
+            value === '' ? 'bg-secondary/70' : 'bg-secondary',
           )}
         />
       </div>

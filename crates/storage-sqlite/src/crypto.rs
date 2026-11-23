@@ -275,6 +275,27 @@ fn seal_plaintext(
             )
             .map_err(backend)?;
     }
+    let webhooks = connection
+        .prepare("SELECT id, token FROM webhooks")
+        .map_err(backend)?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(backend)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(backend)?;
+    for (id, token) in webhooks {
+        if token.starts_with(PREFIX) {
+            continue;
+        }
+        sealed += 1;
+        connection
+            .execute(
+                "UPDATE webhooks SET token = ?2 WHERE id = ?1",
+                params![id, seal_secret_with(cipher, &token)?],
+            )
+            .map_err(backend)?;
+    }
     Ok(sealed)
 }
 
