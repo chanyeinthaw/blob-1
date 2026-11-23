@@ -3,6 +3,7 @@ import { Array, Duration, Effect, Layer, Random, Ref, Schema, Stream, Struct } f
 import { Transport } from './api.ts'
 import {
   type CheckinConfig,
+  type DecisionSlot,
   Discord,
   type DiscordAccessEffect,
   type DiscordAccessRule,
@@ -49,6 +50,7 @@ type State = Readonly<{
   main: Slot
   compaction: Slot | null
   utility: Slot | null
+  decision: DecisionSlot | null
   providers: ReadonlyArray<ProviderRecord>
   defaultAccess: DiscordAccessEffect
   accessRules: ReadonlyArray<DiscordAccessRule>
@@ -80,6 +82,7 @@ const seedState = (): State => ({
   main: { provider: 'cpa1', model: 'gpt-6.1-terra', reasoning: 'medium' },
   compaction: { provider: 'cpa1', model: 'gpt-6-luna', reasoning: 'medium' },
   utility: { provider: 'cpa1', model: 'gpt-6-luna', reasoning: 'low' },
+  decision: null,
   providers: [
     {
       id: 'cpa1',
@@ -167,7 +170,7 @@ const seedState = (): State => ({
 
 const generalReply = (state: State): GeneralSettings => ({
   autoRespond: state.autoRespond,
-  hasUtilityModel: state.utility !== null,
+  hasUtilityModel: state.utility !== null || state.decision !== null,
 })
 
 const instructionsReply = (state: State): Instructions => ({
@@ -179,8 +182,10 @@ const modelsReply = (state: State): Models => ({
   main: state.main,
   compaction: state.compaction,
   utility: state.utility,
+  decision: state.decision,
   providers: state.providers.map(provider => ({
     id: provider.id,
+    api: provider.api,
     models: provider.models,
   })),
 })
@@ -395,10 +400,51 @@ const hasModel = (state: State, providerId: string, modelId: string): boolean =>
     provider => provider.id === providerId && provider.models.some(model => model.id === modelId),
   )
 
+const isCloudflareAiUrl = (baseUrl: string): boolean => {
+  try {
+    const parsed = new URL(baseUrl.trim())
+    const path = parsed.pathname.replace(/\/+$/, '').toLowerCase()
+    return (
+      parsed.hostname.toLowerCase() === 'api.cloudflare.com' &&
+      path.startsWith('/client/v4/accounts/') &&
+      path.endsWith('/ai/run')
+    )
+  } catch {
+    return false
+  }
+}
+
+const cloudflareDecisionModels = (): ReadonlyArray<ModelInfo> => [
+  { id: '@cf/cloudflare/clef-flash', context: 24576, limit: null, images: false },
+  { id: '@cf/cloudflare/clef', context: 65536, limit: null, images: false },
+]
+
+const hasLlmModel = (state: State, provider: string, model: string): boolean => {
+  const entry = state.providers.find(p => p.id === provider)
+  return (
+    entry !== undefined && entry.api !== 'decision' && entry.models.some(info => info.id === model)
+  )
+}
+
+const hasDecisionModel = (state: State, provider: string, model: string): boolean => {
+  const entry = state.providers.find(p => p.id === provider)
+  return (
+    entry !== undefined && entry.api === 'decision' && entry.models.some(info => info.id === model)
+  )
+}
+
 const checkSlot = (state: State, slot: Slot | null): Effect.Effect<Slot | null, string> =>
-  slot === null || hasModel(state, slot.provider, slot.model)
+  slot === null || hasLlmModel(state, slot.provider, slot.model)
     ? Effect.succeed(slot)
-    : Effect.fail('Unknown model')
+    : Effect.fail('Unknown LLM model')
+
+const checkDecisionSlot = (
+  state: State,
+  slot: DecisionSlot | null,
+): Effect.Effect<DecisionSlot | null, string> =>
+  slot === null || hasDecisionModel(state, slot.provider, slot.model)
+    ? Effect.succeed(slot)
+    : Effect.fail('Only decision providers can be used in the Decision slot')
 
 const synthesizeModels = (providerId: string): ReadonlyArray<ModelInfo> =>
   Array.makeBy(REFRESHED_MODEL_COUNT, index => ({
@@ -407,6 +453,53 @@ const synthesizeModels = (providerId: string): ReadonlyArray<ModelInfo> =>
     limit: null,
     images: false,
   }))
+
+const hasValidAuthority = (authority: string): boolean => {
+  const hostPort = authority.slice(authority.indexOf('@') + 1)
+  return (
+    /^[\x21-\x7e]+$/.test(authority) && !/[\\<>"{}|^`]/.test(authority) && !hostPort.includes('%')
+  )
+}
+
+const hasValidPathAndQuery = (raw: string): boolean => {
+  const q = raw.indexOf('?')
+  const path = q === -1 ? raw : raw.slice(0, q)
+  const query = q === -1 ? '' : raw.slice(q + 1)
+  return !/[<>`]/.test(path) && !/[<>"]/.test(query)
+}
+
+const isValidHttpUrl = (baseUrl: string): boolean => {
+  if (/[\s\p{Cc}]/u.test(baseUrl)) return false
+  const match = /^https?:\/\/([^/?#]+)([^#]*)(?:#.*)?$/i.exec(baseUrl)
+  if (
+    match === null ||
+    !hasValidAuthority(match[1] ?? '') ||
+    !hasValidPathAndQuery(match[2] ?? '')
+  ) {
+    return false
+  }
+  try {
+    const parsed = new URL(baseUrl)
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.hostname !== ''
+  } catch {
+    return false
+  }
+}
+
+const resolveInitialModels = (
+  api: ProviderApi,
+  baseUrl: string,
+  models: ReadonlyArray<string> | undefined,
+): Effect.Effect<ReadonlyArray<ModelInfo>, string> => {
+  if (api !== 'decision') return Effect.succeed([])
+  const explicit = (models ?? [])
+    .map(modelId => modelId.trim())
+    .filter(modelId => modelId !== '')
+    .map(modelId => ({ id: modelId, context: null, limit: null, images: false }))
+  if (explicit.length > 0) return Effect.succeed(explicit)
+  if (isCloudflareAiUrl(baseUrl)) return Effect.succeed(cloudflareDecisionModels())
+  return Effect.fail('Enter at least one model ID for non-Cloudflare decision endpoints')
+}
 
 const addProvider = (
   state: State,
@@ -427,13 +520,14 @@ const addProvider = (
     if (state.providers.some(provider => provider.id === id)) {
       return yield* Effect.fail(`Provider ${id} already exists`)
     }
-    if (!URL.canParse(baseUrl)) {
-      return yield* Effect.fail('Base URL is not a valid URL')
+    if (!isValidHttpUrl(baseUrl)) {
+      return yield* Effect.fail('Base URL must be a valid http(s) URL')
     }
 
+    const seededModels = yield* resolveInitialModels(payload.api, baseUrl, payload.models)
     return Struct.evolve(state, {
       providers: providers =>
-        Array.append(providers, { id, api: payload.api, baseUrl, apiKey, models: [] }),
+        Array.append(providers, { id, api: payload.api, baseUrl, apiKey, models: seededModels }),
     })
   })
 
@@ -459,7 +553,7 @@ const removeProvider = (state: State, id: string): Effect.Effect<State, string> 
     if (!state.providers.some(provider => provider.id === id)) {
       return yield* Effect.fail(`Unknown provider ${id}`)
     }
-    const isInUse = [state.main, state.compaction, state.utility].some(
+    const isInUse = [state.main, state.compaction, state.utility, state.decision].some(
       slot => slot?.provider === id,
     )
     if (isInUse) {
@@ -478,7 +572,19 @@ const refreshProvider = (state: State, id: string): Effect.Effect<State, string>
       return yield* Effect.fail(`Unknown provider ${id}`)
     }
 
-    const models = provider.models.length === 0 ? synthesizeModels(id) : provider.models
+    const models =
+      provider.api === 'decision'
+        ? isCloudflareAiUrl(provider.baseUrl)
+          ? [
+              ...cloudflareDecisionModels(),
+              ...provider.models.filter(
+                existing => !cloudflareDecisionModels().some(cf => cf.id === existing.id),
+              ),
+            ]
+          : provider.models
+        : provider.models.length === 0
+          ? synthesizeModels(id)
+          : provider.models
 
     return Struct.evolve(state, {
       providers: providers =>
@@ -810,7 +916,7 @@ const handlers: { readonly [K in RequestType]: Handler<K> } = {
 
   'models.setMain': ({ provider, model, reasoning }, state) =>
     transition(state, current =>
-      hasModel(current, provider, model)
+      hasLlmModel(current, provider, model)
         ? Effect.succeed(
             Struct.evolve(current, {
               main: () => ({ provider, model, reasoning }),
@@ -830,6 +936,13 @@ const handlers: { readonly [K in RequestType]: Handler<K> } = {
     transition(state, current =>
       checkSlot(current, slot).pipe(
         Effect.map(next => Struct.evolve(current, { utility: () => next })),
+      ),
+    ).pipe(Effect.map(modelsReply)),
+
+  'models.setDecision': ({ slot }, state) =>
+    transition(state, current =>
+      checkDecisionSlot(current, slot).pipe(
+        Effect.map(next => Struct.evolve(current, { decision: () => next })),
       ),
     ).pipe(Effect.map(modelsReply)),
 

@@ -42,11 +42,13 @@ const ProvidersOwner = createPersistentMachineContext(
 const apiLabels = {
   responses: 'Responses',
   completions: 'Chat Completions',
+  decision: 'Decision (Clef / Jev)',
 }
 
 const apiOptions = [
   { value: 'responses', label: apiLabels.responses },
   { value: 'completions', label: apiLabels.completions },
+  { value: 'decision', label: apiLabels.decision },
 ]
 
 /** The Providers settings page. */
@@ -394,6 +396,7 @@ interface AddDraft {
   readonly api: ProviderApi
   readonly baseUrl: string
   readonly apiKey: string
+  readonly models: string
 }
 
 type RequiredField = 'id' | 'baseUrl'
@@ -441,6 +444,7 @@ function AddForm(props: AddFormProps) {
     api: 'responses',
     baseUrl: '',
     apiKey: '',
+    models: '',
   })
   const [errors, setErrors] = useState<FieldErrors>({})
   const isSubmitting = AsyncResult.getOrElse(
@@ -473,12 +477,20 @@ function AddForm(props: AddFormProps) {
       return
     }
     const trimmedKey = draft.apiKey.trim()
+    const models =
+      draft.api === 'decision'
+        ? draft.models
+            .split(',')
+            .map(item => item.trim())
+            .filter(item => item !== '')
+        : []
     send(
       ProvidersEvents.SubmitAdd({
         id: draft.id.trim(),
         api: draft.api,
         baseUrl: draft.baseUrl.trim(),
         apiKey: trimmedKey === '' ? null : trimmedKey,
+        models,
       }),
     )
   }
@@ -530,7 +542,11 @@ function AddForm(props: AddFormProps) {
         <Input
           id="provider-base-url"
           className="font-mono"
-          placeholder="https://…/v1"
+          placeholder={
+            draft.api === 'decision'
+              ? 'https://api.cloudflare.com/client/v4/accounts/<id>/ai/run'
+              : 'https://…/v1'
+          }
           value={draft.baseUrl}
           disabled={isSubmitting}
           aria-invalid={errors.baseUrl !== undefined}
@@ -556,6 +572,21 @@ function AddForm(props: AddFormProps) {
           }}
         />
       </FieldRow>
+      {draft.api === 'decision' ? (
+        <FieldRow id="provider-models" label="Models">
+          <Input
+            id="provider-models"
+            className="font-mono"
+            placeholder="Auto-seeded for Cloudflare /ai/run, or comma-separated IDs"
+            value={draft.models}
+            disabled={isSubmitting}
+            onChange={event => {
+              setDraft(current => ({ ...current, models: event.target.value }))
+              if (serverError != null) send(ProvidersEvents.ClearAddError())
+            }}
+          />
+        </FieldRow>
+      ) : null}
       <div className="mt-3 flex flex-col items-start gap-2 md:pl-[120px]">
         <AddButtons />
         <AddError />

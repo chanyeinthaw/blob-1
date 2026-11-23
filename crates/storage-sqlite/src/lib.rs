@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS webhooks (
 
 CREATE TABLE IF NOT EXISTS providers (
     id TEXT PRIMARY KEY,
-    api TEXT NOT NULL CHECK (api IN ('openai-responses', 'openai-completions')),
+    api TEXT NOT NULL CHECK (api IN ('openai-responses', 'openai-completions', 'decision')),
     base_url TEXT NOT NULL,
     api_key TEXT
 ) STRICT;
@@ -119,6 +119,7 @@ CREATE TABLE IF NOT EXISTS models (
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS utility_model (id INTEGER PRIMARY KEY CHECK (id = 1), provider TEXT NOT NULL, model TEXT NOT NULL, reasoning TEXT CHECK (reasoning IN ('off','low','medium','high','xhigh','max')), FOREIGN KEY (provider, model) REFERENCES models (provider, id) ON DELETE CASCADE) STRICT;
+CREATE TABLE IF NOT EXISTS decision_model (id INTEGER PRIMARY KEY CHECK (id = 1), provider TEXT NOT NULL, model TEXT NOT NULL, FOREIGN KEY (provider, model) REFERENCES models (provider, id) ON DELETE CASCADE) STRICT;
 
 CREATE TABLE IF NOT EXISTS mcp_servers (
     id TEXT PRIMARY KEY,
@@ -330,15 +331,16 @@ impl SqliteStorage {
         ensure_unified_access(&mut connection, &mut require_exclusive)?;
         ensure_settings_auto_respond(&mut connection, &mut require_exclusive)?;
         migrate_identity_to_instructions(&mut connection, &mut require_exclusive)?;
-        drop(upgrade_owner);
         let key = match app_key {
             Some(app_key) => Some(crypto::setup(&connection, &app_key)?),
             None => None,
         };
         ensure_providers_api_key(&mut connection, key.as_ref(), has_exclusive)?;
+        ensure_providers_decision_api(&mut connection, &mut require_exclusive)?;
         if let Some(cipher) = &key {
             crypto::migrate(&connection, cipher)?;
         }
+        drop(upgrade_owner);
         Ok(Self {
             connection: Mutex::new(connection),
             key,
@@ -1027,6 +1029,72 @@ fn migrate_identity_to_instructions(
     )
     .map_err(backend)?;
     tx.commit().map_err(backend)?;
+    Ok(())
+}
+
+/// Widens `providers.api` CHECK constraint on existing databases to allow `'decision'`.
+fn ensure_providers_decision_api(
+    connection: &mut Connection,
+    require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let needs_upgrade = |conn: &Connection| -> Result<bool, StoreError> {
+        let has_legacy_col: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('providers') WHERE name = 'api_key_env')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        if has_legacy_col {
+            return Ok(false);
+        }
+        let sql: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'providers'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(sql.is_some_and(|s| !s.contains("'decision'")))
+    };
+    if !needs_upgrade(connection)? {
+        return Ok(());
+    }
+    require_exclusive(
+        "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
+    )?;
+    connection
+        .pragma_update(None, "foreign_keys", "OFF")
+        .map_err(backend)?;
+    let result = (|| -> Result<(), StoreError> {
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        if !needs_upgrade(&tx)? {
+            tx.commit().map_err(backend)?;
+            return Ok(());
+        }
+        tx.execute_batch(
+            "CREATE TABLE providers_v2 (
+                 id TEXT PRIMARY KEY,
+                 api TEXT NOT NULL CHECK (api IN ('openai-responses', 'openai-completions', 'decision')),
+                 base_url TEXT NOT NULL,
+                 api_key TEXT
+             ) STRICT;
+             INSERT INTO providers_v2 (id, api, base_url, api_key)
+             SELECT id, api, base_url, api_key FROM providers;
+             DROP TABLE providers;
+             ALTER TABLE providers_v2 RENAME TO providers;",
+        )
+        .map_err(backend)?;
+        tx.commit().map_err(backend)?;
+        Ok(())
+    })();
+    let restore = connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(backend);
+    result?;
+    restore?;
     Ok(())
 }
 

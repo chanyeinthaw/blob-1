@@ -86,6 +86,12 @@ export const Slot = Schema.Struct({
 })
 export type Slot = typeof Slot.Type
 
+export const DecisionSlot = Schema.Struct({
+  provider: Schema.String,
+  model: Schema.String,
+})
+export type DecisionSlot = typeof DecisionSlot.Type
+
 export const ModelInfo = Schema.Struct({
   id: Schema.String,
   context: Schema.NullOr(Schema.Finite),
@@ -94,8 +100,12 @@ export const ModelInfo = Schema.Struct({
 })
 export type ModelInfo = typeof ModelInfo.Type
 
+export const ProviderApi = Schema.Literals(['responses', 'completions', 'decision'])
+export type ProviderApi = typeof ProviderApi.Type
+
 export const ProviderModels = Schema.Struct({
   id: Schema.String,
+  api: ProviderApi,
   models: Schema.Array(ModelInfo),
 })
 export type ProviderModels = typeof ProviderModels.Type
@@ -104,12 +114,10 @@ export const Models = Schema.Struct({
   main: Slot,
   compaction: Schema.NullOr(Slot),
   utility: Schema.NullOr(Slot),
+  decision: Schema.NullOr(DecisionSlot),
   providers: Schema.Array(ProviderModels),
 })
 export type Models = typeof Models.Type
-
-export const ProviderApi = Schema.Literals(['responses', 'completions'])
-export type ProviderApi = typeof ProviderApi.Type
 
 export const Provider = Schema.Struct({
   id: Schema.String,
@@ -349,6 +357,10 @@ export const requests = {
     payload: Schema.Struct({ slot: Schema.NullOr(Slot) }),
     reply: Models,
   },
+  'models.setDecision': {
+    payload: Schema.Struct({ slot: Schema.NullOr(DecisionSlot) }),
+    reply: Models,
+  },
   'models.setContextLimit': {
     payload: Schema.Struct({
       provider: Schema.String,
@@ -372,6 +384,7 @@ export const requests = {
       api: ProviderApi,
       baseUrl: Schema.String,
       apiKey: Schema.NullOr(Schema.String),
+      models: Schema.optional(Schema.Array(Schema.String)),
     }),
     reply: Schema.Array(Provider),
   },

@@ -514,6 +514,9 @@ enum ProviderCommand {
         /// Save the provider without an API key (for local endpoints).
         #[arg(long)]
         no_key: bool,
+        /// Explicit model IDs for generic decision providers (repeatable; optional for Cloudflare /ai/run which auto-seeds Clef).
+        #[arg(long = "model")]
+        models: Vec<String>,
     },
     Key {
         #[command(subcommand)]
@@ -540,6 +543,7 @@ enum ProviderKeyCommand {
 enum Api {
     Responses,
     Completions,
+    Decision,
 }
 
 #[derive(Subcommand)]
@@ -566,6 +570,9 @@ enum ModelCommand {
         model: String,
         #[arg(long)]
         reasoning: Option<ReasoningLevel>,
+    },
+    Decision {
+        model: String,
     },
     Map {
         model: String,
@@ -754,13 +761,14 @@ async fn main() -> Result<()> {
             match command {
                 AutoRespondCommand::Show => {
                     let enabled = store.auto_respond()?;
-                    let has_utility = store.utility_model()?.is_some();
+                    let has_gate =
+                        store.utility_model()?.is_some() || store.decision_model()?.is_some();
                     if !enabled {
                         println!("off");
-                    } else if has_utility {
+                    } else if has_gate {
                         println!("on");
                     } else {
-                        println!("on (inactive: no utility model configured)");
+                        println!("on (inactive: no decision or utility model configured)");
                     }
                 }
                 AutoRespondCommand::On => store.set_auto_respond(true)?,
@@ -920,12 +928,38 @@ fn provider(store: &SqliteStorage, command: ProviderCommand) -> Result<()> {
             api,
             base_url,
             no_key,
+            models,
         } => {
             if id.is_empty() || id.contains('/') {
                 return Err(format!(
                     "invalid provider id: {id:?}; it must be non-empty and contain no '/'"
                 )
                 .into());
+            }
+            let provider_api = match api {
+                Api::Responses => ProviderApi::OpenAiResponses,
+                Api::Completions => ProviderApi::OpenAiCompletions,
+                Api::Decision => ProviderApi::Decision,
+            };
+            let explicit_models: Vec<storage::DiscoveredModel> = models
+                .into_iter()
+                .map(|m| m.trim().to_owned())
+                .filter(|m| !m.is_empty())
+                .map(|id| storage::DiscoveredModel {
+                    id,
+                    context_window: None,
+                })
+                .collect();
+            if provider_api.is_decision() && !run::valid_http_url(&base_url) {
+                return Err("Base URL must be a valid http(s) URL".into());
+            }
+            if provider_api.is_decision()
+                && !llm_rig::is_cloudflare_ai_url(&base_url)
+                && explicit_models.is_empty()
+            {
+                return Err(
+                    "non-Cloudflare decision providers require at least one --model <id>".into(),
+                );
             }
             let api_key = if no_key {
                 None
@@ -941,18 +975,35 @@ fn provider(store: &SqliteStorage, command: ProviderCommand) -> Result<()> {
                 }
                 Some(key)
             };
+            let provider_id = ProviderId(id);
+            if store
+                .providers()?
+                .iter()
+                .any(|p| p.id == provider_id && (provider_api.is_decision() || p.api.is_decision()))
+            {
+                return Err(format!("provider {} already exists", provider_id.0).into());
+            }
             store.save_provider(
                 Provider {
-                    id: ProviderId(id),
-                    api: match api {
-                        Api::Responses => ProviderApi::OpenAiResponses,
-                        Api::Completions => ProviderApi::OpenAiCompletions,
-                    },
-                    base_url,
+                    id: provider_id.clone(),
+                    api: provider_api,
+                    base_url: base_url.clone(),
                     has_api_key: api_key.is_some(),
                 },
                 api_key.as_deref(),
-            )?
+            )?;
+            if provider_api.is_decision() {
+                let seeded = if !explicit_models.is_empty() {
+                    explicit_models
+                } else if llm_rig::is_cloudflare_ai_url(&base_url) {
+                    llm_rig::cloudflare_decision_models()
+                } else {
+                    Vec::new()
+                };
+                if !seeded.is_empty() {
+                    store.replace_models(&provider_id, seeded)?;
+                }
+            }
         }
         ProviderCommand::Key { command } => match command {
             ProviderKeyCommand::Set { id } => {
@@ -974,6 +1025,7 @@ fn provider(store: &SqliteStorage, command: ProviderCommand) -> Result<()> {
                 let api = match provider.api {
                     ProviderApi::OpenAiResponses => "responses",
                     ProviderApi::OpenAiCompletions => "completions",
+                    ProviderApi::Decision => "decision",
                 };
                 let key_status = if provider.has_api_key {
                     "key set"
@@ -1090,6 +1142,26 @@ async fn models(store: &SqliteStorage, command: ModelsCommand) -> Result<()> {
 }
 
 async fn refresh_provider(store: &SqliteStorage, provider: &Provider) -> Result<usize> {
+    if provider.api.is_decision() {
+        let existing = store.models(&provider.id)?;
+        if !llm_rig::is_cloudflare_ai_url(&provider.base_url) {
+            return Ok(existing.len());
+        }
+        // Merge built-in Cloudflare Clef models while preserving any explicitly
+        // registered model IDs on this provider.
+        let mut merged = llm_rig::cloudflare_decision_models();
+        for model in existing {
+            if !merged.iter().any(|m| m.id == model.id) {
+                merged.push(storage::DiscoveredModel {
+                    id: model.id,
+                    context_window: model.context_window,
+                });
+            }
+        }
+        let count = merged.len();
+        store.replace_models(&provider.id, merged)?;
+        return Ok(count);
+    }
     let key = api_key(store, provider)?;
     let models = llm_rig::discover(provider, &key).await?;
     let count = models.len();
@@ -1113,6 +1185,19 @@ fn known_model(store: &SqliteStorage, model: &str) -> Result<storage::Model> {
         })
 }
 
+fn known_model_with_provider(
+    store: &SqliteStorage,
+    model: &str,
+) -> Result<(storage::Provider, storage::Model)> {
+    let model = known_model(store, model)?;
+    let provider = store
+        .providers()?
+        .into_iter()
+        .find(|p| p.id == model.provider)
+        .ok_or_else(|| format!("unknown provider: {}", model.provider.0))?;
+    Ok((provider, model))
+}
+
 fn model_command(store: &SqliteStorage, command: ModelCommand) -> Result<()> {
     match command {
         ModelCommand::Input { model, input } => {
@@ -1131,7 +1216,10 @@ fn model_command(store: &SqliteStorage, command: ModelCommand) -> Result<()> {
             }
         }
         ModelCommand::Set { model } => {
-            let model = known_model(store, &model)?;
+            let (provider, model) = known_model_with_provider(store, &model)?;
+            if provider.api.is_decision() {
+                return Err("decision models can only be used in the Decision slot".into());
+            }
             let mut settings = store.settings()?;
             settings.default_model = Some(ModelRef {
                 provider: model.provider,
@@ -1145,7 +1233,10 @@ fn model_command(store: &SqliteStorage, command: ModelCommand) -> Result<()> {
                 settings.compaction_model = None;
                 settings.compaction_reasoning = None;
             } else {
-                let model = known_model(store, &model)?;
+                let (provider, model) = known_model_with_provider(store, &model)?;
+                if provider.api.is_decision() {
+                    return Err("decision models can only be used in the Decision slot".into());
+                }
                 settings.compaction_model = Some(ModelRef {
                     provider: model.provider,
                     model: model.id,
@@ -1158,7 +1249,10 @@ fn model_command(store: &SqliteStorage, command: ModelCommand) -> Result<()> {
             let selected = if model == "off" {
                 None
             } else {
-                let model = known_model(store, &model)?;
+                let (provider, model) = known_model_with_provider(store, &model)?;
+                if provider.api.is_decision() {
+                    return Err("decision models can only be used in the Decision slot".into());
+                }
                 Some((
                     ModelRef {
                         provider: model.provider,
@@ -1168,6 +1262,21 @@ fn model_command(store: &SqliteStorage, command: ModelCommand) -> Result<()> {
                 ))
             };
             store.set_utility_model(selected)?;
+        }
+        ModelCommand::Decision { model } => {
+            let selected = if model == "off" || model == "-" {
+                None
+            } else {
+                let (provider, model) = known_model_with_provider(store, &model)?;
+                if !provider.api.is_decision() {
+                    return Err("only decision providers can be used in the Decision slot".into());
+                }
+                Some(ModelRef {
+                    provider: model.provider,
+                    model: model.id,
+                })
+            };
+            store.set_decision_model(selected.as_ref())?;
         }
         ModelCommand::Map { model, pairs } => {
             let model = known_model(store, &model)?;

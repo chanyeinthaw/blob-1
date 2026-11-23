@@ -194,6 +194,17 @@ pub struct ProviderId(pub String);
 pub enum ProviderApi {
     OpenAiResponses,
     OpenAiCompletions,
+    Decision,
+}
+
+impl ProviderApi {
+    pub fn is_decision(self) -> bool {
+        matches!(self, Self::Decision)
+    }
+
+    pub fn is_llm(self) -> bool {
+        !self.is_decision()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -366,6 +377,8 @@ pub trait ConfigStore: Send + Sync {
         &self,
         model: Option<(ModelRef, Option<ReasoningLevel>)>,
     ) -> Result<(), StoreError>;
+    fn decision_model(&self) -> Result<Option<ModelRef>, StoreError>;
+    fn set_decision_model(&self, model: Option<&ModelRef>) -> Result<(), StoreError>;
     fn settings(&self) -> Result<Settings, StoreError>;
     fn save_settings(&self, settings: Settings) -> Result<(), StoreError>;
 }

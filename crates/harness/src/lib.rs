@@ -10,7 +10,7 @@ pub mod prompt;
 pub mod session;
 mod tasks;
 mod utility;
-pub use utility::{decide_respond, parse_inline, parse_respond, Utility};
+pub use utility::{decide_inline, decide_respond, parse_inline, parse_respond, Utility};
 
 pub use chat::{
     ChatHarness, Current, ModelSelection, Models, ZoomId, CHAT_PROMPT, DEFAULT_INSTRUCTIONS,

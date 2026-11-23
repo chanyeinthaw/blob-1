@@ -1,6 +1,7 @@
 import {
   type ModelInfo,
   type Models,
+  type ProviderApi,
   type ProviderModels,
   Reasoning,
   type Slot,
@@ -47,15 +48,18 @@ const ModelsOwner = createPersistentMachineContext('models', ({ input }: { input
 const PAGE_SIZE = 25
 const ALL = '\0all'
 
-type OptionalRole = 'compaction' | 'utility'
-type Role = 'main' | OptionalRole
+type OptionalLlmRole = 'compaction' | 'utility'
+type LlmRole = 'main' | OptionalLlmRole
+type Role = LlmRole | 'decision'
 
-const roles: ReadonlyArray<Role> = ['main', 'compaction', 'utility']
+const llmRoles: ReadonlyArray<LlmRole> = ['main', 'compaction', 'utility']
+const allRoles: ReadonlyArray<Role> = ['main', 'compaction', 'utility', 'decision']
 
 const roleLabels = {
   main: 'Main',
   compaction: 'Compaction',
   utility: 'Utility',
+  decision: 'Decision',
 }
 
 interface Filters {
@@ -67,24 +71,31 @@ interface Filters {
 
 interface Entry {
   readonly provider: string
+  readonly api: ProviderApi
   readonly info: ModelInfo
 }
 
-const optionalSlot = (shown: Models, role: OptionalRole): Slot | null =>
+const optionalSlot = (shown: Models, role: OptionalLlmRole): Slot | null =>
   role === 'compaction' ? shown.compaction : shown.utility
 
-const roleSlot = (shown: Models, role: Role): Slot | null =>
+const roleSlot = (shown: Models, role: LlmRole): Slot | null =>
   role === 'main' ? shown.main : optionalSlot(shown, role)
 
+const hasDecisionRole = (shown: Models, entry: Entry): boolean =>
+  shown.decision !== null &&
+  shown.decision.provider === entry.provider &&
+  shown.decision.model === entry.info.id
+
 const rolesHeldBy = (shown: Models, entry: Entry): ReadonlyArray<Role> =>
-  roles.filter(role => {
+  allRoles.filter(role => {
+    if (role === 'decision') return hasDecisionRole(shown, entry)
     const slot = roleSlot(shown, role)
     return slot !== null && slot.provider === entry.provider && slot.model === entry.info.id
   })
 
 const entriesOf = (shown: Models): ReadonlyArray<Entry> =>
   shown.providers.flatMap(provider =>
-    provider.models.map(info => ({ provider: provider.id, info })),
+    provider.models.map(info => ({ provider: provider.id, api: provider.api, info })),
   )
 
 const isMatch = (filters: Filters, shown: Models, entry: Entry): boolean =>
@@ -95,16 +106,16 @@ const isMatch = (filters: Filters, shown: Models, entry: Entry): boolean =>
 const inUseCount = (shown: Models): number =>
   entriesOf(shown).filter(entry => rolesHeldBy(shown, entry).length > 0).length
 
-const assignOptionalEvent = (role: OptionalRole, slot: Slot | null) =>
+const assignOptionalEvent = (role: OptionalLlmRole, slot: Slot | null) =>
   role === 'compaction'
     ? ModelsEvents.AssignCompaction({ slot })
     : ModelsEvents.AssignUtility({ slot })
 
-const assignEvent = (role: Role, slot: Slot) =>
+const assignEvent = (role: LlmRole, slot: Slot) =>
   role === 'main' ? ModelsEvents.AssignMain({ slot }) : assignOptionalEvent(role, slot)
 
 /** Assigns an entry to a role, keeping the role's current reasoning or 'medium'. */
-const assignEntryEvent = (role: Role, shown: Models, entry: Entry) =>
+const assignEntryEvent = (role: LlmRole, shown: Models, entry: Entry) =>
   assignEvent(role, {
     provider: entry.provider,
     model: entry.info.id,
@@ -351,15 +362,22 @@ function Catalog(props: CatalogProps) {
                 </Button>
               </div>
             ) : null}
-            {props.filters.inUseOnly
-              ? (['compaction', 'utility'] as const)
+            {props.filters.inUseOnly ? (
+              <>
+                {(['compaction', 'utility'] as const)
                   .filter(role => optionalSlot(value.shown, role) === null)
                   .map(role => (
                     <p key={role} className="mt-3 text-sm text-muted-foreground">
                       {roleLabels[role]}: Off
                     </p>
-                  ))
-              : null}
+                  ))}
+                {value.shown.decision === null ? (
+                  <p className="mt-3 text-sm text-muted-foreground">
+                    Decision: Falls back to Utility
+                  </p>
+                ) : null}
+              </>
+            ) : null}
           </div>
         )
       }}
@@ -413,6 +431,9 @@ function ModelRow(props: ModelRowProps) {
           <span className="text-xs text-muted-foreground sm:hidden">{props.entry.provider}</span>
         ) : null}
         {held.map(role => {
+          if (role === 'decision') {
+            return <DecisionRoleChip key="decision" />
+          }
           const slot = roleSlot(props.shown, role)
           return slot === null ? null : (
             <RoleChip key={role} role={role} slot={slot} status={props.roleStatuses[role]} />
@@ -436,9 +457,30 @@ function ModelRow(props: ModelRowProps) {
 }
 
 interface RoleChipProps {
-  readonly role: Role
+  readonly role: LlmRole
   readonly slot: Slot
   readonly status: string | undefined
+}
+
+function DecisionRoleChip() {
+  const machine = ModelsOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  return (
+    <span className="inline-flex h-8 items-center gap-1 rounded-full bg-muted pr-1.5 pl-3 text-xs font-medium md:h-6 md:pr-1 md:pl-2.5">
+      <span>Decision</span>
+      <button
+        type="button"
+        aria-label="Remove Decision role"
+        onClick={() => send(ModelsEvents.AssignDecision({ slot: null }))}
+        className={cn(
+          'grid size-5 cursor-pointer place-items-center rounded-full text-muted-foreground hover:bg-border hover:text-foreground md:size-4',
+          focusRingClassName,
+        )}
+      >
+        <X className="size-3" />
+      </button>
+    </span>
+  )
 }
 
 function RoleChip(props: RoleChipProps) {
@@ -534,22 +576,44 @@ function AssignMenu(props: AssignMenuProps) {
         <TooltipContent>Assign role</TooltipContent>
       </Tooltip>
       <DropdownMenuContent align="end" className="w-[300px] max-w-[calc(100vw-16px)]">
-        {roles.map(role => {
-          const holder = roleSlot(props.shown, role)
-          const isHere = held.includes(role)
-          return (
-            <DropdownMenuItem
-              key={role}
-              disabled={isHere}
-              onClick={() => send(assignEntryEvent(role, props.shown, props.entry))}
-            >
-              <span className="shrink-0">{roleLabels[role]}</span>
-              <span className="ml-auto min-w-0 truncate pl-3 text-xs text-muted-foreground">
-                {isHere ? 'Current' : holder === null ? 'Not set' : `Replaces ${holder.model}`}
-              </span>
-            </DropdownMenuItem>
-          )
-        })}
+        {props.entry.api === 'decision' ? (
+          <DropdownMenuItem
+            disabled={held.includes('decision')}
+            onClick={() =>
+              send(
+                ModelsEvents.AssignDecision({
+                  slot: { provider: props.entry.provider, model: props.entry.info.id },
+                }),
+              )
+            }
+          >
+            <span className="shrink-0">Decision</span>
+            <span className="ml-auto min-w-0 truncate pl-3 text-xs text-muted-foreground">
+              {held.includes('decision')
+                ? 'Current'
+                : props.shown.decision === null
+                  ? 'Falls back to Utility'
+                  : `Replaces ${props.shown.decision.model}`}
+            </span>
+          </DropdownMenuItem>
+        ) : (
+          llmRoles.map(role => {
+            const holder = roleSlot(props.shown, role)
+            const isHere = held.includes(role)
+            return (
+              <DropdownMenuItem
+                key={role}
+                disabled={isHere}
+                onClick={() => send(assignEntryEvent(role, props.shown, props.entry))}
+              >
+                <span className="shrink-0">{roleLabels[role]}</span>
+                <span className="ml-auto min-w-0 truncate pl-3 text-xs text-muted-foreground">
+                  {isHere ? 'Current' : holder === null ? 'Not set' : `Replaces ${holder.model}`}
+                </span>
+              </DropdownMenuItem>
+            )
+          })
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   )

@@ -10,6 +10,7 @@ const Draft = Schema.Struct({
   api: ProviderApi,
   baseUrl: Schema.String,
   apiKey: Schema.NullOr(Schema.String),
+  models: Schema.Array(Schema.String),
 })
 type Draft = typeof Draft.Type
 
@@ -100,6 +101,7 @@ export const ProvidersEvents = Machine.events({
     api: ProviderApi,
     baseUrl: Schema.String,
     apiKey: Schema.NullOr(Schema.String),
+    models: Schema.Array(Schema.String),
   },
   OpenKeyDialog: { id: Schema.String },
   CloseKeyDialog: {},
@@ -226,6 +228,7 @@ export const ProvidersMachine = Machine.make({
                   api: event.api,
                   baseUrl: event.baseUrl,
                   apiKey: event.apiKey,
+                  models: event.models,
                 },
               }),
             },

@@ -399,7 +399,7 @@ fn str_map(payload: &Value, key: &str) -> BTreeMap<String, String> {
 fn general_reply(store: &SqliteStorage) -> crate::Result<Value> {
     Ok(json!({
         "autoRespond": store.auto_respond()?,
-        "hasUtilityModel": store.utility_model()?.is_some(),
+        "hasUtilityModel": store.utility_model()?.is_some() || store.decision_model()?.is_some(),
     }))
 }
 
@@ -428,12 +428,20 @@ fn models_reply(store: &SqliteStorage) -> crate::Result<Value> {
     let utility = store
         .utility_model()?
         .map(|(m, r)| slot(m, r.unwrap_or(ReasoningLevel::Low)));
+    let decision = store
+        .decision_model()?
+        .map(|m| json!({"provider": m.provider.0, "model": m.model}));
     let mut providers = Vec::new();
     for p in store.providers()? {
+        let api = match p.api {
+            storage::ProviderApi::OpenAiResponses => "responses",
+            storage::ProviderApi::OpenAiCompletions => "completions",
+            storage::ProviderApi::Decision => "decision",
+        };
         let models: Vec<Value> = store.models(&p.id)?.into_iter().map(|m| json!({"id":m.id,"context":m.context_window,"limit":m.context_limit,"images":m.images})).collect();
-        providers.push(json!({"id":p.id.0,"models":models}));
+        providers.push(json!({"id":p.id.0,"api":api,"models":models}));
     }
-    Ok(json!({"main":main,"compaction":compaction,"utility":utility,"providers":providers}))
+    Ok(json!({"main":main,"compaction":compaction,"utility":utility,"decision":decision,"providers":providers}))
 }
 fn providers_reply(store: &SqliteStorage) -> crate::Result<Value> {
     let mut result = Vec::new();
@@ -444,6 +452,7 @@ fn providers_reply(store: &SqliteStorage) -> crate::Result<Value> {
             "api": match p.api {
                 storage::ProviderApi::OpenAiResponses => "responses",
                 storage::ProviderApi::OpenAiCompletions => "completions",
+                storage::ProviderApi::Decision => "decision",
             },
             "baseUrl": p.base_url,
             "apiKey": if p.has_api_key { "set" } else { "missing" },
@@ -676,7 +685,10 @@ async fn dispatch(
                 match request_type {
                     "models.setMain" => {
                         let (model, reasoning) = selected.ok_or_else(invalid)?;
-                        let model = crate::known_model(store, &model)?;
+                        let (provider, model) = crate::known_model_with_provider(store, &model)?;
+                        if provider.api.is_decision() {
+                            return Err("Decision models can only be used in the Decision slot".into());
+                        }
                         let mut settings = store.settings()?;
                         settings.default_model = Some(storage::ModelRef {
                             provider: model.provider,
@@ -704,6 +716,19 @@ async fn dispatch(
                         )?;
                     }
                 }
+                models_reply(store)
+            }
+            "models.setDecision" => {
+                let data = payload.get("slot").ok_or_else(invalid)?;
+                let model = if data.is_null() {
+                    "off".to_owned()
+                } else {
+                    let provider = field(data, "provider").map_err(|_| invalid())?;
+                    let model = field(data, "model").map_err(|_| invalid())?;
+                    format!("{provider}/{model}")
+                };
+                let _guard = ctx.settings_lock.lock().await;
+                crate::model_command(store, crate::ModelCommand::Decision { model })?;
                 models_reply(store)
             }
             "models.setContextLimit" | "models.setImages" => {
@@ -763,7 +788,28 @@ async fn dispatch(
                 let api = match get("api")? {
                     "responses" => storage::ProviderApi::OpenAiResponses,
                     "completions" => storage::ProviderApi::OpenAiCompletions,
+                    "decision" => storage::ProviderApi::Decision,
                     _ => return Err(invalid().into()),
+                };
+                let explicit_models: Vec<storage::DiscoveredModel> = match payload.get("models") {
+                    None | Some(Value::Null) => Vec::new(),
+                    Some(Value::Array(items)) => items
+                        .iter()
+                        .map(|v| {
+                            v.as_str()
+                                .map(str::trim)
+                                .ok_or_else(invalid)
+                                .map(str::to_owned)
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .filter(|m| !m.is_empty())
+                        .map(|id| storage::DiscoveredModel {
+                            id,
+                            context_window: None,
+                        })
+                        .collect(),
+                    Some(_) => return Err(invalid().into()),
                 };
                 if id.is_empty() || base_url.is_empty() {
                     return Err("ID and base URL are required".into());
@@ -774,16 +820,39 @@ async fn dispatch(
                 if store.providers()?.iter().any(|p| p.id.0 == id) {
                     return Err(format!("Provider {id} already exists").into());
                 }
-                url::Url::parse(base_url).map_err(|_| "Base URL is not a valid URL")?;
+                if !crate::run::valid_http_url(base_url) {
+                    return Err("Base URL must be a valid http(s) URL".into());
+                }
+                if api.is_decision()
+                    && !llm_rig::is_cloudflare_ai_url(base_url)
+                    && explicit_models.is_empty()
+                {
+                    return Err(
+                        "Enter at least one model ID for non-Cloudflare decision endpoints".into(),
+                    );
+                }
+                let provider_id = storage::ProviderId(id.into());
                 store.save_provider(
                     storage::Provider {
-                        id: storage::ProviderId(id.into()),
+                        id: provider_id.clone(),
                         api,
                         base_url: base_url.into(),
                         has_api_key: api_key.is_some(),
                     },
                     api_key,
                 )?;
+                if api.is_decision() {
+                    let seeded = if !explicit_models.is_empty() {
+                        explicit_models
+                    } else if llm_rig::is_cloudflare_ai_url(base_url) {
+                        llm_rig::cloudflare_decision_models()
+                    } else {
+                        Vec::new()
+                    };
+                    if !seeded.is_empty() {
+                        store.replace_models(&provider_id, seeded)?;
+                    }
+                }
                 providers_reply(store)
             }
             "providers.setKey" => {
@@ -813,8 +882,10 @@ async fn dispatch(
                 if request_type == "providers.refresh" {
                     crate::refresh_provider(store, &provider).await?;
                 } else {
+                    let _guard = ctx.settings_lock.lock().await;
                     let s = store.settings()?;
                     let utility = store.utility_model()?;
+                    let decision = store.decision_model()?;
                     if s.default_model
                         .as_ref()
                         .is_some_and(|m| m.provider == provider.id)
@@ -824,6 +895,9 @@ async fn dispatch(
                         || utility
                             .as_ref()
                             .is_some_and(|(m, _)| m.provider == provider.id)
+                        || decision
+                            .as_ref()
+                            .is_some_and(|m| m.provider == provider.id)
                     {
                         return Err(format!("Provider {id} is used by a model slot").into());
                     }

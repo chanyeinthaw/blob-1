@@ -93,6 +93,30 @@ pub trait Llm {
     ) -> Result<CompletionResponse, LlmError>;
 }
 
+/// One multiple-choice classification question for a System One / Jev-compatible
+/// decision model (such as Cloudflare Workers AI Clef / Clef-flash).
+#[derive(Debug, Clone, Copy)]
+pub struct ChoiceQuestion<'a> {
+    pub instructions: &'a str,
+    pub criteria: &'a [(&'a str, &'a str)],
+}
+
+#[derive(Debug, Clone)]
+pub struct ChoiceAnswer {
+    pub choice: String,
+    pub probability: f64,
+    pub usage: Option<Usage>,
+}
+
+#[async_trait::async_trait]
+pub trait DecisionModel: Send + Sync {
+    async fn choose(
+        &self,
+        state: &str,
+        question: ChoiceQuestion<'_>,
+    ) -> Result<ChoiceAnswer, LlmError>;
+}
+
 /// Resolves the model a role should use now. Callers resolve once at the
 /// start of a unit of work (a turn, a compaction pass, a one-shot call) and
 /// keep the returned client until it finishes; the next unit resolves again.

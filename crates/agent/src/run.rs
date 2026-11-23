@@ -31,6 +31,7 @@ struct Cache {
     summarizer: Option<Option<(Model, Option<u32>)>>,
     compactor: Option<Model>,
     utility: Option<Option<RecordedLlm>>,
+    decision: Option<Option<RecordedDecision>>,
     main_error: Option<String>,
 }
 
@@ -58,6 +59,7 @@ impl ModelFactory {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.store.settings()?.hash(&mut hasher);
         self.store.utility_model()?.hash(&mut hasher);
+        self.store.decision_model()?.hash(&mut hasher);
         for provider in self.store.providers()? {
             provider.hash(&mut hasher);
             self.store
@@ -95,6 +97,9 @@ impl harness::Models for ModelFactory {
         ];
         let search = search.unwrap_or("").to_lowercase();
         for provider in self.store.providers()? {
+            if provider.api.is_decision() {
+                continue;
+            }
             for model in self.store.models(&provider.id)? {
                 if !provider.id.0.to_lowercase().contains(&search)
                     && !model.id.to_lowercase().contains(&search)
@@ -210,6 +215,12 @@ impl harness::Models for ModelFactory {
             .into_iter()
             .find(|p| p.id.0 == provider_id)
             .ok_or_else(unknown)?;
+        if provider.api.is_decision() {
+            return Err(harness::HarnessError::Compaction(format!(
+                "decision provider {} cannot run chat or tasks",
+                provider.id.0
+            )));
+        }
         check_base_url(&provider).map_err(harness::HarnessError::Compaction)?;
         let model = self
             .store
@@ -274,6 +285,10 @@ impl harness::Models for ModelFactory {
                 Ok(utility) => cache.utility = Some(utility),
                 Err(error) => log(&error),
             }
+            match attempt.decision {
+                Ok(decision) => cache.decision = Some(decision),
+                Err(error) => log(&error),
+            }
         }
         let main = cache.main.clone().ok_or_else(|| {
             harness::HarnessError::Compaction(
@@ -283,6 +298,16 @@ impl harness::Models for ModelFactory {
                     .unwrap_or_else(|| "no main model".into()),
             )
         })?;
+        let utility_llm: Option<Arc<dyn llm::Llm + Send + Sync>> = cache
+            .utility
+            .clone()
+            .flatten()
+            .map(|u| Arc::new(u) as Arc<dyn llm::Llm + Send + Sync>);
+        let decision_model: Option<Arc<dyn llm::DecisionModel>> = cache
+            .decision
+            .clone()
+            .flatten()
+            .map(|d| Arc::new(d) as Arc<dyn llm::DecisionModel>);
         Ok(harness::Current {
             main: Model::main(
                 main.llm.clone(),
@@ -301,7 +326,7 @@ impl harness::Models for ModelFactory {
                     &main.selection.model,
                 )
             }),
-            utility: cache.utility.clone().flatten().map(harness::Utility::new),
+            utility: harness::Utility::from_parts(utility_llm, decision_model),
         })
     }
 }
@@ -359,6 +384,59 @@ impl llm::Llm for RecordedLlm {
             eprintln!("usage telemetry write failed: {error}");
         }
         Ok(response)
+    }
+}
+
+/// Wraps a `DecisionClient` to persist per-call token telemetry into SQLite.
+#[derive(Clone)]
+struct RecordedDecision {
+    inner: llm_rig::DecisionClient,
+    store: Arc<SqliteStorage>,
+    provider: Arc<str>,
+    model: Arc<str>,
+}
+
+impl RecordedDecision {
+    fn new(
+        inner: llm_rig::DecisionClient,
+        store: Arc<SqliteStorage>,
+        provider: &str,
+        model: &str,
+    ) -> Self {
+        Self {
+            inner,
+            store,
+            provider: Arc::from(provider),
+            model: Arc::from(model),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl llm::DecisionModel for RecordedDecision {
+    async fn choose(
+        &self,
+        state: &str,
+        question: llm::ChoiceQuestion<'_>,
+    ) -> std::result::Result<llm::ChoiceAnswer, llm::LlmError> {
+        let answer = self.inner.choose(state, question).await?;
+        let usage = answer.usage.unwrap_or_default();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if let Err(error) = self.store.record_usage(&UsageEvent {
+            ts,
+            kind: UsageKind::Utility,
+            provider: self.provider.to_string(),
+            model: self.model.to_string(),
+            input_tokens: usage.input,
+            cached_tokens: usage.cache_read,
+            output_tokens: usage.output,
+        }) {
+            eprintln!("usage telemetry write failed: {error}");
+        }
+        Ok(answer)
     }
 }
 
@@ -443,11 +521,11 @@ struct Attempt {
     summarizer: Resolve<Option<(Model, Option<u32>)>>,
     compactor: Resolve<Model>,
     utility: Resolve<Option<RecordedLlm>>,
+    decision: Resolve<Option<RecordedDecision>>,
 }
 
-fn check_base_url(provider: &Provider) -> Resolve<()> {
-    let base_url = &provider.base_url;
-    let valid = !base_url
+pub(crate) fn valid_http_url(base_url: &str) -> bool {
+    !base_url
         .chars()
         .any(|c| c.is_whitespace() || c.is_control())
         && url::Url::parse(base_url)
@@ -455,8 +533,12 @@ fn check_base_url(provider: &Provider) -> Resolve<()> {
             .unwrap_or(false)
         && base_url
             .parse::<axum::http::Uri>()
-            .is_ok_and(|uri| uri.host().is_some_and(|host| !host.is_empty()));
-    if valid {
+            .is_ok_and(|uri| uri.host().is_some_and(|host| !host.is_empty()))
+}
+
+fn check_base_url(provider: &Provider) -> Resolve<()> {
+    let base_url = &provider.base_url;
+    if valid_http_url(base_url) {
         Ok(())
     } else {
         Err(format!(
@@ -496,6 +578,12 @@ fn resolve_main(store: &SqliteStorage, settings: &storage::Settings) -> Resolve<
         return Err("no default model; run `agent model set <provider>/<model>`".into());
     };
     let (provider, model) = resolve_model(store, selected)?;
+    if provider.api.is_decision() {
+        return Err(format!(
+            "decision provider {} cannot be used as the main model",
+            provider.id.0
+        ));
+    }
     let key = api_key(store, &provider).map_err(|error| error.to_string())?;
     Ok(Working {
         llm: llm_rig::connect(&provider, &key, &model, settings.reasoning),
@@ -521,6 +609,12 @@ fn resolve_summarizer(
         return Ok(None);
     };
     let (provider, stored) = resolve_model(store, selected)?;
+    if provider.api.is_decision() {
+        return Err(format!(
+            "decision provider {} cannot be used as the compaction model",
+            provider.id.0
+        ));
+    }
     let key = api_key(store, &provider).map_err(|error| error.to_string())?;
     let llm = RecordedLlm::new(
         llm_rig::connect(
@@ -564,6 +658,12 @@ fn resolve_compactor(store: &Arc<SqliteStorage>, settings: &storage::Settings) -
         return Err("no default model; run `agent model set <provider>/<model>`".into());
     };
     let (provider, stored) = resolve_model(store, selected)?;
+    if provider.api.is_decision() {
+        return Err(format!(
+            "decision provider {} cannot be used as the compaction model",
+            provider.id.0
+        ));
+    }
     let key = api_key(store, &provider).map_err(|error| error.to_string())?;
     Ok(Model::main(
         llm_rig::connect(
@@ -588,7 +688,8 @@ fn resolve(store: &Arc<SqliteStorage>, cached: Option<&Working>) -> Attempt {
                 main: Err(error.clone()),
                 summarizer: Err(error.clone()),
                 compactor: Err(error.clone()),
-                utility: Err(error),
+                utility: Err(error.clone()),
+                decision: Err(error),
             };
         }
     };
@@ -606,6 +707,12 @@ fn resolve(store: &Arc<SqliteStorage>, cached: Option<&Working>) -> Attempt {
             return Ok(None);
         };
         let (provider, model) = resolve_model(store, &selected)?;
+        if provider.api.is_decision() {
+            return Err(format!(
+                "decision provider {} cannot be used as the utility LLM",
+                provider.id.0
+            ));
+        }
         let key = api_key(store, &provider).map_err(|error| error.to_string())?;
         Ok(Some(RecordedLlm::new(
             llm_rig::connect(
@@ -620,11 +727,31 @@ fn resolve(store: &Arc<SqliteStorage>, cached: Option<&Working>) -> Attempt {
             &model.id,
         )))
     })();
+    let decision = (|| -> Resolve<Option<RecordedDecision>> {
+        let Some(selected) = store.decision_model().map_err(|error| error.to_string())? else {
+            return Ok(None);
+        };
+        let (provider, model) = resolve_model(store, &selected)?;
+        if !provider.api.is_decision() {
+            return Err(format!(
+                "provider {} is not a decision provider",
+                provider.id.0
+            ));
+        }
+        let key = api_key(store, &provider).map_err(|error| error.to_string())?;
+        Ok(Some(RecordedDecision::new(
+            llm_rig::connect_decision(&provider, &key, &model),
+            store.clone(),
+            &provider.id.0,
+            &model.id,
+        )))
+    })();
     Attempt {
         main,
         summarizer,
         compactor,
         utility,
+        decision,
     }
 }
 
@@ -761,23 +888,7 @@ async fn decide_inline(
     history: &[messenger::Fetched],
     inbound: &messenger::Inbound,
 ) -> bool {
-    let history = history
-        .iter()
-        .map(|m| format!("{}: {}", m.author.name, m.text))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let quote = inbound.quote.as_ref().map_or("", |q| q.text.as_str());
-    let attachments = inbound
-        .attachments
-        .iter()
-        .map(|a| a.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let prompt = format!(
-        "Recent messages:\n{history}\nMessage: {}\nQuote: {quote}\nAttachments: {attachments}",
-        inbound.text
-    );
-    utility.generate("Decide how a team chat bot should answer this message. Reply 'inline' for a quick question, greeting or short answer; reply 'thread' if it will need work, several messages, files or a longer discussion. Reply with one word.", &prompt).await.is_ok_and(|answer| harness::parse_inline(&answer))
+    harness::decide_inline(utility, history, inbound).await
 }
 
 /// Returns any explicit interaction override matching the message location and
@@ -1545,9 +1656,10 @@ pub async fn serve(
                         false
                     }
                 };
-                let has_utility = match filter_store.utility_model() {
-                    Ok(model) => model.is_some(),
-                    Err(error) => {
+                let has_utility = match (filter_store.utility_model(), filter_store.decision_model())
+                {
+                    (Ok(u), Ok(d)) => u.is_some() || d.is_some(),
+                    (Err(error), _) | (_, Err(error)) => {
                         eprintln!("{error}");
                         false
                     }

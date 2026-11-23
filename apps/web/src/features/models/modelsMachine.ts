@@ -1,5 +1,5 @@
 import { Api } from '@blob-1/client/api'
-import { Models, type ModelInfo, Slot } from '@blob-1/contracts'
+import { DecisionSlot, Models, type ModelInfo, Slot } from '@blob-1/contracts'
 import { Machine } from '@typeonce/effect-machine'
 import { Array, Effect, Option, Schema } from 'effect'
 
@@ -36,6 +36,8 @@ const rootFields = {
   contextJobs: Schema.Array(ContextJob),
   /** Bumped on every confirmed Compaction save, so an older Main reply can't overwrite it. */
   compactionVersion: Schema.Finite,
+  /** Bumped on every confirmed Decision save, so an older Refresh reply can't overwrite it. */
+  decisionVersion: Schema.Finite,
 }
 const RootData = Schema.Struct(rootFields)
 type RootData = typeof RootData.Type
@@ -61,7 +63,7 @@ export const parseContextLimit = (input: string): number | null | undefined => {
 export const contextText = (context: number | null): string =>
   context === null ? '—' : context.toLocaleString('en-US')
 
-const sameSlot = (a: Slot | null, b: Slot | null): boolean =>
+const sameSlot = (a: Slot | DecisionSlot | null, b: Slot | DecisionSlot | null): boolean =>
   JSON.stringify(a) === JSON.stringify(b)
 
 const findInfo = (models: Models, provider: string, modelId: string): ModelInfo | undefined =>
@@ -94,7 +96,7 @@ const withLimit = (
   limit: number | null,
 ): Models => withModelInfo(models, provider, modelId, info => ({ ...info, limit }))
 
-type Role = 'main' | 'compaction' | 'utility'
+type Role = 'main' | 'compaction' | 'utility' | 'decision'
 
 /** A role reply owns that role's slot; preserves newer optimistic edits if shown moved on. */
 const confirmRole = <R extends Role>(
@@ -285,6 +287,13 @@ const setUtility = Effect.fn('ModelsSettings.setUtility')(function* (slot: Slot 
     .pipe(Effect.tapError(error => notify(error.message)))
 })
 
+const setDecision = Effect.fn('ModelsSettings.setDecision')(function* (slot: DecisionSlot | null) {
+  const api = yield* Api
+  return yield* api
+    .request('models.setDecision', { slot })
+    .pipe(Effect.tapError(error => notify(error.message)))
+})
+
 const setImages = Effect.fn('ModelsSettings.setImages')(function* (job: ImageJob) {
   const api = yield* Api
   return yield* api
@@ -308,7 +317,12 @@ export const ModelsStates = Machine.state({
   type: 'parallel',
   fields: rootFields,
   states: {
-    Sync: { states: { Idle: {}, Refreshing: {} } },
+    Sync: {
+      states: {
+        Idle: {},
+        Refreshing: { fields: { decisionVersion: Schema.Finite } },
+      },
+    },
     Main: {
       states: {
         Idle: {},
@@ -327,6 +341,12 @@ export const ModelsStates = Machine.state({
         Saving: { fields: { submitted: Schema.NullOr(Slot) } },
       },
     },
+    Decision: {
+      states: {
+        Idle: {},
+        Saving: { fields: { submitted: Schema.NullOr(DecisionSlot) } },
+      },
+    },
     Images: { states: { Idle: {}, Saving: {} } },
     Context: { states: { Idle: {}, Saving: {} } },
   },
@@ -337,6 +357,7 @@ export const ModelsEvents = Machine.events({
   AssignMain: { slot: Slot },
   AssignCompaction: { slot: Schema.NullOr(Slot) },
   AssignUtility: { slot: Schema.NullOr(Slot) },
+  AssignDecision: { slot: Schema.NullOr(DecisionSlot) },
   ToggleImages: { provider: Schema.String, modelId: Schema.String, images: Schema.Boolean },
   UpdateContext: { provider: Schema.String, modelId: Schema.String, value: Schema.String },
   FlushContext: { provider: Schema.String, modelId: Schema.String },
@@ -347,13 +368,22 @@ export const ModelsMachine = Machine.make({
   root: ModelsStates,
   events: ModelsEvents,
   input: ModelsInput,
-  effects: { fetchModels, setMain, setCompaction, setUtility, setImages, setContextLimit },
+  effects: {
+    fetchModels,
+    setMain,
+    setCompaction,
+    setUtility,
+    setDecision,
+    setImages,
+    setContextLimit,
+  },
 }).handle({
   root: ({ input }) => ({
     server: input,
     shown: input,
     roleStatuses: {},
     compactionVersion: 0,
+    decisionVersion: 0,
     contextDrafts: {},
     imageJobs: [],
     contextJobs: [],
@@ -399,7 +429,10 @@ export const ModelsMachine = Machine.make({
       states: {
         Idle: {
           on: {
-            Refresh: { target: 'Sync.Refreshing' },
+            Refresh: {
+              target: 'Sync.Refreshing',
+              data: ({ root }) => ({ decisionVersion: root.decisionVersion }),
+            },
           },
         },
         Refreshing: {
@@ -408,8 +441,12 @@ export const ModelsMachine = Machine.make({
             onDone: {
               target: 'Sync.Idle',
               update: 'root',
-              data: ({ root, output }) => {
+              data: ({ root, state, output }) => {
                 if (output === null) return { target: undefined, update: root }
+                const decisionStale = state.decisionVersion !== root.decisionVersion
+                const server: Models = decisionStale
+                  ? { ...output, decision: root.server.decision }
+                  : output
                 const shown: Models = {
                   providers: root.imageJobs.reduce(
                     (models, job) => withImages(models, job.provider, job.modelId, job.images),
@@ -430,8 +467,14 @@ export const ModelsMachine = Machine.make({
                     !sameSlot(root.shown.utility, root.server.utility)
                       ? root.shown.utility
                       : output.utility,
+                  decision:
+                    decisionStale ||
+                    root.roleStatuses['decision'] === 'Saving…' ||
+                    !sameSlot(root.shown.decision, root.server.decision)
+                      ? root.shown.decision
+                      : output.decision,
                 }
-                return { target: undefined, update: { ...root, server: output, shown } }
+                return { target: undefined, update: { ...root, server, shown } }
               },
             },
           },
@@ -648,6 +691,78 @@ export const ModelsMachine = Machine.make({
                       : root.shown.utility,
                   },
                   roleStatuses: { ...root.roleStatuses, utility: error.message },
+                },
+              }),
+            },
+          },
+        },
+      },
+    },
+    Decision: {
+      initial: { target: 'Decision.Idle' },
+      states: {
+        Idle: {
+          always: {
+            target: 'Decision.Saving',
+            guard: ({ root }) => !sameSlot(root.shown.decision, root.server.decision),
+            data: ({ root }) => ({ submitted: root.shown.decision }),
+          },
+          on: {
+            AssignDecision: {
+              target: 'Decision.Saving',
+              update: 'root',
+              data: ({ event, root }) => ({
+                target: { submitted: event.slot },
+                update: {
+                  ...root,
+                  shown: { ...root.shown, decision: event.slot },
+                  roleStatuses: { ...root.roleStatuses, decision: 'Saving…' },
+                },
+              }),
+            },
+          },
+        },
+        Saving: {
+          on: {
+            AssignDecision: {
+              update: 'root',
+              data: ({ event, root }) => ({
+                ...root,
+                shown: { ...root.shown, decision: event.slot },
+                roleStatuses: { ...root.roleStatuses, decision: 'Saving…' },
+              }),
+            },
+          },
+          invoke: {
+            src: 'setDecision',
+            input: ({ state }) => state.submitted,
+            onDone: {
+              target: 'Decision.Idle',
+              update: 'root',
+              data: ({ root, state, output }) => ({
+                target: undefined,
+                update: {
+                  ...root,
+                  ...confirmRole(root, 'decision', output, state.submitted),
+                  decisionVersion: root.decisionVersion + 1,
+                  roleStatuses: { ...root.roleStatuses, decision: 'Saved' },
+                },
+              }),
+            },
+            onFailure: {
+              target: 'Decision.Idle',
+              update: 'root',
+              data: ({ root, state, error }) => ({
+                target: undefined,
+                update: {
+                  ...root,
+                  shown: {
+                    ...root.shown,
+                    decision: sameSlot(root.shown.decision, state.submitted)
+                      ? root.server.decision
+                      : root.shown.decision,
+                  },
+                  roleStatuses: { ...root.roleStatuses, decision: error.message },
                 },
               }),
             },

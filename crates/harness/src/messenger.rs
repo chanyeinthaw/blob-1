@@ -599,9 +599,13 @@ impl Messengers {
             let _ = self.store.clear_pending_thread(destination);
         }
         if sent.created_thread {
-            if let (Some((place, prompt)), Some(utility)) =
-                (title_prompt, self.utility.as_ref().and_then(|u| u()))
-            {
+            if let (Some((place, prompt)), Some(utility)) = (
+                title_prompt,
+                self.utility
+                    .as_ref()
+                    .and_then(|u| u())
+                    .filter(|u| u.has_llm()),
+            ) {
                 let messenger = self
                     .messengers
                     .iter()

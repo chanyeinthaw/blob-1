@@ -76,20 +76,21 @@ Background workers spawned by the chat.
 
 ## Models
 
-- Code: `crates/agent/src/run.rs` (`setup`, `chat_harness`, `ModelFactory`), `crates/llm-rig/src/lib.rs`
-- Main model: `agent model set <provider>/<model>`, `agent reasoning set <level>`
-- Compaction model: `agent model compaction <provider>/<model> [--reasoning]`
-- Utility model: `agent model utility <provider>/<model> [--reasoning] | off`
+- Code: `crates/agent/src/run.rs` (`setup`, `chat_harness`, `ModelFactory`, `RecordedDecision`), `crates/llm/src/lib.rs` (`DecisionModel`), `crates/llm-rig/src/{lib,decision}.rs`
+- Main model: `agent model set <provider>/<model>`, `agent reasoning set <level>` (LLM providers only)
+- Compaction model: `agent model compaction <provider>/<model> [--reasoning]` (LLM providers only)
+- Utility model: `agent model utility <provider>/<model> [--reasoning] | off` (LLM providers only)
+- Decision model: `agent model decision <provider>/<model> | off` (`decision` providers only; optional fast classifier slot with automatic fallback to `utility`)
 - Per model: `agent model map`, `agent model context`, `agent model input <provider/model|provider> <text|image>`
-- Providers: `agent provider add [--no-key] | key set | key clear | list | remove`, `agent models refresh | list`
-- Tables: `providers`, `models`, `model_reasoning`, `model_images`, `settings`, `utility_model`
+- Providers: `agent provider add --api <responses|completions|decision> [--no-key] [--model <id>...] | key set | key clear | list | remove`, `agent models refresh | list` (`decision` providers use the generic System One / Jev wire format, auto-seed `@cf/cloudflare/clef-flash` and `@cf/cloudflare/clef` for Cloudflare Workers AI `/ai/run` URLs, and require at least one explicit `--model <id>` / model ID for non-Cloudflare decision endpoints; refresh preserves explicitly registered decision model IDs)
+- Tables: `providers`, `models`, `model_reasoning`, `model_images`, `settings`, `utility_model`, `decision_model`
 
-## Utility model
+## Utility & Decision models
 
-One-shot generation: one request, no tools, no memory, no session.
+One-shot generation and fast classification: one request, no tools, no memory, no session.
 
-- Code: `crates/harness/src/utility.rs` (`Utility::generate`, `decide_respond`, `parse_respond`, `parse_inline`)
-- Used by the shared pre-messenger **Auto-respond** gate (`settings.auto_respond`, default ON when a utility model is configured; toggled on the **General** tab at `/settings/general` or via `agent auto-respond show | on | off`; conservative in channels, more responsive in threads, silently drops `IGNORE` before typing/reactions; caches recent history in memory for actively participating channels/threads with 30m/2h TTL to avoid repeated Discord REST calls; both the addressed fast-lane and the unaddressed triage lane deliver the first message immediately when idle, and while a turn is active or work is queued for that place debounce bursts per place with a 1.5s quiet period, 6s max wait, and 10-message batch cap, emitting each admitted message unmerged with its own `reply`/`to` tokens), the reply-mode gate, and thread titles; without a utility model, all three are off
+- Code: `crates/harness/src/utility.rs` (`Utility::from_parts`, `Utility::generate`, `Utility::choose`, `decide_respond`, `decide_inline`, `parse_respond`, `parse_inline`)
+- Used by the shared pre-messenger **Auto-respond** gate (`settings.auto_respond`, default ON when a decision or utility model is configured; toggled on the **General** tab at `/settings/general` or via `agent auto-respond show | on | off`; conservative in channels with `P(RESPOND) >= 0.65` on decision models, more responsive in threads with `P(RESPOND) >= 0.50`, silently drops `IGNORE` before typing/reactions; caches recent history in memory for actively participating channels/threads with 30m/2h TTL to avoid repeated Discord REST calls; both the addressed fast-lane and the unaddressed triage lane deliver the first message immediately when idle, and while a turn is active or work is queued for that place debounce bursts per place with a 1.5s quiet period, 6s max wait, and 10-message batch cap, emitting each admitted message unmerged with its own `reply`/`to` tokens), the reply-mode gate (`decide_inline`), and thread titles (Utility LLM). Auto-respond and reply-mode prefer the **Decision** model when configured and fall back to **Utility** if unset or on error; without either model, Auto-respond and inline-vs-thread classification are off.
 
 ## Messengers (Discord)
 

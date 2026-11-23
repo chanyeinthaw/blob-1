@@ -100,7 +100,7 @@ function AutoRespondSection() {
             </p>
             {value.hasUtilityModel ? null : (
               <p className="mt-1 text-xs text-muted-foreground">
-                Requires a utility model.{' '}
+                Requires a decision or utility model.{' '}
                 <Link
                   to="/settings/models"
                   className="font-medium text-foreground underline underline-offset-2"

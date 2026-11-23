@@ -1,5 +1,8 @@
 use base64::Engine as _;
 use environment::ToolSpec;
+
+mod decision;
+pub use decision::{cloudflare_decision_models, is_cloudflare_ai_url, DecisionClient};
 use llm::{CompletionRequest, CompletionResponse, Llm, LlmError, ToolCallRequest, Usage};
 use regex::Regex;
 use rig_core::{
@@ -65,7 +68,7 @@ pub fn connect(provider: &Provider, api_key: &str, model: &Model, level: Reasoni
     let client = client(provider, api_key);
     let id = match provider.api {
         ProviderApi::OpenAiResponses => model.id.rsplit('/').next().unwrap_or(&model.id),
-        ProviderApi::OpenAiCompletions => &model.id,
+        ProviderApi::OpenAiCompletions | ProviderApi::Decision => &model.id,
     };
     let catalog = Catalog::builtin();
     let provider_id = ProviderId::catalog("openai").expect("OpenAI is in rig's catalog");
@@ -82,7 +85,7 @@ pub fn connect(provider: &Provider, api_key: &str, model: &Model, level: Reasoni
             rig.wire = rig.wire.with_facts(facts);
             RigLlm::new(rig)
         }
-        ProviderApi::OpenAiCompletions => {
+        ProviderApi::OpenAiCompletions | ProviderApi::Decision => {
             let mut rig = client.chat(&model.id);
             rig.wire = rig.wire.with_facts(facts);
             RigLlm::new(rig)
@@ -93,11 +96,18 @@ pub fn connect(provider: &Provider, api_key: &str, model: &Model, level: Reasoni
     llm
 }
 
+pub fn connect_decision(provider: &Provider, api_key: &str, model: &Model) -> DecisionClient {
+    DecisionClient::new(provider, api_key, model)
+}
+
 pub fn reasoning_levels(provider: &Provider, model: &Model) -> Option<Vec<ReasoningLevel>> {
+    if provider.api.is_decision() {
+        return None;
+    }
     let client = client(provider, "unused");
     let rig = match provider.api {
         ProviderApi::OpenAiResponses => RigLlm::new(client.responses(&model.id)),
-        ProviderApi::OpenAiCompletions => RigLlm::new(client.chat(&model.id)),
+        ProviderApi::OpenAiCompletions | ProviderApi::Decision => RigLlm::new(client.chat(&model.id)),
     };
     rig.model.spec()?;
     Some(supported_levels(&rig.model, model))
@@ -169,6 +179,12 @@ pub async fn discover(
     provider: &Provider,
     api_key: &str,
 ) -> Result<Vec<DiscoveredModel>, LlmError> {
+    if provider.api.is_decision() {
+        if is_cloudflare_ai_url(&provider.base_url) {
+            return Ok(cloudflare_decision_models());
+        }
+        return Ok(Vec::new());
+    }
     let listed = client(provider, api_key)
         .list_models()
         .await
@@ -230,6 +246,7 @@ impl Llm for RigLlm {
                         serde_json::Value::String(value.clone()),
                     );
                 }
+                ProviderApi::Decision => {}
             },
             None => {}
         }

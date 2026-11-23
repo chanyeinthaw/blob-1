@@ -412,6 +412,35 @@ impl ConfigStore for SqliteStorage {
         Ok(())
     }
 
+    fn decision_model(&self) -> Result<Option<ModelRef>, StoreError> {
+        self.lock()
+            .query_row(
+                "SELECT provider, model FROM decision_model WHERE id = 1",
+                [],
+                |row| {
+                    Ok(ModelRef {
+                        provider: ProviderId(row.get(0)?),
+                        model: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(backend)
+    }
+
+    fn set_decision_model(&self, model: Option<&ModelRef>) -> Result<(), StoreError> {
+        let connection = self.lock();
+        match model {
+            Some(model) => connection.execute(
+                "INSERT INTO decision_model (id, provider, model) VALUES (1, ?1, ?2) ON CONFLICT (id) DO UPDATE SET provider = excluded.provider, model = excluded.model",
+                params![model.provider.0, model.model],
+            ),
+            None => connection.execute("DELETE FROM decision_model WHERE id = 1", []),
+        }
+        .map_err(backend)?;
+        Ok(())
+    }
+
     fn settings(&self) -> Result<Settings, StoreError> {
         let (provider, model, reasoning, compaction_provider, compaction_model, compaction_reasoning) = self
             .lock()
@@ -502,6 +531,7 @@ fn provider_from_row(row: &Row) -> rusqlite::Result<Provider> {
         api: match api.as_str() {
             "openai-responses" => ProviderApi::OpenAiResponses,
             "openai-completions" => ProviderApi::OpenAiCompletions,
+            "decision" => ProviderApi::Decision,
             _ => {
                 return Err(rusqlite::Error::FromSqlConversionFailure(
                     1,
@@ -519,5 +549,6 @@ fn api_name(api: ProviderApi) -> &'static str {
     match api {
         ProviderApi::OpenAiResponses => "openai-responses",
         ProviderApi::OpenAiCompletions => "openai-completions",
+        ProviderApi::Decision => "decision",
     }
 }
