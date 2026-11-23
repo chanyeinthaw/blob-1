@@ -41,7 +41,7 @@ The bot is one chat that never ends. It coordinates and talks; tasks do the work
 
 - Code: `crates/harness/src/chat.rs` (`ChatHarness`, `CHAT_PROMPT`, `MESSENGER_PROMPT`), `crates/harness/src/prompt.rs`
 - Runs: a run ends when the agent is done. Task reports and reminders steer a live run or wake an idle agent (`resume`).
-- Input: every outside input is one XML element with escaped text: `<message>`, `<report>`, `<reminder>`, `<scheduled>`, `<checkin>`, `<event>`
+- Input: every outside input is one XML element with escaped text: `<message>` (carries `time="Day YYYY-MM-DD HH:MM <TZ>"` in `clock.timezone`, falling back to `UTC`, both on live arrival and `zoom(id, 1)`), `<report>`, `<reminder>`, `<scheduled>`, `<checkin>`, `<event>` (also carries `time="..."`)
 - Final reply `NO_UPDATES` ends a messenger turn silently.
 - Tools: `zoom`, `date`, `spawn`, `models`, `tasks`, `tell`, `stop`, `send` (when messengers are configured), plus calendar (`schedule`, `unschedule`, `schedules`) and watch (`watch`, `unwatch`, `watches`) tools; connected MCP servers are listed in the chat prompt so chat can delegate them to background tasks
 - Prompt caching: `ChatHarness` and `SessionHarness` pass a stable per-workspace/session `prompt_cache_key` on OpenAI Responses (`llm-rig`), and keeping MCP behind static `mcp_search` + `mcp_execute` in tasks avoids mutating the `tools` list mid-turn.

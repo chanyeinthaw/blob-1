@@ -147,6 +147,22 @@ pub fn validate_timezone(value: &str) -> Result<String> {
     Ok(tz.name().to_string())
 }
 
+/// Resolves the configured `clock.timezone` (falling back to `UTC`).
+pub(crate) fn current_timezone(config: &dyn ConfigStore) -> Tz {
+    config
+        .timezone()
+        .ok()
+        .and_then(|tz| tz.parse().ok())
+        .unwrap_or(chrono_tz::UTC)
+}
+
+/// Formats a UTC RFC 3339 timestamp in `tz` as `Mon 2026-11-23 21:45 Asia/Tokyo`.
+pub(crate) fn format_local_time(utc_rfc3339: &str, tz: Tz) -> Option<String> {
+    let dt = DateTime::parse_from_rfc3339(utc_rfc3339).ok()?;
+    let local = dt.with_timezone(&tz);
+    Some(format!("{} {tz}", local.format("%a %Y-%m-%d %H:%M")))
+}
+
 /// Computes the next check-in unix timestamp (seconds) from now, if valid.
 pub fn next_checkin_timestamp(config: &Checkin, timezone: &str) -> Option<i64> {
     let tz: Tz = timezone.parse().ok()?;
@@ -542,5 +558,66 @@ where
             };
             tokio::time::sleep(wait).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storage::{Meta, Person, Place};
+
+    #[test]
+    fn formats_local_time_and_attaches_to_rendered_inputs() {
+        let tokyo: Tz = "Asia/Tokyo".parse().unwrap();
+        let formatted = format_local_time("2026-11-23T12:45:09Z", tokyo).unwrap();
+        assert_eq!(formatted, "Mon 2026-11-23 21:45 Asia/Tokyo");
+
+        let utc_formatted = format_local_time("2026-11-23T12:45:09Z", chrono_tz::UTC).unwrap();
+        assert_eq!(utc_formatted, "Mon 2026-11-23 12:45 UTC");
+
+        // Plain CLI user message gets time="..."
+        let cli = storage::render_input(None, 1, "hi", Some(&formatted));
+        assert_eq!(
+            cli,
+            "<message time=\"Mon 2026-11-23 21:45 Asia/Tokyo\">\nhi\n</message>"
+        );
+
+        // Messenger <message> gets time="..." right after where="..."
+        let msg_meta = Meta::Message {
+            messenger: "discord".into(),
+            place: Place {
+                channel: "c1".into(),
+                thread: None,
+                dm: false,
+            },
+            message: "m1".into(),
+            author: Person {
+                id: "u1".into(),
+                name: "Chan".into(),
+            },
+            to: 7,
+            location: "#dev".into(),
+            earlier: None,
+            quote: None,
+            attachments: Vec::new(),
+            inline: false,
+            unaddressed: false,
+        };
+        let rendered_msg = storage::render_input(Some(&msg_meta), 42, "yo", Some(&formatted));
+        assert!(rendered_msg.starts_with(
+            "<message messenger=\"discord\" reply=\"m42\" to=\"d7\" author=\"u1\" author_name=\"Chan\" where=\"#dev\" time=\"Mon 2026-11-23 21:45 Asia/Tokyo\">"
+        ));
+
+        // <event> gets time="..." after for="..."
+        let ev_meta = Meta::Event {
+            source: "callback".into(),
+            name: "build".into(),
+            for_message: Some("m42".into()),
+        };
+        let rendered_ev = storage::render_input(Some(&ev_meta), 43, "ok", Some(&formatted));
+        assert_eq!(
+            rendered_ev,
+            "<event source=\"callback\" name=\"build\" for=\"m42\" time=\"Mon 2026-11-23 21:45 Asia/Tokyo\">\nok\n</event>"
+        );
     }
 }

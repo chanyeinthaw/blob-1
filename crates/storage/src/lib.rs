@@ -547,11 +547,17 @@ pub fn render_attachments(attachments: &[Attachment]) -> String {
         .collect()
 }
 
-pub fn render_input(meta: Option<&Meta>, i: u64, body: &str) -> String {
+pub fn render_input(meta: Option<&Meta>, i: u64, body: &str, time: Option<&str>) -> String {
     match meta {
-        Some(meta) => meta.render(i, body),
-        None => format!("<message>\n{}\n</message>", escape(body)),
+        Some(meta) => meta.render_at(i, body, time),
+        None => format!("<message{}>\n{}\n</message>", time_attribute(time), escape(body)),
     }
+}
+
+fn time_attribute(value: Option<&str>) -> String {
+    value.map_or_else(String::new, |value| {
+        format!(" time=\"{}\"", attribute(value))
+    })
 }
 
 fn for_attribute(value: &Option<String>) -> String {
@@ -562,6 +568,10 @@ fn for_attribute(value: &Option<String>) -> String {
 
 impl Meta {
     pub fn render(&self, i: u64, body: &str) -> String {
+        self.render_at(i, body, None)
+    }
+
+    pub fn render_at(&self, i: u64, body: &str, time: Option<&str>) -> String {
         if let Self::Checkin { time, home } = self {
             return format!(
                 "<checkin time=\"{}\"{}>\n{body}\n</checkin>",
@@ -593,10 +603,11 @@ impl Meta {
                 name,
                 for_message,
             } => format!(
-                "<event source=\"{}\" name=\"{}\"{}>\n{body}\n</event>",
+                "<event source=\"{}\" name=\"{}\"{}{}>\n{body}\n</event>",
                 attribute(source),
                 attribute(name),
-                for_attribute(for_message)
+                for_attribute(for_message),
+                time_attribute(time)
             ),
             Self::Message {
                 messenger,
@@ -610,11 +621,12 @@ impl Meta {
                 unaddressed,
                 ..
             } => format!(
-                "<message messenger=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}{}{}>\n{}{}{body}\n</message>",
+                "<message messenger=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}{}{}{}>\n{}{}{body}\n</message>",
                 attribute(messenger),
                 attribute(&author.id),
                 attribute(&author.name),
                 attribute(location),
+                time_attribute(time),
                 earlier.map_or_else(String::new, |n| format!(" earlier=\"{n}\"")),
                 if *inline { " mode=\"inline\"" } else { "" },
                 if *unaddressed {

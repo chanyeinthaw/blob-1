@@ -435,6 +435,16 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
         Ok(render(&s.chat, &s.nodes, u64::MAX, false))
     }
     pub fn zoom(&self, id: u64, n: u64, at: usize) -> Result<String, MemoryError> {
+        self.zoom_with_time(id, n, at, |_| None)
+    }
+
+    pub fn zoom_with_time(
+        &self,
+        id: u64,
+        n: u64,
+        at: usize,
+        format_time: impl Fn(&str) -> Option<String>,
+    ) -> Result<String, MemoryError> {
         let state = self.lock();
         if !n.is_power_of_two()
             || !id.is_multiple_of(n)
@@ -453,7 +463,10 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
             let more = m.text.chars().nth(next).is_some();
             let text = match m.kind {
                 Kind::Work if m.meta.is_none() => storage::escape(&text),
-                Kind::User | Kind::Work => storage::render_input(m.meta.as_ref(), id, &text),
+                Kind::User | Kind::Work => {
+                    let time = format_time(&m.date);
+                    storage::render_input(m.meta.as_ref(), id, &text, time.as_deref())
+                }
                 _ => text,
             };
             return Ok(format!(

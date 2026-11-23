@@ -220,6 +220,7 @@ pub(crate) struct Inner<E, S, M, F: Models> {
     pub share: Option<crate::ShareTools>,
     pub callback: Option<crate::CallbackTools>,
     pub mcp: Option<mcp::Mcp>,
+    pub config: Arc<dyn ConfigStore>,
     pub pulses: Mutex<Vec<(u64, tokio::task::Id)>>,
     pub schedule_gate: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
@@ -322,6 +323,7 @@ where
                 share: None,
                 callback: None,
                 mcp: None,
+                config: Arc::clone(&config),
                 pulses: Mutex::new(Vec::new()),
                 schedule_gate: None,
             }),
@@ -390,7 +392,14 @@ where
 
     fn append_user(&self, text: &str, meta: Option<&Meta>) -> Result<String, HarnessError> {
         let ids = self.inner.memory.append(Kind::User, text, meta)?;
-        Ok(storage::render_input(meta, ids[0], text))
+        let tz = crate::schedule::current_timezone(self.inner.config.as_ref());
+        let time = self
+            .inner
+            .memory
+            .date(ids[0])
+            .ok()
+            .and_then(|utc| crate::schedule::format_local_time(&utc, tz));
+        Ok(storage::render_input(meta, ids[0], text, time.as_deref()))
     }
 
     pub async fn run(&self, text: &str) -> Result<String, HarnessError> {
@@ -715,7 +724,12 @@ where
 {
     fn zoom(&self, id: ZoomId, n: u64, at: usize) -> Result<String, HarnessError> {
         match id {
-            ZoomId::Number(id) => Ok(self.memory.zoom(id, n, at)?),
+            ZoomId::Number(id) => {
+                let tz = crate::schedule::current_timezone(self.config.as_ref());
+                Ok(self
+                    .memory
+                    .zoom_with_time(id, n, at, |utc| crate::schedule::format_local_time(utc, tz))?)
+            }
             ZoomId::Name(name) => tasks::zoom(self, &name, at),
         }
     }
