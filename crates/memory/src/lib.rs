@@ -317,8 +317,9 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
         text: &str,
         meta: Option<&Meta>,
     ) -> Result<Vec<u64>, MemoryError> {
+        let redacted = storage::redact_callback_tokens(text);
         let mut state = self.lock();
-        let mut rest = text;
+        let mut rest = redacted.as_ref();
         let mut rows = Vec::new();
         loop {
             let end = rest

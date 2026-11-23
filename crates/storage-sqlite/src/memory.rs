@@ -88,10 +88,16 @@ impl MemoryStore for SqliteStorage {
             let meta = row
                 .meta
                 .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|error| StoreError::Backend(Box::new(error)))?;
-            tx.execute("INSERT INTO memory_messages (i, kind, text, size, date, more, meta) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![next, row.kind.as_str(), row.text, sql_integer(row.size)?, row.date, row.more, meta]).map_err(backend)?;
+                .map(|m| -> Result<String, StoreError> {
+                    let mut val = serde_json::to_value(m)
+                        .map_err(|error| StoreError::Backend(Box::new(error)))?;
+                    storage::redact_json_value(&mut val);
+                    serde_json::to_string(&val)
+                        .map_err(|error| StoreError::Backend(Box::new(error)))
+                })
+                .transpose()?;
+            let text = storage::redact_callback_tokens(&row.text);
+            tx.execute("INSERT INTO memory_messages (i, kind, text, size, date, more, meta) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![next, row.kind.as_str(), text.as_ref(), sql_integer(row.size)?, row.date, row.more, meta]).map_err(backend)?;
         }
         save_views(&tx, changes)?;
         tx.commit().map_err(backend)
@@ -150,12 +156,13 @@ impl MemoryStore for SqliteStorage {
     fn put_node(&self, node: MemoryNode, changes: &[ViewChange]) -> Result<(), StoreError> {
         let mut connection = self.lock();
         let tx = connection.transaction().map_err(backend)?;
+        let text = storage::redact_callback_tokens(&node.text);
         tx.execute(
             "INSERT INTO memory_nodes (l, i, text, size) VALUES (?1, ?2, ?3, ?4)",
             params![
                 node.l,
                 sql_integer(node.i)?,
-                node.text,
+                text.as_ref(),
                 sql_integer(node.size)?
             ],
         )

@@ -6,8 +6,8 @@ use environment_local::LocalEnvironment;
 use harness::{ChatHarness, EnvironmentPaths, Models};
 use messenger::Messenger;
 use storage::{
-    ConfigStore, McpStore, MessengerStore, Provider, ReasoningLevel, SkillStore, UsageEvent,
-    UsageKind, UsageStore,
+    CallbackStore, ConfigStore, McpStore, MessengerStore, Provider, ReasoningLevel, SkillStore,
+    UsageEvent, UsageKind, UsageStore,
 };
 use storage_sqlite::SqliteStorage;
 use tokio::signal::unix::{signal, SignalKind};
@@ -471,27 +471,61 @@ impl llm::Llm for Model {
     }
 }
 
-/// Shared handle to the running `ChatHarness` used by inbound webhooks.
+/// Shared handle to the running `ChatHarness` used by inbound webhooks and
+/// temporary callbacks. Uses an async `RwLock` so shutdown (`close()`) waits
+/// for any in-flight `PreparedInject` before stopping delivery, guaranteeing
+/// late callbacks receive 503 before consumption and accepted events drain.
 #[derive(Clone, Default)]
 pub struct LiveChat {
-    inner: Arc<std::sync::RwLock<Option<(Arc<Chat>, ModelFactory)>>>,
+    inner: Arc<tokio::sync::RwLock<Option<(Arc<Chat>, ModelFactory)>>>,
+    outbox: Arc<tokio::sync::Notify>,
+}
+
+/// Validated live chat handle holding a read lock across callback consumption
+/// and notification so shutdown cannot race between `prepare` and `wake`.
+pub struct PreparedInject {
+    guard: tokio::sync::OwnedRwLockReadGuard<Option<(Arc<Chat>, ModelFactory)>>,
+    outbox: Arc<tokio::sync::Notify>,
+}
+
+impl PreparedInject {
+    pub fn deliver(self, text: String, meta: Option<storage::Meta>) {
+        let (chat, _) = self.guard.as_ref().expect("LiveChat verified in prepare");
+        chat.steer_message(text, meta);
+    }
+
+    pub fn wake(self) {
+        self.outbox.notify_one();
+    }
 }
 
 impl LiveChat {
-    fn set(&self, harness: Arc<Chat>, models: ModelFactory) {
-        *self.inner.write().expect("live chat lock poisoned") = Some((harness, models));
+    async fn set(&self, harness: Arc<Chat>, models: ModelFactory) {
+        *self.inner.write().await = Some((harness, models));
     }
 
-    fn get(&self) -> Option<(Arc<Chat>, ModelFactory)> {
-        self.inner.read().expect("live chat lock poisoned").clone()
+    pub async fn close(&self) {
+        *self.inner.write().await = None;
     }
 
-    pub fn inject(&self, text: String, meta: Option<storage::Meta>) -> Result<()> {
-        let Some((chat, models)) = self.get() else {
-            return Err("agent is still starting".into());
+    fn outbox_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.outbox.clone()
+    }
+
+    pub async fn prepare(&self) -> Result<PreparedInject> {
+        let guard = self.inner.clone().read_owned().await;
+        let Some((_, models)) = guard.as_ref() else {
+            return Err("agent is not accepting events".into());
         };
         models.current()?;
-        chat.steer_message(text, meta);
+        Ok(PreparedInject {
+            guard,
+            outbox: self.outbox.clone(),
+        })
+    }
+
+    pub async fn inject(&self, text: String, meta: Option<storage::Meta>) -> Result<()> {
+        self.prepare().await?.deliver(text, meta);
         Ok(())
     }
 }
@@ -819,9 +853,10 @@ async fn chat_harness(
     )
     .with_share(harness::ShareTools::new(
         store.clone(),
-        store,
+        store.clone(),
         pinned_workspace,
     ))
+    .with_callback(harness::CallbackTools::new(store.clone(), store))
     .with_mcp(mcp))
 }
 
@@ -1613,7 +1648,7 @@ pub async fn serve(
                 }
             }),
     );
-    live_chat.set(Arc::clone(&harness), models.clone());
+    live_chat.set(Arc::clone(&harness), models.clone()).await;
     // The cheap per-message gate the gateway runs before any Discord REST
     // call: evaluate the access policy and exact channel/thread/user
     // interaction overrides, asking for parent resolution only when an
@@ -2115,24 +2150,51 @@ pub async fn serve(
     });
     let mut pending = std::collections::VecDeque::<(String, Option<storage::Meta>)>::new();
     let mut backoff = false;
-    tokio::select! {
+    let outbox_notify = live_chat.outbox_notify();
+    let loop_result: Result<()> = tokio::select! {
         result = async {
     loop {
+        // Register outbox listener BEFORE querying SQLite so a callback commit +
+        // `notify_one()` racing with an empty query can never miss a wakeup.
+        let outbox_wait = outbox_notify.notified();
+        tokio::pin!(outbox_wait);
+        outbox_wait.as_mut().enable();
+        let mut active_pending_event_id: Option<i64> = None;
         let next = if let Some(next) = pending.pop_front() {
             Some(next)
+        } else if let Some(ev) = store.next_pending_event()? {
+            if backoff {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            active_pending_event_id = Some(ev.id);
+            Some((
+                ev.payload,
+                Some(storage::Meta::Event {
+                    source: ev.source,
+                    name: ev.name,
+                    for_message: ev.for_token,
+                }),
+            ))
         } else {
             tokio::select! {
                 value = admitted_rx.recv() => match value {
                     Some(next) => { let (text, meta) = next?; Some((text, Some(meta))) },
                     None => return match listener.await? { Err(error) => Err(error.into()), Ok(()) => Err("discord listener stopped".into()) },
                 },
+                _ = &mut outbox_wait => continue,
                 _ = async {
                     if backoff {
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     }
                     harness.work().await
                 } => None,
-                _ = shutdown.changed() => { listener.abort(); admission.abort(); supervisor.abort(); return Ok(()); },
+                _ = shutdown.changed() => {
+                    live_chat.close().await;
+                    listener.abort();
+                    admission.abort();
+                    supervisor.abort();
+                    return Ok(());
+                },
             }
         };
         turn_active.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2152,8 +2214,14 @@ pub async fn serve(
                     turn_active.store(false, std::sync::atomic::Ordering::Relaxed);
                     backoff = result.is_err();
                     match result {
-                        Ok(answer) if !answer.is_empty() => println!("{answer}"),
-                        Ok(_) => {}
+                        Ok(answer) => {
+                            if let Some(ev_id) = active_pending_event_id {
+                                store.delete_pending_event(ev_id)?;
+                            }
+                            if !answer.is_empty() {
+                                println!("{answer}");
+                            }
+                        }
                         Err(error) => eprintln!("{error}"),
                     }
                     break;
@@ -2162,7 +2230,13 @@ pub async fn serve(
                     Some(next) => { let (text, meta) = next?; harness.steer_message(text, Some(meta)); },
                     None => return match listener.await? { Err(error) => Err(error.into()), Ok(()) => Err("discord listener stopped".into()) },
                 },
-                _ = shutdown.changed() => { listener.abort(); admission.abort(); supervisor.abort(); return Ok(()); },
+                _ = shutdown.changed() => {
+                    live_chat.close().await;
+                    listener.abort();
+                    admission.abort();
+                    supervisor.abort();
+                    return Ok(());
+                },
             }
         }
         messengers.quiet();
@@ -2178,7 +2252,9 @@ pub async fn serve(
     }
         } => result,
         _ = harness.run_schedules() => unreachable!(),
-    }
+    };
+    live_chat.close().await;
+    loop_result
 }
 
 #[cfg(test)]

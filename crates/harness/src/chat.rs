@@ -56,10 +56,12 @@ When tool calls do not depend on each other, make them together in one response 
 
 # Tasks
 
-You coordinate and talk; tasks do the work. You have no file, command or web tools, so anything that touches files, commands, the web or the machine goes to a task. Tasks have:
+You coordinate and talk; tasks do the work. You have no file, command, web, share, messenger lookup or MCP tools, so anything that needs those goes to a task. Tasks have:
 - read, write and edit for files, and bash for commands, in the working directory
 - read-only zoom and date on your memory
-- the skills listed below, which they load themselves
+- read-only messenger lookup (message, history, search, participants; never send)
+- share for creating public links to files or long writeups (when a public URL is configured)
+- the skills and MCP servers listed below
 
 A task knows only what you tell it and what it finds in your memory. Brief it like a capable teammate: the goal, what is already known or decided, the paths, ids or tokens it needs, and what to put in its report. Name a skill when one fits. Ask for a short report with the findings that matter, since the report is what lands in your memory.
 
@@ -75,15 +77,15 @@ People on messengers only see what you send. Messenger messages have a <message 
 
 Always answer DMs, mentions and replies to you with at least one send. For group-chat messages marked unaddressed="true", people may be talking to each other rather than to you: decide first whether to reply to that message. Chime in when it is aimed at you, continues an exchange with you, or asks for something you should help with; otherwise skip sending a reply to it.
 
-For a message you are answering that has no text or refers to something you have not seen, read recent messages with history first, then answer what was asked, or ask what they need if it is still unclear.
+For a message you are answering that has no text or refers to something you have not seen, spawn a task with the to token to read recent messages with history first (tell it to pass channel: true when the preceding context is in a thread's parent channel, and briefly tell the person you are checking if needed), or ask what they need if it is still unclear.
 
-Write plain, unescaped text in send. Send with reply to answer the message; send with to to post plainly in that conversation. You may send any number of messages per turn. Several people and conversations can be active, so pick the right token. Talk like a human teammate. Keep each send at most 300 characters. For a short multi-line answer, a few sends are fine. To share generated images, screenshots, charts, or small files directly inline in chat, pass their relative workspace paths in send's files array (up to 10 files). For long text responses (reports, tables, multi-section writeups, large code blocks), call share with content (or path for a file a task already wrote in the workspace), defaulting to Markdown unless the user asks for HTML or another format, then send a concise summary with the link instead of spamming many sends. If share is unavailable (for example, no public URL is configured), fall back to splitting the reply across a few send calls. Mention people by user id with mention; find ids with participants.
+Write plain, unescaped text in send. Send with reply to answer the message; send with to to post plainly in that conversation. You may send any number of messages per turn. Several people and conversations can be active, so pick the right token. Talk like a human teammate. Keep each send at most 300 characters. For a short multi-line answer, a few sends are fine. To share generated images, screenshots, charts, or small files directly inline in chat, pass their relative workspace paths in send's files array (up to 10 files). For long text responses (reports, tables, multi-section writeups, large code blocks), spawn a task to write the file and call share (defaulting to Markdown unless the user asks for HTML or another format), then send a concise summary with the link from its report instead of spamming many sends. If share is unavailable (for example, no public URL is configured), attach the file path the task wrote using send's files array (or fall back to splitting a concise reply across a few send calls). Mention people by user id with mention when known, or spawn a task to look them up with participants.
 
 When you answer a message marked mode="inline", answer inline with reply. If an inline exchange turns into real work, send with thread: true to continue in a thread.
 
-A reply includes the referenced message as <quote>. Use message to read a linked message or one by id. Messages, quotes and lookup results can carry <attachment name type size url/> elements. You cannot download files yourself. Spawn a task with the URLs and what to do; tell it to download them immediately, because links expire in about a day, to a new path it chooses under the working directory (never one built from the attachment name, which is only a label), with curl --fail --location --output '<path>' '<url>', and only then read or process the files and report what matters. For images, the chosen path must end with an extension matching the attachment type (e.g. .png for image/png); when the type is missing, the task identifies the downloaded file from its bytes (e.g. with file) and renames it to the matching extension before reading, so read can show it the image. If its model cannot view images, spawn it on one that can; models lists image support.
+A reply includes the referenced message as <quote>. Spawn a task to read a linked message or one by id with message. Messages, quotes and lookup results can carry <attachment name type size url/> elements. You cannot download files yourself. Spawn a task with the URLs and what to do; tell it to download them immediately, because links expire in about a day, to a new path it chooses under the working directory (never one built from the attachment name, which is only a label), with curl --fail --location --output '<path>' '<url>', and only then read or process the files and report what matters. For images, the chosen path must end with an extension matching the attachment type (e.g. .png for image/png); when the type is missing, the task identifies the downloaded file from its bytes (e.g. with file) and renames it to the matching extension before reading, so read can show it the image. If its model cannot view images, spawn it on one that can; models lists image support.
 
-Tasks can also read messengers: message, history, search and participants, never send. For a quick look at recent context, call history yourself. For anything longer, like paging far back, checking several conversations, or finding what was decided about something, spawn a task with the question and the to tokens of the conversations involved, or the messenger name when it must look across a whole messenger, and send people the answer from its report. When you delegate, briefly tell the person you are on it.
+Tasks have read-only messenger lookup tools: message, history, search and participants, never send. When you need earlier messages, linked messages, conversation search or participant user ids, spawn a task with the question and the to tokens of the conversations involved (or the messenger name when it must look across a whole messenger), briefly tell the person you are on it, and send the answer from its report.
 
 Once every message that needs a reply has been answered and nothing else remains to report, end with exactly NO_UPDATES."#;
 
@@ -216,8 +218,8 @@ pub(crate) struct Inner<E, S, M, F: Models> {
     pub notify: Notify,
     pub messengers: Option<crate::Messengers>,
     pub share: Option<crate::ShareTools>,
+    pub callback: Option<crate::CallbackTools>,
     pub mcp: Option<mcp::Mcp>,
-    pub mcp_session: Option<Arc<mcp::SessionTools>>,
     pub pulses: Mutex<Vec<(u64, tokio::task::Id)>>,
     pub schedule_gate: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
@@ -318,8 +320,8 @@ where
                 notify: Notify::new(),
                 messengers: None,
                 share: None,
+                callback: None,
                 mcp: None,
-                mcp_session: None,
                 pulses: Mutex::new(Vec::new()),
                 schedule_gate: None,
             }),
@@ -340,6 +342,13 @@ where
         self
     }
 
+    pub fn with_callback(mut self, callback: crate::CallbackTools) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("unshared chat")
+            .callback = Some(callback);
+        self
+    }
+
     /// Schedules and check-ins wait while `ready` is false; due jobs then fire late.
     pub fn with_schedule_gate(mut self, ready: impl Fn() -> bool + Send + Sync + 'static) -> Self {
         Arc::get_mut(&mut self.inner)
@@ -350,7 +359,6 @@ where
 
     pub fn with_mcp(mut self, mcp: mcp::Mcp) -> Self {
         let inner = Arc::get_mut(&mut self.inner).expect("unshared chat");
-        inner.mcp_session = Some(Arc::new(mcp::SessionTools::new(mcp.clone())));
         inner.mcp = Some(mcp);
         self
     }
@@ -521,7 +529,7 @@ where
 
     async fn turn_loop(&self, text: &str, view: String) -> Result<String, HarnessError> {
         // The turn keeps the model it starts on; the next turn resolves again.
-        let (llm, _, selection) = self.inner.models.connect(None, None)?;
+        let (llm, _, _) = self.inner.models.connect(None, None)?;
         let skills = self.inner.environment.skill_catalog().await?;
         let mcp_servers = match &self.inner.mcp {
             Some(mcp) => mcp.describe().await,
@@ -546,13 +554,6 @@ where
         tools.extend_from_slice(crate::watch::TOOLS);
         if self.inner.messengers.is_some() {
             tools.push(crate::messenger::SEND);
-            tools.extend_from_slice(crate::messenger::LOOKUP);
-        }
-        if self.inner.share.is_some() {
-            tools.push(crate::share::TOOL);
-        }
-        if let Some(mcp) = &self.inner.mcp_session {
-            tools.extend(mcp.specs());
         }
         let cache_key = crate::prompt_cache_key("chat", &self.inner.paths.workspace, "");
         loop {
@@ -623,46 +624,27 @@ where
                 });
             }
             for call in response.tool_calls {
+                let logged_args = storage::redact_json_str(&call.arguments);
                 self.inner.memory.append(
                     Kind::Tool,
-                    &format!("{} {}", call.name, call.arguments),
+                    &format!("{} {}", call.name, logged_args),
                     None,
                 )?;
-                let (mut content, mut images) = match self.execute(&call).await {
+                let content = match self.execute(&call).await {
                     Ok(result) => result,
-                    Err(error) => (format!("error: {error}"), Vec::new()),
+                    Err(error) => format!("error: {error}"),
                 };
-                let echo = if images.is_empty() {
-                    content.clone()
-                } else {
-                    let echo = format!("{content}\n[{} image(s) omitted]", images.len());
-                    if !selection.images {
-                        images.clear();
-                        content = echo.clone();
-                    }
-                    echo
-                };
-                let clip_live = !matches!(
-                    call.name.as_str(),
-                    "zoom" | "history" | "search" | "mcp_search"
-                );
-                let clip_echo = !matches!(call.name.as_str(), "zoom" | "history" | "search");
-                let content = if clip_live {
-                    memory::clip_tool_output(&content)
-                } else {
+                let content = if call.name == "zoom" {
                     content
-                };
-                let echo = if clip_echo {
-                    memory::clip_tool_output(&echo)
                 } else {
-                    echo
+                    memory::clip_tool_output(&content)
                 };
-                self.inner.memory.append(Kind::Echo, &echo, None)?;
+                self.inner.memory.append(Kind::Echo, &content, None)?;
                 messages.push(Message::ToolResult {
                     id: call.id,
                     name: call.name,
                     content,
-                    images,
+                    images: Vec::new(),
                 });
             }
         }
@@ -671,24 +653,7 @@ where
     async fn execute(
         &self,
         call: &crate::ToolCallRequest,
-    ) -> Result<(String, Vec<storage::Image>), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(mcp) = &self.inner.mcp_session {
-            if let Some(result) = mcp.execute(&call.name, &call.arguments).await {
-                let outcome =
-                    result.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-                return Ok((
-                    outcome.content,
-                    outcome
-                        .images
-                        .into_iter()
-                        .map(|image| storage::Image {
-                            mime: image.mime,
-                            data: image.data,
-                        })
-                        .collect(),
-                ));
-            }
-        }
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let content = match call.name.as_str() {
             "watch" | "unwatch" | "watches" => crate::watch::execute(
                 &self.inner.store,
@@ -735,23 +700,9 @@ where
                     .send(&call.arguments)
                     .await?
             }
-            "message" | "history" | "search" | "participants" => {
-                self.inner
-                    .messengers
-                    .as_ref()
-                    .ok_or("messengers not configured")?
-                    .lookup(&call.name, &call.arguments)
-                    .await?
-            }
-            "share" => self
-                .inner
-                .share
-                .as_ref()
-                .ok_or("share tool not configured")?
-                .execute(&call.arguments)?,
             _ => return Err(format!("unknown tool: {}", call.name).into()),
         };
-        Ok((content, Vec::new()))
+        Ok(content)
     }
 }
 

@@ -38,8 +38,17 @@ Sharing long outputs: when your task produces a long report, document,
 or generated file meant for the user, write it to the workspace (prefer
 Markdown unless another format was asked for), call share to get a
 public link, and include that link in your report. If share is
-unavailable (for example, no public URL is configured), include the key
-findings directly in your report instead."#;
+unavailable (for example, no public URL is configured), include the
+relative workspace file path and the key findings in your report so
+the main agent can attach the file or summarize it.
+
+Async callbacks: when you start external work that finishes later (a
+remote job, external agent, build, or script) and need to wake the main
+agent with the result, call callback to create a temporary webhook URL
+(default one-shot, 24h expiry; pass the originating reply/destination
+token in for when known) and have the external process HTTP POST its
+result to that URL. If callback is unavailable (no public URL is
+configured), note that in your report."#;
 
 /// `mcp` holds `(id, one-line description)` for each enabled MCP server;
 /// empty when no server is configured.
@@ -53,6 +62,18 @@ fn mcp_section(mcp: &[(String, String)]) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
     Some(format!("MCP servers provide extra tools, resources and prompts. Call mcp_search {{server?, query?}} to find a server's tools and their JSON schemas, then call mcp_execute {{server, tool, arguments?}} to run them. mcp_resources {{server?, query?}} and mcp_read {{server, uri}} cover resources; mcp_prompts {{server?, query?}} and mcp_prompt {{server, name, arguments?}} cover prompts.\n\n{servers}"))
+}
+
+fn mcp_section_for_chat(mcp: &[(String, String)]) -> Option<String> {
+    if mcp.is_empty() {
+        return None;
+    }
+    let servers = mcp
+        .iter()
+        .map(|(id, description)| format!("- {id}: {description}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!("Tasks can use these connected MCP servers; name the relevant server in the task when it fits:\n\n{servers}"))
 }
 
 pub fn build(workspace: &Path, skills: &[SkillEntry], mcp: &[(String, String)]) -> String {
@@ -100,7 +121,7 @@ pub fn build_chat(workspace: &Path, skills: &[SkillEntry], mcp: &[(String, Strin
             .join("\n");
         sections.push(format!("Tasks can load these skills; name the skill in the task when it fits.\n\n<available_skills>\n{entries}\n</available_skills>"));
     }
-    if let Some(section) = mcp_section(mcp) {
+    if let Some(section) = mcp_section_for_chat(mcp) {
         sections.push(section);
     }
     sections.join("\n\n")

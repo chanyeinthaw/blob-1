@@ -185,11 +185,16 @@ impl SqliteStorage {
                         id, name, content, ..
                     } => ("tool_result", content, Some(id), Some(name), None),
                 };
+                let content = if role == "tool_call" {
+                    storage::redact_json_str(content)
+                } else {
+                    storage::redact_callback_tokens(content)
+                };
                 insert.execute(params![
                     session.id.0,
                     position as i64,
                     role,
-                    content,
+                    content.as_ref(),
                     tool_call_id,
                     tool_name,
                     details
@@ -225,9 +230,10 @@ impl SessionStore for SqliteStorage {
         if inserted == 0 {
             return Ok(false);
         }
+        let redacted = storage::redact_callback_tokens(text);
         tx.execute(
             "INSERT INTO messages (session_id, position, role, content) VALUES (?1, 0, 'user', ?2)",
-            params![id, text],
+            params![id, redacted.as_ref()],
         )
         .map_err(backend)?;
         tx.execute(

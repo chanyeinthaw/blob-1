@@ -103,6 +103,25 @@ CREATE TABLE IF NOT EXISTS webhooks (
     last_triggered_at INTEGER
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS callbacks (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    token_hash BLOB NOT NULL UNIQUE,
+    for_token TEXT,
+    remaining_uses INTEGER NOT NULL CHECK (remaining_uses > 0),
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS pending_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    name TEXT NOT NULL,
+    for_token TEXT,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS providers (
     id TEXT PRIMARY KEY,
     api TEXT NOT NULL CHECK (api IN ('openai-responses', 'openai-completions', 'decision')),

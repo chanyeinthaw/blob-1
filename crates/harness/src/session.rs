@@ -82,6 +82,7 @@ pub struct SessionHarness<L, E, S> {
     memory_tools: Option<Arc<dyn MemoryTools>>,
     lookup_tools: Option<crate::Messengers>,
     share_tools: Option<crate::ShareTools>,
+    callback_tools: Option<crate::CallbackTools>,
     mcp_tools: Option<Arc<SessionTools>>,
     observer: Option<Arc<dyn Fn(Step) + Send + Sync>>,
     summarizer: Option<Arc<Summarizer<L>>>,
@@ -104,6 +105,7 @@ where
             memory_tools: None,
             lookup_tools: None,
             share_tools: None,
+            callback_tools: None,
             mcp_tools: None,
             observer: None,
             summarizer: None,
@@ -127,6 +129,11 @@ where
 
     pub fn with_share_tools(mut self, tools: crate::ShareTools) -> Self {
         self.share_tools = Some(tools);
+        self
+    }
+
+    pub fn with_callback_tools(mut self, tools: crate::CallbackTools) -> Self {
+        self.callback_tools = Some(tools);
         self
     }
 
@@ -205,6 +212,9 @@ where
         }
         if self.share_tools.is_some() {
             tools.push(crate::share::TOOL);
+        }
+        if self.callback_tools.is_some() {
+            tools.push(crate::callback::TOOL);
         }
         if let Some(mcp) = &self.mcp_tools {
             tools.extend(mcp.specs());
@@ -358,6 +368,12 @@ where
                     .filter(|_| call.name == "share")
                 {
                     share.execute(&call.arguments).map_err(|e| e.to_string())
+                } else if let Some(callback) = self
+                    .callback_tools
+                    .as_ref()
+                    .filter(|_| call.name == "callback")
+                {
+                    callback.execute(&call.arguments).map_err(|e| e.to_string())
                 } else if let Some(result) = match &self.mcp_tools {
                     Some(mcp) => mcp.execute(&call.name, &call.arguments).await,
                     None => None,

@@ -25,9 +25,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use storage::{
-    Checkin, CheckinStore, ConfigStore, McpServer, McpStore, McpTransport, MessengerStore,
-    PublicFileStore, ReasoningLevel, ScheduleStore, UsageStore, WatchStore, WebAuthStore,
-    WebhookStore,
+    CallbackStore, Checkin, CheckinStore, ConfigStore, McpServer, McpStore, McpTransport,
+    MessengerStore, PublicFileStore, ReasoningLevel, ScheduleStore, UsageStore, WatchStore,
+    WebAuthStore, WebhookStore,
 };
 use storage_sqlite::SqliteStorage;
 
@@ -130,6 +130,7 @@ pub async fn serve(
         .route("/ws", get(ws))
         .route("/p/{id}", get(public_file))
         .route("/p/{id}/{name}", get(public_file_named))
+        .route("/hooks/cb/{token}", post(inbound_callback))
         .route("/hooks/{token}", post(inbound_webhook))
         .fallback(assets)
         .with_state(store);
@@ -1715,13 +1716,18 @@ async fn inbound_webhook(
     } else {
         text
     };
-    if let Err(error) = ctx.live_chat.inject(
-        payload,
-        Some(storage::Meta::Event {
-            source: "webhook".into(),
-            name: hook.name,
-        }),
-    ) {
+    if let Err(error) = ctx
+        .live_chat
+        .inject(
+            payload,
+            Some(storage::Meta::Event {
+                source: "webhook".into(),
+                name: hook.name,
+                for_message: None,
+            }),
+        )
+        .await
+    {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "ok": false, "error": error.to_string() })),
@@ -1730,6 +1736,54 @@ async fn inbound_webhook(
     }
     let _ = ctx.store.touch_webhook(&hook.id, now());
     (StatusCode::ACCEPTED, Json(json!({ "ok": true }))).into_response()
+}
+
+async fn inbound_callback(
+    State(ctx): State<Context>,
+    AxumPath(token): AxumPath<String>,
+    body: Body,
+) -> Response {
+    let token_hash = Sha256::digest(token.as_bytes());
+    match ctx.store.has_active_callback(&token_hash, now()) {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    let bytes = match axum::body::to_bytes(body, MAX_WEBHOOK_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let text = String::from_utf8_lossy(&bytes).trim().to_owned();
+    let payload = if text.is_empty() {
+        "(empty payload)".to_owned()
+    } else {
+        text
+    };
+    // Validate live chat readiness BEFORE consuming a one-shot callback so a
+    // transient 503 or shutdown never burns the caller's token. Once consumed,
+    // the event is durably committed to `pending_events` in the same SQLite
+    // transaction before returning 202 Accepted, surviving crashes or restarts.
+    let prepared = match ctx.live_chat.prepare().await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "ok": false, "error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    let cb = match ctx.store.consume_callback(&token_hash, now(), &payload) {
+        Ok(Some(cb)) => cb,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    prepared.wake();
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "ok": true, "remainingUses": cb.remaining_uses })),
+    )
+        .into_response()
 }
 
 async fn assets(uri: Uri) -> Response {
@@ -1975,6 +2029,56 @@ mod public_file_tests {
         )
         .await;
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
+
+        // Temporary callback: unknown -> 404, oversized -> 413, 503 does not burn token, expired -> 404.
+        let cb_token = "cb-secret-token";
+        let cb_hash = Sha256::digest(cb_token.as_bytes());
+        let ts = now();
+        store
+            .create_callback("cb1", "async-job", &cb_hash, Some("m17"), 1, ts + 600, ts)
+            .unwrap();
+        assert_eq!(
+            inbound_callback(State(ctx.clone()), AxumPath("wrong".into()), Body::from("hi"))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let big = vec![b'a'; MAX_WEBHOOK_BODY_BYTES + 1];
+        assert_eq!(
+            inbound_callback(State(ctx.clone()), AxumPath(cb_token.into()), Body::from(big))
+                .await
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        // LiveChat not attached -> 503 AND callback remains unconsumed.
+        assert_eq!(
+            inbound_callback(
+                State(ctx.clone()),
+                AxumPath(cb_token.into()),
+                Body::from("done")
+            )
+            .await
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(store.has_active_callback(&cb_hash, now()).unwrap());
+
+        // Expired callback -> 404.
+        let exp_token = "cb-expired-token";
+        let exp_hash = Sha256::digest(exp_token.as_bytes());
+        store
+            .create_callback("cb2", "old-job", &exp_hash, None, 1, ts - 1, ts - 60)
+            .unwrap();
+        assert_eq!(
+            inbound_callback(
+                State(ctx.clone()),
+                AxumPath(exp_token.into()),
+                Body::from("late")
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

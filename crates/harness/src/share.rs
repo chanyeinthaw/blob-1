@@ -127,7 +127,7 @@ impl PinnedWorkspace {
     }
 }
 
-/// Shared handle for the `share` tool, usable from both chat and background tasks.
+/// Shared handle for the `share` tool used by background tasks.
 #[derive(Clone)]
 pub struct ShareTools {
     files: Arc<dyn PublicFileStore>,

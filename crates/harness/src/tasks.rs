@@ -442,6 +442,9 @@ where
     if let Some(share) = &inner.share {
         session = session.with_share_tools(share.clone());
     }
+    if let Some(callback) = &inner.callback {
+        session = session.with_callback_tools(callback.clone());
+    }
     if let Some(mcp) = &inner.mcp {
         session = session.with_mcp_tools(Arc::new(mcp::SessionTools::new(mcp.clone())));
     }

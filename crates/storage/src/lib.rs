@@ -472,6 +472,8 @@ pub enum Meta {
     Event {
         source: String,
         name: String,
+        #[serde(rename = "for", default, skip_serializing_if = "Option::is_none")]
+        for_message: Option<String>,
     },
     Message {
         #[serde(alias = "interface")]
@@ -586,10 +588,15 @@ impl Meta {
                 "<reminder task=\"{}\" running=\"{}\" last_activity=\"{}\"{}>\n{body}\n</reminder>",
                 attribute(task), attribute(running), attribute(last_activity), for_attribute(for_message)
             ),
-            Self::Event { source, name } => format!(
-                "<event source=\"{}\" name=\"{}\">\n{body}\n</event>",
+            Self::Event {
+                source,
+                name,
+                for_message,
+            } => format!(
+                "<event source=\"{}\" name=\"{}\"{}>\n{body}\n</event>",
                 attribute(source),
-                attribute(name)
+                attribute(name),
+                for_attribute(for_message)
             ),
             Self::Message {
                 messenger,
@@ -630,7 +637,7 @@ impl Meta {
             Self::Scheduled { id, .. } => format!("scheduled {id}"),
             Self::Report { task, status, .. } => format!("task {task}, {}", status.as_str()),
             Self::Reminder { task, .. } => format!("reminder for task {task}"),
-            Self::Event { source, name } => format!("{source} {name}"),
+            Self::Event { source, name, .. } => format!("{source} {name}"),
             Self::Message {
                 messenger,
                 author,
@@ -1552,5 +1559,532 @@ impl<T: WebhookStore + ?Sized> WebhookStore for Arc<T> {
 
     fn touch_webhook(&self, id: &str, triggered_at: i64) -> Result<(), StoreError> {
         (**self).touch_webhook(id, triggered_at)
+    }
+}
+
+/// Redacts ephemeral callback credentials (`cbk_<43-char-token>` anywhere in
+/// text, as well as `/hooks/cb/<token>` paths) before persisting transcripts or
+/// memory rows so database snapshots never leak active callback tokens.
+pub fn redact_callback_tokens(text: &str) -> std::borrow::Cow<'_, str> {
+    const URL_PREFIX: &str = "/hooks/cb/";
+    const TOKEN_PREFIX: &str = "cbk_";
+    const TOKEN_LEN: usize = 43;
+    let is_token_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+    if !text.contains(URL_PREFIX) && !text.contains(TOKEN_PREFIX) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut prev_is_token = false;
+    let mut replaced = false;
+    while !rest.is_empty() {
+        let next_url = rest.find(URL_PREFIX).map(|pos| (pos, true));
+        let next_tok = rest.find(TOKEN_PREFIX).map(|pos| (pos, false));
+        let next = match (next_url, next_tok) {
+            (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+            (a, b) => a.or(b),
+        };
+        let Some((pos, is_url)) = next else {
+            out.push_str(rest);
+            break;
+        };
+        let boundary_ok = if pos > 0 {
+            !is_token_byte(rest.as_bytes()[pos - 1])
+        } else {
+            !prev_is_token
+        };
+        if is_url {
+            let split = pos + URL_PREFIX.len();
+            out.push_str(&rest[..split]);
+            let after = &rest[split..];
+            let token_len = after.bytes().take_while(|&b| is_token_byte(b)).count();
+            if token_len > 0 {
+                out.push_str("<redacted>");
+                rest = &after[token_len..];
+                prev_is_token = false;
+                replaced = true;
+            } else {
+                rest = after;
+                prev_is_token = false;
+            }
+        } else {
+            out.push_str(&rest[..pos]);
+            let after = &rest[pos + TOKEN_PREFIX.len()..];
+            let token_len = after.bytes().take_while(|&b| is_token_byte(b)).count();
+            if boundary_ok && token_len == TOKEN_LEN {
+                out.push_str("<redacted>");
+                rest = &after[token_len..];
+                prev_is_token = false;
+                replaced = true;
+            } else {
+                out.push_str(TOKEN_PREFIX);
+                rest = after;
+                prev_is_token = true;
+            }
+        }
+    }
+    if replaced {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+/// Recursively redacts callback credentials inside every decoded string value
+/// and object key of a `serde_json::Value` before JSON escaping can mask token
+/// boundaries (e.g. `\n` or `\u0063` escapes). Reserves unchanged keys first
+/// so redacted keys never collide with plain keys, and gives distinct colliding
+/// redacted keys `#2`, `#3`, ... suffixes so no field is overwritten.
+pub fn redact_json_value(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => {
+            if let std::borrow::Cow::Owned(redacted) = redact_callback_tokens(s) {
+                *s = redacted;
+                true
+            } else {
+                false
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= redact_json_value(item);
+            }
+            changed
+        }
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            let entries: Vec<(String, serde_json::Value)> = std::mem::take(map).into_iter().collect();
+            let mut reserved: std::collections::HashSet<String> = entries
+                .iter()
+                .filter_map(|(k, _)| {
+                    matches!(redact_callback_tokens(k), std::borrow::Cow::Borrowed(_))
+                        .then(|| k.clone())
+                })
+                .collect();
+            for (k, mut v) in entries {
+                let final_key = match redact_callback_tokens(&k) {
+                    std::borrow::Cow::Owned(redacted) => {
+                        changed = true;
+                        let chosen = pick_unique_key(redacted, &reserved);
+                        reserved.insert(chosen.clone());
+                        chosen
+                    }
+                    std::borrow::Cow::Borrowed(_) => k,
+                };
+                changed |= redact_json_value(&mut v);
+                map.insert(final_key, v);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn pick_unique_key(base: String, reserved: &std::collections::HashSet<String>) -> String {
+    if !reserved.contains(&base) {
+        return base;
+    }
+    let mut n = 2usize;
+    loop {
+        let candidate = format!("{base}#{n}");
+        if !reserved.contains(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Returns true if `s` starts immediately with a `cbk_<43-char-token>`
+/// credential on a non-token end boundary.
+fn starts_with_callback_credential(s: &str) -> bool {
+    const TOKEN_PREFIX: &str = "cbk_";
+    const TOKEN_LEN: usize = 43;
+    let is_token_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+    if let Some(after) = s.strip_prefix(TOKEN_PREFIX) {
+        let len = after.bytes().take_while(|&b| is_token_byte(b)).count();
+        return len == TOKEN_LEN;
+    }
+    false
+}
+
+/// UTF-8-safe lossy JSON string unescaper used when `serde_json::from_str::<String>`
+/// rejects a raw quoted span (e.g. lone UTF-16 surrogates `\uD800` or malformed
+/// escapes). Validates ASCII hex bytes before slicing and advances by whole
+/// UTF-8 characters. On an unknown escape `\X`, peeks ahead (bounded O(1) window)
+/// to decide per-escape whether `X` starts a credential (preserving `X` after `\`,
+/// e.g. `\cbk_...` / `\c\u0062k_...`) or precedes one (replacing `\X` with `U+FFFD`,
+/// e.g. `\xcbk_...` / `\ccbk_...`), so mixed modes in one string are all redacted.
+fn lossy_unescape_json_inner(inner: &str, peek_credentials: bool) -> String {
+    let bytes = inner.as_bytes();
+    let mut out = String::with_capacity(inner.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            let esc = i + 1;
+            match bytes[esc] {
+                b'"' => {
+                    out.push('"');
+                    i = esc + 1;
+                }
+                b'\\' => {
+                    out.push('\\');
+                    i = esc + 1;
+                }
+                b'/' => {
+                    out.push('/');
+                    i = esc + 1;
+                }
+                b'b' => {
+                    out.push('\u{0008}');
+                    i = esc + 1;
+                }
+                b'f' => {
+                    out.push('\u{000C}');
+                    i = esc + 1;
+                }
+                b'n' => {
+                    out.push('\n');
+                    i = esc + 1;
+                }
+                b'r' => {
+                    out.push('\r');
+                    i = esc + 1;
+                }
+                b't' => {
+                    out.push('\t');
+                    i = esc + 1;
+                }
+                b'u' if esc + 5 <= bytes.len()
+                    && bytes[esc + 1..esc + 5].iter().all(u8::is_ascii_hexdigit) =>
+                {
+                    let code = u16::from_str_radix(&inner[esc + 1..esc + 5], 16).unwrap_or(0xFFFD);
+                    i = esc + 5;
+                    if (0xD800..=0xDBFF).contains(&code)
+                        && i + 6 <= bytes.len()
+                        && &bytes[i..i + 2] == b"\\u"
+                        && bytes[i + 2..i + 6].iter().all(u8::is_ascii_hexdigit)
+                    {
+                        let low = u16::from_str_radix(&inner[i + 2..i + 6], 16).unwrap_or(0);
+                        if (0xDC00..=0xDFFF).contains(&low) {
+                            let cp = 0x10000
+                                + (((u32::from(code) - 0xD800) << 10) | (u32::from(low) - 0xDC00));
+                            out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                            i += 6;
+                            continue;
+                        }
+                    }
+                    out.push(char::from_u32(u32::from(code)).unwrap_or('\u{FFFD}'));
+                }
+                _ => {
+                    let starts_cred = if peek_credentials {
+                        bytes[esc] == b'c' && {
+                            let mut end = (esc + 300).min(bytes.len());
+                            while end < bytes.len() && !inner.is_char_boundary(end) {
+                                end += 1;
+                            }
+                            starts_with_callback_credential(&lossy_unescape_json_inner(
+                                &inner[esc..end],
+                                false,
+                            ))
+                        }
+                    } else {
+                        true
+                    };
+                    if starts_cred {
+                        out.push('\\');
+                        i = esc;
+                    } else {
+                        out.push('\u{FFFD}');
+                        let ch = inner[esc..].chars().next().unwrap();
+                        i = esc + ch.len_utf8();
+                    }
+                }
+            }
+        } else {
+            let ch = inner[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// Decodes and redacts a malformed (or unterminated) JSON string body with
+/// per-escape recovery so mixed malformed escapes in the same string are all
+/// redacted.
+fn redact_malformed_json_inner(inner: &str) -> (String, Option<String>) {
+    let decoded = lossy_unescape_json_inner(inner, true);
+    let redacted = match redact_callback_tokens(&decoded) {
+        std::borrow::Cow::Owned(r) => Some(r),
+        std::borrow::Cow::Borrowed(_) => None,
+    };
+    (decoded, redacted)
+}
+
+/// Redacts callback credentials inside a JSON string (such as tool call
+/// arguments or callback payloads) by scanning every JSON string literal in
+/// place:
+/// - Decodes each literal individually (falling back to UTF-8-safe lossy escape
+///   decoding for malformed or unterminated literals) so Unicode escapes,
+///   escaped newlines, and duplicate keys are redacted without dropping members.
+/// - Scans only non-literal gaps as plain text and copies unchanged valid
+///   literals verbatim so escaped identifier boundaries never cause false hits.
+/// - Reserves unchanged object keys per object before disambiguating colliding
+///   redacted keys (`#2`, `#3`, ...), and reuses the same assigned name for
+///   repeated copies of the same original credential-bearing key.
+pub fn redact_json_str(raw: &str) -> std::borrow::Cow<'_, str> {
+    struct LiteralSpan {
+        start: usize,
+        end: usize,
+        decoded: String,
+        redacted: Option<String>,
+        obj_key: Option<usize>,
+        terminated: bool,
+    }
+
+    let bytes = raw.as_bytes();
+    let mut spans: Vec<LiteralSpan> = Vec::new();
+    let mut obj_stack: Vec<usize> = Vec::new();
+    let mut next_obj_id = 0usize;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => {
+                obj_stack.push(next_obj_id);
+                next_obj_id += 1;
+                i += 1;
+            }
+            b'}' => {
+                obj_stack.pop();
+                i += 1;
+            }
+            b'"' => {
+                let start = i;
+                i += 1;
+                let mut escaped = false;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    if escaped {
+                        escaped = false;
+                    } else if b == b'\\' {
+                        escaped = true;
+                    } else if b == b'"' {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'"' {
+                    let end = i + 1;
+                    let literal = &raw[start..end];
+                    let (decoded, redacted) = match serde_json::from_str::<String>(literal) {
+                        Ok(decoded) => {
+                            let redacted = match redact_callback_tokens(&decoded) {
+                                std::borrow::Cow::Owned(r) => Some(r),
+                                std::borrow::Cow::Borrowed(_) => None,
+                            };
+                            (decoded, redacted)
+                        }
+                        Err(_) => redact_malformed_json_inner(&raw[start + 1..end - 1]),
+                    };
+                    let mut look = end;
+                    while look < bytes.len() && bytes[look].is_ascii_whitespace() {
+                        look += 1;
+                    }
+                    let obj_key = if look < bytes.len() && bytes[look] == b':' {
+                        obj_stack.last().copied()
+                    } else {
+                        None
+                    };
+                    spans.push(LiteralSpan {
+                        start,
+                        end,
+                        decoded,
+                        redacted,
+                        obj_key,
+                        terminated: true,
+                    });
+                    i = end;
+                } else {
+                    // Unterminated quote: decode escapes across the remaining tail once.
+                    let (decoded, redacted) = redact_malformed_json_inner(&raw[start + 1..]);
+                    spans.push(LiteralSpan {
+                        start,
+                        end: bytes.len(),
+                        decoded,
+                        redacted,
+                        obj_key: None,
+                        terminated: false,
+                    });
+                    break;
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    // Pass 1: reserve every unchanged key in each object so redacted keys never
+    // collide with plain keys appearing earlier or later in the same object.
+    let mut reserved_per_obj: Vec<std::collections::HashSet<String>> =
+        vec![std::collections::HashSet::new(); next_obj_id];
+    let mut assigned_per_obj: Vec<std::collections::HashMap<String, String>> =
+        vec![std::collections::HashMap::new(); next_obj_id];
+    for span in &spans {
+        if span.redacted.is_none() {
+            if let Some(obj_id) = span.obj_key {
+                reserved_per_obj[obj_id].insert(span.decoded.clone());
+            }
+        }
+    }
+
+    // Pass 2: emit redacted spans and plain gaps without rescanning unchanged valid literals.
+    let mut out = String::new();
+    let mut changed = false;
+    let mut copied_until = 0usize;
+    let mut gap_start = 0usize;
+
+    let flush_gap = |out: &mut String,
+                     changed: &mut bool,
+                     copied_until: &mut usize,
+                     from: usize,
+                     to: usize| {
+        if from >= to {
+            return;
+        }
+        if let std::borrow::Cow::Owned(redacted) = redact_callback_tokens(&raw[from..to]) {
+            if !*changed {
+                out.push_str(&raw[..from]);
+                *changed = true;
+            } else if *copied_until < from {
+                out.push_str(&raw[*copied_until..from]);
+            }
+            out.push_str(&redacted);
+            *copied_until = to;
+        }
+    };
+
+    for span in spans {
+        flush_gap(&mut out, &mut changed, &mut copied_until, gap_start, span.start);
+        if let Some(mut redacted) = span.redacted {
+            if let Some(obj_id) = span.obj_key {
+                if let Some(existing) = assigned_per_obj[obj_id].get(&span.decoded) {
+                    redacted = existing.clone();
+                } else {
+                    let chosen = pick_unique_key(redacted, &reserved_per_obj[obj_id]);
+                    reserved_per_obj[obj_id].insert(chosen.clone());
+                    assigned_per_obj[obj_id].insert(span.decoded, chosen.clone());
+                    redacted = chosen;
+                }
+            }
+            if let Ok(encoded) = serde_json::to_string(&redacted) {
+                let replacement = if span.terminated {
+                    encoded.as_str()
+                } else {
+                    // Keep the unterminated quote unterminated rather than inventing a closing quote.
+                    &encoded[..encoded.len() - 1]
+                };
+                if !changed {
+                    out.push_str(&raw[..span.start]);
+                    changed = true;
+                } else if copied_until < span.start {
+                    out.push_str(&raw[copied_until..span.start]);
+                }
+                out.push_str(replacement);
+                copied_until = span.end;
+            }
+        }
+        gap_start = span.end;
+    }
+    flush_gap(&mut out, &mut changed, &mut copied_until, gap_start, bytes.len());
+    if changed {
+        if copied_until < bytes.len() {
+            out.push_str(&raw[copied_until..]);
+        }
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(raw)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Callback {
+    pub id: String,
+    pub name: String,
+    pub for_token: Option<String>,
+    pub remaining_uses: u32,
+    pub expires_at: i64,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingEvent {
+    pub id: i64,
+    pub source: String,
+    pub name: String,
+    pub for_token: Option<String>,
+    pub payload: String,
+    pub created_at: i64,
+}
+
+pub trait CallbackStore: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    fn create_callback(
+        &self,
+        id: &str,
+        name: &str,
+        token_hash: &[u8],
+        for_token: Option<&str>,
+        max_uses: u32,
+        expires_at: i64,
+        created_at: i64,
+    ) -> Result<Callback, StoreError>;
+    fn has_active_callback(&self, token_hash: &[u8], now: i64) -> Result<bool, StoreError>;
+    /// Atomically consumes one use of the callback AND persists the wake event
+    /// into `pending_events` in the same SQLite transaction so a `202 Accepted`
+    /// callback survives crashes, restarts, or transient turn failures.
+    fn consume_callback(
+        &self,
+        token_hash: &[u8],
+        now: i64,
+        payload: &str,
+    ) -> Result<Option<Callback>, StoreError>;
+    fn next_pending_event(&self) -> Result<Option<PendingEvent>, StoreError>;
+    fn delete_pending_event(&self, id: i64) -> Result<(), StoreError>;
+}
+
+impl<T: CallbackStore + ?Sized> CallbackStore for Arc<T> {
+    fn create_callback(
+        &self,
+        id: &str,
+        name: &str,
+        token_hash: &[u8],
+        for_token: Option<&str>,
+        max_uses: u32,
+        expires_at: i64,
+        created_at: i64,
+    ) -> Result<Callback, StoreError> {
+        (**self).create_callback(
+            id, name, token_hash, for_token, max_uses, expires_at, created_at,
+        )
+    }
+    fn has_active_callback(&self, token_hash: &[u8], now: i64) -> Result<bool, StoreError> {
+        (**self).has_active_callback(token_hash, now)
+    }
+    fn consume_callback(
+        &self,
+        token_hash: &[u8],
+        now: i64,
+        payload: &str,
+    ) -> Result<Option<Callback>, StoreError> {
+        (**self).consume_callback(token_hash, now, payload)
+    }
+    fn next_pending_event(&self) -> Result<Option<PendingEvent>, StoreError> {
+        (**self).next_pending_event()
+    }
+    fn delete_pending_event(&self, id: i64) -> Result<(), StoreError> {
+        (**self).delete_pending_event(id)
     }
 }
