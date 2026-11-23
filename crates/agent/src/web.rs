@@ -403,11 +403,12 @@ fn general_reply(store: &SqliteStorage) -> crate::Result<Value> {
     }))
 }
 
-fn identity_reply(store: &SqliteStorage) -> crate::Result<Value> {
-    let identity = store.identity()?;
-    Ok(
-        json!({"text": identity.as_deref().unwrap_or(harness::DEFAULT_IDENTITY), "isDefault": identity.is_none()}),
-    )
+fn instructions_reply(store: &SqliteStorage) -> crate::Result<Value> {
+    let instructions = store.instructions()?;
+    Ok(json!({
+        "text": instructions.as_deref().unwrap_or(harness::DEFAULT_INSTRUCTIONS),
+        "isDefault": instructions.is_none()
+    }))
 }
 fn models_reply(store: &SqliteStorage) -> crate::Result<Value> {
     let settings = store.settings()?;
@@ -643,18 +644,15 @@ async fn dispatch(
                 store.set_auto_respond(enabled)?;
                 general_reply(store)
             }
-            "identity.get" => identity_reply(store),
-            "identity.set" => {
+            "instructions.get" => instructions_reply(store),
+            "instructions.set" => {
                 let text = get("text")?;
-                if text.trim().is_empty() {
-                    return Err("Identity cannot be blank".into());
-                }
-                crate::set_identity(store, text)?;
-                identity_reply(store)
+                crate::set_instructions(store, text)?;
+                instructions_reply(store)
             }
-            "identity.reset" => {
-                store.set_identity(None)?;
-                identity_reply(store)
+            "instructions.reset" => {
+                store.set_instructions(None)?;
+                instructions_reply(store)
             }
             "models.get" => models_reply(store),
             "models.setMain" | "models.setCompaction" | "models.setUtility" => {

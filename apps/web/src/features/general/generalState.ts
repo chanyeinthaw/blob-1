@@ -4,11 +4,11 @@ import { Atom } from 'effect/reactivity'
 
 import { AppRuntime } from '~/lib/runtime'
 
-/** Loads and caches bot-wide General settings and identity across tab switches. */
+/** Loads and caches bot-wide General settings and instructions across tab switches. */
 export const generalPageAtom = AppRuntime.atom(
   Effect.all(
     {
-      identity: request('identity.get', {}),
+      instructions: request('instructions.get', {}),
       general: request('general.get', {}),
     },
     { concurrency: 'unbounded' },

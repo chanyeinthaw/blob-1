@@ -1,10 +1,10 @@
 import { Schema } from 'effect'
 
-export const Identity = Schema.Struct({
+export const Instructions = Schema.Struct({
   text: Schema.String,
   isDefault: Schema.Boolean,
 })
-export type Identity = typeof Identity.Type
+export type Instructions = typeof Instructions.Type
 
 export const GeneralSettings = Schema.Struct({
   autoRespond: Schema.Boolean,
@@ -341,12 +341,12 @@ export const requests = {
     payload: Schema.Struct({ enabled: Schema.Boolean }),
     reply: GeneralSettings,
   },
-  'identity.get': { payload: NoPayload, reply: Identity },
-  'identity.set': {
+  'instructions.get': { payload: NoPayload, reply: Instructions },
+  'instructions.set': {
     payload: Schema.Struct({ text: Schema.String }),
-    reply: Identity,
+    reply: Instructions,
   },
-  'identity.reset': { payload: NoPayload, reply: Identity },
+  'instructions.reset': { payload: NoPayload, reply: Instructions },
   'models.get': { payload: NoPayload, reply: Models },
   'models.setMain': {
     payload: Schema.Struct({

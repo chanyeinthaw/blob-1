@@ -26,8 +26,12 @@ import { matchCached } from '~/lib/useBackgroundRefresh'
 import { cn } from '~/lib/utils'
 
 import { GeneralEvents, type GeneralInput, GeneralMachine } from './generalMachine'
-import { IdentityEvents, type IdentityInput, IdentityMachine } from './identityMachine'
-import { generalPageAtom } from './identityState'
+import { generalPageAtom } from './generalState'
+import {
+  InstructionsEvents,
+  type InstructionsInput,
+  InstructionsMachine,
+} from './instructionsMachine'
 import { UsageSection } from './UsageSection'
 
 const GeneralOwner = createPersistentMachineContext(
@@ -35,17 +39,17 @@ const GeneralOwner = createPersistentMachineContext(
   ({ input }: { input: GeneralInput }) => MachineAtoms.make(GeneralMachine, input),
 )
 
-const IdentityOwner = createPersistentMachineContext(
-  'identity',
-  ({ input }: { input: IdentityInput }) => MachineAtoms.make(IdentityMachine, input),
+const InstructionsOwner = createPersistentMachineContext(
+  'instructions',
+  ({ input }: { input: InstructionsInput }) => MachineAtoms.make(InstructionsMachine, input),
 )
 
-const resetAllowed = AtomMachine.can(IdentityEvents.Reset())
+const resetAllowed = AtomMachine.can(InstructionsEvents.Reset())
 
 const textClassName =
   'col-start-1 row-start-1 min-h-56 w-full px-3.5 py-3 whitespace-pre-wrap break-words text-base leading-relaxed text-foreground md:text-sm'
 
-/** The General settings page: bot-wide Auto-respond gate and autosaving Identity editor. */
+/** The General settings page: autosaving Instructions editor, bot-wide Auto-respond gate, and Usage. */
 export function GeneralPage() {
   const result = useAtomValue(generalPageAtom)
   const retry = useAtomRefresh(generalPageAtom)
@@ -62,18 +66,18 @@ export function GeneralPage() {
     ),
     onSuccess: value => (
       <GeneralOwner.Provider input={value.general}>
-        <IdentityOwner.Provider input={value.identity}>
+        <InstructionsOwner.Provider input={value.instructions}>
           <Page title="General">
             <div className="space-y-8">
-              <Section title="Identity" action={<IdentityActions />}>
-                <IdentityEditor />
+              <Section title="Instructions" action={<InstructionsActions />}>
+                <InstructionsEditor />
               </Section>
               <AutoRespondSection />
               <UsageSection />
             </div>
             <UnsavedGuard />
           </Page>
-        </IdentityOwner.Provider>
+        </InstructionsOwner.Provider>
       </GeneralOwner.Provider>
     ),
   })
@@ -117,8 +121,8 @@ function AutoRespondSection() {
   )
 }
 
-function IdentityActions() {
-  const machine = IdentityOwner.useMachine()
+function InstructionsActions() {
+  const machine = InstructionsOwner.useMachine()
   const send = useAtomSet(machine.send)
   const canReset = AsyncResult.match(useMachineResult(resetAllowed(machine)), {
     onInitial: () => false,
@@ -158,10 +162,10 @@ function IdentityActions() {
                   <Undo2 />
                 </Button>
               }
-              title="Reset identity?"
-              detail="This replaces your custom identity with the default."
+              title="Reset instructions?"
+              detail="This replaces your custom instructions with the default."
               confirmLabel="Reset"
-              onConfirm={() => send(IdentityEvents.Reset())}
+              onConfirm={() => send(InstructionsEvents.Reset())}
             />
           )
         }
@@ -170,7 +174,7 @@ function IdentityActions() {
   )
 }
 
-interface IdentityFooterProps {
+interface InstructionsFooterProps {
   readonly error: string | null
   readonly failedAction: 'save' | 'reset' | null
   readonly hasSaved: boolean
@@ -181,7 +185,7 @@ interface IdentityFooterProps {
   readonly onRetryReset: () => void
 }
 
-function IdentityFooter(props: IdentityFooterProps) {
+function InstructionsFooter(props: InstructionsFooterProps) {
   const mobileStatus =
     props.error !== null
       ? null
@@ -197,7 +201,7 @@ function IdentityFooter(props: IdentityFooterProps) {
       {props.error === null ? null : (
         <div className="mt-2 flex flex-wrap items-center gap-3">
           <p
-            id="identity-error"
+            id="instructions-error"
             role="alert"
             className="break-words text-xs text-destructive [overflow-wrap:anywhere]"
           >
@@ -225,8 +229,8 @@ function IdentityFooter(props: IdentityFooterProps) {
   )
 }
 
-function IdentityEditor() {
-  const machine = IdentityOwner.useMachine()
+function InstructionsEditor() {
+  const machine = InstructionsOwner.useMachine()
   const send = useAtomSet(machine.send)
   const isResetting = AsyncResult.match(
     useMachineResult(AtomMachine.matches('Resetting')(machine)),
@@ -257,28 +261,28 @@ function IdentityEditor() {
               {value.draftText}{' '}
             </div>
             <textarea
-              aria-label="Identity"
+              aria-label="Instructions"
               aria-invalid={value.error !== null}
-              aria-describedby={value.error === null ? undefined : 'identity-error'}
+              aria-describedby={value.error === null ? undefined : 'instructions-error'}
               className={cn(
                 textClassName,
                 'h-full resize-none overflow-hidden bg-transparent caret-foreground outline-none disabled:cursor-not-allowed disabled:opacity-50',
               )}
               value={value.draftText}
               disabled={isResetting}
-              onChange={event => send(IdentityEvents.Edit({ text: event.target.value }))}
-              onBlur={() => send(IdentityEvents.Flush())}
+              onChange={event => send(InstructionsEvents.Edit({ text: event.target.value }))}
+              onBlur={() => send(InstructionsEvents.Flush())}
             />
           </div>
-          <IdentityFooter
+          <InstructionsFooter
             error={value.error}
             failedAction={value.failedAction}
             hasSaved={value.hasSaved}
             canRetrySave={value.draftText.trim() !== ''}
             isSaving={isSaving}
             isResetting={isResetting}
-            onRetrySave={() => send(IdentityEvents.Flush())}
-            onRetryReset={() => send(IdentityEvents.Reset())}
+            onRetrySave={() => send(InstructionsEvents.Flush())}
+            onRetryReset={() => send(InstructionsEvents.Reset())}
           />
         </div>
       )}
@@ -287,7 +291,7 @@ function IdentityEditor() {
 }
 
 function UnsavedGuard() {
-  const machine = IdentityOwner.useMachine()
+  const machine = InstructionsOwner.useMachine()
   const isDirty = AsyncResult.match(useMachineResult(AtomMachine.select(machine, '')), {
     onInitial: () => false,
     onFailure: () => false,
@@ -320,7 +324,7 @@ function UnsavedGuard() {
         <AlertDialogHeader>
           <AlertDialogTitle>Unsaved changes</AlertDialogTitle>
           <AlertDialogDescription>
-            Your identity edits have not finished saving yet.
+            Your instruction edits have not finished saving yet.
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>

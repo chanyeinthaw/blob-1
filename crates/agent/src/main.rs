@@ -71,9 +71,9 @@ enum Command {
         #[command(subcommand)]
         command: HomeCommand,
     },
-    Identity {
+    Instructions {
         #[command(subcommand)]
-        command: IdentityCommand,
+        command: InstructionsCommand,
     },
     AutoRespond {
         #[command(subcommand)]
@@ -251,7 +251,7 @@ enum AutoRespondCommand {
 }
 
 #[derive(Subcommand)]
-enum IdentityCommand {
+enum InstructionsCommand {
     Show,
     Set { file: PathBuf },
     Reset,
@@ -706,7 +706,7 @@ async fn main() -> Result<()> {
                 | Command::Web { .. }
                 | Command::Messenger { .. }
                 | Command::Mcp { .. }
-                | Command::Identity { .. }
+                | Command::Instructions { .. }
                 | Command::AutoRespond { .. }
                 | Command::Timezone { .. }
                 | Command::Home { .. }
@@ -793,7 +793,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Identity { command } => identity(&store, command),
+        Command::Instructions { command } => instructions(&store, command),
         Command::AutoRespond { command } => {
             match command {
                 AutoRespondCommand::Show => {
@@ -925,16 +925,16 @@ fn set_home(store: &SqliteStorage, home: Option<storage::Home>) -> Result<()> {
     Ok(())
 }
 
-fn identity(store: &SqliteStorage, command: IdentityCommand) -> Result<()> {
+fn instructions(store: &SqliteStorage, command: InstructionsCommand) -> Result<()> {
     match command {
-        IdentityCommand::Show => println!(
+        InstructionsCommand::Show => print!(
             "{}",
             store
-                .identity()?
+                .instructions()?
                 .as_deref()
-                .unwrap_or(harness::DEFAULT_IDENTITY)
+                .unwrap_or(harness::DEFAULT_INSTRUCTIONS)
         ),
-        IdentityCommand::Set { file } => {
+        InstructionsCommand::Set { file } => {
             let text = if file == std::path::Path::new("-") {
                 let mut text = String::new();
                 std::io::stdin().read_to_string(&mut text)?;
@@ -942,19 +942,18 @@ fn identity(store: &SqliteStorage, command: IdentityCommand) -> Result<()> {
             } else {
                 std::fs::read_to_string(file)?
             };
-            set_identity(store, &text)?;
+            set_instructions(store, &text)?;
         }
-        IdentityCommand::Reset => store.set_identity(None)?,
+        InstructionsCommand::Reset => store.set_instructions(None)?,
     }
     Ok(())
 }
 
-fn set_identity(store: &SqliteStorage, text: &str) -> Result<()> {
-    let text = text.trim_end();
-    if text.is_empty() {
-        return Err("identity cannot be empty".into());
+fn set_instructions(store: &SqliteStorage, text: &str) -> Result<()> {
+    if text.trim().is_empty() {
+        return Err("Instructions cannot be blank".into());
     }
-    store.set_identity(Some(text))?;
+    store.set_instructions(Some(text))?;
     Ok(())
 }
 

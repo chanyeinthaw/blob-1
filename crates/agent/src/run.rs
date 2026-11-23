@@ -1427,9 +1427,9 @@ async fn admit_batch(
         let first_msg_id = triage_snapshot[0].message.clone();
         let auto_respond = store.auto_respond()?;
         if let Some(utility) = utility.filter(|_| auto_respond) {
-            let identity = store
-                .identity()?
-                .or_else(|| Some(harness::DEFAULT_IDENTITY.into()));
+            let instructions = store
+                .instructions()?
+                .or_else(|| Some(harness::DEFAULT_INSTRUCTIONS.into()));
             let bot_id = discord.self_id();
             let cached_history = discord.recent_history(&place, Some(&first_msg_id), 10);
             let warm_hold = cached_history
@@ -1475,7 +1475,7 @@ async fn admit_batch(
                 }
                 let respond = harness::decide_respond(
                     utility,
-                    identity.as_deref(),
+                    instructions.as_deref(),
                     bot_id.as_deref(),
                     &prompt_history,
                     &live_snapshot,

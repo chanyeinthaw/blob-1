@@ -13,7 +13,7 @@ import {
   type DiscordReplyOverride,
   type GeneralSettings,
   Home,
-  Identity,
+  type Instructions,
   McpServer,
   ModelInfo,
   Models,
@@ -45,7 +45,7 @@ type ProviderRecord = Readonly<{
 }>
 
 type State = Readonly<{
-  identity: string
+  instructions: string | null
   autoRespond: boolean
   main: Slot
   compaction: Slot | null
@@ -73,12 +73,12 @@ type State = Readonly<{
   nextWebhookId: number
 }>
 
-const DEFAULT_IDENTITY = 'You are Blob-1.'
+const DEFAULT_INSTRUCTIONS = '# Identity\n\nYou are Blob-1'
 const REFRESHED_MODEL_COUNT = 49
 const NUMERIC_ID = /^\d+$/
 
 const seedState = (): State => ({
-  identity: DEFAULT_IDENTITY,
+  instructions: null,
   autoRespond: true,
   main: { provider: 'cpa1', model: 'gpt-6.1-terra', reasoning: 'medium' },
   compaction: { provider: 'cpa1', model: 'gpt-6-luna', reasoning: 'medium' },
@@ -177,9 +177,9 @@ const generalReply = (state: State): GeneralSettings => ({
   hasUtilityModel: state.utility !== null,
 })
 
-const identityReply = (state: State): Identity => ({
-  text: state.identity,
-  isDefault: state.identity === DEFAULT_IDENTITY,
+const instructionsReply = (state: State): Instructions => ({
+  text: state.instructions ?? DEFAULT_INSTRUCTIONS,
+  isDefault: state.instructions === null,
 })
 
 const modelsReply = (state: State): Models => ({
@@ -795,19 +795,19 @@ const handlers: { readonly [K in RequestType]: Handler<K> } = {
       Effect.succeed(Struct.evolve(current, { autoRespond: () => enabled })),
     ).pipe(Effect.map(generalReply)),
 
-  'identity.get': (_payload, state) => Ref.get(state).pipe(Effect.map(identityReply)),
+  'instructions.get': (_payload, state) => Ref.get(state).pipe(Effect.map(instructionsReply)),
 
-  'identity.set': ({ text }, state) =>
+  'instructions.set': ({ text }, state) =>
     transition(state, current =>
       text.trim() === ''
-        ? Effect.fail('Identity cannot be blank')
-        : Effect.succeed(Struct.evolve(current, { identity: () => text })),
-    ).pipe(Effect.map(identityReply)),
+        ? Effect.fail('Instructions cannot be blank')
+        : Effect.succeed(Struct.evolve(current, { instructions: () => text })),
+    ).pipe(Effect.map(instructionsReply)),
 
-  'identity.reset': (_payload, state) =>
+  'instructions.reset': (_payload, state) =>
     transition(state, current =>
-      Effect.succeed(Struct.evolve(current, { identity: () => DEFAULT_IDENTITY })),
-    ).pipe(Effect.map(identityReply)),
+      Effect.succeed(Struct.evolve(current, { instructions: () => null })),
+    ).pipe(Effect.map(instructionsReply)),
 
   'models.get': (_payload, state) => Ref.get(state).pipe(Effect.map(modelsReply)),
 

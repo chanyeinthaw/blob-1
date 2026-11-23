@@ -13,7 +13,7 @@ mod utility;
 pub use utility::{decide_respond, parse_inline, parse_respond, Utility};
 
 pub use chat::{
-    ChatHarness, Current, ModelSelection, Models, ZoomId, CHAT_PROMPT, DEFAULT_IDENTITY,
+    ChatHarness, Current, ModelSelection, Models, ZoomId, CHAT_PROMPT, DEFAULT_INSTRUCTIONS,
 };
 pub use llm::{CompletionRequest, CompletionResponse, Llm, LlmError, ToolCallRequest, Usage};
 pub use prompt::SUB_PROMPT;

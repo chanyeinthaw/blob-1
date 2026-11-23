@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS reply_modes (messenger TEXT NOT NULL, scope TEXT NOT 
 CREATE TABLE IF NOT EXISTS messenger_defaults (messenger TEXT PRIMARY KEY, interaction_mode TEXT NOT NULL CHECK (interaction_mode IN ('mention-only', 'always', 'auto')), reply_mode TEXT NOT NULL CHECK (reply_mode IN ('auto', 'thread', 'direct'))) STRICT;
 CREATE TABLE IF NOT EXISTS seen_threads (messenger TEXT NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, PRIMARY KEY (messenger, channel, thread)) STRICT;
 
-CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK (id = 1), text TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS instructions (id INTEGER PRIMARY KEY CHECK (id = 1), text TEXT NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS public_url (id INTEGER PRIMARY KEY CHECK (id = 1), url TEXT NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS public_files (
     id TEXT PRIMARY KEY,
@@ -331,6 +331,7 @@ impl SqliteStorage {
         ensure_reply_modes_v2(&mut connection, &mut require_exclusive)?;
         ensure_access_entries(&mut connection, &mut require_exclusive)?;
         ensure_settings_auto_respond(&mut connection, &mut require_exclusive)?;
+        migrate_identity_to_instructions(&mut connection, &mut require_exclusive)?;
         drop(upgrade_owner);
         let key = match app_key {
             Some(app_key) => Some(crypto::setup(&connection, &app_key)?),
@@ -761,6 +762,41 @@ fn ensure_settings_auto_respond(
     Ok(())
 }
 
+/// Copies any row verbatim from the legacy `identity` table into `instructions`
+/// and drops `identity`.
+fn migrate_identity_to_instructions(
+    connection: &mut Connection,
+    require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let has_legacy = |conn: &Connection| -> Result<bool, StoreError> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'identity')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(backend)
+    };
+    if !has_legacy(connection)? {
+        return Ok(());
+    }
+    require_exclusive(
+        "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
+    )?;
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    if !has_legacy(&tx)? {
+        return Ok(());
+    }
+    tx.execute_batch(
+        "INSERT OR REPLACE INTO instructions (id, text) SELECT id, text FROM identity;
+         DROP TABLE identity;",
+    )
+    .map_err(backend)?;
+    tx.commit().map_err(backend)?;
+    Ok(())
+}
+
 /// One-time migration from `providers.api_key_env` to encrypted `providers.api_key`.
 /// Runs only on an exclusive open (`serve` / `chat`, where the runtime environment
 /// holds the legacy env vars) so a read-only CLI command cannot drop `api_key_env`
@@ -981,5 +1017,72 @@ mod provider_key_tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "gpt-6-luna");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn migrates_legacy_identity_table_to_instructions_verbatim() {
+        let dir = std::env::temp_dir().join(format!(
+            "blob-1-migrate-instructions-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.db");
+        let legacy_text = "Custom instructions\nwith trailing newline\n";
+
+        {
+            let store = SqliteStorage::open(&path, None).unwrap();
+            let conn = store.lock();
+            conn.execute_batch(
+                "DROP TABLE instructions;
+                 CREATE TABLE identity (id INTEGER PRIMARY KEY CHECK (id = 1), text TEXT NOT NULL) STRICT;",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO identity (id, text) VALUES (1, ?1)", [legacy_text])
+                .unwrap();
+        }
+
+        let store = SqliteStorage::open(&path, None).unwrap();
+        assert_eq!(store.instructions().unwrap().as_deref(), Some(legacy_text));
+        let legacy_exists: bool = store
+            .lock()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'identity')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!legacy_exists);
+        // Downgrade + edit + re-upgrade: legacy row overwrites stale instructions row.
+        let newer_legacy = "Updated during rollback\n";
+        {
+            let conn = store.lock();
+            conn.execute_batch(
+                "CREATE TABLE identity (id INTEGER PRIMARY KEY CHECK (id = 1), text TEXT NOT NULL) STRICT;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO identity (id, text) VALUES (1, ?1)",
+                [newer_legacy],
+            )
+            .unwrap();
+        }
+        drop(store);
+        let store = SqliteStorage::open(&path, None).unwrap();
+        assert_eq!(store.instructions().unwrap().as_deref(), Some(newer_legacy));
+        // Downgrade without editing (old build recreates empty `identity` table) + re-upgrade:
+        // must preserve saved `instructions` rather than wiping them.
+        {
+            let conn = store.lock();
+            conn.execute_batch(
+                "CREATE TABLE identity (id INTEGER PRIMARY KEY CHECK (id = 1), text TEXT NOT NULL) STRICT;",
+            )
+            .unwrap();
+        }
+        drop(store);
+        let store = SqliteStorage::open(&path, None).unwrap();
+        assert_eq!(store.instructions().unwrap().as_deref(), Some(newer_legacy));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

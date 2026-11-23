@@ -16,7 +16,7 @@ use crate::{
     prompt, tasks, CompletionRequest, EnvironmentPaths, HarnessError, Llm, SessionHarness,
 };
 
-pub const DEFAULT_IDENTITY: &str = "You are Blob-1.";
+pub const DEFAULT_INSTRUCTIONS: &str = "# Identity\n\nYou are Blob-1";
 pub const CHAT_PROMPT: &str = r#"Calendar: Schedule one-off (at) or recurring (cron) jobs. The timezone defaults to yours. When a job fires, you receive <scheduled …>text</scheduled>. If late is present, judge whether the job still matters and say so. to and for say where to answer; home is the home channel when there is no destination. When a scheduled job, or a watch in a check-in, has a result but no destination and there is no home, write that result in your final reply; it stays in your memory. End with NO_UPDATES only when no result is left to report. Anyone you work for may ask you to schedule or cancel things.
 
 Keeping an eye on: Use watch to keep an eye on something until it is resolved. until is optional; to or reply says where to report. During check-ins you receive <checkin> with each item as <watch …>. Check each item, spawning tasks when it needs work. Report real changes where the item says, or home. Unwatch resolved items. End with NO_UPDATES when nothing changed.
@@ -527,12 +527,12 @@ where
             Some(mcp) => mcp.describe().await,
             None => Vec::new(),
         };
-        let identity = self
+        let instructions = self
             .config
-            .identity()?
-            .unwrap_or_else(|| DEFAULT_IDENTITY.to_owned());
+            .instructions()?
+            .unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_owned());
         let system = format!(
-            "# Identity\n\n{identity}\n\nThis identity is current and overrides anything your memory says about who you are.\n\n{CHAT_PROMPT}\n\n{}{}",
+            "{instructions}\n\nThese instructions are current and override anything conflicting in your memory.\n\n{CHAT_PROMPT}\n\n{}{}",
             if self.inner.messengers.is_some() {
                 format!("{MESSENGER_PROMPT}\n\n")
             } else {

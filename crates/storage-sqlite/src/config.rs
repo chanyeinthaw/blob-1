@@ -53,20 +53,20 @@ impl ConfigStore for SqliteStorage {
         Ok(())
     }
 
-    fn identity(&self) -> Result<Option<String>, StoreError> {
+    fn instructions(&self) -> Result<Option<String>, StoreError> {
         self.lock()
-            .query_row("SELECT text FROM identity WHERE id = 1", [], |row| {
+            .query_row("SELECT text FROM instructions WHERE id = 1", [], |row| {
                 row.get(0)
             })
             .optional()
             .map_err(backend)
     }
 
-    fn set_identity(&self, text: Option<&str>) -> Result<(), StoreError> {
+    fn set_instructions(&self, text: Option<&str>) -> Result<(), StoreError> {
         let connection = self.lock();
         match text {
-            Some(text) => connection.execute("INSERT INTO identity (id, text) VALUES (1, ?1) ON CONFLICT (id) DO UPDATE SET text = excluded.text", [text]),
-            None => connection.execute("DELETE FROM identity WHERE id = 1", []),
+            Some(text) => connection.execute("INSERT INTO instructions (id, text) VALUES (1, ?1) ON CONFLICT (id) DO UPDATE SET text = excluded.text", [text]),
+            None => connection.execute("DELETE FROM instructions WHERE id = 1", []),
         }.map_err(backend)?;
         Ok(())
     }

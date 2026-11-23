@@ -1,17 +1,17 @@
 import { Api } from '@blob-1/client/api'
-import { Identity } from '@blob-1/contracts'
+import { Instructions } from '@blob-1/contracts'
 import { Machine } from '@typeonce/effect-machine'
 import { Effect, Schema } from 'effect'
 
-const saveIdentity = Effect.fn('IdentitySettings.save')(function* (text: string) {
+const saveInstructions = Effect.fn('InstructionsSettings.save')(function* (text: string) {
   const api = yield* Api
-  return yield* api.request('identity.set', { text })
+  return yield* api.request('instructions.set', { text })
 })
 
-const resetIdentity = Effect.flatMap(Api, api => api.request('identity.reset', {}))
+const resetInstructions = Effect.flatMap(Api, api => api.request('instructions.reset', {}))
 
-export const IdentityInput = Identity
-export type IdentityInput = typeof IdentityInput.Type
+export const InstructionsInput = Instructions
+export type InstructionsInput = typeof InstructionsInput.Type
 
 const FailedAction = Schema.Literals(['save', 'reset'])
 
@@ -31,11 +31,11 @@ const applyEdit = (root: RootData, text: string): RootData => ({
   ...root,
   draftText: text,
   hasSaved: false,
-  error: text.trim() === '' ? "Identity can't be blank." : null,
+  error: text.trim() === '' ? "Instructions can't be blank." : null,
   failedAction: null,
 })
 
-export const IdentityStates = Machine.state({
+export const InstructionsStates = Machine.state({
   fields: rootFields,
   states: {
     Idle: {},
@@ -45,20 +45,20 @@ export const IdentityStates = Machine.state({
   },
 })
 
-export const IdentityEvents = Machine.events({
+export const InstructionsEvents = Machine.events({
   Edit: { text: Schema.String },
   Flush: {},
   Reset: {},
-  Sync: { identity: Identity },
+  Sync: { instructions: Instructions },
 })
 
-/** The identity editor: autosaves 800ms after typing stops, on blur, and resets on demand. */
-export const IdentityMachine = Machine.make({
-  id: 'IdentitySettings',
-  root: IdentityStates,
-  events: IdentityEvents,
-  input: IdentityInput,
-  effects: { saveIdentity, resetIdentity },
+/** The instructions editor: autosaves 800ms after typing stops, on blur, and resets on demand. */
+export const InstructionsMachine = Machine.make({
+  id: 'InstructionsSettings',
+  root: InstructionsStates,
+  events: InstructionsEvents,
+  input: InstructionsInput,
+  effects: { saveInstructions, resetInstructions },
   timers: { autosaveDelay: '800 millis' },
   branches: {
     flush: {
@@ -121,9 +121,9 @@ export const IdentityMachine = Machine.make({
               ? root
               : {
                   ...root,
-                  savedText: event.identity.text,
-                  draftText: event.identity.text,
-                  isDefault: event.identity.isDefault,
+                  savedText: event.instructions.text,
+                  draftText: event.instructions.text,
+                  isDefault: event.instructions.isDefault,
                 },
         },
       },
@@ -184,7 +184,7 @@ export const IdentityMachine = Machine.make({
         },
       },
       invoke: {
-        src: 'saveIdentity',
+        src: 'saveInstructions',
         input: ({ state }) => state.text,
         onDone: {
           branches: 'saved',
@@ -210,7 +210,7 @@ export const IdentityMachine = Machine.make({
             }
             // A flush queued during the write re-fires so the latest draft saves now.
             if (root.pendingFlush) {
-              enqueue.raise(IdentityEvents.Flush())
+              enqueue.raise(InstructionsEvents.Flush())
             }
             return select.dirty({
               update: { data: { ...confirmed, hasSaved: root.draftText === output.text } },
@@ -236,7 +236,7 @@ export const IdentityMachine = Machine.make({
             // A newer draft still saves: now if it was already flushed, else after the debounce.
             // It keeps its own validation error.
             if (root.pendingFlush) {
-              enqueue.raise(IdentityEvents.Flush())
+              enqueue.raise(InstructionsEvents.Flush())
               return select.failed({ update: { data: { ...root, pendingFlush: false } } })
             }
             return select.retry({ update: { data: { ...root, pendingFlush: false } } })
@@ -252,7 +252,7 @@ export const IdentityMachine = Machine.make({
         },
       },
       invoke: {
-        src: 'resetIdentity',
+        src: 'resetInstructions',
         onDone: {
           target: 'Idle',
           update: 'root',

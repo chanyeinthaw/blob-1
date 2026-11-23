@@ -52,7 +52,7 @@ const THREAD_TRIAGE_PROMPT: &str = "You are a fast response gate deciding whethe
 /// the main model.
 pub async fn decide_respond(
     utility: &Utility,
-    identity: Option<&str>,
+    instructions: Option<&str>,
     bot_id: Option<&str>,
     history: &[messenger::Fetched],
     burst: &[messenger::Inbound],
@@ -61,9 +61,9 @@ pub async fn decide_respond(
         return false;
     };
     let mut sections = Vec::new();
-    if let Some(identity) = identity.map(str::trim).filter(|s| !s.is_empty()) {
-        let snippet: String = identity.chars().take(300).collect();
-        sections.push(format!("Assistant identity:\n{snippet}"));
+    if let Some(instructions) = instructions.map(str::trim).filter(|s| !s.is_empty()) {
+        let snippet: String = instructions.chars().take(300).collect();
+        sections.push(format!("Assistant instructions:\n{snippet}"));
     }
     sections.push(format!("Where: {}", first.location));
     if !history.is_empty() {

@@ -21,7 +21,7 @@ Where each feature lives: code, CLI, model tools and storage.
 
 ## Web settings
 
-- Code: `crates/agent/src/web.rs`, `crates/storage-sqlite/src/web_auth.rs`, `packages/contracts/src/protocol.ts` (wire schemas), `packages/client/src/{api,ws,session,mock}.ts` (API client), `apps/web/src/routes/*`, `apps/web/src/lib/{session.ts,shellMachines.tsx,useBackgroundRefresh.ts}` (cached session guard, shell-scoped persistent page machines, stale-while-revalidate rendering), and `apps/web/src/features/{session,identity,schedules,models,providers,chat,mcp}/` (pages)
+- Code: `crates/agent/src/web.rs`, `crates/storage-sqlite/src/web_auth.rs`, `packages/contracts/src/protocol.ts` (wire schemas), `packages/client/src/{api,ws,session,mock}.ts` (API client), `apps/web/src/routes/*`, `apps/web/src/lib/{session.ts,shellMachines.tsx,useBackgroundRefresh.ts}` (cached session guard, shell-scoped persistent page machines, stale-while-revalidate rendering), and `apps/web/src/features/{session,general,schedules,models,providers,chat,mcp,webhooks}/` (pages)
 - Settings navigation is instant: once signed in, `requireSession` returns from an in-memory cache (cleared on sign-out or session expiry), `Shell` prefetches all 6 `Atom.keepAlive` settings page atoms, `ShellMachinesProvider` keeps page machines alive across tab switches so pending save queues never cancel on navigation, `matchCached` keeps cached pages visible if a background refresh fails, and toggles/pickers update optimistically with coalesced background saves.
 - The app is a pnpm workspace (vite-plus, React, TanStack Router, shadcn on Base UI, Effect, effect-machine) that `agent` embeds from `apps/web/dist`; `VITE_MOCK=1 pnpm dev` runs it against an in-memory mock (password `blob`)
 - `agent serve --web <addr>` serves the app (default `127.0.0.1:7878`); `agent web password set` sets the password.
@@ -48,12 +48,12 @@ The bot is one chat that never ends. It coordinates and talks; tasks do the work
 - MCP tool results carrying png, jpg, gif or webp images reach the model as images when the main model accepts image input; the memory echo keeps the `[N image(s) omitted]` note
 - CLI: `agent chat <message>` (one message, then waits for its tasks to report)
 
-## Identity
+## Instructions
 
-- Code: `crates/harness/src/chat.rs` (`DEFAULT_IDENTITY`)
-- Prompt: `# Identity` block at the top of the chat system prompt, default `You are Blob-1.`, read every turn
-- CLI: `agent identity show | set <file|-> | reset`
-- Table: `identity`
+- Code: `crates/harness/src/chat.rs` (`DEFAULT_INSTRUCTIONS`)
+- Prompt: stored instructions text verbatim followed by `These instructions are current and override anything conflicting in your memory.` at the top of the chat system prompt, default `# Identity\n\nYou are Blob-1`, read every turn; also passed as `Assistant instructions:` snippet to the Auto-respond utility model
+- CLI: `agent instructions show | set <file|-> | reset`
+- Table: `instructions` (legacy `identity` rows migrate verbatim on startup and drop `identity`)
 
 ## Memory
 

@@ -320,8 +320,8 @@ pub trait ConfigStore: Send + Sync {
     fn set_timezone(&self, timezone: &str) -> Result<(), StoreError>;
     fn home(&self) -> Result<Option<Home>, StoreError>;
     fn set_home(&self, home: Option<&Home>) -> Result<(), StoreError>;
-    fn identity(&self) -> Result<Option<String>, StoreError>;
-    fn set_identity(&self, text: Option<&str>) -> Result<(), StoreError>;
+    fn instructions(&self) -> Result<Option<String>, StoreError>;
+    fn set_instructions(&self, text: Option<&str>) -> Result<(), StoreError>;
     fn auto_respond(&self) -> Result<bool, StoreError>;
     fn set_auto_respond(&self, enabled: bool) -> Result<(), StoreError>;
     fn public_url(&self) -> Result<Option<String>, StoreError>;
