@@ -146,9 +146,21 @@ CREATE TABLE IF NOT EXISTS bots (
     name TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     created_at INTEGER NOT NULL,
-    generation INTEGER NOT NULL DEFAULT 0
+    generation INTEGER NOT NULL DEFAULT 0,
+    environment TEXT NOT NULL DEFAULT 'local'
 ) STRICT;
 INSERT OR IGNORE INTO bots (id, name, enabled, created_at) VALUES ('default', 'Blob-1', 1, 0);
+CREATE TABLE IF NOT EXISTS environments (
+    name TEXT PRIMARY KEY,
+    node_id TEXT NOT NULL UNIQUE,
+    credential BLOB NOT NULL,
+    pending_key BLOB,
+    enrollment BLOB,
+    hostname TEXT,
+    version TEXT,
+    last_seen INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+) STRICT;
 
 CREATE TABLE IF NOT EXISTS bot_sequence (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -391,6 +403,10 @@ impl SqliteStorage {
         ensure_unified_access(&mut connection, &mut require_exclusive)?;
         ensure_settings_auto_respond(&mut connection, &mut require_exclusive)?;
         ensure_bots_generation(&mut connection, &mut require_exclusive)?;
+        ensure_bots_environment(&mut connection, &mut require_exclusive)?;
+        ensure_environments_pending_key(&mut connection, &mut require_exclusive)?;
+        ensure_environments_hostname(&mut connection, &mut require_exclusive)?;
+        ensure_environments_enrollment(&mut connection, &mut require_exclusive)?;
         ensure_model_enabled(&mut connection, &mut require_exclusive)?;
         migrate_identity_to_instructions(&mut connection, &mut require_exclusive)?;
         let key = match app_key {
@@ -1092,11 +1108,130 @@ fn ensure_bots_generation(
     Ok(())
 }
 
+fn ensure_bots_environment(
+    connection: &mut Connection,
+    require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let has_column = |conn: &Connection| -> Result<bool, StoreError> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name = 'environment')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(backend)
+    };
+    if has_column(connection)? {
+        return Ok(());
+    }
+    require_exclusive(
+        "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
+    )?;
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    if !has_column(&tx)? {
+        tx.execute_batch("ALTER TABLE bots ADD COLUMN environment TEXT NOT NULL DEFAULT 'local';")
+            .map_err(backend)?;
+    }
+    tx.commit().map_err(backend)?;
+    Ok(())
+}
+
 /// Creates `model_enabled` (presence = enabled; models default to disabled) and,
 /// on first creation only, seeds it with every model currently assigned to a
 /// role slot so existing assignments keep working. Because the flag table is
 /// created here rather than in SCHEMA, an existing table means the seed already
 /// ran — models disabled later are never re-enabled on reopen.
+fn ensure_environments_hostname(
+    connection: &mut Connection,
+    require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let has_column = |conn: &Connection| -> Result<bool, StoreError> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('environments') WHERE name = 'hostname')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(backend)
+    };
+    if has_column(connection)? {
+        return Ok(());
+    }
+    require_exclusive(
+        "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
+    )?;
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    if !has_column(&tx)? {
+        tx.execute_batch("ALTER TABLE environments ADD COLUMN hostname TEXT;")
+            .map_err(backend)?;
+    }
+    tx.commit().map_err(backend)
+}
+
+/// Creates `enrollment` (per-accept identity, minted fresh by
+/// `accept_pending_node`) and backfills one for rows already accepted so
+/// their bots keep a valid pin.
+fn ensure_environments_enrollment(
+    connection: &mut Connection,
+    require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let has_column = |conn: &Connection| -> Result<bool, StoreError> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('environments') WHERE name = 'enrollment')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(backend)
+    };
+    if has_column(connection)? {
+        return Ok(());
+    }
+    require_exclusive(
+        "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
+    )?;
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    if !has_column(&tx)? {
+        tx.execute_batch(
+            "ALTER TABLE environments ADD COLUMN enrollment BLOB;
+             UPDATE environments SET enrollment = randomblob(16) WHERE credential != x'';",
+        )
+        .map_err(backend)?;
+    }
+    tx.commit().map_err(backend)
+}
+
+fn ensure_environments_pending_key(
+    connection: &mut Connection,
+    require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let has_column = |conn: &Connection| -> Result<bool, StoreError> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('environments') WHERE name = 'pending_key')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(backend)
+    };
+    if has_column(connection)? {
+        return Ok(());
+    }
+    require_exclusive(
+        "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
+    )?;
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    if !has_column(&tx)? {
+        tx.execute_batch("ALTER TABLE environments ADD COLUMN pending_key BLOB;")
+            .map_err(backend)?;
+    }
+    tx.commit().map_err(backend)
+}
+
 fn ensure_model_enabled(
     connection: &mut Connection,
     require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,

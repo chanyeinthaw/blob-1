@@ -1,6 +1,6 @@
 use std::{borrow::Cow, collections::BTreeMap, path::PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub fn valid_skill_name(name: &str) -> bool {
     !name.is_empty() && !name.starts_with('.') && !name.contains('/')
@@ -38,28 +38,29 @@ pub fn parse_frontmatter(content: &str) -> Option<Frontmatter> {
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillFile {
     pub path: String,
     pub mode: u32,
+    #[serde(with = "base64_bytes")]
     pub content: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillBundle {
     pub name: String,
     pub hash: String,
     pub files: Vec<SkillFile>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillEntry {
     pub name: String,
     pub description: String,
     pub location: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "name",
     content = "arguments",
@@ -107,26 +108,43 @@ impl ToolInput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Replacement {
     pub old_text: String,
     pub new_text: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub input: ToolInput,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Image {
     pub mime: String,
+    #[serde(with = "base64_bytes")]
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Byte fields cross the `/ws/node` wire as base64 strings; serde's default
+/// JSON number array would roughly quadruple image and skill payloads.
+mod base64_bytes {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        STANDARD.decode(text).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult {
     pub id: String,
     pub content: String,
@@ -198,3 +216,25 @@ pub trait Environment: Send + Sync {
     async fn skill_catalog(&self) -> Result<Vec<SkillEntry>, ToolError>;
     async fn execute(&self, call: ToolCall) -> Result<ToolResult, ToolError>;
 }
+
+#[async_trait::async_trait]
+impl Environment for std::sync::Arc<dyn Environment> {
+    async fn managed_skills(&self) -> Result<BTreeMap<String, (String, bool)>, ToolError> {
+        (**self).managed_skills().await
+    }
+    async fn apply_skills(
+        &self,
+        put: Vec<SkillBundle>,
+        remove: Vec<String>,
+    ) -> Result<Vec<String>, ToolError> {
+        (**self).apply_skills(put, remove).await
+    }
+    async fn skill_catalog(&self) -> Result<Vec<SkillEntry>, ToolError> {
+        (**self).skill_catalog().await
+    }
+    async fn execute(&self, call: ToolCall) -> Result<ToolResult, ToolError> {
+        (**self).execute(call).await
+    }
+}
+
+pub mod node;

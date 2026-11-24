@@ -2,7 +2,7 @@ import type { BotSummary } from '@blob-1/contracts'
 import { useAtomMount, useAtomSet, useAtomValue } from '@effect/atom-react'
 import { Link, type LinkProps, Navigate, useNavigate, useRouterState } from '@tanstack/react-router'
 import { AsyncResult } from 'effect/reactivity'
-import { Cloud, Cpu, LogOut, Plug, Plus, type LucideIcon } from 'lucide-react'
+import { Cloud, Cpu, LogOut, Plug, Plus, Server, type LucideIcon } from 'lucide-react'
 import { type ReactNode, useEffect, useState } from 'react'
 import { toast } from 'sonner'
 
@@ -34,6 +34,12 @@ const globalNavItems: ReadonlyArray<GlobalNavItem> = [
   { label: 'Providers', mobileLabel: 'Providers', to: '/settings/providers', icon: Cloud },
   { label: 'Model catalog', mobileLabel: 'Models', to: '/settings/models', icon: Cpu },
   { label: 'MCP', mobileLabel: 'MCP', to: '/settings/mcp', icon: Plug },
+  {
+    label: 'Environments',
+    mobileLabel: 'Environments',
+    to: '/settings/environments',
+    icon: Server,
+  },
 ]
 
 function botDotClass(bot: BotSummary): string {
@@ -430,6 +436,8 @@ const DEFAULT_FALLBACK_BOTS: ReadonlyArray<BotSummary> = [
     generation: 0,
     mainModel: null,
     connection: { state: 'off' },
+    environment: 'local',
+    environmentOnline: true,
   },
 ]
 

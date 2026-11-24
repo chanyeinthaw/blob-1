@@ -154,8 +154,37 @@ export const BotSummary = Schema.Struct({
   generation: Schema.Finite,
   mainModel: Schema.NullOr(Schema.String),
   connection: DiscordConnection,
+  /** 'local' or the name of the remote execution environment this bot runs on. */
+  environment: Schema.String,
+  environmentOnline: Schema.Boolean,
 })
 export type BotSummary = typeof BotSummary.Type
+
+/** A node that connected and is waiting to be accepted as an environment. */
+export const PendingNode = Schema.Struct({
+  nodeId: Schema.String,
+  hostname: Schema.String,
+  version: Schema.String,
+  /** Unix epoch seconds. */
+  connectedAt: Schema.Finite,
+})
+export type PendingNode = typeof PendingNode.Type
+
+export const EnvironmentInfo = Schema.Struct({
+  name: Schema.String,
+  nodeId: Schema.String,
+  version: Schema.NullOr(Schema.String),
+  /** Unix epoch seconds. */
+  lastSeen: Schema.Finite,
+  online: Schema.Boolean,
+})
+export type EnvironmentInfo = typeof EnvironmentInfo.Type
+
+export const Environments = Schema.Struct({
+  pending: Schema.Array(PendingNode),
+  environments: Schema.Array(EnvironmentInfo),
+})
+export type Environments = typeof Environments.Type
 
 export const BotMcpServer = Schema.Struct({
   id: Schema.String,
@@ -381,10 +410,34 @@ export const requests = {
     payload: Schema.Struct({ id: Schema.String, botGeneration: Schema.optional(Schema.Finite) }),
     reply: Schema.Array(BotSummary),
   },
+  'bots.setEnvironment': {
+    payload: Schema.Struct({
+      botId: Schema.String,
+      environment: Schema.String,
+      botGeneration: Schema.optional(Schema.Finite),
+    }),
+    reply: Schema.Array(BotSummary),
+  },
   'bot.mcp.get': { payload: BotScopedPayload, reply: BotMcpState },
   'bot.mcp.setEnabled': {
     payload: Schema.Struct({ ...botIdField, id: Schema.String, enabled: Schema.Boolean }),
     reply: BotMcpState,
+  },
+  'environments.list': { payload: NoPayload, reply: Environments },
+  'environments.accept': {
+    payload: Schema.Struct({
+      nodeId: Schema.String,
+      name: Schema.optional(Schema.String),
+    }),
+    reply: Environments,
+  },
+  'environments.remove': {
+    payload: Schema.Struct({ name: Schema.String }),
+    reply: Environments,
+  },
+  'environments.rename': {
+    payload: Schema.Struct({ name: Schema.String, to: Schema.String }),
+    reply: Environments,
   },
   'general.get': { payload: BotScopedPayload, reply: GeneralSettings },
   'general.setAutoRespond': {

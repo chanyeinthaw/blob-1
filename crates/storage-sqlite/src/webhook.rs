@@ -317,6 +317,24 @@ impl CallbackStore for SqliteStorage {
             .map_err(backend)?;
         Ok(())
     }
+
+    fn add_pending_event(
+        &self,
+        source: &str,
+        name: &str,
+        for_token: Option<&str>,
+        payload: &str,
+        created_at: i64,
+    ) -> Result<i64, StoreError> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO pending_events (source, name, for_token, payload, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![source, name, for_token, payload, created_at],
+        )
+        .map_err(backend)?;
+        Ok(conn.last_insert_rowid())
+    }
 }
 
 #[cfg(test)]

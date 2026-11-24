@@ -107,6 +107,8 @@ impl Session {
 pub enum StoreError {
     #[error("storage failed: {0}")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("{0}")]
+    Invalid(String),
 }
 
 pub trait SessionStore: Send + Sync {
@@ -2063,6 +2065,185 @@ pub struct Bot {
     pub enabled: bool,
     pub created_at: i64,
     pub generation: i64,
+    /// Execution environment name; "local" means the primary's machine.
+    pub environment: String,
+}
+
+/// A remote execution environment — a `blob-1 node` accepted by an admin.
+/// `credential` is sha256(node_key) and never leaves the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Environment {
+    pub name: String,
+    pub node_id: String,
+    pub credential: Vec<u8>,
+    /// Fresh random ID minted at each accept — stable across redials and
+    /// renames, invalidated by revoke. Consumers pin this (not the node
+    /// key) so re-enrollment under the same name can't take over a binding.
+    /// Empty for pending rows and environments accepted before the column
+    /// existed (those are backfilled by migration).
+    pub enrollment: Vec<u8>,
+    /// Stashed node key hash while the row is pending (`None` after accept).
+    pub pending_key: Option<Vec<u8>>,
+    /// Hostname the node reported; display metadata for pending rows.
+    pub hostname: Option<String>,
+    pub version: Option<String>,
+    pub last_seen: i64,
+    pub created_at: i64,
+}
+
+pub const LOCAL_ENVIRONMENT: &str = "local";
+
+/// Environment names must not collide with the built-in local executor or
+/// the internal `pending:`/`revoked:` row namespaces.
+pub fn environment_name_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name != LOCAL_ENVIRONMENT
+        && !name.starts_with("pending:")
+        && !name.starts_with("revoked:")
+}
+
+/// A revoked environment leaves this tombstone binding on its bots so a
+/// re-enrolled node under the same name cannot silently inherit them.
+pub fn revoked_environment(name: &str) -> String {
+    format!("revoked:{name}")
+}
+
+pub trait EnvironmentStore: Send + Sync {
+    fn environments(&self) -> Result<Vec<Environment>, StoreError>;
+    fn environment(&self, name: &str) -> Result<Option<Environment>, StoreError>;
+    fn environment_for_node(&self, node_id: &str) -> Result<Option<Environment>, StoreError>;
+    /// The environment whose stored credential matches `sha256(node_key)`.
+    fn environment_for_key(&self, key_hash: &[u8]) -> Result<Option<Environment>, StoreError>;
+    /// Renames `from` to `to`, returning the row actually renamed — the
+    /// caller must not re-read by `to`, which a concurrent mutation could
+    /// have recycled for another node. `expected_enrollment` pins the
+    /// update to the row the caller read, so a name recycled for a
+    /// different node's environment is left alone. Accepted rows only.
+    fn rename_environment(
+        &self,
+        from: &str,
+        to: &str,
+        expected_enrollment: &[u8],
+    ) -> Result<Option<Environment>, StoreError>;
+    /// Deletes the environment named `name`, but only the row carrying
+    /// `expected_enrollment`: a cross-process rename that recycled the name
+    /// for another node leaves the replacement untouched and returns
+    /// `false`. Pass an empty slice for rows without an enrollment
+    /// (pending).
+    fn remove_environment(
+        &self,
+        name: &str,
+        expected_enrollment: &[u8],
+    ) -> Result<bool, StoreError>;
+    /// Refreshes version/last_seen when a node's session authenticates.
+    fn touch_environment(
+        &self,
+        node_id: &str,
+        version: &str,
+        last_seen: i64,
+    ) -> Result<(), StoreError>;
+    /// Records a node awaiting accept (empty credential = pending); the
+    /// presented key hash is stashed until accept promotes it. Refreshes
+    /// `last_seen`/`version` on repeat connects; accepted rows are untouched.
+    /// The first-presented key hash is pinned until the row expires: a
+    /// reconnect presenting a different key for the same node_id updates
+    /// nothing and returns `false`, so what the operator reviewed is what
+    /// `accept_pending_node` enrolls.
+    fn upsert_pending_node(
+        &self,
+        node_id: &str,
+        hostname: &str,
+        version: &str,
+        key_hash: &[u8],
+        seen_at: i64,
+    ) -> Result<bool, StoreError>;
+    /// Drops a pending (unaccepted) node row so a node_id pinned by a
+    /// different key can re-enroll. `expected_pending_key` pins the delete
+    /// to the row the caller reviewed — a re-registration in between is
+    /// left alone. Returns `false` when no matching pending row.
+    fn drop_pending_node(
+        &self,
+        node_id: &str,
+        expected_pending_key: &[u8],
+    ) -> Result<bool, StoreError>;
+    /// Promotes a pending node into a named environment, adopting the key it
+    /// presented. `expected_pending_key` pins the promotion to the exact row
+    /// the caller reviewed: a deny+re-register in between leaves the new row
+    /// untouched and returns `None`.
+    fn accept_pending_node(
+        &self,
+        node_id: &str,
+        name: &str,
+        expected_pending_key: &[u8],
+    ) -> Result<Option<Environment>, StoreError>;
+    /// Drops pending nodes whose `last_seen` is older than `before`.
+    fn expire_pending_nodes(&self, before: i64) -> Result<Vec<String>, StoreError>;
+}
+
+impl<T: EnvironmentStore + ?Sized> EnvironmentStore for Arc<T> {
+    fn environments(&self) -> Result<Vec<Environment>, StoreError> {
+        (**self).environments()
+    }
+    fn environment(&self, name: &str) -> Result<Option<Environment>, StoreError> {
+        (**self).environment(name)
+    }
+    fn environment_for_node(&self, node_id: &str) -> Result<Option<Environment>, StoreError> {
+        (**self).environment_for_node(node_id)
+    }
+    fn environment_for_key(&self, key_hash: &[u8]) -> Result<Option<Environment>, StoreError> {
+        (**self).environment_for_key(key_hash)
+    }
+    fn rename_environment(
+        &self,
+        from: &str,
+        to: &str,
+        expected_enrollment: &[u8],
+    ) -> Result<Option<Environment>, StoreError> {
+        (**self).rename_environment(from, to, expected_enrollment)
+    }
+    fn remove_environment(
+        &self,
+        name: &str,
+        expected_enrollment: &[u8],
+    ) -> Result<bool, StoreError> {
+        (**self).remove_environment(name, expected_enrollment)
+    }
+    fn touch_environment(
+        &self,
+        node_id: &str,
+        version: &str,
+        last_seen: i64,
+    ) -> Result<(), StoreError> {
+        (**self).touch_environment(node_id, version, last_seen)
+    }
+    fn upsert_pending_node(
+        &self,
+        node_id: &str,
+        hostname: &str,
+        version: &str,
+        key_hash: &[u8],
+        seen_at: i64,
+    ) -> Result<bool, StoreError> {
+        (**self).upsert_pending_node(node_id, hostname, version, key_hash, seen_at)
+    }
+    fn drop_pending_node(
+        &self,
+        node_id: &str,
+        expected_pending_key: &[u8],
+    ) -> Result<bool, StoreError> {
+        (**self).drop_pending_node(node_id, expected_pending_key)
+    }
+    fn accept_pending_node(
+        &self,
+        node_id: &str,
+        name: &str,
+        expected_pending_key: &[u8],
+    ) -> Result<Option<Environment>, StoreError> {
+        (**self).accept_pending_node(node_id, name, expected_pending_key)
+    }
+    fn expire_pending_nodes(&self, before: i64) -> Result<Vec<String>, StoreError> {
+        (**self).expire_pending_nodes(before)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2124,6 +2305,19 @@ pub trait BotStore: Send + Sync {
     ) -> Result<(), StoreError>;
     fn provider_in_use_by_bot(&self, provider: &ProviderId) -> Result<Option<String>, StoreError>;
     fn bot_disabled_mcp_servers(&self, bot_id: &str) -> Result<Vec<String>, StoreError>;
+    /// `None` binds the bot back to `local`.
+    fn set_bot_environment(
+        &self,
+        bot_id: &str,
+        environment: Option<&str>,
+    ) -> Result<bool, StoreError>;
+    /// The bot's environment name and the bound env's enrollment ID, read in
+    /// one query so a revoke+re-accept between reads can't split them.
+    /// `enrollment` is `None` for `local`, tombstones, and unaccepted rows.
+    fn bot_env_binding(
+        &self,
+        bot_id: &str,
+    ) -> Result<Option<(String, Option<Vec<u8>>)>, StoreError>;
     fn set_bot_mcp_server_enabled(
         &self,
         bot_id: &str,
@@ -2192,6 +2386,19 @@ impl<T: BotStore + ?Sized> BotStore for Arc<T> {
     fn bot_disabled_mcp_servers(&self, bot_id: &str) -> Result<Vec<String>, StoreError> {
         (**self).bot_disabled_mcp_servers(bot_id)
     }
+    fn set_bot_environment(
+        &self,
+        bot_id: &str,
+        environment: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        (**self).set_bot_environment(bot_id, environment)
+    }
+    fn bot_env_binding(
+        &self,
+        bot_id: &str,
+    ) -> Result<Option<(String, Option<Vec<u8>>)>, StoreError> {
+        (**self).bot_env_binding(bot_id)
+    }
     fn set_bot_mcp_server_enabled(
         &self,
         bot_id: &str,
@@ -2246,6 +2453,16 @@ pub trait CallbackStore: Send + Sync {
     ) -> Result<Option<Callback>, StoreError>;
     fn next_pending_event(&self) -> Result<Option<PendingEvent>, StoreError>;
     fn delete_pending_event(&self, id: i64) -> Result<(), StoreError>;
+    /// Enqueues a system-originated event (e.g. environment notices) that the
+    /// bot loop consumes like a callback wake.
+    fn add_pending_event(
+        &self,
+        source: &str,
+        name: &str,
+        for_token: Option<&str>,
+        payload: &str,
+        created_at: i64,
+    ) -> Result<i64, StoreError>;
 }
 
 impl<T: CallbackStore + ?Sized> CallbackStore for Arc<T> {
@@ -2279,5 +2496,15 @@ impl<T: CallbackStore + ?Sized> CallbackStore for Arc<T> {
     }
     fn delete_pending_event(&self, id: i64) -> Result<(), StoreError> {
         (**self).delete_pending_event(id)
+    }
+    fn add_pending_event(
+        &self,
+        source: &str,
+        name: &str,
+        for_token: Option<&str>,
+        payload: &str,
+        created_at: i64,
+    ) -> Result<i64, StoreError> {
+        (**self).add_pending_event(source, name, for_token, payload, created_at)
     }
 }

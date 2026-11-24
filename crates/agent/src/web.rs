@@ -36,6 +36,7 @@ const COOKIE: &str = "blob_session";
 struct WebContext {
     store: Arc<SqliteStorage>,
     bots: crate::run::BotRegistry,
+    nodes: Arc<crate::nodes::NodeRegistry>,
     settings_lock: tokio::sync::Mutex<()>,
     mcp: mcp::Mcp,
     public_url: Option<url::Url>,
@@ -104,6 +105,7 @@ pub async fn serve(
     listener: tokio::net::TcpListener,
     store: Arc<SqliteStorage>,
     bots: crate::run::BotRegistry,
+    nodes: Arc<crate::nodes::NodeRegistry>,
     mcp: mcp::Mcp,
     shutdown: tokio::sync::watch::Receiver<bool>,
     public_url: Option<url::Url>,
@@ -111,6 +113,7 @@ pub async fn serve(
     let store = Arc::new(WebContext {
         store,
         bots,
+        nodes,
         settings_lock: tokio::sync::Mutex::new(()),
         mcp,
         public_url,
@@ -122,6 +125,7 @@ pub async fn serve(
         .route("/api/mcp/login", get(mcp_login))
         .route("/api/mcp/callback", get(mcp_callback))
         .route("/ws", get(ws))
+        .route("/ws/node", get(node_ws))
         .route("/p/{id}", get(public_file))
         .route("/p/{id}/{name}", get(public_file_named))
         .route("/hooks/cb/{token}", post(inbound_callback))
@@ -275,6 +279,17 @@ async fn ws(
     response.headers_mut().insert(header::SET_COOKIE, cookie);
     response
 }
+
+/// `/ws/node` is the node-facing socket: a remote executor dials in and says
+/// hello; `NodeRegistry` authenticates the session before any work flows.
+/// No cookie auth — nodes authenticate in-band with their credential.
+async fn node_ws(State(ctx): State<Context>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade
+        .max_frame_size(environment::node::MAX_FRAME_BYTES)
+        .max_message_size(environment::node::MAX_FRAME_BYTES)
+        .on_upgrade(move |socket| ctx.nodes.handle_connection(socket))
+        .into_response()
+}
 /// A bare origin (`scheme://host[:port]`) must equal the public URL's; a
 /// browser omits the port when it is the scheme's default.
 fn origin_ok(origin: Option<&Uri>, headers: &HeaderMap, public_url: Option<&url::Url>) -> bool {
@@ -413,10 +428,9 @@ fn instructions_reply(store: &SqliteStorage) -> crate::Result<Value> {
 fn models_reply(global_store: &SqliteStorage, bot_id: &str) -> crate::Result<Value> {
     let bm = global_store.bot_models(bot_id)?;
     let slot = |model: storage::ModelRef, reasoning: ReasoningLevel| json!({"provider":model.provider.0,"model":model.model,"reasoning":reasoning.as_str()});
-    let main = bm
-        .main
-        .map(|m| slot(m, bm.main_reasoning))
-        .unwrap_or_else(|| json!({"provider":"","model":"","reasoning":bm.main_reasoning.as_str()}));
+    let main = bm.main.map(|m| slot(m, bm.main_reasoning)).unwrap_or_else(
+        || json!({"provider":"","model":"","reasoning":bm.main_reasoning.as_str()}),
+    );
     let compaction = bm
         .compaction
         .map(|m| slot(m, bm.compaction_reasoning.unwrap_or(bm.main_reasoning)));
@@ -437,7 +451,9 @@ fn models_reply(global_store: &SqliteStorage, bot_id: &str) -> crate::Result<Val
         let models: Vec<Value> = global_store.models(&p.id)?.into_iter().map(|m| json!({"id":m.id,"context":m.context_window,"limit":m.context_limit,"images":m.images,"enabled":m.enabled})).collect();
         providers.push(json!({"id":p.id.0,"api":api,"models":models}));
     }
-    Ok(json!({"main":main,"compaction":compaction,"utility":utility,"decision":decision,"providers":providers}))
+    Ok(
+        json!({"main":main,"compaction":compaction,"utility":utility,"decision":decision,"providers":providers}),
+    )
 }
 
 async fn bots_reply(ctx: &WebContext) -> crate::Result<Value> {
@@ -458,10 +474,20 @@ async fn bots_reply(ctx: &WebContext) -> crate::Result<Value> {
             "createdAt": bot.created_at,
             "generation": bot.generation,
             "mainModel": main_model,
+            "environment": bot.environment,
+            "environmentOnline": bot.environment == storage::LOCAL_ENVIRONMENT
+                || ctx.nodes.availability(&bot.environment).borrow().is_some(),
             "connection": connection,
         }));
     }
     Ok(json!(out))
+}
+
+fn environments_reply(ctx: &WebContext) -> crate::Result<Value> {
+    Ok(json!({
+        "environments": ctx.nodes.environments(),
+        "pending": ctx.nodes.pending(),
+    }))
 }
 
 fn bot_mcp_reply(global_store: &SqliteStorage, bot_id: &str) -> crate::Result<Value> {
@@ -761,6 +787,57 @@ async fn dispatch(
                 ctx.bots.remove(id).await?;
                 bots_reply(ctx).await
             }
+            "bots.setEnvironment" => {
+                let id = get("botId")?;
+                let environment = get("environment")?.trim();
+                if environment.is_empty() {
+                    return Err(invalid().into());
+                }
+                let target = (environment != storage::LOCAL_ENVIRONMENT).then_some(environment);
+                if let Some(name) = target {
+                    if !ctx.nodes.environment_exists(name) {
+                        return Err(format!("Unknown environment '{name}'").into());
+                    }
+                }
+                let _guard = ctx.settings_lock.lock().await;
+                recheck_bot_generation(global, payload, id, None)?;
+                ctx.bots.set_environment(id, target).await?;
+                bots_reply(ctx).await
+            }
+            "environments.list" => environments_reply(ctx),
+            "environments.accept" => {
+                let node_id = get("nodeId")?;
+                let name = payload
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty());
+                let _guard = ctx.settings_lock.lock().await;
+                ctx.nodes.accept(node_id, name).await?;
+                environments_reply(ctx)
+            }
+            "environments.remove" => {
+                let name = get("name")?;
+                let _guard = ctx.settings_lock.lock().await;
+                // Pending rows carry the `pending:<node_id>` name; removing
+                // one discards the row and drops the socket (deny).
+                match name.strip_prefix("pending:") {
+                    Some(node_id) => ctx.nodes.deny(node_id).await?,
+                    None => ctx.nodes.revoke(name).await?,
+                }
+                environments_reply(ctx)
+            }
+            "environments.rename" => {
+                let name = get("name")?;
+                let to = get("to")?.trim();
+                if to.is_empty() {
+                    return Err(invalid().into());
+                }
+                let _guard = ctx.settings_lock.lock().await;
+                ctx.nodes.rename(name, to).await?;
+                ctx.bots.restart_environment(to).await?;
+                environments_reply(ctx)
+            }
             "bot.mcp.get" => {
                 resolve_bot(ctx, payload, bot_id).await?;
                 bot_mcp_reply(global, bot_id)
@@ -875,7 +952,9 @@ async fn dispatch(
                         crate::known_model_with_provider(global, &format!("{provider}/{model}"))
                             .map_err(|_| "Unknown model")?;
                     if !prov.api.is_decision() {
-                        return Err("only decision providers can be used in the Decision slot".into());
+                        return Err(
+                            "only decision providers can be used in the Decision slot".into()
+                        );
                     }
                     Some(storage::ModelRef {
                         provider: m.provider,
@@ -1061,10 +1140,10 @@ async fn dispatch(
                 } else {
                     let _guard = ctx.settings_lock.lock().await;
                     if let Some(used_by) = global.provider_in_use_by_bot(&provider.id)? {
-                        return Err(
-                            format!("Provider {id} is used by a model slot on bot '{used_by}'")
-                                .into(),
-                        );
+                        return Err(format!(
+                            "Provider {id} is used by a model slot on bot '{used_by}'"
+                        )
+                        .into());
                     }
                     crate::provider(global, crate::ProviderCommand::Remove { id: id.into() })?;
                 }
@@ -1138,9 +1217,7 @@ async fn dispatch(
                                 .flatten()
                                 .map(|b| b.name)
                                 .unwrap_or_else(|| other.id.clone());
-                            return Err(
-                                format!("Token already in use by bot '{name}'").into()
-                            );
+                            return Err(format!("Token already in use by bot '{name}'").into());
                         }
                     }
                 }
@@ -1337,7 +1414,8 @@ async fn dispatch(
                                 return Err(invalid().into());
                             }
                         }
-                        (storage::AccessScope::Server, Some(id)) if crate::valid_discord_id(id) => {}
+                        (storage::AccessScope::Server, Some(id)) if crate::valid_discord_id(id) => {
+                        }
                         (storage::AccessScope::Channel, Some(id))
                             if crate::valid_discord_id(id) => {}
                         (storage::AccessScope::Global, Some(_)) => return Err(invalid().into()),
@@ -1355,8 +1433,10 @@ async fn dispatch(
                     }
                     match (scope, scope_id) {
                         (storage::AccessScope::Global, None) if user_id.is_some() => {}
-                        (storage::AccessScope::Server | storage::AccessScope::Channel, Some(id))
-                            if !id.is_empty() => {}
+                        (
+                            storage::AccessScope::Server | storage::AccessScope::Channel,
+                            Some(id),
+                        ) if !id.is_empty() => {}
                         _ => return Err(invalid().into()),
                     }
                     store.remove_access_rule("discord", user_id, scope, scope_id)?;
@@ -1972,7 +2052,10 @@ async fn inbound_webhook(
                 .into_response();
         }
     };
-    match bot.store.enqueue_webhook_event(&token_hash, now(), &payload) {
+    match bot
+        .store
+        .enqueue_webhook_event(&token_hash, now(), &payload)
+    {
         Ok(Some(_)) => {}
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -2082,9 +2165,14 @@ mod public_file_tests {
     use super::*;
     use storage::PublicFile;
 
+    fn ctx_nodes(store: Arc<SqliteStorage>) -> Arc<crate::nodes::NodeRegistry> {
+        crate::nodes::NodeRegistry::new(store)
+    }
+
     #[tokio::test]
     async fn serves_shared_files_with_sandbox_csp_and_blocks_escapes() {
-        let dir = std::env::temp_dir().join(format!("blob-1-web-share-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("blob-1-web-share-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let workspace = dir.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -2154,11 +2242,13 @@ mod public_file_tests {
             pinned,
             None,
             mcp.clone(),
+            crate::nodes::NodeRegistry::new(store.clone()),
         );
         bots.register_default_for_test().await.unwrap();
         let ctx = WebContext {
             store: store.clone(),
             bots,
+            nodes: ctx_nodes(store.clone()),
             settings_lock: tokio::sync::Mutex::new(()),
             mcp,
             public_url: Some(public_url("https://blob-1.example.com").unwrap()),
@@ -2171,15 +2261,23 @@ mod public_file_tests {
             "text/plain; charset=utf-8"
         );
         assert_eq!(
-            md_resp.headers().get(header::CONTENT_SECURITY_POLICY).unwrap(),
+            md_resp
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .unwrap(),
             "sandbox allow-scripts"
         );
         assert_eq!(
-            md_resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            md_resp
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
             "nosniff"
         );
         assert!(md_resp.headers().get(header::CONTENT_LENGTH).is_none());
-        let md_body = axum::body::to_bytes(md_resp.into_body(), 1024).await.unwrap();
+        let md_body = axum::body::to_bytes(md_resp.into_body(), 1024)
+            .await
+            .unwrap();
         assert_eq!(md_body.as_ref(), b"# Hello\nworld");
 
         let head_resp = serve_public_file(&ctx, &md_id, true).await;
@@ -2217,7 +2315,9 @@ mod public_file_tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            serve_public_file(&ctx, "other-ws-link", false).await.status(),
+            serve_public_file(&ctx, "other-ws-link", false)
+                .await
+                .status(),
             StatusCode::NOT_FOUND
         );
 
@@ -2226,14 +2326,12 @@ mod public_file_tests {
 
     #[tokio::test]
     async fn inbound_webhook_validates_token_enabled_and_body_limit() {
-        let dir =
-            std::env::temp_dir().join(format!("blob-1-web-hook-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("blob-1-web-hook-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let workspace = dir.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let key = storage_sqlite::AppKey::new("test-key".into());
-        let store =
-            Arc::new(SqliteStorage::open(dir.join("agent.db"), Some(key.clone())).unwrap());
+        let store = Arc::new(SqliteStorage::open(dir.join("agent.db"), Some(key.clone())).unwrap());
         let pinned = harness::PinnedWorkspace::open(&workspace).unwrap();
 
         let token = "secret-hook-token";
@@ -2251,11 +2349,13 @@ mod public_file_tests {
             pinned,
             None,
             mcp.clone(),
+            ctx_nodes(store.clone()),
         );
         bots.register_default_for_test().await.unwrap();
         let ctx = Arc::new(WebContext {
             store: store.clone(),
             bots,
+            nodes: ctx_nodes(store.clone()),
             settings_lock: tokio::sync::Mutex::new(()),
             mcp,
             public_url: Some(public_url("https://blob-1.example.com").unwrap()),
@@ -2272,12 +2372,7 @@ mod public_file_tests {
 
         // Oversized payload (> 64 KiB) -> 413.
         let big = vec![b'a'; MAX_WEBHOOK_BODY_BYTES + 1];
-        let r = inbound_webhook(
-            State(ctx.clone()),
-            AxumPath(token.into()),
-            Body::from(big),
-        )
-        .await;
+        let r = inbound_webhook(State(ctx.clone()), AxumPath(token.into()), Body::from(big)).await;
         assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
         // Valid token when chat harness is not attached yet -> 503 and does not update last_triggered_at.
@@ -2289,18 +2384,17 @@ mod public_file_tests {
         .await;
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            store.webhook_by_token_hash(&hash).unwrap().unwrap().last_triggered_at,
+            store
+                .webhook_by_token_hash(&hash)
+                .unwrap()
+                .unwrap()
+                .last_triggered_at,
             None
         );
 
         // Disabled webhook -> 404.
         store.set_webhook_enabled("h1", false).unwrap();
-        let r = inbound_webhook(
-            State(ctx.clone()),
-            AxumPath(token.into()),
-            Body::from("hi"),
-        )
-        .await;
+        let r = inbound_webhook(State(ctx.clone()), AxumPath(token.into()), Body::from("hi")).await;
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
 
         // Temporary callback: unknown -> 404, oversized -> 413, 503 does not burn token, expired -> 404.
@@ -2311,16 +2405,24 @@ mod public_file_tests {
             .create_callback("cb1", "async-job", &cb_hash, Some("m17"), 1, ts + 600, ts)
             .unwrap();
         assert_eq!(
-            inbound_callback(State(ctx.clone()), AxumPath("wrong".into()), Body::from("hi"))
-                .await
-                .status(),
+            inbound_callback(
+                State(ctx.clone()),
+                AxumPath("wrong".into()),
+                Body::from("hi")
+            )
+            .await
+            .status(),
             StatusCode::NOT_FOUND
         );
         let big = vec![b'a'; MAX_WEBHOOK_BODY_BYTES + 1];
         assert_eq!(
-            inbound_callback(State(ctx.clone()), AxumPath(cb_token.into()), Body::from(big))
-                .await
-                .status(),
+            inbound_callback(
+                State(ctx.clone()),
+                AxumPath(cb_token.into()),
+                Body::from(big)
+            )
+            .await
+            .status(),
             StatusCode::PAYLOAD_TOO_LARGE
         );
         // LiveChat not attached -> 503 AND callback remains unconsumed.

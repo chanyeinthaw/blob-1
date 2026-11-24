@@ -11,6 +11,7 @@ use storage::{
 use storage_sqlite::{AppKey, SqliteStorage};
 
 mod import;
+mod nodes;
 mod run;
 mod runtime;
 mod web;
@@ -109,6 +110,20 @@ enum Command {
     },
     Chat {
         message: String,
+    },
+    /// Run as a remote executor node, dialing into a primary `serve`.
+    Node {
+        /// WebSocket URL of the primary, e.g. wss://host/ws/node.
+        #[arg(long)]
+        url: String,
+        /// Root directory for bot workspaces (default ~/.blob-1/workspaces).
+        #[arg(long)]
+        workspaces: Option<PathBuf>,
+    },
+    /// Manage execution environments (remote nodes).
+    Environment {
+        #[command(subcommand)]
+        command: EnvironmentCommand,
     },
     /// Download a release and switch to it.
     Update {
@@ -604,6 +619,26 @@ enum SkillCommand {
     Remove { name: String },
 }
 
+#[derive(Subcommand)]
+enum EnvironmentCommand {
+    /// List pending nodes and accepted environments.
+    List,
+    /// Accept a pending node as a named environment.
+    Accept {
+        /// Node id from `environment list`.
+        node_id: String,
+        /// Environment name (default: node's hostname).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Revoke an environment; its node falls back to pending.
+    Revoke { name: String },
+    /// Discard a pending node (e.g. to clear a slot pinned by a stale key).
+    Deny { node_id: String },
+    /// Rename an environment; bound bots follow the new name.
+    Rename { name: String, to: String },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let matches = Cli::command().version(VERSION).get_matches();
@@ -649,6 +684,16 @@ async fn main() -> Result<()> {
             })
             .await;
         }
+        Command::Node { url, workspaces } => {
+            // A node is a pure executor: it dials out and never opens the
+            // primary's agent.db (which must not exist on node machines).
+            return environment_node::run(environment_node::NodeOptions {
+                url: url.clone(),
+                workspaces: workspaces.clone(),
+            })
+            .await
+            .map_err(|error| error.to_string().into());
+        }
         _ => {}
     }
     let path = data_dir.join("agent.db");
@@ -671,6 +716,7 @@ async fn main() -> Result<()> {
                 | Command::Web { .. }
                 | Command::Messenger { .. }
                 | Command::Mcp { .. }
+                | Command::Environment { .. }
                 | Command::Instructions { .. }
                 | Command::AutoRespond { .. }
                 | Command::Timezone { .. }
@@ -803,6 +849,7 @@ async fn main() -> Result<()> {
             let mcp = mcp::Mcp::new(store.clone());
             let mcp_for_web = mcp.clone();
             let mcp_shutdown = mcp.clone();
+            let nodes = nodes::NodeRegistry::new(store.clone());
             let registry = run::BotRegistry::new(
                 store.clone(),
                 data_dir.clone(),
@@ -811,6 +858,7 @@ async fn main() -> Result<()> {
                 pinned_workspace.clone(),
                 skills_dir.clone(),
                 mcp,
+                nodes.clone(),
             );
             registry.start_all().await?;
             runtime::mark_ready();
@@ -829,6 +877,7 @@ async fn main() -> Result<()> {
                 listener,
                 store,
                 registry.clone(),
+                nodes.clone(),
                 mcp_for_web,
                 shutdown_rx,
                 public_url,
@@ -855,7 +904,8 @@ async fn main() -> Result<()> {
             let workspace = workspace.canonicalize()?;
             run::chat(store, &workspace, skills_dir.as_deref(), message).await
         }
-        Command::Update { .. } | Command::Launcher { .. } => unreachable!(),
+        Command::Environment { command } => environment_command(&store, &command),
+        Command::Update { .. } | Command::Launcher { .. } | Command::Node { .. } => unreachable!(),
     }
 }
 
@@ -928,9 +978,7 @@ fn provider(store: &SqliteStorage, command: ProviderCommand) -> Result<()> {
             };
             let base_url = match (provider_api, base_url) {
                 (_, Some(base_url)) => base_url,
-                (ProviderApi::OpenCodeGo, None) => {
-                    "https://opencode.ai/inference/go".to_owned()
-                }
+                (ProviderApi::OpenCodeGo, None) => "https://opencode.ai/inference/go".to_owned(),
                 (_, None) => return Err("--base-url is required".into()),
             };
             let explicit_models: Vec<storage::DiscoveredModel> = models
@@ -1531,7 +1579,9 @@ async fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<(
                             rule.scope.as_str(),
                             scope_id
                         ),
-                        None => println!("{} {} {}", rule.effect.as_str(), who, rule.scope.as_str()),
+                        None => {
+                            println!("{} {} {}", rule.effect.as_str(), who, rule.scope.as_str())
+                        }
                     }
                 }
             }
@@ -1582,7 +1632,13 @@ async fn messenger(store: &SqliteStorage, command: MessengerCommand) -> Result<(
                         return Err("cannot specify both --server and --channel".into());
                     }
                 };
-                store.set_access_rule(&messenger, user.as_deref(), scope, scope_id, effect.into())?;
+                store.set_access_rule(
+                    &messenger,
+                    user.as_deref(),
+                    scope,
+                    scope_id,
+                    effect.into(),
+                )?;
             }
             MessengerAccessCommand::Remove {
                 messenger,
@@ -1750,4 +1806,53 @@ async fn mcp_command(store: &Arc<SqliteStorage>, command: McpCommand) -> Result<
         }
     }
     Ok(())
+}
+
+/// `environment` subcommands operate on the shared store — a running `serve`
+/// reconciles live node sessions on its next sweep.
+fn environment_command(store: &Arc<SqliteStorage>, command: &EnvironmentCommand) -> Result<()> {
+    use storage::EnvironmentStore;
+    match command {
+        EnvironmentCommand::List => {
+            let envs = store.environments()?;
+            let (pending, accepted): (Vec<_>, Vec<_>) =
+                envs.into_iter().partition(|e| e.credential.is_empty());
+            if accepted.is_empty() {
+                println!("no environments");
+            }
+            for env in &accepted {
+                println!(
+                    "{}\tnode {}\tlast seen {}",
+                    env.name, env.node_id, env.last_seen
+                );
+            }
+            if !pending.is_empty() {
+                println!("pending:");
+                for env in &pending {
+                    println!("  {}\tseen {}", env.node_id, env.last_seen);
+                }
+            }
+            Ok(())
+        }
+        EnvironmentCommand::Accept { node_id, name } => {
+            let env = nodes::accept_row(store, node_id, name.as_deref())?;
+            println!("accepted '{}' (node {})", env.name, env.node_id);
+            Ok(())
+        }
+        EnvironmentCommand::Revoke { name } => {
+            nodes::revoke_row(store, name)?;
+            println!("revoked '{name}'");
+            Ok(())
+        }
+        EnvironmentCommand::Deny { node_id } => {
+            nodes::deny_row(store, node_id)?;
+            println!("denied '{node_id}'");
+            Ok(())
+        }
+        EnvironmentCommand::Rename { name, to } => {
+            nodes::rename_row(store, name, to)?;
+            println!("renamed '{name}' -> '{to}'");
+            Ok(())
+        }
+    }
 }

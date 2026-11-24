@@ -70,7 +70,9 @@ impl ModelFactory {
     fn fingerprint(&self) -> std::result::Result<u64, harness::HarnessError> {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.global_store.bot_models(&self.bot_id)?.hash(&mut hasher);
+        self.global_store
+            .bot_models(&self.bot_id)?
+            .hash(&mut hasher);
         for provider in self.global_store.providers()? {
             provider.hash(&mut hasher);
             self.global_store
@@ -96,11 +98,7 @@ impl harness::Models for ModelFactory {
             self.global_store
                 .models(&selected.provider)
                 .ok()
-                .and_then(|models| {
-                    models
-                        .into_iter()
-                        .find(|model| model.id == selected.model)
-                })
+                .and_then(|models| models.into_iter().find(|model| model.id == selected.model))
                 .is_some_and(|model| model.enabled)
         };
         let unavailable = |enabled: bool| {
@@ -583,7 +581,8 @@ impl llm::Source for Compactor {
     }
 }
 
-type Chat = ChatHarness<LocalEnvironment, Arc<SqliteStorage>, Compactor, ModelFactory>;
+type Chat =
+    ChatHarness<Arc<dyn environment::Environment>, Arc<SqliteStorage>, Compactor, ModelFactory>;
 
 type Resolve<T> = std::result::Result<T, String>;
 
@@ -840,12 +839,12 @@ fn resolve(
     }
 }
 
+/// Pushes DB-tracked skills onto the bot's execution environment — local or a
+/// remote node, whichever the `Environment` impl targets.
 async fn sync_shared_skills(
     store: &Arc<SqliteStorage>,
-    workspace: &Path,
-    skills_dir: Option<&Path>,
+    environment: &Arc<dyn environment::Environment>,
 ) -> Result<()> {
-    let environment = LocalEnvironment::new(workspace, skills_dir.map(Path::to_path_buf))?;
     let manifest = environment.managed_skills().await?;
     let skills = store.skills()?;
     let mut put = Vec::new();
@@ -878,17 +877,19 @@ async fn sync_shared_skills(
     Ok(())
 }
 
+/// `pinned_workspace` is `None` for remote environments: `share` and file
+/// attachments read the primary's disk, so they are withheld rather than
+/// served from a workspace the bot's tools never see.
 async fn chat_harness(
     global_store: Arc<SqliteStorage>,
     bot_store: Arc<SqliteStorage>,
     bot_id: String,
     workspace: &Path,
-    pinned_workspace: harness::PinnedWorkspace,
-    skills_dir: Option<&Path>,
+    pinned_workspace: Option<harness::PinnedWorkspace>,
+    environment: Arc<dyn environment::Environment>,
     models: ModelFactory,
     mcp: mcp::Mcp,
 ) -> Result<Chat> {
-    let environment = LocalEnvironment::new(workspace, skills_dir.map(Path::to_path_buf))?;
     let memory = memory::Memory::open(
         bot_store.clone(),
         Compactor(models.clone()),
@@ -896,13 +897,14 @@ async fn chat_harness(
     )?;
     let filter_store = global_store.clone();
     let filter_bot = bot_id;
-    let mcp_filter: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(move |server_id: &str| {
-        match filter_store.bot_disabled_mcp_servers(&filter_bot) {
-            Ok(disabled) => !disabled.iter().any(|id| id == server_id),
-            Err(_) => false,
-        }
-    });
-    Ok(ChatHarness::new(
+    let mcp_filter: Arc<dyn Fn(&str) -> bool + Send + Sync> =
+        Arc::new(
+            move |server_id: &str| match filter_store.bot_disabled_mcp_servers(&filter_bot) {
+                Ok(disabled) => !disabled.iter().any(|id| id == server_id),
+                Err(_) => false,
+            },
+        );
+    let harness = ChatHarness::new(
         environment,
         bot_store.clone(),
         memory,
@@ -911,15 +913,19 @@ async fn chat_harness(
         },
         models,
         bot_store.clone(),
-    )
-    .with_share(harness::ShareTools::new(
-        bot_store.clone(),
-        global_store.clone(),
-        pinned_workspace,
-    ))
-    .with_callback(harness::CallbackTools::new(bot_store, global_store))
-    .with_mcp(mcp)
-    .with_mcp_filter(mcp_filter))
+    );
+    let harness = match pinned_workspace {
+        Some(pinned) => harness.with_share(harness::ShareTools::new(
+            bot_store.clone(),
+            global_store.clone(),
+            pinned,
+        )),
+        None => harness,
+    };
+    Ok(harness
+        .with_callback(harness::CallbackTools::new(bot_store, global_store))
+        .with_mcp(mcp)
+        .with_mcp_filter(mcp_filter))
 }
 
 pub async fn chat(
@@ -938,15 +944,19 @@ pub async fn chat(
     let mcp = mcp::Mcp::new(store.clone());
     let mcp_shutdown = mcp.clone();
     std::fs::create_dir_all(workspace)?;
-    sync_shared_skills(&store, workspace, skills_dir).await?;
+    let environment: Arc<dyn environment::Environment> = Arc::new(LocalEnvironment::new(
+        workspace,
+        skills_dir.map(Path::to_path_buf),
+    )?);
+    sync_shared_skills(&store, &environment).await?;
     let pinned_workspace = harness::PinnedWorkspace::open(workspace)?;
     let harness = chat_harness(
         store.clone(),
         store,
         DEFAULT_BOT_ID.to_owned(),
         workspace,
-        pinned_workspace,
-        skills_dir,
+        Some(pinned_workspace),
+        environment,
         models,
         mcp,
     )
@@ -1071,7 +1081,11 @@ fn evaluate_access(
     let find = |user: Option<&str>, scope: AccessScope, scope_id: Option<&str>| {
         rules
             .iter()
-            .find(|r| r.user_id.as_deref() == user && r.scope == scope && r.scope_id.as_deref() == scope_id)
+            .find(|r| {
+                r.user_id.as_deref() == user
+                    && r.scope == scope
+                    && r.scope_id.as_deref() == scope_id
+            })
             .map(|r| r.effect)
     };
     if dm {
@@ -1149,7 +1163,15 @@ fn pre_filter_decision(
     use storage::{AccessEffect, AccessScope, InteractionMode, InteractionScope};
     let dm = guild.is_none();
     let access_decision = if channel_known || dm {
-        if access_allowed(default_access, access_rules, author, guild, channel, thread, dm) {
+        if access_allowed(
+            default_access,
+            access_rules,
+            author,
+            guild,
+            channel,
+            thread,
+            dm,
+        ) {
             PreFilterDecision::Allow
         } else {
             PreFilterDecision::Reject
@@ -1169,20 +1191,22 @@ fn pre_filter_decision(
                 })
                 .map(|r| r.effect)
         };
-        let (known_effect, matched_step) =
-            if let Some(e) = find(Some(author), AccessScope::Channel, Some(channel)) {
-                (e, 1u8)
-            } else if let Some(e) = guild.and_then(|g| find(Some(author), AccessScope::Server, Some(g))) {
-                (e, 3)
-            } else if let Some(e) = find(Some(author), AccessScope::Global, None) {
-                (e, 4)
-            } else if let Some(e) = find(None, AccessScope::Channel, Some(channel)) {
-                (e, 5)
-            } else if let Some(e) = guild.and_then(|g| find(None, AccessScope::Server, Some(g))) {
-                (e, 7)
-            } else {
-                (default_access, 8)
-            };
+        let (known_effect, matched_step) = if let Some(e) =
+            find(Some(author), AccessScope::Channel, Some(channel))
+        {
+            (e, 1u8)
+        } else if let Some(e) = guild.and_then(|g| find(Some(author), AccessScope::Server, Some(g)))
+        {
+            (e, 3)
+        } else if let Some(e) = find(Some(author), AccessScope::Global, None) {
+            (e, 4)
+        } else if let Some(e) = find(None, AccessScope::Channel, Some(channel)) {
+            (e, 5)
+        } else if let Some(e) = guild.and_then(|g| find(None, AccessScope::Server, Some(g))) {
+            (e, 7)
+        } else {
+            (default_access, 8)
+        };
         // Step 2 (`user` in parent channel) beats steps 3..=8.
         let user_parent_can_flip = matched_step > 2
             && access_rules.iter().any(|r| {
@@ -1193,9 +1217,7 @@ fn pre_filter_decision(
         // Step 6 (`everyone` in parent channel) beats only steps 7..=8.
         let everyone_parent_can_flip = matched_step > 6
             && access_rules.iter().any(|r| {
-                r.user_id.is_none()
-                    && r.scope == AccessScope::Channel
-                    && r.effect != known_effect
+                r.user_id.is_none() && r.scope == AccessScope::Channel && r.effect != known_effect
             });
         if user_parent_can_flip || everyone_parent_can_flip {
             PreFilterDecision::NeedParent
@@ -1659,9 +1681,7 @@ async fn admit_batch(
                     let _ = tx.send(Ok(item)).await;
                 }
             }
-            AdmissionPolicy::AutoRespondCheck
-                if approved_triage_ids.contains(&inbound.message) =>
-            {
+            AdmissionPolicy::AutoRespondCheck if approved_triage_ids.contains(&inbound.message) => {
                 let prefetched = triage_prefetched
                     .as_ref()
                     .and_then(|(id, h)| (*id == inbound.message).then_some(h.as_slice()));
@@ -1702,7 +1722,17 @@ pub struct BotHandle {
 struct BotEntry {
     handle: BotHandle,
     workspace_path: PathBuf,
-    running: Option<(tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>)>,
+    running: Option<(
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    )>,
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Manages every bot running inside one `blob-1 serve` process. The `'default'`
@@ -1718,6 +1748,11 @@ pub struct BotRegistry {
     root_pinned_workspace: harness::PinnedWorkspace,
     skills_dir: Option<PathBuf>,
     mcp: mcp::Mcp,
+    nodes: Arc<crate::nodes::NodeRegistry>,
+    /// Per-env serialization of remote skill pushes: bots sharing a node
+    /// would otherwise race the same node-wide skills dir on reconnect.
+    /// env name is unique per node, so one lock per env = one per node.
+    skill_sync: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     bots: Arc<tokio::sync::RwLock<HashMap<String, BotEntry>>>,
 }
 
@@ -1731,6 +1766,7 @@ impl BotRegistry {
         root_pinned_workspace: harness::PinnedWorkspace,
         skills_dir: Option<PathBuf>,
         mcp: mcp::Mcp,
+        nodes: Arc<crate::nodes::NodeRegistry>,
     ) -> Self {
         Self {
             global_store,
@@ -1740,6 +1776,8 @@ impl BotRegistry {
             root_pinned_workspace,
             skills_dir,
             mcp,
+            nodes,
+            skill_sync: Arc::new(dashmap::DashMap::new()),
             bots: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
     }
@@ -1824,27 +1862,155 @@ impl BotRegistry {
         let global_store = self.global_store.clone();
         let bot_store = entry.handle.store.clone();
         let bot_id = entry.handle.id.clone();
+        // Remote workspace dir on the node. The generation keeps a recreated
+        // slug from inheriting a deleted bot's files, as the local trash does.
+        let remote_workspace = format!("{}-{}", entry.handle.id, entry.handle.generation);
         let ws_path = entry.workspace_path.clone();
         let pinned = entry.handle.workspace.clone();
         let skills_dir = self.skills_dir.clone();
         let discord = entry.handle.discord.clone();
         let mcp = self.mcp.clone();
         let live_chat = entry.handle.live_chat.clone();
+        let nodes = self.nodes.clone();
+        let skill_sync = self.skill_sync.clone();
         let task = tokio::spawn(async move {
-            let result = serve_bot(
-                global_store,
-                bot_store,
-                bot_id.clone(),
-                &ws_path,
-                pinned,
-                skills_dir.as_deref(),
-                discord.clone(),
-                rx,
-                mcp,
-                live_chat,
-            )
+            // A bot bound to a remote environment runs only while its node
+            // session is authenticated; env drops pause the whole bot and a
+            // reconnect resumes it with a generic notice. The binding is
+            // re-read every iteration so env renames/rebinds propagate.
+            let result: Result<()> = async {
+                'supervised: loop {
+                    // Binding name and the bound env's enrollment ID come
+                    // from one query — a revoke+re-accept between reads
+                    // can't split them and pin the replacement's identity.
+                    let (env_name, pin) = global_store
+                        .bot_env_binding(&bot_id)?
+                        .unwrap_or_else(|| (storage::LOCAL_ENVIRONMENT.to_owned(), None));
+                    let mut env_online = (env_name != storage::LOCAL_ENVIRONMENT)
+                        .then(|| nodes.availability(&env_name));
+                    let mut env_was_down = false;
+                    if let Some(online) = &mut env_online {
+                        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                        tick.tick().await; // skip the immediate first tick
+                                           // Wait until the routed enrollment IS the bound one:
+                                           // a re-enrolled name (even same node) isn't online
+                                           // for this binding.
+                        while pin.is_none() || online.borrow().as_deref() != pin.as_deref() {
+                            env_was_down = true;
+                            let mut shutdown = rx.clone();
+                            tokio::select! {
+                                _ = shutdown.changed() => break 'supervised Ok(()),
+                                changed = online.changed() => {
+                                    if changed.is_err() {
+                                        break 'supervised Ok(());
+                                    }
+                                }
+                                _ = tick.tick() => {
+                                    let current = global_store
+                                        .bot_env_binding(&bot_id)
+                                        .ok()
+                                        .flatten();
+                                    if current.as_ref() != Some(&(env_name.clone(), pin.clone())) {
+                                        continue 'supervised;
+                                    }
+                                }
+                            }
+                        }
+                        if env_was_down {
+                            let _ = bot_store.add_pending_event(
+                                "system",
+                                "environment-resumed",
+                                None,
+                                "The execution environment was unreachable and is back online now.",
+                                now(),
+                            );
+                        }
+                    }
+                    let (environment, env_watch): (
+                        Arc<dyn environment::Environment>,
+                        Option<tokio::sync::watch::Receiver<bool>>,
+                    ) = match &env_online {
+                        Some(_) => {
+                            // Pinned to the bound enrollment: a re-enrolled
+                            // name flips its derived watch offline and fails
+                            // its calls until the supervisor rebinds.
+                            let remote = environment_remote::RemoteEnvironment::new(
+                                env_name.clone(),
+                                remote_workspace.clone(),
+                                nodes.clone(),
+                                pin.clone(),
+                            );
+                            let watch = remote.availability();
+                            (Arc::new(remote), Some(watch))
+                        }
+                        None => (
+                            Arc::new(LocalEnvironment::new(ws_path.clone(), skills_dir.clone())?),
+                            None,
+                        ),
+                    };
+                    // Remote skills dirs are node-wide; the global catalog is
+                    // the single authoritative set pushed on each (re)connect,
+                    // matching the local shared-dir model. The per-env lock
+                    // stops bots sharing one node from racing the same dir.
+                    if env_online.is_some() {
+                        let lock = skill_sync
+                            .entry(env_name.clone())
+                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                            .clone();
+                        if *rx.borrow() {
+                            break 'supervised Ok(());
+                        }
+                        let mut shutdown = rx.clone();
+                        let _sync = tokio::select! {
+                            _ = shutdown.changed() => break 'supervised Ok(()),
+                            guard = lock.lock() => guard,
+                        };
+                        // Shutdown interrupts the sync too — a held lock
+                        // shouldn't stall a stop (e.g. web rename) by two
+                        // RPC timeouts.
+                        let result = tokio::select! {
+                            _ = shutdown.changed() => break 'supervised Ok(()),
+                            result = sync_shared_skills(&global_store, &environment) => result,
+                        };
+                        if let Err(error) = result {
+                            eprintln!("bot {bot_id} remote skill sync failed: {error}");
+                        }
+                    }
+                    // Remote bots run in the node's `<workspaces>/<bot_id>-<generation>`
+                    // (reported in `hello`); `share`/attachments stay off
+                    // since they read the primary's disk.
+                    let remote = env_online.is_some();
+                    let run_workspace = match remote {
+                        true => nodes.workspace_root(&env_name, &remote_workspace),
+                        false => ws_path.clone(),
+                    };
+                    let result = serve_bot(
+                        global_store.clone(),
+                        bot_store.clone(),
+                        bot_id.clone(),
+                        &run_workspace,
+                        (!remote).then(|| pinned.clone()),
+                        environment,
+                        env_watch,
+                        discord.clone(),
+                        rx.clone(),
+                        mcp.clone(),
+                        live_chat.clone(),
+                    )
+                    .await;
+                    discord.disconnect();
+                    match result {
+                        Err(error) => break 'supervised Err(error),
+                        Ok(()) => {
+                            if *rx.borrow() {
+                                break 'supervised Ok(());
+                            }
+                            // Otherwise the env dropped — loop back to wait for it.
+                        }
+                    }
+                }
+            }
             .await;
-            discord.disconnect();
             if let Err(error) = result {
                 eprintln!("bot {bot_id} stopped with error: {error}");
             }
@@ -1853,12 +2019,11 @@ impl BotRegistry {
     }
 
     pub async fn start_all(&self) -> Result<()> {
-        sync_shared_skills(
-            &self.global_store,
+        let environment: Arc<dyn environment::Environment> = Arc::new(LocalEnvironment::new(
             &self.root_workspace,
-            self.skills_dir.as_deref(),
-        )
-        .await?;
+            self.skills_dir.clone(),
+        )?);
+        sync_shared_skills(&self.global_store, &environment).await?;
         let bots = self.global_store.bots()?;
         let mut map = self.bots.write().await;
         for bot in bots {
@@ -1953,12 +2118,7 @@ impl BotRegistry {
         Ok(bot)
     }
 
-    pub async fn update(
-        &self,
-        id: &str,
-        name: Option<&str>,
-        enabled: Option<bool>,
-    ) -> Result<Bot> {
+    pub async fn update(&self, id: &str, name: Option<&str>, enabled: Option<bool>) -> Result<Bot> {
         if let Some(name) = name {
             let trimmed = name.trim();
             if trimmed.is_empty() || trimmed.chars().count() > 64 {
@@ -1987,6 +2147,84 @@ impl BotRegistry {
             let _ = task.await;
         }
         Ok(updated)
+    }
+
+    /// Rebinds a bot to another execution environment. The running loop is
+    /// restarted and the bot gets a generic workspace-reset notice — files do
+    /// not follow the bot between machines.
+    pub async fn set_environment(&self, id: &str, environment: Option<&str>) -> Result<Bot> {
+        let mut stop_task = None;
+        let bot = {
+            let mut map = self.bots.write().await;
+            let Some(entry) = map.get_mut(id) else {
+                return Err(format!("Unknown bot {id}").into());
+            };
+            if !self.global_store.set_bot_environment(id, environment)? {
+                return Err(format!("Unknown bot {id}").into());
+            }
+            let _ = entry.handle.store.add_pending_event(
+                "system",
+                "environment-changed",
+                None,
+                "The execution environment changed; the workspace was reset and previous files are not available.",
+                now(),
+            );
+            let bot = self
+                .global_store
+                .bot(id)?
+                .ok_or_else(|| format!("Unknown bot {id}"))?;
+            if bot.enabled {
+                if let Some((tx, task)) = entry.running.take() {
+                    let _ = tx.send(true);
+                    stop_task = Some(task);
+                }
+            }
+            bot
+        };
+        if let Some(task) = stop_task {
+            let _ = task.await;
+        }
+        if bot.enabled {
+            let mut map = self.bots.write().await;
+            if let Some(entry) = map.get_mut(id) {
+                self.spawn_bot_loop(entry);
+            }
+        }
+        Ok(bot)
+    }
+
+    /// Restarts enabled bots bound to `env` — e.g. after the env is renamed
+    /// (storage cascades the binding, so each loop respawns on the new name).
+    pub async fn restart_environment(&self, env: &str) -> Result<()> {
+        let ids: Vec<String> = self
+            .global_store
+            .bots()?
+            .into_iter()
+            .filter(|b| b.environment == env && b.enabled)
+            .map(|b| b.id)
+            .collect();
+        let mut stops = Vec::new();
+        {
+            let mut map = self.bots.write().await;
+            for id in &ids {
+                if let Some(entry) = map.get_mut(id) {
+                    if let Some((tx, task)) = entry.running.take() {
+                        let _ = tx.send(true);
+                        stops.push(task);
+                    }
+                }
+            }
+        }
+        for task in stops {
+            let _ = task.await;
+        }
+        let mut map = self.bots.write().await;
+        for id in &ids {
+            if let Some(entry) = map.get_mut(id) {
+                self.spawn_bot_loop(entry);
+            }
+        }
+        Ok(())
     }
 
     pub async fn remove(&self, id: &str) -> Result<()> {
@@ -2107,8 +2345,9 @@ pub async fn serve_bot(
     store: Arc<SqliteStorage>,
     bot_id: String,
     workspace: &Path,
-    pinned_workspace: harness::PinnedWorkspace,
-    skills_dir: Option<&Path>,
+    pinned_workspace: Option<harness::PinnedWorkspace>,
+    environment: Arc<dyn environment::Environment>,
+    env_online: Option<tokio::sync::watch::Receiver<bool>>,
     discord: Arc<messenger_discord::Discord>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     mcp: mcp::Mcp,
@@ -2121,18 +2360,21 @@ pub async fn serve_bot(
         bot_id.clone(),
         workspace,
         pinned_workspace.clone(),
-        skills_dir,
+        environment,
         models.clone(),
         mcp.clone(),
     )
     .await?;
     let outgoing: Arc<dyn messenger::Messenger> = discord.clone();
-    let messengers = harness::Messengers::new(vec![outgoing.clone()], store.clone())
-        .with_workspace(pinned_workspace)
-        .with_utility({
-            let models = models.clone();
-            move || models.current().ok().and_then(|current| current.utility)
-        });
+    let messengers = harness::Messengers::new(vec![outgoing.clone()], store.clone());
+    let messengers = match pinned_workspace {
+        Some(pinned) => messengers.with_workspace(pinned),
+        None => messengers,
+    };
+    let messengers = messengers.with_utility({
+        let models = models.clone();
+        move || models.current().ok().and_then(|current| current.utility)
+    });
     let harness = Arc::new(
         harness
             .with_messengers(messengers.clone())
@@ -2234,7 +2476,9 @@ pub async fn serve_bot(
     }
     let (tx, mut rx) = tokio::sync::mpsc::channel(128);
     let listener_discord = discord.clone();
-    let mut listener = Some(tokio::spawn(async move { listener_discord.listen(tx).await }));
+    let mut listener = Some(tokio::spawn(
+        async move { listener_discord.listen(tx).await },
+    ));
     let supervisor = {
         let store = store.clone();
         let models = models.clone();
@@ -2651,6 +2895,21 @@ pub async fn serve_bot(
     let mut pending = std::collections::VecDeque::<(String, Option<storage::Meta>)>::new();
     let mut backoff = false;
     let outbox_notify = live_chat.outbox_notify();
+    // A remote environment dropping pauses the whole bot — the loop exits and
+    // the spawner re-runs it once the env session comes back.
+    let env_offline = async {
+        match env_online {
+            Some(mut online) => {
+                while *online.borrow() {
+                    if online.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(env_offline);
     let loop_result: Result<()> = tokio::select! {
         result = async {
     'serve: loop {
@@ -2689,6 +2948,7 @@ pub async fn serve_bot(
                     harness.work().await
                 } => None,
                 _ = shutdown.changed() => break Ok(()),
+                _ = &mut env_offline => break Ok(()),
             }
         };
         turn_active.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2732,6 +2992,10 @@ pub async fn serve_bot(
                     },
                 },
                 _ = shutdown.changed() => {
+                    shutting_down = true;
+                    break;
+                },
+                _ = &mut env_offline => {
                     shutting_down = true;
                     break;
                 },
@@ -2951,7 +3215,10 @@ mod tests {
     fn pre_filter_avoids_rest_for_unrelated_channels() {
         use messenger_discord::PreFilterDecision;
         use storage::{AccessEffect, AccessRule, AccessScope};
-        let rule = |user: Option<&str>, scope: AccessScope, scope_id: Option<&str>, effect: AccessEffect| AccessRule {
+        let rule = |user: Option<&str>,
+                    scope: AccessScope,
+                    scope_id: Option<&str>,
+                    effect: AccessEffect| AccessRule {
             user_id: user.map(Into::into),
             scope,
             scope_id: scope_id.map(Into::into),
@@ -2959,8 +3226,18 @@ mod tests {
         };
         let access = vec![
             rule(Some("u1"), AccessScope::Global, None, AccessEffect::Allow),
-            rule(Some("u2"), AccessScope::Server, Some("g1"), AccessEffect::Allow),
-            rule(Some("u3"), AccessScope::Channel, Some("c1"), AccessEffect::Allow),
+            rule(
+                Some("u2"),
+                AccessScope::Server,
+                Some("g1"),
+                AccessEffect::Allow,
+            ),
+            rule(
+                Some("u3"),
+                AccessScope::Channel,
+                Some("c1"),
+                AccessEffect::Allow,
+            ),
         ];
         let overrides = vec![
             channel_override("c1", InteractionMode::Always),
@@ -3103,7 +3380,12 @@ mod tests {
             PreFilterDecision::Reject
         );
         // Default Allow + channel-blocked user in uncached thread resolves parent once.
-        let bl = vec![rule(Some("u4"), AccessScope::Channel, Some("c1"), AccessEffect::Block)];
+        let bl = vec![rule(
+            Some("u4"),
+            AccessScope::Channel,
+            Some("c1"),
+            AccessEffect::Block,
+        )];
         assert_eq!(
             pre_filter_decision(
                 AccessEffect::Allow,
@@ -3228,7 +3510,10 @@ mod tests {
     fn unified_access_precedence_and_need_parent() {
         use messenger_discord::PreFilterDecision;
         use storage::{AccessEffect, AccessRule, AccessScope};
-        let rule = |user: Option<&str>, scope: AccessScope, scope_id: Option<&str>, effect: AccessEffect| AccessRule {
+        let rule = |user: Option<&str>,
+                    scope: AccessScope,
+                    scope_id: Option<&str>,
+                    effect: AccessEffect| AccessRule {
             user_id: user.map(Into::into),
             scope,
             scope_id: scope_id.map(Into::into),
@@ -3240,52 +3525,204 @@ mod tests {
         // > 4. user global (Block) > 5. everyone in thread (Allow) > 6. everyone in parent channel (Block)
         // > 7. everyone in server (Allow) > 8. default (Block).
         let rules = vec![
-            rule(Some("u1"), AccessScope::Channel, Some("t1"), AccessEffect::Allow),
-            rule(Some("u1"), AccessScope::Channel, Some("c1"), AccessEffect::Block),
-            rule(Some("u1"), AccessScope::Server, Some("g1"), AccessEffect::Allow),
+            rule(
+                Some("u1"),
+                AccessScope::Channel,
+                Some("t1"),
+                AccessEffect::Allow,
+            ),
+            rule(
+                Some("u1"),
+                AccessScope::Channel,
+                Some("c1"),
+                AccessEffect::Block,
+            ),
+            rule(
+                Some("u1"),
+                AccessScope::Server,
+                Some("g1"),
+                AccessEffect::Allow,
+            ),
             rule(Some("u1"), AccessScope::Global, None, AccessEffect::Block),
             rule(None, AccessScope::Channel, Some("t1"), AccessEffect::Allow),
-            rule(None, AccessScope::Channel, Some("t_all"), AccessEffect::Allow),
+            rule(
+                None,
+                AccessScope::Channel,
+                Some("t_all"),
+                AccessEffect::Allow,
+            ),
             rule(None, AccessScope::Channel, Some("c1"), AccessEffect::Block),
             rule(None, AccessScope::Server, Some("g1"), AccessEffect::Allow),
         ];
 
         // Step 1: user in thread beats step 2 (user in parent channel).
-        assert!(access_allowed(AccessEffect::Block, &rules, "u1", Some("g1"), "c1", Some("t1"), false));
+        assert!(access_allowed(
+            AccessEffect::Block,
+            &rules,
+            "u1",
+            Some("g1"),
+            "c1",
+            Some("t1"),
+            false
+        ));
         // Step 2: user in parent channel beats step 3 (user in server).
-        assert!(!access_allowed(AccessEffect::Block, &rules, "u1", Some("g1"), "c1", Some("t2"), false));
+        assert!(!access_allowed(
+            AccessEffect::Block,
+            &rules,
+            "u1",
+            Some("g1"),
+            "c1",
+            Some("t2"),
+            false
+        ));
         // Step 3: user in server beats step 4 (user global).
-        assert!(access_allowed(AccessEffect::Block, &rules, "u1", Some("g1"), "c2", None, false));
+        assert!(access_allowed(
+            AccessEffect::Block,
+            &rules,
+            "u1",
+            Some("g1"),
+            "c2",
+            None,
+            false
+        ));
         // Step 4: user global beats steps 5-7 (everyone rules).
-        assert!(!access_allowed(AccessEffect::Block, &rules, "u1", Some("g2"), "c2", Some("t_all"), false));
+        assert!(!access_allowed(
+            AccessEffect::Block,
+            &rules,
+            "u1",
+            Some("g2"),
+            "c2",
+            Some("t_all"),
+            false
+        ));
         // Step 5: everyone in thread beats step 6 (everyone in parent channel).
-        assert!(access_allowed(AccessEffect::Block, &rules, "u_other", Some("g1"), "c1", Some("t1"), false));
+        assert!(access_allowed(
+            AccessEffect::Block,
+            &rules,
+            "u_other",
+            Some("g1"),
+            "c1",
+            Some("t1"),
+            false
+        ));
         // Step 6: everyone in parent channel beats step 7 (everyone in server).
-        assert!(!access_allowed(AccessEffect::Block, &rules, "u_other", Some("g1"), "c1", Some("t2"), false));
+        assert!(!access_allowed(
+            AccessEffect::Block,
+            &rules,
+            "u_other",
+            Some("g1"),
+            "c1",
+            Some("t2"),
+            false
+        ));
         // Step 7: everyone in server beats step 8 (default Block).
-        assert!(access_allowed(AccessEffect::Block, &rules, "u_other", Some("g1"), "c2", None, false));
+        assert!(access_allowed(
+            AccessEffect::Block,
+            &rules,
+            "u_other",
+            Some("g1"),
+            "c2",
+            None,
+            false
+        ));
         // Step 8: falls back to default.
-        assert!(!access_allowed(AccessEffect::Block, &rules, "u_other", Some("g2"), "c2", None, false));
-        assert!(access_allowed(AccessEffect::Allow, &rules, "u_other", Some("g2"), "c2", None, false));
+        assert!(!access_allowed(
+            AccessEffect::Block,
+            &rules,
+            "u_other",
+            Some("g2"),
+            "c2",
+            None,
+            false
+        ));
+        assert!(access_allowed(
+            AccessEffect::Allow,
+            &rules,
+            "u_other",
+            Some("g2"),
+            "c2",
+            None,
+            false
+        ));
 
         // DMs only check step 4 (user global) then step 8 (default), ignoring server/channel rules.
         let dm_rules = vec![
-            rule(Some("u_global_allow"), AccessScope::Global, None, AccessEffect::Allow),
-            rule(Some("u_global_block"), AccessScope::Global, None, AccessEffect::Block),
-            rule(Some("u_server_only"), AccessScope::Server, Some("g1"), AccessEffect::Allow),
+            rule(
+                Some("u_global_allow"),
+                AccessScope::Global,
+                None,
+                AccessEffect::Allow,
+            ),
+            rule(
+                Some("u_global_block"),
+                AccessScope::Global,
+                None,
+                AccessEffect::Block,
+            ),
+            rule(
+                Some("u_server_only"),
+                AccessScope::Server,
+                Some("g1"),
+                AccessEffect::Allow,
+            ),
             rule(None, AccessScope::Channel, Some("dm1"), AccessEffect::Allow),
         ];
-        assert!(access_allowed(AccessEffect::Block, &dm_rules, "u_global_allow", None, "dm1", None, true));
-        assert!(!access_allowed(AccessEffect::Allow, &dm_rules, "u_global_block", None, "dm1", None, true));
-        assert!(!access_allowed(AccessEffect::Block, &dm_rules, "u_server_only", None, "dm1", None, true));
-        assert!(!access_allowed(AccessEffect::Block, &dm_rules, "anyone", None, "dm1", None, true));
-        assert!(access_allowed(AccessEffect::Allow, &dm_rules, "anyone", None, "dm1", None, true));
+        assert!(access_allowed(
+            AccessEffect::Block,
+            &dm_rules,
+            "u_global_allow",
+            None,
+            "dm1",
+            None,
+            true
+        ));
+        assert!(!access_allowed(
+            AccessEffect::Allow,
+            &dm_rules,
+            "u_global_block",
+            None,
+            "dm1",
+            None,
+            true
+        ));
+        assert!(!access_allowed(
+            AccessEffect::Block,
+            &dm_rules,
+            "u_server_only",
+            None,
+            "dm1",
+            None,
+            true
+        ));
+        assert!(!access_allowed(
+            AccessEffect::Block,
+            &dm_rules,
+            "anyone",
+            None,
+            "dm1",
+            None,
+            true
+        ));
+        assert!(access_allowed(
+            AccessEffect::Allow,
+            &dm_rules,
+            "anyone",
+            None,
+            "dm1",
+            None,
+            true
+        ));
 
         // Pre-filter NeedParent precision:
         // 1) Step 4 (user global Allow) beats Step 6 (everyone channel Block) -> NO NeedParent!
         let global_vs_chan = vec![
             rule(Some("u1"), AccessScope::Global, None, AccessEffect::Allow),
-            rule(None, AccessScope::Channel, Some("c_bad"), AccessEffect::Block),
+            rule(
+                None,
+                AccessScope::Channel,
+                Some("c_bad"),
+                AccessEffect::Block,
+            ),
         ];
         assert_eq!(
             pre_filter_decision(
@@ -3322,8 +3759,18 @@ mod tests {
         );
         // 3) Step 1 (direct user rule on thread id) beats Step 2 (user parent channel) -> NO NeedParent!
         let thread_vs_parent = vec![
-            rule(Some("u1"), AccessScope::Channel, Some("t1"), AccessEffect::Allow),
-            rule(Some("u1"), AccessScope::Channel, Some("c1"), AccessEffect::Block),
+            rule(
+                Some("u1"),
+                AccessScope::Channel,
+                Some("t1"),
+                AccessEffect::Allow,
+            ),
+            rule(
+                Some("u1"),
+                AccessScope::Channel,
+                Some("c1"),
+                AccessEffect::Block,
+            ),
         ];
         assert_eq!(
             pre_filter_decision(
@@ -3906,5 +4353,4 @@ mod tests {
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 }

@@ -24,7 +24,10 @@ export const AppRuntime = Atom.runtime(AppLayer)
 export const MachineAtoms = AtomMachine.bind(AppRuntime)
 
 const isGlobalRequest = (type: RequestType): boolean =>
-  type.startsWith('providers.') || type.startsWith('mcp.') || type.startsWith('bots.')
+  type.startsWith('providers.') ||
+  type.startsWith('mcp.') ||
+  type.startsWith('bots.') ||
+  type.startsWith('environments.')
 
 const scopedApiLayer = (
   botId: string,

@@ -9,6 +9,9 @@ llm.workspace = true
 async-trait.workspace = true
 clap.workspace = true
 environment-local.workspace = true
+environment-node.workspace = true
+environment-remote.workspace = true
+dashmap = "6"
 harness.workspace = true
 llm-rig.workspace = true
 mcp.workspace = true
@@ -16,6 +19,7 @@ storage.workspace = true
 storage-sqlite.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 environment.workspace = true
+thiserror.workspace = true
 sha2 = "0.10"
 url = "2"
 axum = { version = "0.8", features = ["ws"] }

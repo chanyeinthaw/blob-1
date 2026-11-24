@@ -10,6 +10,8 @@ members = [
   "crates/storage-sqlite",
   "crates/environment",
   "crates/environment-local",
+  "crates/environment-node",
+  "crates/environment-remote",
   "crates/mcp",
   "crates/messenger",
   "crates/messenger-discord",
@@ -36,6 +38,8 @@ chrono-tz = "0.10.4"
 chrono = "0.4"
 croner = "4.0.3"
 environment-local = { path = "crates/environment-local" }
+environment-node = { path = "crates/environment-node" }
+environment-remote = { path = "crates/environment-remote" }
 llm = { path = "crates/llm" }
 memory = { path = "crates/memory" }
 llm-rig = { path = "crates/llm-rig" }

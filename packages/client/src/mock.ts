@@ -13,12 +13,15 @@ import {
   type DiscordInteractionOverride,
   type DiscordReplyMode,
   type DiscordReplyOverride,
+  type EnvironmentInfo,
+  type Environments,
   type GeneralSettings,
   Home,
   type Instructions,
   McpServer,
   ModelInfo,
   Models,
+  type PendingNode,
   Provider,
   ProviderApi,
   type ReplyFrame,
@@ -911,13 +914,20 @@ type BotRecord = Readonly<{
   createdAt: number
   generation: number
   disabledMcp: ReadonlyArray<string>
+  /** 'local' or the name of a remote execution environment. */
+  environment: string
   state: State
 }>
+
+/** EnvironmentInfo plus the node's hostname so a revoked node can return to pending. */
+type EnvironmentRecord = EnvironmentInfo & Readonly<{ hostname: string }>
 
 type MockRoot = Readonly<{
   providers: ReadonlyArray<ProviderRecord>
   mcpServers: ReadonlyArray<McpServer>
   bots: ReadonlyArray<BotRecord>
+  pendingNodes: ReadonlyArray<PendingNode>
+  environments: ReadonlyArray<EnvironmentRecord>
   /** Monotonic instance id so a recreated slug never reuses a prior generation. */
   nextGeneration: number
 }>
@@ -960,12 +970,34 @@ const seedRoot = (): MockRoot => {
         createdAt: 0,
         generation: 0,
         disabledMcp: [],
+        environment: 'local',
         state: initial,
+      },
+    ],
+    pendingNodes: [
+      {
+        nodeId: 'node-a31f',
+        hostname: 'build-box-1',
+        version: '0.4.2',
+        connectedAt: Math.floor(Date.now() / 1000) - 240,
+      },
+    ],
+    environments: [
+      {
+        name: 'staging',
+        nodeId: 'node-b72c',
+        hostname: 'gpu-rig-2',
+        version: '0.4.2',
+        lastSeen: Math.floor(Date.now() / 1000) - 90,
+        online: true,
       },
     ],
     nextGeneration: 1,
   }
 }
+
+const environmentOnline = (root: MockRoot, name: string): boolean =>
+  name === 'local' || (root.environments.find(entry => entry.name === name)?.online ?? false)
 
 const botsReply = (root: MockRoot): ReadonlyArray<BotSummary> =>
   root.bots.map(bot => ({
@@ -981,7 +1013,20 @@ const botsReply = (root: MockRoot): ReadonlyArray<BotSummary> =>
         : null,
     connection:
       bot.enabled && bot.state.hasToken ? { state: 'online', bot: bot.name } : { state: 'off' },
+    environment: bot.environment,
+    environmentOnline: environmentOnline(root, bot.environment),
   }))
+
+const environmentsReply = (root: MockRoot): Environments => ({
+  pending: root.pendingNodes,
+  environments: root.environments.map(record => ({
+    name: record.name,
+    nodeId: record.nodeId,
+    version: record.version,
+    lastSeen: record.lastSeen,
+    online: record.online,
+  })),
+})
 
 const botMcpReply = (root: MockRoot, botId: string): Effect.Effect<BotMcpState, string> => {
   const bot = root.bots.find(entry => entry.id === botId)
@@ -1012,7 +1057,17 @@ const providerInUseByBot = (root: MockRoot, providerId: string): string | null =
 
 type LegacyRequestType = Exclude<
   RequestType,
-  'bots.list' | 'bots.create' | 'bots.update' | 'bots.remove' | 'bot.mcp.get' | 'bot.mcp.setEnabled'
+  | 'bots.list'
+  | 'bots.create'
+  | 'bots.update'
+  | 'bots.remove'
+  | 'bots.setEnvironment'
+  | 'bot.mcp.get'
+  | 'bot.mcp.setEnabled'
+  | 'environments.list'
+  | 'environments.accept'
+  | 'environments.remove'
+  | 'environments.rename'
 >
 
 type Handler<K extends LegacyRequestType> = (
@@ -1542,6 +1597,7 @@ const botControlHandlers = {
             createdAt,
             generation: root.nextGeneration,
             disabledMcp: [],
+            environment: 'local',
             state: emptyBotState(name, seedState()),
           },
         ],
@@ -1594,6 +1650,113 @@ const botControlHandlers = {
       return botsReply(next)
     }),
 
+  'bots.setEnvironment': (
+    { botId, environment, botGeneration }: RequestPayload<'bots.setEnvironment'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const bot = root.bots.find(entry => entry.id === botId)
+      if (bot === undefined) return yield* Effect.fail(`Unknown bot ${botId}`)
+      yield* checkGeneration(bot, botGeneration)
+      if (environment !== 'local' && !root.environments.some(entry => entry.name === environment)) {
+        return yield* Effect.fail(`Unknown environment ${environment}`)
+      }
+      const next: MockRoot = Struct.evolve(root, {
+        bots: bots =>
+          bots.map(entry =>
+            entry.id === botId ? Struct.evolve(entry, { environment: () => environment }) : entry,
+          ),
+      })
+      yield* Ref.set(rootRef, next)
+      return botsReply(next)
+    }),
+
+  'environments.list': (
+    _payload: RequestPayload<'environments.list'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) => Ref.get(rootRef).pipe(Effect.map(environmentsReply)),
+
+  'environments.accept': (
+    { nodeId, name }: RequestPayload<'environments.accept'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const node = root.pendingNodes.find(entry => entry.nodeId === nodeId)
+      if (node === undefined) return yield* Effect.fail(`Unknown node ${nodeId}`)
+      const trimmed = name?.trim() ?? ''
+      const envName = trimmed === '' ? node.hostname.toLowerCase() : trimmed
+      if (root.environments.some(entry => entry.name === envName)) {
+        return yield* Effect.fail(`Environment ${envName} already exists`)
+      }
+      const next: MockRoot = Struct.evolve(root, {
+        pendingNodes: list => list.filter(entry => entry.nodeId !== nodeId),
+        environments: list => [
+          ...list,
+          {
+            name: envName,
+            nodeId: node.nodeId,
+            hostname: node.hostname,
+            version: node.version,
+            lastSeen: Math.floor(Date.now() / 1000),
+            online: true,
+          },
+        ],
+      })
+      yield* Ref.set(rootRef, next)
+      return environmentsReply(next)
+    }),
+
+  'environments.remove': (
+    { name }: RequestPayload<'environments.remove'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const env = root.environments.find(entry => entry.name === name)
+      if (env === undefined) return yield* Effect.fail(`Unknown environment ${name}`)
+      const next: MockRoot = Struct.evolve(root, {
+        environments: list => list.filter(entry => entry.name !== name),
+        pendingNodes: list => [
+          ...list,
+          {
+            nodeId: env.nodeId,
+            hostname: env.hostname,
+            version: env.version ?? 'unknown',
+            connectedAt: Math.floor(Date.now() / 1000),
+          },
+        ],
+      })
+      yield* Ref.set(rootRef, next)
+      return environmentsReply(next)
+    }),
+
+  'environments.rename': (
+    { name, to }: RequestPayload<'environments.rename'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const env = root.environments.find(entry => entry.name === name)
+      if (env === undefined) return yield* Effect.fail(`Unknown environment ${name}`)
+      const nextName = to.trim()
+      if (nextName === '') return yield* Effect.fail('Environment name is required')
+      if (root.environments.some(entry => entry.name === nextName && entry.name !== name)) {
+        return yield* Effect.fail(`Environment ${nextName} already exists`)
+      }
+      const next: MockRoot = Struct.evolve(root, {
+        environments: list =>
+          list.map(entry => (entry.name === name ? { ...entry, name: nextName } : entry)),
+        bots: bots =>
+          bots.map(bot =>
+            bot.environment === name ? Struct.evolve(bot, { environment: () => nextName }) : bot,
+          ),
+      })
+      yield* Ref.set(rootRef, next)
+      return environmentsReply(next)
+    }),
+
   'bot.mcp.get': (
     { botId, botGeneration }: RequestPayload<'bot.mcp.get'>,
     rootRef: Ref.Ref<MockRoot>,
@@ -1639,8 +1802,13 @@ const botControlHandlers = {
       | 'bots.create'
       | 'bots.update'
       | 'bots.remove'
+      | 'bots.setEnvironment'
       | 'bot.mcp.get'
       | 'bot.mcp.setEnabled'
+      | 'environments.list'
+      | 'environments.accept'
+      | 'environments.remove'
+      | 'environments.rename'
   ]: (
     payload: RequestPayload<K>,
     rootRef: Ref.Ref<MockRoot>,

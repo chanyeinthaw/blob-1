@@ -1,7 +1,7 @@
 use rusqlite::{params, types::Type, OptionalExtension};
 use storage::{
-    Bot, BotModels, BotStore, ConfigStore, ModelRef, ProviderId, ReasoningLevel, StoreError,
-    DEFAULT_BOT_ID,
+    Bot, BotModels, BotStore, ConfigStore, Environment, EnvironmentStore, ModelRef, ProviderId,
+    ReasoningLevel, StoreError, DEFAULT_BOT_ID,
 };
 
 use crate::{backend, SqliteStorage};
@@ -26,6 +26,7 @@ fn bot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Bot> {
         enabled: row.get::<_, i64>(2)? != 0,
         created_at: row.get(3)?,
         generation: row.get(4)?,
+        environment: row.get(5)?,
     })
 }
 
@@ -34,7 +35,7 @@ impl BotStore for SqliteStorage {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT id, name, enabled, created_at, generation
+                "SELECT id, name, enabled, created_at, generation, environment
                  FROM bots
                  ORDER BY CASE WHEN id = 'default' THEN 0 ELSE 1 END, created_at ASC, id ASC",
             )
@@ -50,7 +51,7 @@ impl BotStore for SqliteStorage {
     fn bot(&self, id: &str) -> Result<Option<Bot>, StoreError> {
         self.lock()
             .query_row(
-                "SELECT id, name, enabled, created_at, generation FROM bots WHERE id = ?1",
+                "SELECT id, name, enabled, created_at, generation, environment FROM bots WHERE id = ?1",
                 [id],
                 bot_from_row,
             )
@@ -87,6 +88,7 @@ impl BotStore for SqliteStorage {
             enabled: true,
             created_at,
             generation,
+            environment: storage::LOCAL_ENVIRONMENT.to_owned(),
         })
     }
 
@@ -102,7 +104,7 @@ impl BotStore for SqliteStorage {
             .map_err(backend)?;
         let Some(mut existing) = tx
             .query_row(
-                "SELECT id, name, enabled, created_at, generation FROM bots WHERE id = ?1",
+                "SELECT id, name, enabled, created_at, generation, environment FROM bots WHERE id = ?1",
                 [id],
                 bot_from_row,
             )
@@ -369,6 +371,63 @@ impl BotStore for SqliteStorage {
         Ok(ids)
     }
 
+    fn set_bot_environment(
+        &self,
+        bot_id: &str,
+        environment: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let environment = environment.unwrap_or(storage::LOCAL_ENVIRONMENT);
+        let mut conn = self.lock();
+        // Target validation and the binding share one transaction so a
+        // revoke between check and write cannot strand the bot on a plain
+        // name a future enrollment would silently inherit.
+        let tx = conn.transaction().map_err(backend)?;
+        if environment != storage::LOCAL_ENVIRONMENT {
+            let accepted = tx
+                .query_row(
+                    "SELECT 1 FROM environments WHERE name = ?1 AND credential != x''",
+                    [environment],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(backend)?
+                .is_some();
+            if !accepted {
+                return Err(StoreError::Invalid(format!(
+                    "unknown environment '{environment}'"
+                )));
+            }
+        }
+        let changed = tx
+            .execute(
+                "UPDATE bots SET environment = ?2 WHERE id = ?1",
+                params![bot_id, environment],
+            )
+            .map_err(backend)?;
+        tx.commit().map_err(backend)?;
+        Ok(changed > 0)
+    }
+
+    fn bot_env_binding(
+        &self,
+        bot_id: &str,
+    ) -> Result<Option<(String, Option<Vec<u8>>)>, StoreError> {
+        // Binding name and the bound env's enrollment in one row — a
+        // revoke+re-accept between separate reads can't split them.
+        self.lock()
+            .query_row(
+                "SELECT b.environment, e.enrollment
+                 FROM bots b
+                 LEFT JOIN environments e
+                   ON e.name = b.environment AND length(e.credential) > 0
+                 WHERE b.id = ?1",
+                [bot_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(backend)
+    }
+
     fn set_bot_mcp_server_enabled(
         &self,
         bot_id: &str,
@@ -389,6 +448,234 @@ impl BotStore for SqliteStorage {
             )
             .map_err(backend)?;
         }
+        Ok(())
+    }
+}
+
+fn environment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Environment> {
+    Ok(Environment {
+        name: row.get(0)?,
+        node_id: row.get(1)?,
+        credential: row.get(2)?,
+        pending_key: row.get(3)?,
+        enrollment: row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
+        hostname: row.get(5)?,
+        version: row.get(6)?,
+        last_seen: row.get(7)?,
+        created_at: row.get(8)?,
+    })
+}
+
+const ENVIRONMENT_COLS: &str =
+    "name, node_id, credential, pending_key, enrollment, hostname, version, last_seen, created_at";
+
+impl EnvironmentStore for SqliteStorage {
+    fn environments(&self) -> Result<Vec<Environment>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {ENVIRONMENT_COLS} FROM environments ORDER BY name"
+            ))
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([], environment_from_row)
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?;
+        Ok(rows)
+    }
+
+    fn environment(&self, name: &str) -> Result<Option<Environment>, StoreError> {
+        self.lock()
+            .query_row(
+                &format!("SELECT {ENVIRONMENT_COLS} FROM environments WHERE name = ?1"),
+                [name],
+                environment_from_row,
+            )
+            .optional()
+            .map_err(backend)
+    }
+
+    fn environment_for_node(&self, node_id: &str) -> Result<Option<Environment>, StoreError> {
+        self.lock()
+            .query_row(
+                &format!("SELECT {ENVIRONMENT_COLS} FROM environments WHERE node_id = ?1"),
+                [node_id],
+                environment_from_row,
+            )
+            .optional()
+            .map_err(backend)
+    }
+
+    fn environment_for_key(&self, key_hash: &[u8]) -> Result<Option<Environment>, StoreError> {
+        self.lock()
+            .query_row(
+                &format!("SELECT {ENVIRONMENT_COLS} FROM environments WHERE credential = ?1 AND length(credential) > 0"),
+                [key_hash],
+                environment_from_row,
+            )
+            .optional()
+            .map_err(backend)
+    }
+
+    fn rename_environment(
+        &self,
+        from: &str,
+        to: &str,
+        expected_enrollment: &[u8],
+    ) -> Result<Option<Environment>, StoreError> {
+        if !storage::environment_name_valid(to) {
+            return Err(StoreError::Invalid(format!(
+                "'{to}' is a reserved environment name"
+            )));
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(backend)?;
+        // RETURNING gives back the row actually renamed — a later lookup by
+        // `to` could resolve a different node's recycled name. Accepted
+        // rows only, and only the one carrying `expected_enrollment`: a
+        // `pending:<id>` rename would strand the pending node, and a name
+        // recycled for another node's row must not move.
+        let renamed = tx
+            .query_row(
+                &format!(
+                    "UPDATE environments SET name = ?2 WHERE name = ?1 AND length(credential) > 0 AND COALESCE(enrollment, x'') = ?3 RETURNING {ENVIRONMENT_COLS}"
+                ),
+                params![from, to, expected_enrollment],
+                environment_from_row,
+            )
+            .optional()
+            .map_err(backend)?;
+        if renamed.is_some() {
+            // Bound bots follow the rename so they rebind rather than pause on
+            // a dangling name.
+            tx.execute(
+                "UPDATE bots SET environment = ?2 WHERE environment = ?1",
+                params![from, to],
+            )
+            .map_err(backend)?;
+        }
+        tx.commit().map_err(backend)?;
+        Ok(renamed)
+    }
+
+    fn remove_environment(
+        &self,
+        name: &str,
+        expected_enrollment: &[u8],
+    ) -> Result<bool, StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(backend)?;
+        // `enrollment` pins the delete to the row the caller read — a
+        // recycled name under another node doesn't match.
+        let changed = tx
+            .execute(
+                "DELETE FROM environments WHERE name = ?1 AND COALESCE(enrollment, x'') = ?2",
+                params![name, expected_enrollment],
+            )
+            .map_err(backend)?;
+        if changed > 0 {
+            // Tombstone bound bots so a re-enrolled node under the same name
+            // can't silently inherit them — the operator rebinds explicitly.
+            tx.execute(
+                "UPDATE bots SET environment = ?2 WHERE environment = ?1",
+                params![name, storage::revoked_environment(name)],
+            )
+            .map_err(backend)?;
+        }
+        tx.commit().map_err(backend)?;
+        Ok(changed > 0)
+    }
+
+    fn upsert_pending_node(
+        &self,
+        node_id: &str,
+        hostname: &str,
+        version: &str,
+        key_hash: &[u8],
+        seen_at: i64,
+    ) -> Result<bool, StoreError> {
+        // `pending_key = ?5` in the WHERE pins the whole row to the first key:
+        // a reconnect with a different key changes nothing the operator saw.
+        let changed = self
+            .lock()
+            .execute(
+                "INSERT INTO environments (name, node_id, credential, pending_key, hostname, version, last_seen, created_at)                  VALUES (?1, ?2, x'', ?5, ?6, ?3, ?4, ?4)                  ON CONFLICT(node_id) DO UPDATE SET version = ?3, last_seen = ?4, hostname = ?6                  WHERE credential = x'' AND pending_key = ?5",
+                params![format!("pending:{node_id}"), node_id, version, seen_at, key_hash, hostname],
+            )
+            .map_err(backend)?;
+        Ok(changed > 0)
+    }
+
+    fn drop_pending_node(
+        &self,
+        node_id: &str,
+        expected_pending_key: &[u8],
+    ) -> Result<bool, StoreError> {
+        // `pending_key = ?2` pins the delete to the row the caller
+        // reviewed — a re-registration under a different key survives.
+        let changed = self
+            .lock()
+            .execute(
+                "DELETE FROM environments WHERE node_id = ?1 AND credential = x'' AND pending_key = ?2",
+                params![node_id, expected_pending_key],
+            )
+            .map_err(backend)?;
+        Ok(changed > 0)
+    }
+
+    fn accept_pending_node(
+        &self,
+        node_id: &str,
+        name: &str,
+        expected_pending_key: &[u8],
+    ) -> Result<Option<Environment>, StoreError> {
+        if !storage::environment_name_valid(name) {
+            return Err(StoreError::Invalid(format!(
+                "'{name}' is a reserved environment name"
+            )));
+        }
+        // `pending_key = ?3` pins the promotion to the row the caller
+        // reviewed — a deny + different-key re-register can't be adopted.
+        // RETURNING hands back the promoted row itself; a follow-up SELECT
+        // could miss or read a replacement after a concurrent revoke.
+        self.lock()
+            .query_row(
+                &format!(
+                    "UPDATE environments SET name = ?2, credential = pending_key, pending_key = NULL, enrollment = randomblob(16)                     WHERE node_id = ?1 AND credential = x'' AND pending_key = ?3                     RETURNING {ENVIRONMENT_COLS}"
+                ),
+                params![node_id, name, expected_pending_key],
+                environment_from_row,
+            )
+            .optional()
+            .map_err(backend)
+    }
+
+    fn expire_pending_nodes(&self, before: i64) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("DELETE FROM environments WHERE credential = x'' AND last_seen < ?1 RETURNING node_id")
+            .map_err(backend)?;
+        let ids = stmt
+            .query_map([before], |row| row.get(0))
+            .map_err(backend)?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(backend)?;
+        Ok(ids)
+    }
+
+    fn touch_environment(
+        &self,
+        node_id: &str,
+        version: &str,
+        last_seen: i64,
+    ) -> Result<(), StoreError> {
+        self.lock()
+            .execute(
+                "UPDATE environments SET version = ?2, last_seen = ?3 WHERE node_id = ?1",
+                params![node_id, version, last_seen],
+            )
+            .map_err(backend)?;
         Ok(())
     }
 }
@@ -509,13 +796,11 @@ mod tests {
         // Fresh models are disabled until explicitly enabled; unknown models error.
         assert!(store.models(&pid).unwrap().iter().all(|m| !m.enabled));
         store.set_enabled(&pid, "gpt-6-luna", true).unwrap();
-        assert!(
-            store
-                .models(&pid)
-                .unwrap()
-                .iter()
-                .any(|m| m.id == "gpt-6-luna" && m.enabled)
-        );
+        assert!(store
+            .models(&pid)
+            .unwrap()
+            .iter()
+            .any(|m| m.id == "gpt-6-luna" && m.enabled));
         store.set_enabled(&pid, "gpt-6-luna", false).unwrap();
         assert!(store.models(&pid).unwrap().iter().all(|m| !m.enabled));
         assert!(store.set_enabled(&pid, "nope", true).is_err());

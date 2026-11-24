@@ -627,6 +627,10 @@ impl Messengers {
         let messenger = self.find(&name)?;
         let files = match attachment_workspace {
             Some(workspace) => read_outbound_files(workspace, args.files).await?,
+            // Remote workspaces live on the node — no attachment reads.
+            None if !args.files.is_empty() => {
+                return Err("file attachments are not available in this environment".into())
+            }
             None => Vec::new(),
         };
         let sent = messenger

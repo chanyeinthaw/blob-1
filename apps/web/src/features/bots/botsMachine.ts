@@ -24,6 +24,12 @@ const RosterOp = Schema.Union([
     id: Schema.String,
     botGeneration: Schema.Finite,
   }),
+  Schema.Struct({
+    kind: Schema.Literal('setEnvironment'),
+    id: Schema.String,
+    environment: Schema.String,
+    botGeneration: Schema.Finite,
+  }),
 ])
 type RosterOp = typeof RosterOp.Type
 
@@ -35,17 +41,27 @@ type MutateResult = typeof MutateOk.Type | typeof MutateFailed.Type
 const mutateBot = Effect.fn('Bots.mutate')(function* (op: RosterOp) {
   const api = yield* Api
   const notify = yield* Notify
-  const write =
-    op.kind === 'create'
-      ? api.request('bots.create', { id: op.id, name: op.name })
-      : op.kind === 'update'
-        ? api.request('bots.update', {
-            id: op.id,
-            name: op.name,
-            enabled: op.enabled,
-            botGeneration: op.botGeneration,
-          })
-        : api.request('bots.remove', { id: op.id, botGeneration: op.botGeneration })
+  const write = (() => {
+    switch (op.kind) {
+      case 'create':
+        return api.request('bots.create', { id: op.id, name: op.name })
+      case 'update':
+        return api.request('bots.update', {
+          id: op.id,
+          name: op.name,
+          enabled: op.enabled,
+          botGeneration: op.botGeneration,
+        })
+      case 'remove':
+        return api.request('bots.remove', { id: op.id, botGeneration: op.botGeneration })
+      case 'setEnvironment':
+        return api.request('bots.setEnvironment', {
+          botId: op.id,
+          environment: op.environment,
+          botGeneration: op.botGeneration,
+        })
+    }
+  })()
   return yield* write.pipe(
     Effect.map((bots): MutateResult => ({ ok: true, bots })),
     Effect.catch(error =>
@@ -99,6 +115,11 @@ export const BotsEvents = Machine.events({
     botGeneration: Schema.Finite,
   },
   Remove: { id: Schema.String, botGeneration: Schema.Finite },
+  SetEnvironment: {
+    id: Schema.String,
+    environment: Schema.String,
+    botGeneration: Schema.Finite,
+  },
   Refresh: {},
 })
 
@@ -186,6 +207,16 @@ export const BotsMachine = Machine.make({
                   botGeneration: event.botGeneration,
                 }),
             },
+            SetEnvironment: {
+              update: 'root',
+              data: ({ root, event }) =>
+                enqueue(root, {
+                  kind: 'setEnvironment',
+                  id: event.id,
+                  environment: event.environment,
+                  botGeneration: event.botGeneration,
+                }),
+            },
             ClearCreateState: {
               update: 'root',
               data: ({ root }) => ({ ...root, createError: null, lastCreatedId: null }),
@@ -257,6 +288,16 @@ export const BotsMachine = Machine.make({
                 enqueue(root, {
                   kind: 'remove',
                   id: event.id,
+                  botGeneration: event.botGeneration,
+                }),
+            },
+            SetEnvironment: {
+              update: 'root',
+              data: ({ root, event }) =>
+                enqueue(root, {
+                  kind: 'setEnvironment',
+                  id: event.id,
+                  environment: event.environment,
                   botGeneration: event.botGeneration,
                 }),
             },

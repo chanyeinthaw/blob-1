@@ -1,3 +1,4 @@
+import type { BotSummary } from '@blob-1/contracts'
 import { useAtomRefresh, useAtomSet, useAtomValue } from '@effect/atom-react'
 import { Link, useBlocker } from '@tanstack/react-router'
 import { AtomMachine } from '@typeonce/effect-machine/reactivity'
@@ -21,9 +22,17 @@ import {
 } from '~/components/ui/alert-dialog'
 import { Button } from '~/components/ui/button'
 import { Input } from '~/components/ui/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '~/components/ui/select'
 import { Switch } from '~/components/ui/switch'
 import { BotsEvents } from '~/features/bots/botsMachine'
 import { BotsOwner, useBotInstanceKey, useBotsRoot } from '~/features/bots/CreateBotDialog'
+import { environmentsPageAtom } from '~/features/environments/environmentsState'
 import { machineAtomsForBot } from '~/lib/runtime'
 import { createPersistentMachineContext } from '~/lib/shellMachines'
 import { matchCached } from '~/lib/useBackgroundRefresh'
@@ -184,6 +193,11 @@ function BotIdentitySection(props: BotIdentitySectionProps) {
             </div>
           </FieldRow>
         </form>
+        <FieldRow labelId={`bot-environment-${bot.id}`} label="Environment">
+          <div className="flex sm:justify-end">
+            <EnvironmentSelect bot={bot} busy={busy} labelId={`bot-environment-${bot.id}`} />
+          </div>
+        </FieldRow>
         <div className="flex items-center justify-between gap-4 border-t border-border/60 pt-3">
           <div className="min-w-0">
             <p className="text-sm font-medium text-foreground">Enabled</p>
@@ -209,6 +223,68 @@ function BotIdentitySection(props: BotIdentitySectionProps) {
         </div>
       </div>
     </Section>
+  )
+}
+
+interface EnvironmentSelectProps {
+  readonly bot: BotSummary
+  readonly busy: boolean
+  readonly labelId: string
+}
+
+/** Picks the execution environment a bot runs on; offline environments stay selectable. */
+function EnvironmentSelect(props: EnvironmentSelectProps) {
+  const machine = BotsOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  // The list is cached across pages; refetch on open so accepts and online changes show up.
+  const refreshEnvironments = useAtomRefresh(environmentsPageAtom)
+  const environments = AsyncResult.getOrElse(useAtomValue(environmentsPageAtom), () => ({
+    pending: [],
+    environments: [],
+  })).environments
+  const onlineByName = new Map(environments.map(entry => [entry.name, entry.online]))
+  const names = [
+    ...new Set(['local', props.bot.environment, ...environments.map(entry => entry.name)]),
+  ]
+  const items = names.map(name => ({ value: name, label: name === 'local' ? 'Local' : name }))
+  const isOnline = (name: string): boolean =>
+    name === 'local' ||
+    (onlineByName.get(name) ?? (name === props.bot.environment && props.bot.environmentOnline))
+
+  return (
+    <Select
+      value={props.bot.environment}
+      items={items}
+      disabled={props.busy}
+      onOpenChange={open => {
+        if (open) refreshEnvironments()
+      }}
+      onValueChange={next => {
+        if (next !== null && next !== props.bot.environment) {
+          send(
+            BotsEvents.SetEnvironment({
+              id: props.bot.id,
+              environment: next,
+              botGeneration: props.bot.generation,
+            }),
+          )
+        }
+      }}
+    >
+      <SelectTrigger aria-labelledby={props.labelId} className="w-full sm:w-56">
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        {items.map(item => (
+          <SelectItem key={item.value} value={item.value}>
+            {isOnline(item.value) ? null : (
+              <span aria-hidden="true" className="size-1.5 rounded-full bg-muted-foreground/40" />
+            )}
+            {item.label}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
   )
 }
 
