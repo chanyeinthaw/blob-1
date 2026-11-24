@@ -1118,6 +1118,32 @@ async fn dispatch(
                 if let Err(error) = messenger_discord::validate_token(&token).await {
                     return Err(error.into());
                 }
+                // Two bots sharing one Discord account would list the same
+                // servers in pickers and both answer the same messages. The
+                // check and the write stay under settings_lock so concurrent
+                // saves can't race past each other; twilight accepts an
+                // optional "Bot " prefix, so compare without it.
+                let _guard = ctx.settings_lock.lock().await;
+                recheck_bot_generation(global, payload, bot_id, Some(bot.generation))?;
+                let bare = token.trim_start_matches("Bot ");
+                for other in ctx.bots.all_handles().await {
+                    if other.id == bot.id {
+                        continue;
+                    }
+                    if let Some(existing) = other.store.messenger_token("discord")? {
+                        if existing.trim_start_matches("Bot ") == bare {
+                            let name = global
+                                .bot(&other.id)
+                                .ok()
+                                .flatten()
+                                .map(|b| b.name)
+                                .unwrap_or_else(|| other.id.clone());
+                            return Err(
+                                format!("Token already in use by bot '{name}'").into()
+                            );
+                        }
+                    }
+                }
                 bot.store.set_messenger_token("discord", Some(&token))?;
                 let enabled = global.bot(bot_id)?.is_some_and(|b| b.enabled);
                 if enabled && !bot.discord.uses_token(&token) {

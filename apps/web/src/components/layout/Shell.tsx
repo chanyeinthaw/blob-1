@@ -159,6 +159,25 @@ function activeBotIdFromPath(pathname: string): string | null {
   return match?.[1] ?? null
 }
 
+/** Keeps a bot switch on the same settings sub-page; falls back to General elsewhere. */
+function botSwitchTarget(pathname: string): NonNullable<LinkProps['to']> {
+  const sub = /^\/settings\/bots\/[^/]+\/([^/]+)/.exec(pathname)?.[1]
+  switch (sub) {
+    case 'discord':
+      return '/settings/bots/$botId/discord'
+    case 'mcp':
+      return '/settings/bots/$botId/mcp'
+    case 'models':
+      return '/settings/bots/$botId/models'
+    case 'schedules':
+      return '/settings/bots/$botId/schedules'
+    case 'webhooks':
+      return '/settings/bots/$botId/webhooks'
+    default:
+      return '/settings/bots/$botId/general'
+  }
+}
+
 interface RailProps {
   readonly onCreateBot: () => void
 }
@@ -179,7 +198,7 @@ function Rail(props: RailProps) {
               <TooltipTrigger
                 render={
                   <Link
-                    to="/settings/bots/$botId/general"
+                    to={botSwitchTarget(pathname)}
                     params={{ botId: bot.id }}
                     aria-label={bot.name}
                     className={cn(
@@ -330,7 +349,7 @@ function MobileHeader(props: MobileHeaderProps) {
             return (
               <Link
                 key={bot.id}
-                to="/settings/bots/$botId"
+                to={botSwitchTarget(pathname)}
                 params={{ botId: bot.id }}
                 className={cn(
                   'flex h-9 shrink-0 items-center gap-1.5 rounded-full px-3 text-xs font-medium transition-colors',
