@@ -7,6 +7,7 @@ import { type ReactNode, useEffect, useState } from 'react'
 import { toast } from 'sonner'
 
 import { BlobTile } from '~/components/BlobMark'
+import { BotAvatar } from '~/components/BotAvatar'
 import { ConfirmDialog } from '~/components/ConfirmDialog'
 import { Tooltip, TooltipContent, TooltipTrigger } from '~/components/ui/tooltip'
 import { botsListAtom } from '~/features/bots/botsState'
@@ -34,16 +35,6 @@ const globalNavItems: ReadonlyArray<GlobalNavItem> = [
   { label: 'Model catalog', mobileLabel: 'Models', to: '/settings/models', icon: Cpu },
   { label: 'MCP', mobileLabel: 'MCP', to: '/settings/mcp', icon: Plug },
 ]
-
-function botInitials(name: string): string {
-  const parts = name
-    .trim()
-    .split(/[\s-]+/)
-    .filter(Boolean)
-  if (parts.length === 0) return '?'
-  if (parts.length === 1) return parts[0]!.slice(0, 2).toUpperCase()
-  return `${parts[0]![0] ?? ''}${parts[1]![0] ?? ''}`.toUpperCase()
-}
 
 function botDotClass(bot: BotSummary): string {
   if (!bot.enabled) return 'bg-ring'
@@ -192,7 +183,7 @@ function Rail(props: RailProps) {
                     params={{ botId: bot.id }}
                     aria-label={bot.name}
                     className={cn(
-                      'relative grid size-10 place-items-center rounded-2xl transition-all',
+                      'relative grid size-9 place-items-center rounded-xl transition-all',
                       focusRingClassName,
                       isActive
                         ? 'ring-2 ring-foreground ring-offset-2 ring-offset-shelf'
@@ -202,13 +193,7 @@ function Rail(props: RailProps) {
                   />
                 }
               >
-                {bot.isDefault ? (
-                  <BlobTile className="size-10 rounded-2xl" />
-                ) : (
-                  <span className="grid size-10 place-items-center rounded-2xl bg-card text-xs font-semibold tracking-tight text-foreground shadow-xs ring-1 ring-border">
-                    {botInitials(bot.name)}
-                  </span>
-                )}
+                <BotAvatar seed={`${bot.id}@${bot.generation}`} className="size-9 rounded-xl" />
                 <span
                   aria-hidden="true"
                   className={cn(

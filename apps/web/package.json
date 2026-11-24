@@ -12,6 +12,8 @@
     "@base-ui/react": "catalog:",
     "@blob-1/client": "workspace:*",
     "@blob-1/contracts": "workspace:*",
+    "@dicebear/core": "10.7.0",
+    "@dicebear/styles": "10.6.0",
     "@effect/atom-react": "catalog:",
     "@fontsource-variable/inter": "catalog:",
     "@fontsource-variable/jetbrains-mono": "catalog:",
