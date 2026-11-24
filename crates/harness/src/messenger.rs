@@ -18,29 +18,29 @@ const MAX_SEND_TOTAL_BYTES: u64 = 25 * 1024 * 1024;
 
 pub const SEND: ToolSpec = ToolSpec {
     name: Cow::Borrowed("send"),
-    description: Cow::Borrowed("Send a message to people on a messenger. Give exactly one of reply (an m-token from a <message> tag: answers that message) or to (a d-token: posts plainly in that conversation), and text and/or files. At most 300 characters of text; split longer text into several sends. files: relative workspace file paths to attach (max 10 files, 10 MiB each, 25 MiB total). mention: user ids to mention; the system adds the mentions."),
-    input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"text":{"type":"string","description":"Message text (at most 300 characters; optional when files are attached)"},"reply":{"type":"string","description":"m-token of the message to reply to"},"to":{"type":"string","description":"d-token of the conversation"},"mention":{"type":"array","items":{"type":"string"},"description":"User ids to mention"},"thread":{"type":"boolean","description":"thread: true moves the conversation into a thread started from the message you reply to; use it when an inline exchange turns into real work"},"files":{"type":"array","items":{"type":"string"},"maxItems":10,"description":"Relative paths to workspace files to attach (max 10 files, 10 MiB per file, 25 MiB total)"}}}"#),
+    description: Cow::Borrowed("Send a message to people on a messenger. Give exactly one of reply (an m-token from a <message> tag: answers that message) or to (a d-token or messenger URL such as a Discord channel link: posts plainly in that conversation), and text and/or files. At most 300 characters of text; split longer text into several sends. files: relative workspace file paths to attach (max 10 files, 10 MiB each, 25 MiB total). mention: user ids to mention; the system adds the mentions."),
+    input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"text":{"type":"string","description":"Message text (at most 300 characters; optional when files are attached)"},"reply":{"type":"string","description":"m-token of the message to reply to"},"to":{"type":"string","description":"d-token of the conversation, or a messenger URL such as a Discord channel or message link"},"mention":{"type":"array","items":{"type":"string"},"description":"User ids to mention"},"thread":{"type":"boolean","description":"thread: true moves the conversation into a thread started from the message you reply to; use it when an inline exchange turns into real work"},"files":{"type":"array","items":{"type":"string"},"maxItems":10,"description":"Relative paths to workspace files to attach (max 10 files, 10 MiB per file, 25 MiB total)"}}}"#),
 };
 pub const LOOKUP: &[ToolSpec] = &[
     ToolSpec {
         name: Cow::Borrowed("message"),
-        description: Cow::Borrowed("Read one message: by link (a message link someone pasted), or by to (d-token) plus message id (ids appear in history/search results); channel: true means the thread's parent channel."),
-        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"link":{"type":"string"},"to":{"type":"string"},"message":{"type":"string"},"channel":{"type":"boolean"}}}"#),
+        description: Cow::Borrowed("Read one message: by link (a message link someone pasted), or by to (d-token or messenger URL) plus message id (ids appear in history/search results); channel: true means the thread's parent channel (d-token to only)."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"link":{"type":"string"},"to":{"type":"string"},"message":{"type":"string"},"channel":{"type":"boolean","description":"Use the parent channel instead of the thread (d-token to only)"}}}"#),
     },
     ToolSpec {
         name: Cow::Borrowed("history"),
-        description: Cow::Borrowed("Read earlier messages of a conversation (to = d-token), oldest first; channel: true reads the thread's parent channel instead. before: a message id to page further back. limit 1-50, default 20."),
-        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"to":{"type":"string","description":"d-token of the conversation"},"channel":{"type":"boolean","description":"Use the parent channel instead of the thread"},"before":{"type":"string","description":"Message id to page before"},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":["to"]}"#),
+        description: Cow::Borrowed("Read earlier messages of a conversation (to = d-token or messenger URL), oldest first; channel: true reads the thread's parent channel instead (d-token to only). before: a message id to page further back. limit 1-50, default 20."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"to":{"type":"string","description":"d-token of the conversation, or a messenger URL such as a Discord channel or message link"},"channel":{"type":"boolean","description":"Use the parent channel instead of the thread (d-token to only)"},"before":{"type":"string","description":"Message id to page before"},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":["to"]}"#),
     },
     ToolSpec {
         name: Cow::Borrowed("search"),
-        description: Cow::Borrowed("Search messages containing query, in one conversation (to = d-token, channel: true for its parent channel) or across a whole messenger (messenger = name, if supported). limit 1-50, default 20."),
-        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"query":{"type":"string"},"to":{"type":"string","description":"d-token of the conversation"},"channel":{"type":"boolean","description":"Use the parent channel instead of the thread"},"messenger":{"type":"string","description":"Messenger name for a messenger-wide lookup"},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":["query"]}"#),
+        description: Cow::Borrowed("Search messages containing query, in one conversation (to = d-token or messenger URL, channel: true for its parent channel, d-token only) or across a whole messenger (messenger = name, if supported). limit 1-50, default 20."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"query":{"type":"string"},"to":{"type":"string","description":"d-token of the conversation, or a messenger URL such as a Discord channel or message link"},"channel":{"type":"boolean","description":"Use the parent channel instead of the thread (d-token to only)"},"messenger":{"type":"string","description":"Messenger name for a messenger-wide lookup"},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":["query"]}"#),
     },
     ToolSpec {
         name: Cow::Borrowed("participants"),
-        description: Cow::Borrowed("Find people and their user ids, in one conversation (to, channel) or across a whole messenger (messenger + query). Use the ids with send's mention."),
-        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"to":{"type":"string","description":"d-token of the conversation"},"channel":{"type":"boolean","description":"Use the parent channel instead of the thread"},"messenger":{"type":"string","description":"Messenger name for a messenger-wide lookup"},"query":{"type":"string"}}}"#),
+        description: Cow::Borrowed("Find people and their user ids, in one conversation (to; channel for the parent, d-token only) or across a whole messenger (messenger + query). Use the ids with send's mention."),
+        input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"to":{"type":"string","description":"d-token of the conversation, or a messenger URL such as a Discord channel or message link"},"channel":{"type":"boolean","description":"Use the parent channel instead of the thread (d-token to only)"},"messenger":{"type":"string","description":"Messenger name for a messenger-wide lookup"},"query":{"type":"string"}}}"#),
     },
 ];
 
@@ -405,11 +405,28 @@ impl Messengers {
             .map(Arc::as_ref)
             .ok_or_else(|| format!("unknown messenger: {name}").into())
     }
+    /// Resolves `to` — a `d` destination token or a URL the messenger parses
+    /// (e.g. a Discord channel or message link) — to (messenger, place).
+    /// `discord://` URIs also start with 'd', so the token path is chosen on a
+    /// successful `d`-token parse, not on the prefix alone.
     fn place(&self, value: &str, channel: bool) -> Result<(String, Place), Error> {
-        let (name, mut place) = self
-            .store
-            .place(token(value, 'd')?)?
-            .ok_or("unknown destination")?;
+        let (name, mut place) = match token(value, 'd') {
+            Ok(id) => self.store.place(id)?.ok_or("unknown destination")?,
+            Err(_) => {
+                // A URL place's channel is already the concrete channel or
+                // thread id from the link; there is no stored parent to hoist.
+                if channel {
+                    return Err("channel only applies to d destination tokens".into());
+                }
+                self.messengers
+                    .iter()
+                    .find_map(|m| {
+                        m.parse_place(value)
+                            .map(|place| (m.name().to_owned(), place))
+                    })
+                    .ok_or("unknown destination")?
+            }
+        };
         if channel {
             place.thread = None;
         }
@@ -480,7 +497,7 @@ impl Messengers {
         let mut answering = None;
         let mut title_prompt = None;
         let mut threading = false;
-        let (name, target, destination) = match (args.reply, args.to) {
+        let (name, target, destination, url_thread) = match (args.reply, args.to) {
             (Some(reply), None) => {
                 let id = token(&reply, 'm')?;
                 answering = Some(id);
@@ -553,18 +570,42 @@ impl Messengers {
                                 first,
                                 thread,
                             },
-                            to,
+                            Some(to),
+                            false,
                         )
                     }
                     _ => return Err("message has no messenger metadata".into()),
                 }
             }
             (None, Some(to)) => {
-                let to_id = token(&to, 'd')?;
                 let (name, place) = self.place(&to, false)?;
-                let forced_direct =
-                    !place.dm && self.is_direct_channel(&name, &place.channel).await?;
-                let is_pending = place.thread.is_some() && self.store.is_pending_thread(to_id)?;
+                let (to_id, url_thread) = match token(&to, 'd') {
+                    Ok(id) => (Some(id), false),
+                    Err(_) => {
+                        let id = self.store.place_id(&name, &place)?;
+                        // A thread URL posts into the thread's channel but
+                        // reports used_thread=false — the stored row knows it
+                        // is a thread, so flag it for pending cleanup.
+                        let thread = match id {
+                            Some(id) => self
+                                .store
+                                .place(id)?
+                                .is_some_and(|(_, p)| p.thread.is_some()),
+                            None => false,
+                        };
+                        (id, thread)
+                    }
+                };
+                // Thread handling only applies when the place carries a
+                // thread; skip the reply-mode lookup (possibly a REST call)
+                // for plain-channel places and URLs.
+                let forced_direct = !place.dm
+                    && place.thread.is_some()
+                    && self.is_direct_channel(&name, &place.channel).await?;
+                let is_pending = match to_id {
+                    Some(id) if place.thread.is_some() => self.store.is_pending_thread(id)?,
+                    _ => false,
+                };
                 let create_thread = !forced_direct;
                 let fallback_parent = forced_direct && is_pending;
                 if place.thread.is_some() && !place.dm && create_thread {
@@ -578,6 +619,7 @@ impl Messengers {
                         fallback_parent,
                     },
                     to_id,
+                    url_thread,
                 )
             }
             _ => return Err("exactly one of reply or to is required".into()),
@@ -595,8 +637,10 @@ impl Messengers {
                 files,
             })
             .await?;
-        if sent.created_thread || sent.used_thread {
-            let _ = self.store.clear_pending_thread(destination);
+        if let Some(destination) = destination {
+            if sent.created_thread || sent.used_thread || url_thread {
+                let _ = self.store.clear_pending_thread(destination);
+            }
         }
         if sent.created_thread {
             if let (Some((place, prompt)), Some(utility)) = (
@@ -660,14 +704,16 @@ impl Messengers {
                 .expect("answered mutex poisoned")
                 .insert(id);
         }
-        if let Some(pulse) = self
-            .live
-            .0
-            .lock()
-            .expect("live mutex poisoned")
-            .remove(&destination)
-        {
-            pulse.abort();
+        if let Some(destination) = destination {
+            if let Some(pulse) = self
+                .live
+                .0
+                .lock()
+                .expect("live mutex poisoned")
+                .remove(&destination)
+            {
+                pulse.abort();
+            }
         }
         Ok("sent".into())
     }
@@ -733,5 +779,20 @@ impl Messengers {
             }
             _ => Err(format!("unknown tool: {name}").into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::token;
+
+    /// `discord://` URIs start with 'd' but are not destination tokens —
+    /// `Messengers::place` picks the URL path on this parse failing.
+    #[test]
+    fn token_classifies_only_d_ids_as_destinations() {
+        assert_eq!(token("d42", 'd').unwrap(), 42);
+        assert!(token("discord://-/channels/111/222", 'd').is_err());
+        assert!(token("dabc", 'd').is_err());
+        assert!(token("https://discord.com/channels/1/2", 'd').is_err());
     }
 }

@@ -158,6 +158,57 @@ fn reaction(mark: Mark) -> twilight_http::request::channel::reaction::RequestRea
     }
 }
 
+/// Splits a Discord URL or URI into (guild, channel, optional message).
+/// Accepts `https?://` links on the discord.com/discordapp.com hosts and
+/// `discord://` in-app URIs (`-/channels/<guild>/<channel>[/<message>]`).
+fn split_link(value: &str) -> Option<(String, String, Option<String>)> {
+    let (link, uri) = match value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+    {
+        Some(link) => (link, false),
+        None => (value.strip_prefix("discord://")?, true),
+    };
+    let link = link.split(['?', '#']).next()?;
+    let (host, path) = link.split_once('/')?;
+    let discord_host = matches!(
+        host,
+        "discord.com"
+            | "discordapp.com"
+            | "ptb.discord.com"
+            | "canary.discord.com"
+            | "ptb.discordapp.com"
+            | "canary.discordapp.com"
+    );
+    if !(discord_host || (uri && host == "-")) {
+        return None;
+    }
+    let mut parts = path.split('/');
+    if parts.next()? != "channels" {
+        return None;
+    }
+    let guild = parts.next()?.to_owned();
+    let channel = parts.next()?.to_owned();
+    let message = parts.next().map(str::to_owned);
+    let numeric = |v: &str| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
+    if !(guild == "@me" || numeric(&guild))
+        || !numeric(&channel)
+        || message.as_deref().is_some_and(|m| !numeric(m))
+        || parts.next().is_some()
+    {
+        return None;
+    }
+    Some((guild, channel, message))
+}
+
+fn link_place(guild: &str, channel: String) -> Place {
+    Place {
+        channel,
+        thread: None,
+        dm: guild == "@me",
+    }
+}
+
 fn person(user: &User) -> Person {
     Person {
         id: user.id.to_string(),
@@ -784,43 +835,13 @@ impl Lookup for Discord {
     }
 
     fn parse_link(&self, link: &str) -> Option<(Place, String)> {
-        let link = link.strip_prefix("https://")?;
-        let link = link.split(['?', '#']).next()?;
-        let (host, path) = link.split_once('/')?;
-        if !matches!(
-            host,
-            "discord.com"
-                | "discordapp.com"
-                | "ptb.discord.com"
-                | "canary.discord.com"
-                | "ptb.discordapp.com"
-                | "canary.discordapp.com"
-        ) {
-            return None;
-        }
-        let mut parts = path.split('/');
-        if parts.next()? != "channels" {
-            return None;
-        }
-        let guild = parts.next()?;
-        let channel = parts.next()?;
-        let message = parts.next()?;
-        let numeric = |value: &str| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
-        if !(guild == "@me" || numeric(guild))
-            || !numeric(channel)
-            || !numeric(message)
-            || parts.next().is_some()
-        {
-            return None;
-        }
-        Some((
-            Place {
-                channel: channel.into(),
-                thread: None,
-                dm: guild == "@me",
-            },
-            message.into(),
-        ))
+        let (guild, channel, message) = split_link(link)?;
+        Some((link_place(&guild, channel), message?))
+    }
+
+    fn parse_place(&self, value: &str) -> Option<Place> {
+        let (guild, channel, _) = split_link(value)?;
+        Some(link_place(&guild, channel))
     }
 
     async fn history(
@@ -1012,6 +1033,41 @@ impl Messenger for Discord {
 #[cfg(test)]
 mod recent_history_tests {
     use super::*;
+
+    #[test]
+    fn split_link_parses_channel_and_message_urls() {
+        let (guild, channel, message) =
+            split_link("https://discord.com/channels/111/222/333").unwrap();
+        assert_eq!(
+            (guild.as_str(), channel.as_str(), message.as_deref()),
+            ("111", "222", Some("333"))
+        );
+        let (_, channel, message) = split_link("https://discord.com/channels/111/222").unwrap();
+        assert_eq!((channel.as_str(), message), ("222", None));
+        let (guild, ..) = split_link("https://canary.discord.com/channels/@me/222/333").unwrap();
+        assert_eq!(guild, "@me");
+        let (guild, channel, message) = split_link("discord://-/channels/111/222").unwrap();
+        assert_eq!(
+            (guild.as_str(), channel.as_str(), message),
+            ("111", "222", None)
+        );
+        // Query/fragment suffixes and ptb/discordapp hosts are fine too.
+        assert!(split_link("https://ptb.discordapp.com/channels/1/2/3?x=1").is_some());
+        assert!(split_link("https://discord.com/channels/1/2/3#tail").is_some());
+        // Non-discord hosts, missing channel, non-numeric ids and extra parts fail.
+        // `-` is only a valid host for the discord:// URI scheme, not http(s).
+        for bad in [
+            "https://example.com/channels/1/2",
+            "https://-/channels/1/2",
+            "https://discord.com/channels/1",
+            "https://discord.com/channels/guild/2/3",
+            "https://discord.com/channels/1/2/3/4",
+            "discord://-/channels/1/abc",
+            "d42",
+        ] {
+            assert!(split_link(bad).is_none(), "{bad}");
+        }
+    }
 
     fn mk_fetched(id: &str, text: &str) -> Fetched {
         Fetched {

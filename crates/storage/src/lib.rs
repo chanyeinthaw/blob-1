@@ -1014,6 +1014,8 @@ pub struct AccessRule {
 
 pub trait MessengerStore: Send + Sync {
     fn destination(&self, messenger: &str, place: &Place) -> Result<u64, StoreError>;
+    /// The destination id for `place`, without creating a row.
+    fn place_id(&self, messenger: &str, place: &Place) -> Result<Option<u64>, StoreError>;
     fn place(&self, id: u64) -> Result<Option<(String, Place)>, StoreError>;
     fn allowed_users(&self, messenger: &str) -> Result<Vec<String>, StoreError>;
     fn allow_user(&self, messenger: &str, user: &str) -> Result<(), StoreError>;
@@ -1100,6 +1102,9 @@ pub trait MessengerStore: Send + Sync {
 impl<T: MessengerStore + ?Sized> MessengerStore for std::sync::Arc<T> {
     fn destination(&self, messenger: &str, place: &Place) -> Result<u64, StoreError> {
         (**self).destination(messenger, place)
+    }
+    fn place_id(&self, messenger: &str, place: &Place) -> Result<Option<u64>, StoreError> {
+        (**self).place_id(messenger, place)
     }
     fn place(&self, id: u64) -> Result<Option<(String, Place)>, StoreError> {
         (**self).place(id)

@@ -123,6 +123,12 @@ pub trait Lookup: Send + Sync {
     }
     async fn message(&self, place: &Place, id: &str) -> Result<Fetched, MessengerError>;
     fn parse_link(&self, link: &str) -> Option<(Place, String)>;
+    /// Parses a messenger URL or URI into a place (e.g. a Discord channel or
+    /// message link); `None` when the value is not in this messenger's format.
+    /// Tool `to` fields accept this alongside `d` destination tokens.
+    fn parse_place(&self, _value: &str) -> Option<Place> {
+        None
+    }
     async fn history(
         &self,
         place: &Place,

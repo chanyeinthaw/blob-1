@@ -26,6 +26,27 @@ impl MessengerStore for SqliteStorage {
             .map(|id| id as u64)
     }
 
+    fn place_id(&self, messenger: &str, place: &Place) -> Result<Option<u64>, StoreError> {
+        // A thread URL arrives as channel=<thread-id>, while the stored row
+        // keeps it as (parent channel, thread) — match either shape, and
+        // prefer that canonical thread row over a thread-as-channel home row.
+        self.lock()
+            .query_row(
+                "SELECT id FROM destinations \
+                 WHERE messenger = ?1 AND ((channel = ?2 AND thread = ?3) OR thread = ?2) \
+                 ORDER BY thread = ?2 DESC",
+                params![
+                    messenger,
+                    place.channel,
+                    place.thread.as_deref().unwrap_or("")
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(backend)
+            .map(|id| id.map(|id| id as u64))
+    }
+
     fn place(&self, id: u64) -> Result<Option<(String, Place)>, StoreError> {
         self.lock()
             .query_row(
