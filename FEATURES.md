@@ -59,9 +59,8 @@ The bot is one chat that never ends. It coordinates and talks; tasks do the work
 ## Memory
 
 - Code: `crates/memory/src/lib.rs`, `crates/storage-sqlite/src/memory.rs`
-- Append-only rows with JSON `meta`; binary summary tree; chat view and seen view, compacted when they pass `chat_high` (128,000 bytes) and `seen_high` (32,000 bytes); 512-byte nodes; `zoom`, `date`
-- Compaction model summarizes in the background with up to 8 workers; per-message leaves take priority, and with more than one worker at least one slot is kept for leaves
-- Before a turn, `settle` waits only for every earlier message's leaf summary; pair merges keep running in the background (the view shows a merge's two children until it lands) unless the chat view is over `chat_high`, in which case pending merges are awaited too
+- Append-only rows with JSON `meta`; binary summary tree; chat view (128,000 bytes) and seen view (32,000 bytes); 512-byte nodes; `zoom`, `date`
+- Compaction model summarizes in the background
 - Tables: `memory_messages`, `memory_nodes`, `memory_views`, `memory_view_parts`
 
 ## Tasks
