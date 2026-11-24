@@ -431,9 +431,10 @@ fn models_reply(global_store: &SqliteStorage, bot_id: &str) -> crate::Result<Val
         let api = match p.api {
             storage::ProviderApi::OpenAiResponses => "responses",
             storage::ProviderApi::OpenAiCompletions => "completions",
+            storage::ProviderApi::OpenCodeGo => "opencode-go",
             storage::ProviderApi::Decision => "decision",
         };
-        let models: Vec<Value> = global_store.models(&p.id)?.into_iter().map(|m| json!({"id":m.id,"context":m.context_window,"limit":m.context_limit,"images":m.images})).collect();
+        let models: Vec<Value> = global_store.models(&p.id)?.into_iter().map(|m| json!({"id":m.id,"context":m.context_window,"limit":m.context_limit,"images":m.images,"enabled":m.enabled})).collect();
         providers.push(json!({"id":p.id.0,"api":api,"models":models}));
     }
     Ok(json!({"main":main,"compaction":compaction,"utility":utility,"decision":decision,"providers":providers}))
@@ -499,6 +500,7 @@ fn providers_reply(store: &SqliteStorage) -> crate::Result<Value> {
             "api": match p.api {
                 storage::ProviderApi::OpenAiResponses => "responses",
                 storage::ProviderApi::OpenAiCompletions => "completions",
+                storage::ProviderApi::OpenCodeGo => "opencode-go",
                 storage::ProviderApi::Decision => "decision",
             },
             "baseUrl": p.base_url,
@@ -885,6 +887,18 @@ async fn dispatch(
                 global.set_bot_decision_model(bot_id, selected.as_ref())?;
                 models_reply(global, bot_id)
             }
+            "models.setEnabled" => {
+                let provider = get("provider")?;
+                let model = get("model")?;
+                let enabled = payload
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(invalid)?;
+                global
+                    .set_enabled(&storage::ProviderId(provider.to_owned()), model, enabled)
+                    .map_err(|_| "Unknown model")?;
+                models_reply(global, bot_id)
+            }
             "models.setContextLimit" | "models.setImages" => {
                 let provider = get("provider")?;
                 let model = get("model")?;
@@ -926,7 +940,6 @@ async fn dispatch(
             "providers.list" => providers_reply(global),
             "providers.add" => {
                 let id = get("id")?.trim();
-                let base_url = get("baseUrl")?.trim();
                 let api_key = match payload.get("apiKey") {
                     None | Some(Value::Null) => None,
                     Some(Value::String(s)) => {
@@ -942,8 +955,16 @@ async fn dispatch(
                 let api = match get("api")? {
                     "responses" => storage::ProviderApi::OpenAiResponses,
                     "completions" => storage::ProviderApi::OpenAiCompletions,
+                    "opencode-go" => storage::ProviderApi::OpenCodeGo,
                     "decision" => storage::ProviderApi::Decision,
                     _ => return Err(invalid().into()),
+                };
+                let base_url = match get("baseUrl")?.trim() {
+                    "" if api == storage::ProviderApi::OpenCodeGo => {
+                        "https://opencode.ai/inference/go".to_owned()
+                    }
+                    "" => return Err(invalid().into()),
+                    base_url => base_url.to_owned(),
                 };
                 let explicit_models: Vec<storage::DiscoveredModel> = match payload.get("models") {
                     None | Some(Value::Null) => Vec::new(),
@@ -974,11 +995,11 @@ async fn dispatch(
                 if global.providers()?.iter().any(|p| p.id.0 == id) {
                     return Err(format!("Provider {id} already exists").into());
                 }
-                if !crate::run::valid_http_url(base_url) {
+                if !crate::run::valid_http_url(&base_url) {
                     return Err("Base URL must be a valid http(s) URL".into());
                 }
                 if api.is_decision()
-                    && !llm_rig::is_cloudflare_ai_url(base_url)
+                    && !llm_rig::is_cloudflare_ai_url(&base_url)
                     && explicit_models.is_empty()
                 {
                     return Err(
@@ -986,26 +1007,28 @@ async fn dispatch(
                     );
                 }
                 let provider_id = storage::ProviderId(id.into());
+                let seeded = if api.is_decision() {
+                    if !explicit_models.is_empty() {
+                        explicit_models
+                    } else if llm_rig::is_cloudflare_ai_url(&base_url) {
+                        llm_rig::cloudflare_decision_models()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
                 global.save_provider(
                     storage::Provider {
                         id: provider_id.clone(),
                         api,
-                        base_url: base_url.into(),
+                        base_url,
                         has_api_key: api_key.is_some(),
                     },
                     api_key,
                 )?;
-                if api.is_decision() {
-                    let seeded = if !explicit_models.is_empty() {
-                        explicit_models
-                    } else if llm_rig::is_cloudflare_ai_url(base_url) {
-                        llm_rig::cloudflare_decision_models()
-                    } else {
-                        Vec::new()
-                    };
-                    if !seeded.is_empty() {
-                        global.replace_models(&provider_id, seeded)?;
-                    }
+                if !seeded.is_empty() {
+                    global.replace_models(&provider_id, seeded)?;
                 }
                 providers_reply(global)
             }

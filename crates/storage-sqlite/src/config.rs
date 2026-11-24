@@ -126,7 +126,30 @@ impl ConfigStore for SqliteStorage {
             Some(key) => Some(self.seal(key)?),
             None => None,
         };
-        self.lock()
+        let connection = self.lock();
+        // Switching `api` changes the wire transport but leaves the existing
+        // models and role assignments in place — they may not be callable
+        // under the new api — so it must go through `provider remove` first.
+        let existing: Option<String> = connection
+            .query_row(
+                "SELECT api FROM providers WHERE id = ?1",
+                [&provider.id.0],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        if let Some(existing) = existing {
+            if existing != api_name(provider.api) {
+                return Err(StoreError::Backend(
+                    format!(
+                        "provider {} already uses api {existing}; run `agent provider remove {}` first to change its api",
+                        provider.id.0, provider.id.0
+                    )
+                    .into(),
+                ));
+            }
+        }
+        connection
             .execute(
                 "INSERT INTO providers (id, api, base_url, api_key) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT (id) DO UPDATE SET
@@ -252,7 +275,7 @@ impl ConfigStore for SqliteStorage {
         let connection = self.lock();
         let listed = connection
             .prepare(
-                "SELECT id, context_window, context_limit, EXISTS(SELECT 1 FROM model_images WHERE model_images.provider = models.provider AND model_images.model = models.id) FROM models
+                "SELECT id, context_window, context_limit, EXISTS(SELECT 1 FROM model_images WHERE model_images.provider = models.provider AND model_images.model = models.id), EXISTS(SELECT 1 FROM model_enabled WHERE model_enabled.provider = models.provider AND model_enabled.model = models.id) FROM models
                  WHERE provider = ?1 ORDER BY id",
             )
             .map_err(backend)?
@@ -262,16 +285,18 @@ impl ConfigStore for SqliteStorage {
                     row.get::<_, Option<u32>>(1)?,
                     row.get::<_, Option<u32>>(2)?,
                     row.get::<_, bool>(3)?,
+                    row.get::<_, bool>(4)?,
                 ))
             })
             .map_err(backend)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(backend)?;
         let mut models = Vec::with_capacity(listed.len());
-        for (id, context_window, context_limit, images) in listed {
+        for (id, context_window, context_limit, images, enabled) in listed {
             let reasoning_map = reasoning_map(&connection, provider, &id)?;
             models.push(Model {
                 images,
+                enabled,
                 provider: provider.clone(),
                 id,
                 context_window,
@@ -312,6 +337,43 @@ impl ConfigStore for SqliteStorage {
             connection
                 .execute(
                     "DELETE FROM model_images WHERE provider = ?1 AND model = ?2",
+                    params![provider.0, model],
+                )
+                .map_err(backend)?;
+        }
+        Ok(())
+    }
+
+    fn set_enabled(
+        &self,
+        provider: &ProviderId,
+        model: &str,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        let connection = self.lock();
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM models WHERE provider = ?1 AND id = ?2)",
+                params![provider.0, model],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        if !exists {
+            return Err(StoreError::Backend(
+                format!("unknown model {}/{model}", provider.0).into(),
+            ));
+        }
+        if enabled {
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO model_enabled (provider, model) VALUES (?1, ?2)",
+                    params![provider.0, model],
+                )
+                .map_err(backend)?;
+        } else {
+            connection
+                .execute(
+                    "DELETE FROM model_enabled WHERE provider = ?1 AND model = ?2",
                     params![provider.0, model],
                 )
                 .map_err(backend)?;
@@ -571,6 +633,7 @@ fn provider_from_row(row: &Row) -> rusqlite::Result<Provider> {
         api: match api.as_str() {
             "openai-responses" => ProviderApi::OpenAiResponses,
             "openai-completions" => ProviderApi::OpenAiCompletions,
+            "opencode-go" => ProviderApi::OpenCodeGo,
             "decision" => ProviderApi::Decision,
             _ => {
                 return Err(rusqlite::Error::FromSqlConversionFailure(
@@ -589,6 +652,7 @@ fn api_name(api: ProviderApi) -> &'static str {
     match api {
         ProviderApi::OpenAiResponses => "openai-responses",
         ProviderApi::OpenAiCompletions => "openai-completions",
+        ProviderApi::OpenCodeGo => "opencode-go",
         ProviderApi::Decision => "decision",
     }
 }

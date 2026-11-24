@@ -27,6 +27,8 @@ pub struct RigLlm {
     model: DynModel<Completion>,
     reasoning: Option<ReasoningSetting>,
     api: ProviderApi,
+    /// Values to scrub out of upstream error bodies before they surface.
+    secrets: Vec<String>,
     hold: Arc<Mutex<Option<Instant>>>,
 }
 
@@ -42,25 +44,65 @@ impl RigLlm {
             model: model.into(),
             reasoning: None,
             api: ProviderApi::OpenAiResponses,
+            secrets: Vec::new(),
             hold: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Upstream error bodies can echo the bearer key or `x-opencode-session`
+    /// back; scrub them out of the message that surfaces.
+    fn scrub(&self, mut text: String, session: Option<&str>) -> String {
+        for secret in self
+            .secrets
+            .iter()
+            .map(String::as_str)
+            .chain(session.into_iter())
+        {
+            if !secret.is_empty() {
+                text = text.replace(secret, "***");
+            }
+        }
+        text
     }
 
     async fn send(
         &self,
         request: completion::CompletionRequest,
+        session: Option<&str>,
     ) -> Result<completion::CompletionResponse, LlmError> {
         let response = self.model.call(request).await.map_err(|error| {
             let status = error
                 .provider_response_status()
                 .map(|status| status.as_u16());
             let retry_after = error.report().retry_after(SystemTime::now());
-            classify_error(error.to_string(), status, retry_after)
+            // Classify on the raw text — a short secret could overlap a term
+            // like "credit balance" and change the variant — then scrub only
+            // the message that surfaces.
+            let text = error.to_string();
+            let classified = classify_error(text.clone(), status, retry_after);
+            with_message(classified, self.scrub(text, session))
         })?;
         match response.error {
-            Some(error) => Err(classify_error(error, None, None)),
+            Some(error) => Err(with_message(
+                classify_error(error.clone(), None, None),
+                self.scrub(error, session),
+            )),
             None => Ok(response),
         }
+    }
+}
+
+/// The classified variant with its message replaced — secret scrubbing
+/// swaps out the text after classification has already read the original.
+fn with_message(error: LlmError, message: String) -> LlmError {
+    match error {
+        LlmError::Request(_) => LlmError::Request(message),
+        LlmError::ContextOverflow(_) => LlmError::ContextOverflow(message),
+        LlmError::QuotaExhausted(_) => LlmError::QuotaExhausted(message),
+        LlmError::RateLimited { retry_after, .. } => LlmError::RateLimited {
+            message,
+            retry_after,
+        },
     }
 }
 
@@ -68,10 +110,16 @@ pub fn connect(provider: &Provider, api_key: &str, model: &Model, level: Reasoni
     let client = client(provider, api_key);
     let id = match provider.api {
         ProviderApi::OpenAiResponses => model.id.rsplit('/').next().unwrap_or(&model.id),
-        ProviderApi::OpenAiCompletions | ProviderApi::Decision => &model.id,
+        ProviderApi::OpenAiCompletions | ProviderApi::OpenCodeGo | ProviderApi::Decision => {
+            &model.id
+        }
     };
     let catalog = Catalog::builtin();
-    let provider_id = ProviderId::catalog("openai").expect("OpenAI is in rig's catalog");
+    let provider_id = ProviderId::catalog(match provider.api {
+        ProviderApi::OpenCodeGo => "opencode-go",
+        _ => "openai",
+    })
+    .expect("provider is in rig's catalog");
     let mut spec = catalog
         .get(provider_id, id)
         .map(|entry| entry.spec.clone())
@@ -85,14 +133,15 @@ pub fn connect(provider: &Provider, api_key: &str, model: &Model, level: Reasoni
             rig.wire = rig.wire.with_facts(facts);
             RigLlm::new(rig)
         }
-        ProviderApi::OpenAiCompletions | ProviderApi::Decision => {
+        ProviderApi::OpenAiCompletions | ProviderApi::OpenCodeGo | ProviderApi::Decision => {
             let mut rig = client.chat(&model.id);
             rig.wire = rig.wire.with_facts(facts);
             RigLlm::new(rig)
         }
     };
-    llm.reasoning = resolve_reasoning(&llm.model, model, level);
+    llm.reasoning = resolve_reasoning(&llm.model, model, level, provider.api);
     llm.api = provider.api;
+    llm.secrets = vec![api_key.to_owned()];
     llm
 }
 
@@ -107,16 +156,28 @@ pub fn reasoning_levels(provider: &Provider, model: &Model) -> Option<Vec<Reason
     let client = client(provider, "unused");
     let rig = match provider.api {
         ProviderApi::OpenAiResponses => RigLlm::new(client.responses(&model.id)),
-        ProviderApi::OpenAiCompletions | ProviderApi::Decision => RigLlm::new(client.chat(&model.id)),
+        ProviderApi::OpenAiCompletions | ProviderApi::OpenCodeGo | ProviderApi::Decision => {
+            RigLlm::new(client.chat(&model.id))
+        }
     };
     rig.model.spec()?;
-    Some(supported_levels(&rig.model, model))
+    Some(supported_levels(&rig.model, model, provider.api))
 }
 
-fn supported_levels(rig: &DynModel<Completion>, model: &Model) -> Vec<ReasoningLevel> {
+fn supported_levels(
+    rig: &DynModel<Completion>,
+    model: &Model,
+    api: ProviderApi,
+) -> Vec<ReasoningLevel> {
     let spec = rig.spec();
     let levels = spec.and_then(|s| s.reasoning.levels());
-    let off = spec.and_then(|s| s.reasoning.can_disable()).unwrap_or(true);
+    // Go only sends a typed effort the catalog confirms; everywhere else
+    // unknown support stays permissive. Explicit `reasoning_map` entries
+    // are honored either way.
+    let confirmed = api != ProviderApi::OpenCodeGo;
+    let off = spec
+        .and_then(|s| s.reasoning.can_disable())
+        .unwrap_or(confirmed);
     ReasoningLevel::ALL
         .into_iter()
         .filter(|level| {
@@ -125,11 +186,12 @@ fn supported_levels(rig: &DynModel<Completion>, model: &Model) -> Vec<ReasoningL
                     if *level == ReasoningLevel::Off {
                         off
                     } else {
-                        levels.is_none_or(|levels| {
-                            levels
+                        match levels {
+                            Some(levels) => levels
                                 .iter()
-                                .any(|effort| effort.as_str() == level.as_str())
-                        })
+                                .any(|effort| effort.as_str() == level.as_str()),
+                            None => confirmed,
+                        }
                     }
                 },
                 Option::is_some,
@@ -142,10 +204,13 @@ fn resolve_reasoning(
     rig: &DynModel<Completion>,
     model: &Model,
     requested: ReasoningLevel,
+    api: ProviderApi,
 ) -> Option<ReasoningSetting> {
     let spec = rig.spec();
-    let off = spec.and_then(|s| s.reasoning.can_disable()).unwrap_or(true);
-    let levels = supported_levels(rig, model);
+    let off = spec
+        .and_then(|s| s.reasoning.can_disable())
+        .unwrap_or(api != ProviderApi::OpenCodeGo);
+    let levels = supported_levels(rig, model, api);
     let supported = |level: ReasoningLevel| levels.contains(&level);
     let chosen = ReasoningLevel::ALL
         .into_iter()
@@ -202,23 +267,72 @@ pub async fn discover(
         .data
         .into_iter()
         .map(|info| DiscoveredModel {
-            context_window: info.context_length.or_else(|| context_window(&info.id)),
+            context_window: info
+                .context_length
+                .or_else(|| context_window(provider.api, &info.id)),
             id: info.id,
         })
         .collect();
+    if provider.api == ProviderApi::OpenCodeGo {
+        // This client only speaks Chat Completions, but Go serves some
+        // models on Responses (`@ai-sdk/openai` npm) or Anthropic Messages
+        // (`@ai-sdk/anthropic`, an `/anthropic/` endpoint). Keep those out
+        // of the catalog so they cannot be selected; a row with no serving
+        // override — or no catalog entry — defaults to Chat Completions.
+        let catalog = Catalog::builtin();
+        let go = ProviderId::catalog("opencode-go").expect("opencode-go is in rig's catalog");
+        models.retain(|model| {
+            if model.id.contains("embedding") {
+                return false;
+            }
+            let Some(provider) = catalog
+                .get(go.clone(), &model.id)
+                .and_then(|entry| entry.spec.details.provider.clone())
+            else {
+                return true;
+            };
+            let npm = provider.npm.as_deref();
+            npm != Some("@ai-sdk/openai")
+                && npm != Some("@ai-sdk/anthropic")
+                && provider.shape.as_deref() != Some("responses")
+                && !provider
+                    .api
+                    .as_deref()
+                    .is_some_and(|url| url.contains("/anthropic/"))
+        });
+    }
     models.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(models)
 }
 
 fn client(provider: &Provider, api_key: &str) -> OpenAI {
-    OpenAIConfig::new(api_key)
+    let config = match provider.api {
+        // The Go dialect sends `x-opencode-session` from the request's
+        // cache key; Go rejects calls without it (400 MissingSessionID).
+        ProviderApi::OpenCodeGo => {
+            OpenAIConfig::with_key(&rig_core::providers::openai::wire::OPENCODE_GO, api_key)
+        }
+        _ => OpenAIConfig::new(api_key),
+    };
+    config
         .with_auth(Auth::OptionalBearer)
         .with_base_url(&provider.base_url)
         .client()
 }
 
-fn context_window(model: &str) -> Option<u32> {
-    Catalog::builtin()
+fn context_window(api: ProviderApi, model: &str) -> Option<u32> {
+    let catalog = Catalog::builtin();
+    if api == ProviderApi::OpenCodeGo {
+        // Prefer the Go row — another vendor's same-named model can carry a
+        // different limit.
+        if let Some(window) = ProviderId::catalog("opencode-go")
+            .and_then(|go| catalog.get(go, model))
+            .and_then(|entry| entry.spec.context_window)
+        {
+            return Some(window);
+        }
+    }
+    catalog
         .iter()
         .find_map(|spec| (spec.id == model).then_some(spec.context_window).flatten())
 }
@@ -234,13 +348,28 @@ impl Llm for RigLlm {
         let mut extra = serde_json::Map::new();
         match &self.reasoning {
             Some(ReasoningSetting::Typed(reasoning)) => {
-                request = request.reasoning(*reasoning);
+                // Go has no rig-side reasoning mapping; send the effort as
+                // `reasoning_effort` like the raw path does, with `Off` as
+                // `"none"` (the catalog only offers Off where the model
+                // accepts it).
+                if self.api == ProviderApi::OpenCodeGo {
+                    let value = match reasoning {
+                        completion::Reasoning::Effort(effort) => Some(effort.as_str()),
+                        completion::Reasoning::Off => Some("none"),
+                        _ => None,
+                    };
+                    if let Some(value) = value {
+                        extra.insert("reasoning_effort".into(), value.into());
+                    }
+                } else {
+                    request = request.reasoning(*reasoning);
+                }
             }
             Some(ReasoningSetting::Raw(value)) => match self.api {
                 ProviderApi::OpenAiResponses => {
                     extra.insert("reasoning".into(), serde_json::json!({"effort": value}));
                 }
-                ProviderApi::OpenAiCompletions => {
+                ProviderApi::OpenAiCompletions | ProviderApi::OpenCodeGo => {
                     extra.insert(
                         "reasoning_effort".into(),
                         serde_json::Value::String(value.clone()),
@@ -258,6 +387,16 @@ impl Llm for RigLlm {
                 );
             }
         }
+        let session = if self.api == ProviderApi::OpenCodeGo {
+            // The Go dialect turns the cache key into the x-opencode-session
+            // header; mint the id here so error redaction knows it too —
+            // rig would otherwise generate one `send()` cannot see.
+            let session = cache_key.map_or_else(rig_core::id::generate, str::to_owned);
+            request.options.cache_key = Some(session.clone());
+            Some(session)
+        } else {
+            None
+        };
         if !extra.is_empty() {
             request = request.additional_params(serde_json::Value::Object(extra));
         }
@@ -271,7 +410,7 @@ impl Llm for RigLlm {
                 }
             }
             attempt += 1;
-            match self.send(request.clone()).await {
+            match self.send(request.clone(), session.as_deref()).await {
                 Err(LlmError::RateLimited {
                     message,
                     retry_after,

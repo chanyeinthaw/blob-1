@@ -509,8 +509,9 @@ enum ProviderCommand {
         id: String,
         #[arg(long)]
         api: Api,
+        /// Provider base URL; defaults to `https://opencode.ai/inference/go` for `--api opencode-go`.
         #[arg(long)]
-        base_url: String,
+        base_url: Option<String>,
         /// Save the provider without an API key (for local endpoints).
         #[arg(long)]
         no_key: bool,
@@ -543,6 +544,7 @@ enum ProviderKeyCommand {
 enum Api {
     Responses,
     Completions,
+    OpencodeGo,
     Decision,
 }
 
@@ -921,7 +923,15 @@ fn provider(store: &SqliteStorage, command: ProviderCommand) -> Result<()> {
             let provider_api = match api {
                 Api::Responses => ProviderApi::OpenAiResponses,
                 Api::Completions => ProviderApi::OpenAiCompletions,
+                Api::OpencodeGo => ProviderApi::OpenCodeGo,
                 Api::Decision => ProviderApi::Decision,
+            };
+            let base_url = match (provider_api, base_url) {
+                (_, Some(base_url)) => base_url,
+                (ProviderApi::OpenCodeGo, None) => {
+                    "https://opencode.ai/inference/go".to_owned()
+                }
+                (_, None) => return Err("--base-url is required".into()),
             };
             let explicit_models: Vec<storage::DiscoveredModel> = models
                 .into_iter()
@@ -1007,6 +1017,7 @@ fn provider(store: &SqliteStorage, command: ProviderCommand) -> Result<()> {
                 let api = match provider.api {
                     ProviderApi::OpenAiResponses => "responses",
                     ProviderApi::OpenAiCompletions => "completions",
+                    ProviderApi::OpenCodeGo => "opencode-go",
                     ProviderApi::Decision => "decision",
                 };
                 let key_status = if provider.has_api_key {

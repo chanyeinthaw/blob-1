@@ -325,7 +325,9 @@ where
                 None => inner.models.connect(None, None),
             };
             let (llm, window, resolved) = match result {
-                Err(HarnessError::UnknownModel(_)) if choice.is_some() => {
+                Err(HarnessError::UnknownModel(_) | HarnessError::DisabledModel(_))
+                    if choice.is_some() =>
+                {
                     fallback = true;
                     inner.models.connect(None, None)?
                 }

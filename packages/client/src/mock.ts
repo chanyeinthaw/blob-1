@@ -94,11 +94,11 @@ const seedState = (): State => ({
       baseUrl: 'http://127.0.0.1:8320/v1',
       apiKey: 'mock-cpa1-key',
       models: [
-        { id: 'gpt-6.1-terra', context: 1050000, limit: 400000, images: true },
-        { id: 'gpt-6-luna', context: 1050000, limit: null, images: true },
-        { id: 'gpt-6-luna-fast', context: null, limit: null, images: false },
-        { id: 'claude-fable-5', context: 1000000, limit: null, images: false },
-        { id: 'gpt-5.6-terra', context: 1050000, limit: null, images: false },
+        { id: 'gpt-6.1-terra', context: 1050000, limit: 400000, images: true, enabled: true },
+        { id: 'gpt-6-luna', context: 1050000, limit: null, images: true, enabled: true },
+        { id: 'gpt-6-luna-fast', context: null, limit: null, images: false, enabled: false },
+        { id: 'claude-fable-5', context: 1000000, limit: null, images: false, enabled: false },
+        { id: 'gpt-5.6-terra', context: 1050000, limit: null, images: false, enabled: false },
       ],
     },
   ],
@@ -420,8 +420,8 @@ const isCloudflareAiUrl = (baseUrl: string): boolean => {
 }
 
 const cloudflareDecisionModels = (): ReadonlyArray<ModelInfo> => [
-  { id: '@cf/cloudflare/clef-flash', context: 24576, limit: null, images: false },
-  { id: '@cf/cloudflare/clef', context: 65536, limit: null, images: false },
+  { id: '@cf/cloudflare/clef-flash', context: 24576, limit: null, images: false, enabled: false },
+  { id: '@cf/cloudflare/clef', context: 65536, limit: null, images: false, enabled: false },
 ]
 
 const hasLlmModel = (state: State, provider: string, model: string): boolean => {
@@ -457,6 +457,7 @@ const synthesizeModels = (providerId: string): ReadonlyArray<ModelInfo> =>
     context: null,
     limit: null,
     images: false,
+    enabled: false,
   }))
 
 const hasValidAuthority = (authority: string): boolean => {
@@ -500,7 +501,7 @@ const resolveInitialModels = (
   const explicit = (models ?? [])
     .map(modelId => modelId.trim())
     .filter(modelId => modelId !== '')
-    .map(modelId => ({ id: modelId, context: null, limit: null, images: false }))
+    .map(modelId => ({ id: modelId, context: null, limit: null, images: false, enabled: false }))
   if (explicit.length > 0) return Effect.succeed(explicit)
   if (isCloudflareAiUrl(baseUrl)) return Effect.succeed(cloudflareDecisionModels())
   return Effect.fail('Enter at least one model ID for non-Cloudflare decision endpoints')
@@ -581,7 +582,18 @@ const refreshProvider = (state: State, id: string): Effect.Effect<State, string>
       provider.api === 'decision'
         ? isCloudflareAiUrl(provider.baseUrl)
           ? [
-              ...cloudflareDecisionModels(),
+              // Like the server's upsert: fresh catalog rows, but flag-table
+              // state (enabled/images/limit) survives on models that persist.
+              ...cloudflareDecisionModels().map(fresh => {
+                const existing = provider.models.find(model => model.id === fresh.id)
+                return {
+                  id: fresh.id,
+                  context: fresh.context,
+                  images: existing?.images ?? fresh.images,
+                  limit: existing?.limit ?? fresh.limit,
+                  enabled: existing?.enabled ?? fresh.enabled,
+                }
+              }),
               ...provider.models.filter(
                 existing => !cloudflareDecisionModels().some(cf => cf.id === existing.id),
               ),
@@ -1104,6 +1116,31 @@ const handlers: { readonly [K in LegacyRequestType]: Handler<K> } = {
                             entryModel.id === model
                               ? Struct.evolve(entryModel, {
                                   images: () => images,
+                                })
+                              : entryModel,
+                          ),
+                      })
+                    : entry,
+                ),
+            }),
+          )
+        : Effect.fail('Unknown model'),
+    ).pipe(Effect.map(modelsReply)),
+
+  'models.setEnabled': ({ provider, model, enabled }, state) =>
+    transition(state, current =>
+      hasModel(current, provider, model)
+        ? Effect.succeed(
+            Struct.evolve(current, {
+              providers: providers =>
+                providers.map(entry =>
+                  entry.id === provider
+                    ? Struct.evolve(entry, {
+                        models: models =>
+                          models.map(entryModel =>
+                            entryModel.id === model
+                              ? Struct.evolve(entryModel, {
+                                  enabled: () => enabled,
                                 })
                               : entryModel,
                           ),
@@ -1695,6 +1732,7 @@ const allHandlers: { readonly [K in RequestType]: RootHandler<K> } = {
   'models.setDecision': wrapLegacy('models.setDecision'),
   'models.setContextLimit': wrapLegacy('models.setContextLimit'),
   'models.setImages': wrapLegacy('models.setImages'),
+  'models.setEnabled': wrapLegacy('models.setEnabled'),
   'providers.list': wrapLegacy('providers.list'),
   'providers.add': wrapLegacy('providers.add'),
   'providers.setKey': wrapLegacy('providers.setKey'),

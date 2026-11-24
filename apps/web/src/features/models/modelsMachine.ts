@@ -12,6 +12,13 @@ const ImageJob = Schema.Struct({
 })
 type ImageJob = typeof ImageJob.Type
 
+const EnabledJob = Schema.Struct({
+  provider: Schema.String,
+  modelId: Schema.String,
+  enabled: Schema.Boolean,
+})
+type EnabledJob = typeof EnabledJob.Type
+
 const ContextJob = Schema.Struct({
   provider: Schema.String,
   modelId: Schema.String,
@@ -33,6 +40,7 @@ const rootFields = {
   roleStatuses: Schema.Record(Schema.String, Schema.String),
   contextDrafts: Schema.Record(Schema.String, ContextDraft),
   imageJobs: Schema.Array(ImageJob),
+  enabledJobs: Schema.Array(EnabledJob),
   contextJobs: Schema.Array(ContextJob),
   /** Bumped on every confirmed Compaction save, so an older Main reply can't overwrite it. */
   compactionVersion: Schema.Finite,
@@ -88,6 +96,9 @@ const withModelInfo = (
 
 const withImages = (models: Models, provider: string, modelId: string, images: boolean): Models =>
   withModelInfo(models, provider, modelId, info => ({ ...info, images }))
+
+const withEnabled = (models: Models, provider: string, modelId: string, enabled: boolean): Models =>
+  withModelInfo(models, provider, modelId, info => ({ ...info, enabled }))
 
 const withLimit = (
   models: Models,
@@ -153,6 +164,29 @@ const settleImages = (
       base(root.shown),
     ),
     imageJobs: rest,
+  }
+}
+
+/** Settles the head enabled job, replaying queued toggles over the confirmed flag. */
+const settleEnabled = (
+  root: RootData,
+  output: Models | null,
+): Pick<RootData, 'server' | 'shown' | 'enabledJobs'> => {
+  const job = root.enabledJobs[0]
+  if (job === undefined) {
+    return { server: root.server, shown: root.shown, enabledJobs: [] }
+  }
+  const confirmed =
+    findInfo(output ?? root.server, job.provider, job.modelId)?.enabled ?? job.enabled
+  const rest = root.enabledJobs.slice(1)
+  const base = (models: Models) => withEnabled(models, job.provider, job.modelId, confirmed)
+  return {
+    server: output === null ? root.server : base(root.server),
+    shown: rest.reduce(
+      (models, queued) => withEnabled(models, queued.provider, queued.modelId, queued.enabled),
+      base(root.shown),
+    ),
+    enabledJobs: rest,
   }
 }
 
@@ -301,6 +335,17 @@ const setImages = Effect.fn('ModelsSettings.setImages')(function* (job: ImageJob
     .pipe(Effect.tapError(error => notify(error.message)))
 })
 
+const setEnabled = Effect.fn('ModelsSettings.setEnabled')(function* (job: EnabledJob) {
+  const api = yield* Api
+  return yield* api
+    .request('models.setEnabled', {
+      provider: job.provider,
+      model: job.modelId,
+      enabled: job.enabled,
+    })
+    .pipe(Effect.tapError(error => notify(error.message)))
+})
+
 const setContextLimit = Effect.fn('ModelsSettings.setContextLimit')(function* (job: ContextJob) {
   const api = yield* Api
   return yield* api.request('models.setContextLimit', {
@@ -348,6 +393,7 @@ export const ModelsStates = Machine.state({
       },
     },
     Images: { states: { Idle: {}, Saving: {} } },
+    Enabled: { states: { Idle: {}, Saving: {} } },
     Context: { states: { Idle: {}, Saving: {} } },
   },
 })
@@ -359,6 +405,7 @@ export const ModelsEvents = Machine.events({
   AssignUtility: { slot: Schema.NullOr(Slot) },
   AssignDecision: { slot: Schema.NullOr(DecisionSlot) },
   ToggleImages: { provider: Schema.String, modelId: Schema.String, images: Schema.Boolean },
+  ToggleEnabled: { provider: Schema.String, modelId: Schema.String, enabled: Schema.Boolean },
   UpdateContext: { provider: Schema.String, modelId: Schema.String, value: Schema.String },
   FlushContext: { provider: Schema.String, modelId: Schema.String },
 })
@@ -375,6 +422,7 @@ export const ModelsMachine = Machine.make({
     setUtility,
     setDecision,
     setImages,
+    setEnabled,
     setContextLimit,
   },
 }).handle({
@@ -386,6 +434,7 @@ export const ModelsMachine = Machine.make({
     decisionVersion: 0,
     contextDrafts: {},
     imageJobs: [],
+    enabledJobs: [],
     contextJobs: [],
   }),
   on: {
@@ -397,6 +446,17 @@ export const ModelsMachine = Machine.make({
         imageJobs: [
           ...root.imageJobs,
           { provider: event.provider, modelId: event.modelId, images: event.images },
+        ],
+      }),
+    },
+    ToggleEnabled: {
+      update: 'root',
+      data: ({ event, root }) => ({
+        ...root,
+        shown: withEnabled(root.shown, event.provider, event.modelId, event.enabled),
+        enabledJobs: [
+          ...root.enabledJobs,
+          { provider: event.provider, modelId: event.modelId, enabled: event.enabled },
         ],
       }),
     },
@@ -448,9 +508,12 @@ export const ModelsMachine = Machine.make({
                   ? { ...output, decision: root.server.decision }
                   : output
                 const shown: Models = {
-                  providers: root.imageJobs.reduce(
-                    (models, job) => withImages(models, job.provider, job.modelId, job.images),
-                    output,
+                  providers: root.enabledJobs.reduce(
+                    (models, job) => withEnabled(models, job.provider, job.modelId, job.enabled),
+                    root.imageJobs.reduce(
+                      (models, job) => withImages(models, job.provider, job.modelId, job.images),
+                      output,
+                    ),
                   ).providers,
                   main:
                     root.roleStatuses['main'] === 'Saving…' ||
@@ -797,6 +860,39 @@ export const ModelsMachine = Machine.make({
               data: ({ root }) => ({
                 target: undefined,
                 update: { ...root, ...settleImages(root, null) },
+              }),
+            },
+          },
+        },
+      },
+    },
+    Enabled: {
+      initial: { target: 'Enabled.Idle' },
+      states: {
+        Idle: {
+          always: {
+            target: 'Enabled.Saving',
+            guard: ({ root }) => root.enabledJobs.length > 0,
+          },
+        },
+        Saving: {
+          invoke: {
+            src: 'setEnabled',
+            input: ({ root }) => Option.getOrThrow(Array.head(root.enabledJobs)),
+            onDone: {
+              target: 'Enabled.Idle',
+              update: 'root',
+              data: ({ root, output }) => ({
+                target: undefined,
+                update: { ...root, ...settleEnabled(root, output) },
+              }),
+            },
+            onFailure: {
+              target: 'Enabled.Idle',
+              update: 'root',
+              data: ({ root }) => ({
+                target: undefined,
+                update: { ...root, ...settleEnabled(root, null) },
               }),
             },
           },

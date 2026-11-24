@@ -90,17 +90,40 @@ impl harness::Models for ModelFactory {
         let default = bm
             .main
             .ok_or_else(|| harness::HarnessError::Compaction("no default model".into()))?;
+        // Role assignments resolve even when disabled; only the table below is
+        // selectable for spawn, so flag disabled slots as unavailable.
+        let enabled_of = |selected: &storage::ModelRef| -> bool {
+            self.global_store
+                .models(&selected.provider)
+                .ok()
+                .and_then(|models| {
+                    models
+                        .into_iter()
+                        .find(|model| model.id == selected.model)
+                })
+                .is_some_and(|model| model.enabled)
+        };
+        let unavailable = |enabled: bool| {
+            if enabled {
+                ""
+            } else {
+                " (disabled for explicit selection)"
+            }
+        };
         let mut lines = vec![
             format!(
-                "default: provider={} model={} reasoning={}",
+                "default: provider={} model={} reasoning={}{}",
                 default.provider.0,
                 default.model,
-                bm.main_reasoning.as_str()
+                bm.main_reasoning.as_str(),
+                unavailable(enabled_of(&default)),
             ),
-            match bm.compaction {
+            match &bm.compaction {
                 Some(model) => format!(
-                    "compaction: provider={} model={}",
-                    model.provider.0, model.model
+                    "compaction: provider={} model={}{}",
+                    model.provider.0,
+                    model.model,
+                    unavailable(enabled_of(model)),
                 ),
                 None => "compaction: default".into(),
             },
@@ -112,6 +135,9 @@ impl harness::Models for ModelFactory {
                 continue;
             }
             for model in self.global_store.models(&provider.id)? {
+                if !model.enabled {
+                    continue;
+                }
                 if !provider.id.0.to_lowercase().contains(&search)
                     && !model.id.to_lowercase().contains(&search)
                 {
@@ -239,6 +265,11 @@ impl harness::Models for ModelFactory {
             .into_iter()
             .find(|m| m.id == model_id)
             .ok_or_else(unknown)?;
+        if !model.enabled {
+            return Err(harness::HarnessError::DisabledModel(format!(
+                "{provider_id}/{model_id}"
+            )));
+        }
         let key = api_key(&self.global_store, &provider)
             .map_err(|error| harness::HarnessError::Compaction(error.to_string()))?;
         Ok((

@@ -10,7 +10,7 @@ Where each feature lives: code, CLI, model tools and storage.
 | `harness` | chat harness, tasks, sessions, prompts, messenger tools, calendar, watches, utility model |
 | `memory` | chat memory: append-only messages, summary tree, views, zoom |
 | `llm` | `Llm` trait and request types, quota fallback |
-| `llm-rig` | `Llm` over rig for OpenAI Responses and Chat Completions providers |
+| `llm-rig` | `Llm` over rig for OpenAI Responses, Chat Completions, and OpenCode Go (`x-opencode-session` from the request cache key) providers |
 | `environment` | tool types (`read`, `write`, `edit`, `bash`) and the `Environment` trait |
 | `environment-local` | local implementation of the environment tools, skill sync |
 | `messenger` | `Messenger` and `Lookup` traits and neutral message types |
@@ -80,9 +80,10 @@ Background workers spawned by the chat.
 - Compaction model: `agent model compaction <provider>/<model> [--reasoning]` (LLM providers only)
 - Utility model: `agent model utility <provider>/<model> [--reasoning] | off` (LLM providers only)
 - Decision model: `agent model decision <provider>/<model> | off` (`decision` providers only; optional fast classifier slot with automatic fallback to `utility`)
-- Per model: `agent model map`, `agent model context`, `agent model input <provider/model|provider> <text|image>`
-- Providers: `agent provider add --api <responses|completions|decision> [--no-key] [--model <id>...] | key set | key clear | list | remove`, `agent models refresh | list` (`decision` providers use the generic System One / Jev wire format, auto-seed `@cf/cloudflare/clef-flash` and `@cf/cloudflare/clef` for Cloudflare Workers AI `/ai/run` URLs, and require at least one explicit `--model <id>` / model ID for non-Cloudflare decision endpoints; refresh preserves explicitly registered decision model IDs)
-- Tables: `providers`, `models`, `model_reasoning`, `model_images`, `settings`, `utility_model`, `decision_model`
+- Per model: `agent model map`, `agent model context`, `agent model input <provider/model|provider> <text|image>`; the **Model catalog** (`models.setEnabled`) toggles `enabled` per model
+- Enabled allowlist: models default to disabled — `model_enabled` presence enables one for `spawn`/`tell` connects and the `models` tool listing; assigned role slots and in-flight tasks are unaffected (soft). First-open migration seeds every model already assigned to a role.
+- Providers: `agent provider add --api <responses|completions|opencode-go|decision> [--no-key] [--model <id>...] | key set | key clear | list | remove`, `agent models refresh | list` (`decision` providers use the generic System One / Jev wire format, auto-seed `@cf/cloudflare/clef-flash` and `@cf/cloudflare/clef` for Cloudflare Workers AI `/ai/run` URLs, and require at least one explicit `--model <id>` / model ID for non-Cloudflare decision endpoints; refresh preserves explicitly registered decision model IDs). `opencode-go` providers are Chat Completions that send `x-opencode-session` (required by OpenCode Go and session-aware proxies — base the provider on `https://opencode.ai/inference/go`, which the rig dialect extends to `/openai/v1/chat/completions` and `/v1/models` (the `zen/go/v1` base does not work); `--base-url` defaults to it for `opencode-go`) — the request's `cache_key` becomes the header value (per-workspace for chat, per-task for spawned tasks), keeping a conversation's turns on a prompt-cache-affine backend; requests with no cache key get a fresh session id
+- Tables: `providers`, `models`, `model_reasoning`, `model_images`, `model_enabled`, `settings`, `utility_model`, `decision_model`
 
 ## Utility & Decision models
 

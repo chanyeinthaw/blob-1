@@ -102,7 +102,7 @@ pub(crate) const EXTRA: &[ToolSpec] = &[
     },
     ToolSpec {
         name: Cow::Borrowed("models"),
-        description: Cow::Borrowed("List the configured providers and models you can give to spawn: provider, model id, context window, supported reasoning levels. Use search to filter."),
+        description: Cow::Borrowed("List the enabled providers and models you can give to spawn: provider, model id, context window, supported reasoning levels. Use search to filter."),
         input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"search":{"type":"string"}}}"#),
     },
     ToolSpec {

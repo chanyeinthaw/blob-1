@@ -42,12 +42,14 @@ const ProvidersOwner = createPersistentMachineContext(
 const apiLabels = {
   responses: 'Responses',
   completions: 'Chat Completions',
+  'opencode-go': 'OpenCode Go',
   decision: 'Decision (Clef / Jev)',
 }
 
 const apiOptions = [
   { value: 'responses', label: apiLabels.responses },
   { value: 'completions', label: apiLabels.completions },
+  { value: 'opencode-go', label: apiLabels['opencode-go'] },
   { value: 'decision', label: apiLabels.decision },
 ]
 
@@ -419,7 +421,7 @@ const validateProviderDraft = (draft: AddDraft, existingIds: ReadonlyArray<strin
   }
   const baseUrl = draft.baseUrl.trim()
   if (baseUrl === '') {
-    errors.baseUrl = 'Required'
+    if (draft.api !== 'opencode-go') errors.baseUrl = 'Required'
   } else if (!URL.canParse(baseUrl)) {
     errors.baseUrl = 'Enter a valid URL.'
   }
@@ -545,7 +547,9 @@ function AddForm(props: AddFormProps) {
           placeholder={
             draft.api === 'decision'
               ? 'https://api.cloudflare.com/client/v4/accounts/<id>/ai/run'
-              : 'https://…/v1'
+              : draft.api === 'opencode-go'
+                ? 'https://opencode.ai/inference/go'
+                : 'https://…/v1'
           }
           value={draft.baseUrl}
           disabled={isSubmitting}

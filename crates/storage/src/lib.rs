@@ -194,6 +194,10 @@ pub struct ProviderId(pub String);
 pub enum ProviderApi {
     OpenAiResponses,
     OpenAiCompletions,
+    /// OpenCode Go (`https://opencode.ai/inference/go`): OpenAI Chat
+    /// Completions plus a required per-conversation `x-opencode-session`
+    /// header.
+    OpenCodeGo,
     Decision,
 }
 
@@ -272,6 +276,9 @@ pub struct DiscoveredModel {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Model {
     pub images: bool,
+    /// Offered to spawn and role pickers. Models are disabled until explicitly
+    /// enabled in the catalog; assigned role slots keep resolving regardless.
+    pub enabled: bool,
     pub provider: ProviderId,
     pub id: String,
     pub context_window: Option<u32>,
@@ -354,6 +361,12 @@ pub trait ConfigStore: Send + Sync {
         provider: &ProviderId,
         model: &str,
         images: bool,
+    ) -> Result<(), StoreError>;
+    fn set_enabled(
+        &self,
+        provider: &ProviderId,
+        model: &str,
+        enabled: bool,
     ) -> Result<(), StoreError>;
     fn replace_models(
         &self,

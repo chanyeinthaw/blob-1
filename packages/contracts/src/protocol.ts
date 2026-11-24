@@ -97,10 +97,11 @@ export const ModelInfo = Schema.Struct({
   context: Schema.NullOr(Schema.Finite),
   limit: Schema.NullOr(Schema.Finite),
   images: Schema.Boolean,
+  enabled: Schema.Boolean,
 })
 export type ModelInfo = typeof ModelInfo.Type
 
-export const ProviderApi = Schema.Literals(['responses', 'completions', 'decision'])
+export const ProviderApi = Schema.Literals(['responses', 'completions', 'opencode-go', 'decision'])
 export type ProviderApi = typeof ProviderApi.Type
 
 export const ProviderModels = Schema.Struct({
@@ -433,6 +434,15 @@ export const requests = {
       provider: Schema.String,
       model: Schema.String,
       images: Schema.Boolean,
+    }),
+    reply: Models,
+  },
+  'models.setEnabled': {
+    payload: Schema.Struct({
+      ...botIdField,
+      provider: Schema.String,
+      model: Schema.String,
+      enabled: Schema.Boolean,
     }),
     reply: Models,
   },

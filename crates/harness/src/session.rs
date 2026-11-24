@@ -56,6 +56,8 @@ pub enum HarnessError {
     Compaction(String),
     #[error("Unknown model {0}; call models to see what is available.")]
     UnknownModel(String),
+    #[error("model {0} is disabled; enable it in the model catalog first")]
+    DisabledModel(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

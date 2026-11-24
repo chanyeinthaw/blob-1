@@ -125,7 +125,7 @@ CREATE TABLE IF NOT EXISTS pending_events (
 
 CREATE TABLE IF NOT EXISTS providers (
     id TEXT PRIMARY KEY,
-    api TEXT NOT NULL CHECK (api IN ('openai-responses', 'openai-completions', 'decision')),
+    api TEXT NOT NULL CHECK (api IN ('openai-responses', 'openai-completions', 'opencode-go', 'decision')),
     base_url TEXT NOT NULL,
     api_key TEXT
 ) STRICT;
@@ -391,6 +391,7 @@ impl SqliteStorage {
         ensure_unified_access(&mut connection, &mut require_exclusive)?;
         ensure_settings_auto_respond(&mut connection, &mut require_exclusive)?;
         ensure_bots_generation(&mut connection, &mut require_exclusive)?;
+        ensure_model_enabled(&mut connection, &mut require_exclusive)?;
         migrate_identity_to_instructions(&mut connection, &mut require_exclusive)?;
         let key = match app_key {
             Some(app_key) => Some(crypto::setup(&connection, &app_key)?),
@@ -398,6 +399,7 @@ impl SqliteStorage {
         };
         ensure_providers_api_key(&mut connection, key.as_ref(), has_exclusive)?;
         ensure_providers_decision_api(&mut connection, &mut require_exclusive)?;
+        ensure_providers_opencode_go(&mut connection, &mut require_exclusive)?;
         if let Some(cipher) = &key {
             crypto::migrate(&connection, cipher)?;
         }
@@ -1090,6 +1092,58 @@ fn ensure_bots_generation(
     Ok(())
 }
 
+/// Creates `model_enabled` (presence = enabled; models default to disabled) and,
+/// on first creation only, seeds it with every model currently assigned to a
+/// role slot so existing assignments keep working. Because the flag table is
+/// created here rather than in SCHEMA, an existing table means the seed already
+/// ran — models disabled later are never re-enabled on reopen.
+fn ensure_model_enabled(
+    connection: &mut Connection,
+    require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let has_table = |conn: &Connection| -> Result<bool, StoreError> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'model_enabled')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(backend)
+    };
+    if has_table(connection)? {
+        return Ok(());
+    }
+    require_exclusive(
+        "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
+    )?;
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    if !has_table(&tx)? {
+        tx.execute_batch(
+            "CREATE TABLE model_enabled (
+                 provider TEXT NOT NULL,
+                 model TEXT NOT NULL,
+                 PRIMARY KEY (provider, model),
+                 FOREIGN KEY (provider, model) REFERENCES models (provider, id) ON DELETE CASCADE
+             ) STRICT;
+             INSERT OR IGNORE INTO model_enabled (provider, model)
+             SELECT refs.provider, refs.model FROM (
+                 SELECT default_provider AS provider, default_model AS model FROM settings
+                 UNION SELECT compaction_provider, compaction_model FROM settings
+                 UNION SELECT provider, model FROM utility_model
+                 UNION SELECT provider, model FROM decision_model
+                 UNION SELECT default_provider, default_model FROM bot_models
+                 UNION SELECT compaction_provider, compaction_model FROM bot_models
+                 UNION SELECT utility_provider, utility_model FROM bot_models
+                 UNION SELECT decision_provider, decision_model FROM bot_models
+             ) refs JOIN models ON models.provider = refs.provider AND models.id = refs.model;",
+        )
+        .map_err(backend)?;
+    }
+    tx.commit().map_err(backend)?;
+    Ok(())
+}
+
 /// Copies any row verbatim from the legacy `identity` table into `instructions`
 /// and drops `identity`.
 fn migrate_identity_to_instructions(
@@ -1178,6 +1232,72 @@ fn ensure_providers_decision_api(
              SELECT id, api, base_url, api_key FROM providers;
              DROP TABLE providers;
              ALTER TABLE providers_v2 RENAME TO providers;",
+        )
+        .map_err(backend)?;
+        tx.commit().map_err(backend)?;
+        Ok(())
+    })();
+    let restore = connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(backend);
+    result?;
+    restore?;
+    Ok(())
+}
+
+/// Widens `providers.api` CHECK constraint on existing databases to allow `'opencode-go'`.
+fn ensure_providers_opencode_go(
+    connection: &mut Connection,
+    require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let needs_upgrade = |conn: &Connection| -> Result<bool, StoreError> {
+        let has_legacy_col: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('providers') WHERE name = 'api_key_env')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        if has_legacy_col {
+            return Ok(false);
+        }
+        let sql: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'providers'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(sql.is_some_and(|s| !s.contains("'opencode-go'")))
+    };
+    if !needs_upgrade(connection)? {
+        return Ok(());
+    }
+    require_exclusive(
+        "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
+    )?;
+    connection
+        .pragma_update(None, "foreign_keys", "OFF")
+        .map_err(backend)?;
+    let result = (|| -> Result<(), StoreError> {
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        if !needs_upgrade(&tx)? {
+            tx.commit().map_err(backend)?;
+            return Ok(());
+        }
+        tx.execute_batch(
+            "CREATE TABLE providers_v3 (
+                 id TEXT PRIMARY KEY,
+                 api TEXT NOT NULL CHECK (api IN ('openai-responses', 'openai-completions', 'opencode-go', 'decision')),
+                 base_url TEXT NOT NULL,
+                 api_key TEXT
+             ) STRICT;
+             INSERT INTO providers_v3 (id, api, base_url, api_key)
+             SELECT id, api, base_url, api_key FROM providers;
+             DROP TABLE providers;
+             ALTER TABLE providers_v3 RENAME TO providers;",
         )
         .map_err(backend)?;
         tx.commit().map_err(backend)?;

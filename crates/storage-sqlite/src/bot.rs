@@ -466,4 +466,109 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn model_enabled_defaults_disabled_seeds_assigned_and_toggles() {
+        let dir = std::env::temp_dir().join(format!("blob-1-enabled-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.db");
+        let store = SqliteStorage::open(&path, None).unwrap();
+        let pid = ProviderId("cpa1".into());
+        store
+            .save_provider(
+                Provider {
+                    id: pid.clone(),
+                    api: ProviderApi::OpenAiResponses,
+                    base_url: "http://127.0.0.1:8320/v1".into(),
+                    has_api_key: false,
+                },
+                None,
+            )
+            .unwrap();
+        store
+            .replace_models(
+                &pid,
+                vec![
+                    DiscoveredModel {
+                        id: "gpt-6.1-terra".into(),
+                        context_window: Some(128_000),
+                    },
+                    DiscoveredModel {
+                        id: "gpt-6-luna".into(),
+                        context_window: None,
+                    },
+                    DiscoveredModel {
+                        id: "gpt-5-terra".into(),
+                        context_window: None,
+                    },
+                ],
+            )
+            .unwrap();
+
+        // Fresh models are disabled until explicitly enabled; unknown models error.
+        assert!(store.models(&pid).unwrap().iter().all(|m| !m.enabled));
+        store.set_enabled(&pid, "gpt-6-luna", true).unwrap();
+        assert!(
+            store
+                .models(&pid)
+                .unwrap()
+                .iter()
+                .any(|m| m.id == "gpt-6-luna" && m.enabled)
+        );
+        store.set_enabled(&pid, "gpt-6-luna", false).unwrap();
+        assert!(store.models(&pid).unwrap().iter().all(|m| !m.enabled));
+        assert!(store.set_enabled(&pid, "nope", true).is_err());
+
+        // Assign models to slots across both store paths, then drop the flag
+        // table to simulate a database created before `model_enabled` existed.
+        store
+            .set_bot_main_model(
+                DEFAULT_BOT_ID,
+                Some(&ModelRef {
+                    provider: pid.clone(),
+                    model: "gpt-6.1-terra".into(),
+                }),
+                ReasoningLevel::Medium,
+            )
+            .unwrap();
+        store.create_bot("sunday", "Sunday", 100).unwrap();
+        store
+            .set_bot_utility_model(
+                "sunday",
+                Some((
+                    &ModelRef {
+                        provider: pid.clone(),
+                        model: "gpt-6-luna".into(),
+                    },
+                    None,
+                )),
+            )
+            .unwrap();
+        {
+            let conn = store.lock();
+            conn.execute_batch("DROP TABLE model_enabled").unwrap();
+        }
+        drop(store);
+
+        // Reopen seeds only the slot-assigned models; unassigned stay disabled.
+        let store = SqliteStorage::open(&path, None).unwrap();
+        let models = store.models(&pid).unwrap();
+        let enabled = |id: &str| models.iter().find(|m| m.id == id).unwrap().enabled;
+        assert!(enabled("gpt-6.1-terra"));
+        assert!(enabled("gpt-6-luna"));
+        assert!(!enabled("gpt-5-terra"));
+
+        // With the table present the seed must not rerun: a later explicit
+        // disable of a slot-assigned model survives reopening.
+        store.set_enabled(&pid, "gpt-6-luna", false).unwrap();
+        drop(store);
+        let store = SqliteStorage::open(&path, None).unwrap();
+        let models = store.models(&pid).unwrap();
+        let enabled = |id: &str| models.iter().find(|m| m.id == id).unwrap().enabled;
+        assert!(enabled("gpt-6.1-terra"));
+        assert!(!enabled("gpt-6-luna"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
