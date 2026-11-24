@@ -165,7 +165,6 @@ fn render(
 fn update_view(
     view: &mut MemoryView,
     nodes: &HashMap<Part, String>,
-    count: u64,
     high: usize,
     size: &mut usize,
     next: bool,
@@ -174,6 +173,9 @@ fn update_view(
     if *size <= high && !(next && view.batch) {
         return;
     }
+    // Due is measured from the view's own end (Unii's `merge`: `t = end(from)`),
+    // which for the seen view stops at the first unbuilt message.
+    let end = view_end(view);
     let mut parts = view.parts.clone();
     let mut current_size = *size;
     while current_size > high / 2 {
@@ -187,7 +189,7 @@ fn update_view(
             if get(&parent).is_none() {
                 continue;
             }
-            let numerator = count as u128 + 1 - ((i as u128) << l);
+            let numerator = end as u128 + 1 - ((i as u128) << l);
             let denominator = 1_u64 << l;
             if best
                 .is_none_or(|(_, num, den)| numerator * (den as u128) > num * (denominator as u128))
@@ -212,17 +214,18 @@ fn update_view(
     view.batch = *size > high / 2;
 }
 
-/// Appends `extra` lines to `view` and fits it (see `update_view`). Returns
-/// the new view (`None` when only `extra` was appended), its size, and the
-/// change to persist.
+/// Keeps the first `keep` parts of `view`, appends `extra` lines, and fits
+/// it (see `update_view`). `size` is the size after that cut and append.
+/// Returns the new view (`None` when only `extra` was appended), its size,
+/// and the change to persist.
 #[allow(clippy::too_many_arguments)]
 fn refit(
     name: ViewName,
     view: &MemoryView,
+    keep: usize,
     extra: &[Part],
     size: usize,
     nodes: &HashMap<Part, String>,
-    count: u64,
     high: usize,
     next: bool,
 ) -> (Option<MemoryView>, usize, ViewChange) {
@@ -232,19 +235,63 @@ fn refit(
         added: extra.to_vec(),
         batch: None,
     };
-    if size <= high && !(next && view.batch) {
+    if keep == view.parts.len() && size <= high && !(next && view.batch) {
         return (None, size, change);
     }
     let mut grown = view.clone();
+    grown.parts.truncate(keep);
     grown.parts.extend_from_slice(extra);
     let mut size = size;
-    update_view(&mut grown, nodes, count, high, &mut size, next);
+    update_view(&mut grown, nodes, high, &mut size, next);
     let before: HashSet<_> = view.parts.iter().copied().collect();
     let after: HashSet<_> = grown.parts.iter().copied().collect();
     change.removed = before.difference(&after).copied().collect();
     change.added = after.difference(&before).copied().collect();
     change.batch = (grown.batch != view.batch).then_some(grown.batch);
     (Some(grown), size, change)
+}
+
+/// The message after a view's last line (Unii's `end`).
+fn view_end(view: &MemoryView) -> u64 {
+    view.parts.last().map_or(0, |&p| {
+        let (id, n) = span(p);
+        id + n
+    })
+}
+
+/// Unii's `reach`: how many of `view`'s parts end before message `end`, the
+/// leaves to append from there up to `end`, and the size after both (built
+/// leaves count their bytes). The seen view reaches only to the first unbuilt
+/// message, so compactions and its merges see what Unii's would.
+fn reach(
+    view: &MemoryView,
+    size: usize,
+    nodes: &HashMap<Part, String>,
+    end: u64,
+) -> (usize, Vec<Part>, usize) {
+    let built = |p: &Part| nodes.get(p).map_or(0, String::len);
+    let keep = view.parts.partition_point(|&p| {
+        let (id, n) = span(p);
+        id + n <= end
+    });
+    let mut size = size - view.parts[keep..].iter().map(built).sum::<usize>();
+    let from = view.parts[..keep].last().map_or(0, |&p| {
+        let (id, n) = span(p);
+        id + n
+    });
+    let extra: Vec<Part> = (from..end).map(|i| (0, i)).collect();
+    size += extra.iter().map(built).sum::<usize>();
+    (keep, extra, size)
+}
+
+/// Where the seen view reaches: the first unbuilt message.
+fn seen_end(state: &State) -> u64 {
+    state
+        .leaves
+        .first()
+        .copied()
+        .unwrap_or(state.count)
+        .min(state.count)
 }
 
 /// Whether part `p` is a line of `view` (parts are ordered by start).
@@ -370,20 +417,24 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
         let (chat, chat_size, chat_change) = refit(
             ViewName::Chat,
             &state.chat,
+            state.chat.parts.len(),
             &added,
             state.chat_size,
             &state.nodes,
-            count,
             self.inner.config.chat_high,
             true,
         );
+        // The new messages start at the old count and are unbuilt, so the seen
+        // view reaches no further than that (`state.leaves` doesn't hold them yet).
+        let first_unbuilt = state.leaves.first().copied().unwrap_or(state.count);
+        let (keep, extra, size) = reach(&state.seen, state.seen_size, &state.nodes, first_unbuilt);
         let (seen, seen_size, seen_change) = refit(
             ViewName::Seen,
             &state.seen,
-            &added,
-            state.seen_size,
+            keep,
+            &extra,
+            size,
             &state.nodes,
-            count,
             self.inner.config.seen_high,
             true,
         );
@@ -399,7 +450,7 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
         }
         match seen {
             Some(seen) => state.seen = seen,
-            None => state.seen.parts.extend(added.iter().copied()),
+            None => state.seen.parts.extend(extra),
         }
         state.chat_size = chat_size;
         state.seen_size = seen_size;
@@ -703,23 +754,33 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
         let (chat, chat_size, chat_change) = refit(
             ViewName::Chat,
             &state.chat,
+            state.chat.parts.len(),
             &[],
             state.chat_size,
             &state.nodes,
-            state.count,
             self.inner.config.chat_high,
             false,
         );
+        let (keep, extra, size) =
+            reach(&state.seen, state.seen_size, &state.nodes, seen_end(state));
         let (seen, seen_size, seen_change) = refit(
             ViewName::Seen,
             &state.seen,
-            &[],
-            state.seen_size,
+            keep,
+            &extra,
+            size,
             &state.nodes,
-            state.count,
             self.inner.config.seen_high,
             false,
         );
+        let seen = match seen {
+            None if !extra.is_empty() => {
+                let mut grown = state.seen.clone();
+                grown.parts.extend(extra);
+                Some(grown)
+            }
+            seen => seen,
+        };
         if chat.is_none() && seen.is_none() {
             return;
         }

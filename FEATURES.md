@@ -61,6 +61,7 @@ The bot is one chat that never ends. It coordinates and talks; tasks do the work
 - Code: `crates/memory/src/lib.rs`, `crates/storage-sqlite/src/memory.rs`
 - Append-only rows with JSON `meta`; binary summary tree; chat view (128,000 bytes) and seen view (32,000 bytes); 512-byte nodes; `zoom`, `date`
 - Follows Unii's `Memory.ts`: the compaction model summarizes in the background with up to 64 calls, oldest first, only for work at or before the 64th unbuilt message; sources that already fit in a node are stored without a call, as a group, and the views are fitted once after each pass; each node keeps its shortest line (up to 5 tries), a few bytes over 512 allowed; a source with no usable line (blank reply, context overflow, or a provider content-policy refusal, `LlmError::Refused`) is cut, and other errors park the node until the next message
+- The chat view takes each new message's line at once; the seen view (the compactions' context) reaches only up to the first unbuilt message, as Unii's `reach` does, and each view's merge order is measured from its own end
 - A view passing its limit merges in whole batches down toward half: after a node build a batch applies only if it reaches its target, and each new message applies what a pending batch can, so the cached view never changes piece by piece
 - Before a turn, `settle` waits only for every earlier message's own node; merges are not awaited
 - Tables: `memory_messages`, `memory_nodes`, `memory_views`, `memory_view_parts`
