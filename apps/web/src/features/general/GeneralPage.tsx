@@ -194,9 +194,7 @@ function BotIdentitySection(props: BotIdentitySectionProps) {
           </FieldRow>
         </form>
         <FieldRow labelId={`bot-environment-${bot.id}`} label="Environment">
-          <div className="flex sm:justify-end">
-            <EnvironmentSelect bot={bot} busy={busy} labelId={`bot-environment-${bot.id}`} />
-          </div>
+          <EnvironmentSelect bot={bot} busy={busy} labelId={`bot-environment-${bot.id}`} />
         </FieldRow>
         <div className="flex items-center justify-between gap-4 border-t border-border/60 pt-3">
           <div className="min-w-0">
@@ -271,7 +269,7 @@ function EnvironmentSelect(props: EnvironmentSelectProps) {
         }
       }}
     >
-      <SelectTrigger aria-labelledby={props.labelId} className="w-full sm:w-56">
+      <SelectTrigger aria-labelledby={props.labelId} className="w-full max-w-xs">
         <SelectValue />
       </SelectTrigger>
       <SelectContent>
