@@ -860,9 +860,7 @@ function SidebarScheduleRow(props: SidebarScheduleRowProps) {
           {item.kind === 'cron' ? <Repeat className="size-3" /> : <Clock className="size-3" />}
         </span>
         <span className="min-w-0 flex-1">
-          <span className="line-clamp-2 block text-xs font-medium text-foreground">
-            {item.text}
-          </span>
+          <span className="line-clamp-2 text-xs font-medium text-foreground">{item.text}</span>
           <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">{meta}</span>
         </span>
       </button>
@@ -898,22 +896,30 @@ function SidebarWatchRow(props: SidebarWatchRowProps) {
   const machine = SchedulesOwner.useMachine()
   const send = useAtomSet(machine.send)
   const { item, timezone, disabled } = props
+  const [detailOpen, setDetailOpen] = useState(false)
+  const until = item.until === null ? null : formatTimestamp(item.until, timezone)
   return (
     <li className="flex items-start gap-2 py-2">
-      <span
-        aria-hidden="true"
-        className="mt-0.5 grid size-6 shrink-0 place-items-center rounded-full bg-muted text-muted-foreground"
+      <button
+        type="button"
+        onClick={() => setDetailOpen(true)}
+        className="flex min-w-0 flex-1 items-start gap-2 text-left"
       >
-        <Eye className="size-3" />
-      </span>
-      <div className="min-w-0 flex-1">
-        <p className="line-clamp-2 text-xs font-medium text-foreground">{item.text}</p>
-        {item.until === null ? null : (
-          <p className="mt-0.5 text-[11px] text-muted-foreground">
-            Until {formatTimestamp(item.until, timezone)}
-          </p>
-        )}
-      </div>
+        <span
+          aria-hidden="true"
+          className="mt-0.5 grid size-6 shrink-0 place-items-center rounded-full bg-muted text-muted-foreground"
+        >
+          <Eye className="size-3" />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="line-clamp-2 text-xs font-medium text-foreground">{item.text}</span>
+          {until === null ? null : (
+            <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">
+              Until {until}
+            </span>
+          )}
+        </span>
+      </button>
       <ConfirmDialog
         tooltip="Remove watch"
         trigger={
@@ -932,6 +938,41 @@ function SidebarWatchRow(props: SidebarWatchRowProps) {
         confirmLabel="Remove"
         onConfirm={() => send(SchedulesEvents.RemoveWatch({ id: item.id }))}
       />
+      <Dialog open={detailOpen} onOpenChange={setDetailOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Watch</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-2.5 text-sm">
+            <p className="break-words whitespace-pre-wrap text-foreground [overflow-wrap:anywhere]">
+              {item.text}
+            </p>
+            {until === null && item.target === null ? null : (
+              <dl className="grid grid-cols-[88px_minmax(0,1fr)] gap-y-1.5 text-xs">
+                {until === null ? null : (
+                  <>
+                    <dt className="text-muted-foreground">Until</dt>
+                    <dd className="text-foreground">
+                      {until} ({timezone})
+                    </dd>
+                  </>
+                )}
+                {item.target === null ? null : (
+                  <>
+                    <dt className="text-muted-foreground">Target</dt>
+                    <dd className="text-foreground">{item.target}</dd>
+                  </>
+                )}
+              </dl>
+            )}
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={() => setDetailOpen(false)}>
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </li>
   )
 }

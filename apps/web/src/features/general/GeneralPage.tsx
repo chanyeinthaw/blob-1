@@ -177,7 +177,7 @@ function BotIdentitySection(props: BotIdentitySectionProps) {
       <div className="space-y-3 rounded-2xl border border-border bg-card px-4 py-3.5 shadow-xs">
         <form onSubmit={handleRename}>
           <FieldRow id={`bot-name-${bot.id}`} label="Name">
-            <div className="flex items-center gap-2">
+            <div className="flex items-center justify-end gap-2">
               <Input
                 id={`bot-name-${bot.id}`}
                 value={currentName}
@@ -194,7 +194,9 @@ function BotIdentitySection(props: BotIdentitySectionProps) {
           </FieldRow>
         </form>
         <FieldRow labelId={`bot-environment-${bot.id}`} label="Environment">
-          <EnvironmentSelect bot={bot} busy={busy} labelId={`bot-environment-${bot.id}`} />
+          <div className="flex justify-end">
+            <EnvironmentSelect bot={bot} busy={busy} labelId={`bot-environment-${bot.id}`} />
+          </div>
         </FieldRow>
         <div className="flex items-center justify-between gap-4 border-t border-border/60 pt-3">
           <div className="min-w-0">
