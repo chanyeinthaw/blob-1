@@ -14,6 +14,7 @@ mod import;
 mod nodes;
 mod run;
 mod runtime;
+mod service;
 mod web;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -124,6 +125,12 @@ enum Command {
     Environment {
         #[command(subcommand)]
         command: EnvironmentCommand,
+    },
+    /// Run blob-1 as a per-user background service that starts at boot
+    /// (systemd user unit on Linux, LaunchAgent on macOS).
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
     },
     /// Manage a bot's secrets.
     Secret {
@@ -628,6 +635,36 @@ enum SkillCommand {
 }
 
 #[derive(Subcommand)]
+enum ServiceCommand {
+    /// Install (or reinstall) and start the service. The app key comes from
+    /// BLOB_1_APP_KEY or a prompt and is kept in a 0600 env file.
+    Install {
+        #[arg(long, default_value = "127.0.0.1:7878")]
+        web: std::net::SocketAddr,
+        #[arg(long)]
+        public_url: Option<String>,
+        /// Install a node that dials this primary URL instead (wss://host/ws/node).
+        #[arg(long, value_name = "URL", conflicts_with = "public_url")]
+        node: Option<String>,
+        /// Node workspaces root (with --node).
+        #[arg(long, requires = "node")]
+        workspaces: Option<PathBuf>,
+    },
+    /// Restart the service.
+    Restart {
+        /// The node service.
+        #[arg(long)]
+        node: bool,
+    },
+    /// Stop the service and remove it and its env file.
+    Uninstall {
+        /// The node service.
+        #[arg(long)]
+        node: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum SecretCommand {
     /// List secret names (values are never shown).
     List,
@@ -708,6 +745,9 @@ async fn main() -> Result<()> {
                 public_url: public_url.clone(),
             })
             .await;
+        }
+        Command::Service { command } => {
+            return service_command(command, &data_dir, &workspace, skills_dir.as_deref());
         }
         Command::Node { url, workspaces } => {
             // A node is a pure executor: it dials out and never opens the
@@ -934,7 +974,10 @@ async fn main() -> Result<()> {
         Command::Secret { bot, command } => {
             secret_command(&store, &data_dir, app_key, &bot, &command)
         }
-        Command::Update { .. } | Command::Launcher { .. } | Command::Node { .. } => unreachable!(),
+        Command::Update { .. }
+        | Command::Launcher { .. }
+        | Command::Node { .. }
+        | Command::Service { .. } => unreachable!(),
     }
 }
 
@@ -1922,6 +1965,57 @@ fn secret_command(
         }
     }
     Ok(())
+}
+
+/// `service` subcommands. A primary install checks the app key against the
+/// existing database before writing anything.
+fn service_command(
+    command: &ServiceCommand,
+    data_dir: &Path,
+    workspace: &Path,
+    skills_dir: Option<&Path>,
+) -> Result<()> {
+    match command {
+        ServiceCommand::Install {
+            node: Some(url),
+            workspaces,
+            ..
+        } => service::install(service::Role::Node {
+            url: url.clone(),
+            workspaces: workspaces.clone(),
+        }),
+        ServiceCommand::Install {
+            web, public_url, ..
+        } => {
+            if let Some(url) = public_url {
+                web::public_url(url)?;
+            }
+            let app_key = match std::env::var("BLOB_1_APP_KEY") {
+                Ok(key) if !key.is_empty() => key,
+                _ if std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
+                    rpassword::prompt_password("BLOB_1_APP_KEY: ")?
+                }
+                _ => return Err("set BLOB_1_APP_KEY".into()),
+            };
+            if app_key.is_empty() {
+                return Err("the app key cannot be empty".into());
+            }
+            let db = data_dir.join("agent.db");
+            if db.exists() {
+                SqliteStorage::open_shared(&db, Some(AppKey::new(app_key.clone())))?;
+            }
+            service::install(service::Role::Primary {
+                data_dir: data_dir.to_path_buf(),
+                workspace: workspace.to_path_buf(),
+                skills_dir: skills_dir.map(Path::to_path_buf),
+                web: *web,
+                public_url: public_url.clone(),
+                app_key,
+            })
+        }
+        ServiceCommand::Restart { node } => service::restart(*node),
+        ServiceCommand::Uninstall { node } => service::uninstall(*node),
+    }
 }
 
 fn environment_command(store: &Arc<SqliteStorage>, command: &EnvironmentCommand) -> Result<()> {

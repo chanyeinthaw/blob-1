@@ -610,6 +610,21 @@ fn launcher_paths(root: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// The executable a service should start: the first launcher symlink that
+/// exists (updates repoint it to the active version), else this binary.
+pub fn service_binary() -> Result<PathBuf> {
+    let root = runtime_dir()?;
+    match launcher_paths(&root).into_iter().find(|path| path.exists()) {
+        Some(path) => Ok(path),
+        None => Ok(std::env::current_exe()?),
+    }
+}
+
+/// `BLOB_1_HOME` (default `~/.blob-1`), where service env files live.
+pub fn blob_home() -> Result<PathBuf> {
+    home_dir()
+}
+
 /// Versions referenced by launcher symlinks, so prune keeps what is linked.
 fn referenced_versions(root: &Path) -> BTreeSet<String> {
     launcher_paths(root)
