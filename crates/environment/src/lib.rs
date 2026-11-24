@@ -215,6 +215,14 @@ pub trait Environment: Send + Sync {
     ) -> Result<Vec<String>, ToolError>;
     async fn skill_catalog(&self) -> Result<Vec<SkillEntry>, ToolError>;
     async fn execute(&self, call: ToolCall) -> Result<ToolResult, ToolError>;
+    /// Writes a secret's value to a private file outside the workspace that
+    /// the environment deletes after `ttl`; returns the file's absolute path.
+    async fn write_secret(
+        &self,
+        name: &str,
+        value: &str,
+        ttl: std::time::Duration,
+    ) -> Result<String, ToolError>;
 }
 
 #[async_trait::async_trait]
@@ -234,6 +242,14 @@ impl Environment for std::sync::Arc<dyn Environment> {
     }
     async fn execute(&self, call: ToolCall) -> Result<ToolResult, ToolError> {
         (**self).execute(call).await
+    }
+    async fn write_secret(
+        &self,
+        name: &str,
+        value: &str,
+        ttl: std::time::Duration,
+    ) -> Result<String, ToolError> {
+        (**self).write_secret(name, value, ttl).await
     }
 }
 

@@ -76,6 +76,25 @@ export const WebhooksPayload = Schema.Struct({
 })
 export type WebhooksPayload = typeof WebhooksPayload.Type
 
+export const Secret = Schema.Struct({
+  name: Schema.String,
+  createdAt: Schema.Finite,
+  updatedAt: Schema.Finite,
+})
+export type Secret = typeof Secret.Type
+
+export const SecretsPayload = Schema.Struct({
+  publicUrl: Schema.NullOr(Schema.String),
+  secrets: Schema.Array(Secret),
+})
+export type SecretsPayload = typeof SecretsPayload.Type
+
+export const SecretRequestLink = Schema.Struct({
+  url: Schema.String,
+  expiresAt: Schema.Finite,
+})
+export type SecretRequestLink = typeof SecretRequestLink.Type
+
 export const Reasoning = Schema.Literals(['off', 'low', 'medium', 'high', 'xhigh', 'max'])
 export type Reasoning = typeof Reasoning.Type
 
@@ -705,6 +724,23 @@ export const requests = {
     payload: Schema.Struct({ ...botIdField, id: Schema.String }),
     reply: WebhooksPayload,
   },
+  'secrets.list': { payload: BotScopedPayload, reply: SecretsPayload },
+  'secrets.set': {
+    payload: Schema.Struct({ ...botIdField, name: Schema.String, value: Schema.String }),
+    reply: SecretsPayload,
+  },
+  'secrets.remove': {
+    payload: Schema.Struct({ ...botIdField, name: Schema.String }),
+    reply: SecretsPayload,
+  },
+  'secrets.request': {
+    payload: Schema.Struct({
+      ...botIdField,
+      name: Schema.String,
+      label: Schema.NullOr(Schema.String),
+    }),
+    reply: SecretRequestLink,
+  },
 }
 
 export type RequestType = keyof typeof requests
@@ -737,7 +773,7 @@ export const ReplyFrame = Schema.Union([
 export type ReplyFrame = typeof ReplyFrame.Type
 
 /** Topics of bot data the server pushes `changed` frames for. */
-export const ChangeTopic = Schema.Literals(['schedule', 'usage', 'webhooks'])
+export const ChangeTopic = Schema.Literals(['schedule', 'usage', 'webhooks', 'secrets'])
 export type ChangeTopic = typeof ChangeTopic.Type
 
 /** Server push on `/ws?changes=1`: a bot's data under `topic` changed, so refetch it. */

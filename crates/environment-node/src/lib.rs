@@ -109,6 +109,11 @@ fn write_config(path: &Path, file: &FileConfig) -> Result<(), NodeError> {
     Ok(())
 }
 
+/// Where this node writes secret files: `~/.blob-1/secrets/<workspace>`.
+fn secrets_root() -> Result<PathBuf, NodeError> {
+    Ok(home_dir()?.join(".blob-1/secrets"))
+}
+
 fn home_dir() -> Result<PathBuf, NodeError> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -151,6 +156,8 @@ pub async fn run(options: NodeOptions) -> Result<(), Box<dyn std::error::Error +
         .map_err(|error| format!("invalid --url '{}': {error}", config.url))?;
     // Env cache and the skills FIFO outlive a single session: a dropped
     // socket's started apply keeps its place in the node-wide order.
+    // Secret files outlive no restart: their deletion timers died with us.
+    environment_local::clear_secrets(&secrets_root()?)?;
     let shared = Arc::new(NodeShared::new(config.workspaces.clone()));
     let mut backoff = std::time::Duration::from_secs(1);
     loop {
@@ -403,7 +410,8 @@ async fn dispatch(
         NodeRequest::Execute { workspace, .. }
         | NodeRequest::ManagedSkills { workspace }
         | NodeRequest::ApplySkills { workspace, .. }
-        | NodeRequest::SkillCatalog { workspace } => workspace.clone(),
+        | NodeRequest::SkillCatalog { workspace }
+        | NodeRequest::WriteSecret { workspace, .. } => workspace.clone(),
     };
     let env = match local_env(root, envs, &workspace).await {
         Ok(env) => env,
@@ -430,6 +438,15 @@ async fn dispatch(
             .skill_catalog()
             .await
             .map(|entries| NodeReply::SkillCatalog { entries }),
+        NodeRequest::WriteSecret {
+            name,
+            value,
+            ttl_secs,
+            ..
+        } => env
+            .write_secret(&name, &value, std::time::Duration::from_secs(ttl_secs))
+            .await
+            .map(|path| NodeReply::WriteSecret { path }),
     };
     result.unwrap_or_else(|error| NodeReply::Error {
         error: error.to_string(),
@@ -452,7 +469,10 @@ async fn local_env(
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|error| ToolError::Io(error.to_string()))?;
-    let env = Arc::new(LocalEnvironment::new(dir, None)?);
+    let secrets = secrets_root()
+        .map_err(|error| ToolError::Invalid(error.to_string()))?
+        .join(workspace);
+    let env = Arc::new(LocalEnvironment::new(dir, None)?.with_secrets_dir(secrets));
     envs.lock()
         .unwrap()
         .insert(workspace.to_owned(), env.clone());

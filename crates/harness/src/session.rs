@@ -85,6 +85,7 @@ pub struct SessionHarness<L, E, S> {
     lookup_tools: Option<crate::Messengers>,
     share_tools: Option<crate::ShareTools>,
     callback_tools: Option<crate::CallbackTools>,
+    secret_tools: Option<crate::SecretTools>,
     mcp_tools: Option<Arc<SessionTools>>,
     observer: Option<Arc<dyn Fn(Step) + Send + Sync>>,
     summarizer: Option<Arc<Summarizer<L>>>,
@@ -108,6 +109,7 @@ where
             lookup_tools: None,
             share_tools: None,
             callback_tools: None,
+            secret_tools: None,
             mcp_tools: None,
             observer: None,
             summarizer: None,
@@ -131,6 +133,11 @@ where
 
     pub fn with_share_tools(mut self, tools: crate::ShareTools) -> Self {
         self.share_tools = Some(tools);
+        self
+    }
+
+    pub fn with_secret_tools(mut self, tools: crate::SecretTools) -> Self {
+        self.secret_tools = Some(tools);
         self
     }
 
@@ -217,6 +224,10 @@ where
         }
         if self.callback_tools.is_some() {
             tools.push(crate::callback::TOOL);
+        }
+        if self.secret_tools.is_some() {
+            tools.push(crate::secret::REQUEST);
+            tools.push(crate::secret::READ);
         }
         if let Some(mcp) = &self.mcp_tools {
             tools.extend(mcp.specs());
@@ -376,6 +387,19 @@ where
                     .filter(|_| call.name == "callback")
                 {
                     callback.execute(&call.arguments).map_err(|e| e.to_string())
+                } else if let Some(secrets) = self
+                    .secret_tools
+                    .as_ref()
+                    .filter(|_| matches!(call.name.as_str(), "request_secret" | "secret"))
+                {
+                    if call.name == "secret" {
+                        secrets
+                            .read(&self.environment, &call.arguments)
+                            .await
+                            .map_err(|e| e.to_string())
+                    } else {
+                        secrets.request(&call.arguments).map_err(|e| e.to_string())
+                    }
                 } else if let Some(result) = match &self.mcp_tools {
                     Some(mcp) => mcp.execute(&call.name, &call.arguments).await,
                     None => None,

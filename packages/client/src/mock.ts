@@ -31,6 +31,9 @@ import {
   type RequestType,
   type ScheduleItem,
   type ScheduleState,
+  type Secret,
+  type SecretRequestLink,
+  type SecretsPayload,
   Slot,
   type UsageKindBucket,
   type UsageSummary,
@@ -76,11 +79,13 @@ type State = Readonly<{
   publicUrl: string | null
   webhooks: ReadonlyArray<Webhook>
   nextWebhookId: number
+  secrets: ReadonlyArray<Secret>
 }>
 
 const DEFAULT_INSTRUCTIONS = '# Identity\n\nYou are Blob-1'
 const REFRESHED_MODEL_COUNT = 49
 const NUMERIC_ID = /^\d+$/
+const VALID_SECRET_NAME = /^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}$/
 
 const seedState = (): State => ({
   instructions: null,
@@ -173,6 +178,7 @@ const seedState = (): State => ({
     },
   ],
   nextWebhookId: 3,
+  secrets: [],
 })
 
 const generalReply = (state: State): GeneralSettings => ({
@@ -217,6 +223,11 @@ const scheduleReply = (state: State): ScheduleState => ({
 const webhooksReply = (state: State): WebhooksPayload => ({
   publicUrl: state.publicUrl,
   webhooks: state.webhooks,
+})
+
+const secretsReply = (state: State): SecretsPayload => ({
+  publicUrl: state.publicUrl,
+  secrets: state.secrets.toSorted((a, b) => a.name.localeCompare(b.name)),
 })
 
 const usageReply = (days: number): UsageSummary => {
@@ -1539,6 +1550,62 @@ const handlers: { readonly [K in LegacyRequestType]: Handler<K> } = {
           )
         : Effect.fail(`Unknown webhook ${id}`),
     ).pipe(Effect.map(webhooksReply)),
+
+  'secrets.list': (_payload, state) => Ref.get(state).pipe(Effect.map(secretsReply)),
+
+  'secrets.set': ({ name, value }, state) =>
+    transition(state, current => {
+      if (!VALID_SECRET_NAME.test(name)) {
+        return Effect.fail(
+          'Name must use 1–64 letters, numbers, dots, underscores or hyphens, not starting with a dot',
+        )
+      }
+      if (value.trim() === '') {
+        return Effect.fail('Secret value is required')
+      }
+      const now = Math.floor(Date.now() / 1000)
+      const previous = current.secrets.find(secret => secret.name === name)
+      // The mock keeps metadata only, like the list reply; the value is never read.
+      const secret: Secret = { name, createdAt: previous?.createdAt ?? now, updatedAt: now }
+      return Effect.succeed(
+        Struct.evolve(current, {
+          secrets: list =>
+            previous === undefined
+              ? [...list, secret]
+              : list.map(entry => (entry.name === name ? secret : entry)),
+        }),
+      )
+    }).pipe(Effect.map(secretsReply)),
+
+  'secrets.remove': ({ name }, state) =>
+    transition(state, current =>
+      current.secrets.some(secret => secret.name === name)
+        ? Effect.succeed(
+            Struct.evolve(current, {
+              secrets: list => list.filter(secret => secret.name !== name),
+            }),
+          )
+        : Effect.fail(`Unknown secret ${name}`),
+    ).pipe(Effect.map(secretsReply)),
+
+  'secrets.request': ({ name }, state) =>
+    Effect.gen(function* () {
+      const current = yield* Ref.get(state)
+      if (!VALID_SECRET_NAME.test(name)) {
+        return yield* Effect.fail(
+          'Name must use 1–64 letters, numbers, dots, underscores or hyphens, not starting with a dot',
+        )
+      }
+      if (current.publicUrl === null) {
+        return yield* Effect.fail('Request links require a public URL')
+      }
+      const now = Math.floor(Date.now() / 1000)
+      const reply: SecretRequestLink = {
+        url: `https://example.test/secret/${crypto.randomUUID()}`,
+        expiresAt: now + 600,
+      }
+      return reply
+    }),
 }
 
 const replyOk = (id: string, payload: ReplyPayload<RequestType>): ReplyFrame => ({
@@ -1941,6 +2008,10 @@ const allHandlers: { readonly [K in RequestType]: RootHandler<K> } = {
   'webhooks.create': wrapLegacy('webhooks.create'),
   'webhooks.setEnabled': wrapLegacy('webhooks.setEnabled'),
   'webhooks.remove': wrapLegacy('webhooks.remove'),
+  'secrets.list': wrapLegacy('secrets.list'),
+  'secrets.set': wrapLegacy('secrets.set'),
+  'secrets.remove': wrapLegacy('secrets.remove'),
+  'secrets.request': wrapLegacy('secrets.request'),
 }
 
 const dispatch = <K extends RequestType>(

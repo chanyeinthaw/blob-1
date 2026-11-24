@@ -58,6 +58,13 @@ pub enum NodeRequest {
     SkillCatalog {
         workspace: String,
     },
+    /// Writes a secret to a private file the node deletes after `ttl_secs`.
+    WriteSecret {
+        workspace: String,
+        name: String,
+        value: String,
+        ttl_secs: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +81,9 @@ pub enum NodeReply {
     },
     SkillCatalog {
         entries: Vec<SkillEntry>,
+    },
+    WriteSecret {
+        path: String,
     },
     Error {
         error: String,

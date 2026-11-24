@@ -32,6 +32,7 @@ import { Route as SettingsBotsBotIdGeneralRouteImport } from './routes/settings.
 import { Route as SettingsBotsBotIdMcpRouteImport } from './routes/settings.bots.$botId.mcp'
 import { Route as SettingsBotsBotIdModelsRouteImport } from './routes/settings.bots.$botId.models'
 import { Route as SettingsBotsBotIdSchedulesRouteImport } from './routes/settings.bots.$botId.schedules'
+import { Route as SettingsBotsBotIdSecretsRouteImport } from './routes/settings.bots.$botId.secrets'
 import { Route as SettingsBotsBotIdWebhooksRouteImport } from './routes/settings.bots.$botId.webhooks'
 
 const IndexRoute = IndexRouteImport.update({
@@ -152,6 +153,12 @@ const SettingsBotsBotIdSchedulesRoute =
     path: '/schedules',
     getParentRoute: () => SettingsBotsBotIdRoute,
   } as any)
+const SettingsBotsBotIdSecretsRoute =
+  SettingsBotsBotIdSecretsRouteImport.update({
+    id: '/secrets',
+    path: '/secrets',
+    getParentRoute: () => SettingsBotsBotIdRoute,
+  } as any)
 const SettingsBotsBotIdWebhooksRoute =
   SettingsBotsBotIdWebhooksRouteImport.update({
     id: '/webhooks',
@@ -182,6 +189,7 @@ export interface FileRoutesByFullPath {
   '/settings/bots/$botId/mcp': typeof SettingsBotsBotIdMcpRoute
   '/settings/bots/$botId/models': typeof SettingsBotsBotIdModelsRoute
   '/settings/bots/$botId/schedules': typeof SettingsBotsBotIdSchedulesRoute
+  '/settings/bots/$botId/secrets': typeof SettingsBotsBotIdSecretsRoute
   '/settings/bots/$botId/webhooks': typeof SettingsBotsBotIdWebhooksRoute
   '/settings/bots/$botId/': typeof SettingsBotsBotIdIndexRoute
 }
@@ -205,6 +213,7 @@ export interface FileRoutesByTo {
   '/settings/bots/$botId/mcp': typeof SettingsBotsBotIdMcpRoute
   '/settings/bots/$botId/models': typeof SettingsBotsBotIdModelsRoute
   '/settings/bots/$botId/schedules': typeof SettingsBotsBotIdSchedulesRoute
+  '/settings/bots/$botId/secrets': typeof SettingsBotsBotIdSecretsRoute
   '/settings/bots/$botId/webhooks': typeof SettingsBotsBotIdWebhooksRoute
   '/settings/bots/$botId': typeof SettingsBotsBotIdIndexRoute
 }
@@ -232,6 +241,7 @@ export interface FileRoutesById {
   '/settings/bots/$botId/mcp': typeof SettingsBotsBotIdMcpRoute
   '/settings/bots/$botId/models': typeof SettingsBotsBotIdModelsRoute
   '/settings/bots/$botId/schedules': typeof SettingsBotsBotIdSchedulesRoute
+  '/settings/bots/$botId/secrets': typeof SettingsBotsBotIdSecretsRoute
   '/settings/bots/$botId/webhooks': typeof SettingsBotsBotIdWebhooksRoute
   '/settings/bots/$botId/': typeof SettingsBotsBotIdIndexRoute
 }
@@ -260,6 +270,7 @@ export interface FileRouteTypes {
     | '/settings/bots/$botId/mcp'
     | '/settings/bots/$botId/models'
     | '/settings/bots/$botId/schedules'
+    | '/settings/bots/$botId/secrets'
     | '/settings/bots/$botId/webhooks'
     | '/settings/bots/$botId/'
   fileRoutesByTo: FileRoutesByTo
@@ -283,6 +294,7 @@ export interface FileRouteTypes {
     | '/settings/bots/$botId/mcp'
     | '/settings/bots/$botId/models'
     | '/settings/bots/$botId/schedules'
+    | '/settings/bots/$botId/secrets'
     | '/settings/bots/$botId/webhooks'
     | '/settings/bots/$botId'
   id:
@@ -309,6 +321,7 @@ export interface FileRouteTypes {
     | '/settings/bots/$botId/mcp'
     | '/settings/bots/$botId/models'
     | '/settings/bots/$botId/schedules'
+    | '/settings/bots/$botId/secrets'
     | '/settings/bots/$botId/webhooks'
     | '/settings/bots/$botId/'
   fileRoutesById: FileRoutesById
@@ -482,6 +495,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SettingsBotsBotIdSchedulesRouteImport
       parentRoute: typeof SettingsBotsBotIdRoute
     }
+    '/settings/bots/$botId/secrets': {
+      id: '/settings/bots/$botId/secrets'
+      path: '/secrets'
+      fullPath: '/settings/bots/$botId/secrets'
+      preLoaderRoute: typeof SettingsBotsBotIdSecretsRouteImport
+      parentRoute: typeof SettingsBotsBotIdRoute
+    }
     '/settings/bots/$botId/webhooks': {
       id: '/settings/bots/$botId/webhooks'
       path: '/webhooks'
@@ -512,6 +532,7 @@ interface SettingsBotsBotIdRouteChildren {
   SettingsBotsBotIdMcpRoute: typeof SettingsBotsBotIdMcpRoute
   SettingsBotsBotIdModelsRoute: typeof SettingsBotsBotIdModelsRoute
   SettingsBotsBotIdSchedulesRoute: typeof SettingsBotsBotIdSchedulesRoute
+  SettingsBotsBotIdSecretsRoute: typeof SettingsBotsBotIdSecretsRoute
   SettingsBotsBotIdWebhooksRoute: typeof SettingsBotsBotIdWebhooksRoute
   SettingsBotsBotIdIndexRoute: typeof SettingsBotsBotIdIndexRoute
 }
@@ -522,6 +543,7 @@ const SettingsBotsBotIdRouteChildren: SettingsBotsBotIdRouteChildren = {
   SettingsBotsBotIdMcpRoute: SettingsBotsBotIdMcpRoute,
   SettingsBotsBotIdModelsRoute: SettingsBotsBotIdModelsRoute,
   SettingsBotsBotIdSchedulesRoute: SettingsBotsBotIdSchedulesRoute,
+  SettingsBotsBotIdSecretsRoute: SettingsBotsBotIdSecretsRoute,
   SettingsBotsBotIdWebhooksRoute: SettingsBotsBotIdWebhooksRoute,
   SettingsBotsBotIdIndexRoute: SettingsBotsBotIdIndexRoute,
 }

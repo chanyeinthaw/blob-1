@@ -1,7 +1,7 @@
 import type { BotSummary } from '@blob-1/contracts'
 import { useAtomMount, useAtomSet } from '@effect/atom-react'
 import { Outlet, useNavigate, useRouterState } from '@tanstack/react-router'
-import { CalendarClock, Cpu, Home, Plug, Zap } from 'lucide-react'
+import { CalendarClock, Cpu, Home, KeyRound, Plug, Zap } from 'lucide-react'
 import { useEffect } from 'react'
 
 import { DiscordIcon } from '~/components/DiscordIcon'
@@ -12,6 +12,7 @@ import { generalPageAtomFor } from '~/features/general/generalState'
 import { usageAtomFor } from '~/features/general/usageState'
 import { modelsPageAtomFor } from '~/features/models/modelsState'
 import { schedulesPageAtomFor } from '~/features/schedules/schedulesState'
+import { secretsPageAtomFor } from '~/features/secrets/secretsState'
 import { webhooksPageAtomFor } from '~/features/webhooks/webhooksState'
 import { cn } from '~/lib/utils'
 
@@ -38,6 +39,7 @@ function BotPrefetch(props: { readonly instanceKey: string }) {
   useAtomMount(modelsPageAtomFor(props.instanceKey))
   useAtomMount(schedulesPageAtomFor(props.instanceKey))
   useAtomMount(webhooksPageAtomFor(props.instanceKey))
+  useAtomMount(secretsPageAtomFor(props.instanceKey))
   useAtomMount(discordPageAtomFor(props.instanceKey))
   useAtomMount(botMcpAtomFor(props.instanceKey))
   return null
@@ -119,6 +121,13 @@ export function BotShellPage(props: BotShellPageProps) {
               label="Webhooks"
               icon={<Zap className="size-4 shrink-0 text-muted-foreground" />}
               isActive={isActive('webhooks')}
+            />
+            <SplitItem
+              to="/settings/bots/$botId/secrets"
+              params={{ botId: props.botId }}
+              label="Secrets"
+              icon={<KeyRound className="size-4 shrink-0 text-muted-foreground" />}
+              isActive={isActive('secrets')}
             />
             <SplitItem
               to="/settings/bots/$botId/mcp"

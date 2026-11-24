@@ -447,6 +447,9 @@ where
     if let Some(callback) = &inner.callback {
         session = session.with_callback_tools(callback.clone());
     }
+    if let Some(secrets) = &inner.secrets {
+        session = session.with_secret_tools(secrets.clone());
+    }
     if let Some(mcp) = &inner.mcp {
         let tools = match &inner.mcp_filter {
             Some(filter) => mcp::SessionTools::with_filter(mcp.clone(), Arc::clone(filter)),

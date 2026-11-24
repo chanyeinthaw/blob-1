@@ -196,6 +196,14 @@ impl<T: Environment> Environment for Shared<T> {
     ) -> Result<environment::ToolResult, environment::ToolError> {
         self.0.execute(call).await
     }
+    async fn write_secret(
+        &self,
+        name: &str,
+        value: &str,
+        ttl: std::time::Duration,
+    ) -> Result<String, environment::ToolError> {
+        self.0.write_secret(name, value, ttl).await
+    }
 }
 
 pub(crate) struct State {
@@ -219,6 +227,7 @@ pub(crate) struct Inner<E, S, M, F: Models> {
     pub messengers: Option<crate::Messengers>,
     pub share: Option<crate::ShareTools>,
     pub callback: Option<crate::CallbackTools>,
+    pub secrets: Option<crate::SecretTools>,
     pub mcp: Option<mcp::Mcp>,
     pub mcp_filter: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
     pub config: Arc<dyn ConfigStore>,
@@ -323,6 +332,7 @@ where
                 messengers: None,
                 share: None,
                 callback: None,
+                secrets: None,
                 mcp: None,
                 mcp_filter: None,
                 config: Arc::clone(&config),
@@ -350,6 +360,13 @@ where
         Arc::get_mut(&mut self.inner)
             .expect("unshared chat")
             .callback = Some(callback);
+        self
+    }
+
+    pub fn with_secrets(mut self, secrets: crate::SecretTools) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("unshared chat")
+            .secrets = Some(secrets);
         self
     }
 
@@ -583,6 +600,9 @@ where
         if self.inner.messengers.is_some() {
             tools.push(crate::messenger::SEND);
         }
+        if self.inner.secrets.is_some() {
+            tools.push(crate::secret::REQUEST);
+        }
         let cache_key = crate::prompt_cache_key("chat", &self.inner.paths.workspace, "");
         loop {
             loop {
@@ -712,6 +732,10 @@ where
                 tasks::spawn(&self.inner, args.tasks).await?.join(", ")
             }
             "tasks" => tasks::list(&self.inner)?,
+            "request_secret" => match &self.inner.secrets {
+                Some(secrets) => secrets.request(&call.arguments)?,
+                None => return Err("secrets are not available".into()),
+            },
             "stop" => {
                 let args: Stop = serde_json::from_str(&call.arguments)?;
                 tasks::stop(&self.inner, &args.task, args.reason).await?

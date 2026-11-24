@@ -35,6 +35,8 @@ impl Drop for ProcessGroup {
 pub struct LocalEnvironment {
     root: PathBuf,
     skills_dir: PathBuf,
+    /// Where `write_secret` puts its files; `None` disables secrets.
+    secrets_dir: Option<PathBuf>,
 }
 
 impl LocalEnvironment {
@@ -50,7 +52,17 @@ impl LocalEnvironment {
         };
         std::fs::create_dir_all(&skills_dir).map_err(io_error)?;
         let skills_dir = skills_dir.canonicalize().map_err(io_error)?;
-        Ok(Self { root, skills_dir })
+        Ok(Self {
+            root,
+            skills_dir,
+            secrets_dir: None,
+        })
+    }
+
+    /// Enables `write_secret`, writing its files under `dir`.
+    pub fn with_secrets_dir(mut self, dir: PathBuf) -> Self {
+        self.secrets_dir = Some(dir);
+        self
     }
 
     async fn read_manifest(&self) -> Result<BTreeMap<String, String>, ToolError> {
@@ -591,8 +603,66 @@ fn io_error(error: std::io::Error) -> ToolError {
     ToolError::Io(error.to_string())
 }
 
+/// Removes every secret file under `dir`. Run at process start: a file's
+/// deletion timer doesn't survive a restart.
+pub fn clear_secrets(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// Writes `value` to a new owner-only file under `dir` (created owner-only).
+/// Each write gets its own file, so one read's timer never deletes another's.
+fn write_secret_file(dir: &Path, name: &str, value: &str) -> Result<PathBuf, ToolError> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    if name.is_empty() || name.starts_with('.') || name.contains('/') {
+        return Err(ToolError::Invalid(format!("invalid secret name '{name}'")));
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(io_error)?;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+        ^ NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("{name}.{nonce:016x}"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(io_error)?;
+    if let Err(error) = file.write_all(value.as_bytes()) {
+        let _ = std::fs::remove_file(&path);
+        return Err(io_error(error));
+    }
+    Ok(path)
+}
+
 #[async_trait::async_trait]
 impl Environment for LocalEnvironment {
+    async fn write_secret(
+        &self,
+        name: &str,
+        value: &str,
+        ttl: Duration,
+    ) -> Result<String, ToolError> {
+        let dir = self.secrets_dir.as_ref().ok_or_else(|| {
+            ToolError::Invalid("secrets are not available in this environment".into())
+        })?;
+        let path = write_secret_file(dir, name, value)?;
+        let expired = path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(ttl).await;
+            let _ = tokio::fs::remove_file(&expired).await;
+        });
+        Ok(path.display().to_string())
+    }
     async fn managed_skills(&self) -> Result<BTreeMap<String, (String, bool)>, ToolError> {
         Ok(self
             .read_manifest()

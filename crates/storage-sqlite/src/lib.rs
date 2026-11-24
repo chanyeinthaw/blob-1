@@ -15,6 +15,7 @@ mod memory;
 mod messenger;
 mod public_file;
 mod schedule;
+mod secret;
 mod session;
 mod skill;
 mod usage;
@@ -110,6 +111,21 @@ CREATE TABLE IF NOT EXISTS callbacks (
     token_hash BLOB NOT NULL UNIQUE,
     for_token TEXT,
     remaining_uses INTEGER NOT NULL CHECK (remaining_uses > 0),
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS secrets (
+    name TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS secret_requests (
+    token_hash BLOB PRIMARY KEY,
+    name TEXT NOT NULL,
+    label TEXT,
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
 ) STRICT;

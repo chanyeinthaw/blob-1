@@ -134,6 +134,23 @@ fn unexpected(reply: NodeReply) -> ToolError {
 
 #[async_trait::async_trait]
 impl<D: NodeDirectory> Environment for RemoteEnvironment<D> {
+    async fn write_secret(
+        &self,
+        name: &str,
+        value: &str,
+        ttl: Duration,
+    ) -> Result<String, ToolError> {
+        let request = NodeRequest::WriteSecret {
+            workspace: self.workspace.clone(),
+            name: name.to_owned(),
+            value: value.to_owned(),
+            ttl_secs: ttl.as_secs(),
+        };
+        match self.call(request, self.skills_timeout).await? {
+            NodeReply::WriteSecret { path } => Ok(path),
+            other => Err(unexpected(other)),
+        }
+    }
     async fn managed_skills(&self) -> Result<BTreeMap<String, (String, bool)>, ToolError> {
         let request = NodeRequest::ManagedSkills {
             workspace: self.workspace.clone(),

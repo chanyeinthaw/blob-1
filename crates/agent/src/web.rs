@@ -26,8 +26,8 @@ use std::{
 };
 use storage::{
     BotStore, CallbackStore, Checkin, CheckinStore, ConfigStore, McpServer, McpStore, McpTransport,
-    MessengerStore, PublicFileStore, ReasoningLevel, ScheduleStore, UsageStore, WatchStore,
-    WebAuthStore, WebhookStore, DEFAULT_BOT_ID,
+    MessengerStore, PublicFileStore, ReasoningLevel, ScheduleStore, SecretStore, UsageStore,
+    WatchStore, WebAuthStore, WebhookStore, DEFAULT_BOT_ID,
 };
 use storage_sqlite::SqliteStorage;
 
@@ -130,6 +130,7 @@ pub async fn serve(
         .route("/p/{id}/{name}", get(public_file_named))
         .route("/hooks/cb/{token}", post(inbound_callback))
         .route("/hooks/{token}", post(inbound_webhook))
+        .route("/secret/{token}", get(secret_form).post(secret_submit))
         .fallback(assets)
         .with_state(store);
     axum::serve(listener, app)
@@ -1818,6 +1819,46 @@ async fn dispatch(
                 }
                 Ok(webhooks_reply(ctx, &bot.store)?)
             }
+            "secrets.list" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                Ok(secrets_reply(ctx, &bot.store)?)
+            }
+            "secrets.set" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let name = get("name")?.trim();
+                if !storage::valid_secret_name(name) {
+                    return Err(SECRET_NAME_RULE.into());
+                }
+                let value = get("value")?;
+                if value.trim().is_empty() {
+                    return Err("Secret value is required".into());
+                }
+                bot.store.set_secret(name, value, now())?;
+                Ok(secrets_reply(ctx, &bot.store)?)
+            }
+            "secrets.remove" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                if !bot.store.remove_secret(get("name")?)? {
+                    return Err("Secret not found".into());
+                }
+                Ok(secrets_reply(ctx, &bot.store)?)
+            }
+            "secrets.request" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let label = payload
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|label| !label.is_empty());
+                let link = harness::secret::create_request(
+                    bot.store.as_ref(),
+                    ctx.store.as_ref(),
+                    get("name")?.trim(),
+                    label,
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(json!({ "url": link.url, "expiresAt": link.expires_at }))
+            }
             _ => Err(format!("Unknown request: {request_type}").into()),
         }
     }
@@ -2048,6 +2089,25 @@ async fn serve_public_file(ctx: &WebContext, id: &str, head_only: bool) -> Respo
 
 const MAX_WEBHOOK_BODY_BYTES: usize = 64 * 1024;
 
+const SECRET_NAME_RULE: &str =
+    "Secret name must be 1-64 of letters, digits, '_', '.' or '-', not starting with '.'";
+
+/// The bot's secrets without their values, which never leave the store here.
+fn secrets_reply(ctx: &WebContext, store: &SqliteStorage) -> crate::Result<Value> {
+    let public_url = ctx
+        .public_url
+        .as_ref()
+        .map(|u| u.as_str().trim_end_matches('/').to_owned());
+    Ok(json!({
+        "publicUrl": public_url,
+        "secrets": store.secrets()?.into_iter().map(|secret| json!({
+            "name": secret.name,
+            "createdAt": secret.created_at,
+            "updatedAt": secret.updated_at,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
 fn webhooks_reply(ctx: &WebContext, store: &SqliteStorage) -> crate::Result<Value> {
     let webhooks = store.webhooks()?;
     let public_url = ctx
@@ -2177,6 +2237,135 @@ async fn inbound_callback(
         Json(json!({ "ok": true, "remainingUses": cb.remaining_uses })),
     )
         .into_response()
+}
+
+/// A submitted secret's size cap; far above any token or key.
+const MAX_SECRET_BYTES: usize = 64 * 1024;
+
+/// The bot whose open secret request matches `token_hash`.
+async fn secret_owner(
+    ctx: &WebContext,
+    token_hash: &[u8],
+) -> Result<Option<(crate::run::BotHandle, storage::SecretRequest)>, StatusCode> {
+    let ts = now();
+    for bot in ctx.bots.all_handles().await {
+        match bot.store.secret_request(token_hash, ts) {
+            Ok(Some(request)) => return Ok(Some((bot, request))),
+            Ok(None) => {}
+            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+        }
+    }
+    Ok(None)
+}
+
+/// A minimal standalone page for the secret form. The token is in the URL, so
+/// nothing is cached, no referrer leaves, no script runs, and the form posts
+/// only back to this origin.
+fn secret_page(status: StatusCode, title: &str, body: &str) -> Response {
+    let html = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{title}</title><style>body{{font-family:system-ui,sans-serif;max-width:28rem;margin:4rem auto;padding:0 1rem;color:#111}}h1{{font-size:1.1rem}}input{{width:100%;box-sizing:border-box;padding:.6rem .9rem;border:1px solid #ccc;border-radius:999px;font:inherit}}button{{margin-top:.75rem;padding:.55rem 1.2rem;border:0;border-radius:999px;background:#111;color:#fff;font:inherit;cursor:pointer}}p{{color:#555}}</style></head><body><h1>{title}</h1>{body}</body></html>",
+        title = storage::escape(title),
+    );
+    let mut response = (status, html).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        ),
+    );
+    response
+}
+
+fn secret_gone() -> Response {
+    secret_page(
+        StatusCode::NOT_FOUND,
+        "Link expired",
+        "<p>This link has expired or was already used.</p>",
+    )
+}
+
+fn secret_form_page(status: StatusCode, request: &storage::SecretRequest, error: Option<&str>) -> Response {
+    let title = request.label.as_deref().unwrap_or(&request.name);
+    let error = error
+        .map(|error| format!("<p>{}</p>", storage::escape(error)))
+        .unwrap_or_default();
+    secret_page(
+        status,
+        title,
+        &format!(
+            "{error}<form method=\"post\"><input type=\"password\" name=\"value\" aria-label=\"{}\" autocomplete=\"off\" autofocus required><button type=\"submit\">Save</button></form>",
+            storage::attribute(&request.name)
+        ),
+    )
+}
+
+/// `GET /secret/{token}`: the form for an open secret request.
+async fn secret_form(State(ctx): State<Context>, AxumPath(token): AxumPath<String>) -> Response {
+    let token_hash = Sha256::digest(token.as_bytes());
+    match secret_owner(&ctx, &token_hash).await {
+        Ok(Some((_, request))) => secret_form_page(StatusCode::OK, &request, None),
+        Ok(None) => secret_gone(),
+        Err(status) => status.into_response(),
+    }
+}
+
+/// `POST /secret/{token}`: stores the submitted value, consumes the request
+/// and wakes the bot with a `secret` event that never carries the value.
+async fn secret_submit(
+    State(ctx): State<Context>,
+    AxumPath(token): AxumPath<String>,
+    body: Body,
+) -> Response {
+    let token_hash = Sha256::digest(token.as_bytes());
+    let (bot, request) = match secret_owner(&ctx, &token_hash).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return secret_gone(),
+        Err(status) => return status.into_response(),
+    };
+    let bytes = match axum::body::to_bytes(body, MAX_SECRET_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let value = url::form_urlencoded::parse(&bytes)
+        .find(|(key, _)| key == "value")
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_default();
+    if value.trim().is_empty() {
+        return secret_form_page(StatusCode::BAD_REQUEST, &request, Some("Enter a value."));
+    }
+    // As with callbacks, check the bot can take the event before consuming
+    // the one-time request, so a stopped bot never burns the link.
+    let prepared = match bot.live_chat.prepare().await {
+        Ok(prepared) => prepared,
+        Err(_) => {
+            return secret_form_page(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &request,
+                Some("The bot isn't running right now. Try again shortly."),
+            )
+        }
+    };
+    match bot.store.fulfill_secret_request(&token_hash, &value, now()) {
+        Ok(Some(_)) => {}
+        Ok(None) => return secret_gone(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    prepared.wake();
+    secret_page(
+        StatusCode::OK,
+        "Saved",
+        "<p>You can close this page.</p>",
+    )
 }
 
 async fn assets(uri: Uri) -> Response {

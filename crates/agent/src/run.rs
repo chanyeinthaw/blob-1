@@ -923,9 +923,25 @@ async fn chat_harness(
         None => harness,
     };
     Ok(harness
+        .with_secrets(harness::SecretTools::new(
+            bot_store.clone(),
+            global_store.clone(),
+        ))
         .with_callback(harness::CallbackTools::new(bot_store, global_store))
         .with_mcp(mcp)
         .with_mcp_filter(mcp_filter))
+}
+
+/// Creates a fresh owner-only directory with a random name under the temp
+/// dir. Creation is atomic and fails if the path exists, so another local user
+/// can't plant it in a shared `/tmp`.
+fn private_temp_dir(prefix: &str) -> Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut nonce = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let dir = std::env::temp_dir().join(format!("{prefix}-{}", hex::encode(nonce)));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    Ok(dir)
 }
 
 pub async fn chat(
@@ -944,10 +960,13 @@ pub async fn chat(
     let mcp = mcp::Mcp::new(store.clone());
     let mcp_shutdown = mcp.clone();
     std::fs::create_dir_all(workspace)?;
-    let environment: Arc<dyn environment::Environment> = Arc::new(LocalEnvironment::new(
-        workspace,
-        skills_dir.map(Path::to_path_buf),
-    )?);
+    // Secret files for this run only: their deletion timers end with the
+    // process, so the directory is removed on the way out.
+    let secrets_dir = private_temp_dir("blob-1-secrets")?;
+    let environment: Arc<dyn environment::Environment> = Arc::new(
+        LocalEnvironment::new(workspace, skills_dir.map(Path::to_path_buf))?
+            .with_secrets_dir(secrets_dir.clone()),
+    );
     sync_shared_skills(&store, &environment).await?;
     let pinned_workspace = harness::PinnedWorkspace::open(workspace)?;
     let harness = chat_harness(
@@ -995,6 +1014,7 @@ pub async fn chat(
         };
     }
     mcp_shutdown.shutdown().await;
+    let _ = environment_local::clear_secrets(&secrets_dir);
     match signal_text {
         Some(signal) => Err(signal.into()),
         None => failure.map_or(Ok(()), |error| Err(error.into())),
@@ -1771,6 +1791,7 @@ fn change_topic(table: &str) -> Option<&'static str> {
         "schedules" | "watches" | "checkin" | "clock" => Some("schedule"),
         "usage_events" => Some("usage"),
         "webhooks" => Some("webhooks"),
+        "secrets" => Some("secrets"),
         _ => None,
     }
 }
@@ -1902,6 +1923,8 @@ impl BotRegistry {
         // Remote workspace dir on the node. The generation keeps a recreated
         // slug from inheriting a deleted bot's files, as the local trash does.
         let remote_workspace = format!("{}-{}", entry.handle.id, entry.handle.generation);
+        // Local secret files, per bot generation like the remote workspace.
+        let secrets_dir = self.data_dir.join("secrets").join(&remote_workspace);
         let ws_path = entry.workspace_path.clone();
         let pinned = entry.handle.workspace.clone();
         let skills_dir = self.skills_dir.clone();
@@ -1981,7 +2004,10 @@ impl BotRegistry {
                             (Arc::new(remote), Some(watch))
                         }
                         None => (
-                            Arc::new(LocalEnvironment::new(ws_path.clone(), skills_dir.clone())?),
+                            Arc::new(
+                                LocalEnvironment::new(ws_path.clone(), skills_dir.clone())?
+                                    .with_secrets_dir(secrets_dir.clone()),
+                            ),
                             None,
                         ),
                     };
@@ -2056,6 +2082,9 @@ impl BotRegistry {
     }
 
     pub async fn start_all(&self) -> Result<()> {
+        // Secret files outlive no restart: their deletion timers died with the
+        // previous process.
+        environment_local::clear_secrets(&self.data_dir.join("secrets"))?;
         let environment: Arc<dyn environment::Environment> = Arc::new(LocalEnvironment::new(
             &self.root_workspace,
             self.skills_dir.clone(),

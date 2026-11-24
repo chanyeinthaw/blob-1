@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
@@ -124,6 +124,14 @@ enum Command {
     Environment {
         #[command(subcommand)]
         command: EnvironmentCommand,
+    },
+    /// Manage a bot's secrets.
+    Secret {
+        /// Bot whose secrets to manage.
+        #[arg(long, default_value = storage::DEFAULT_BOT_ID)]
+        bot: String,
+        #[command(subcommand)]
+        command: SecretCommand,
     },
     /// Download a release and switch to it.
     Update {
@@ -620,6 +628,23 @@ enum SkillCommand {
 }
 
 #[derive(Subcommand)]
+enum SecretCommand {
+    /// List secret names (values are never shown).
+    List,
+    /// Create or replace a secret; the value is read from stdin.
+    Set { name: String },
+    /// Delete a secret.
+    Remove { name: String },
+    /// Print a one-time link (valid 10 minutes) where someone can enter a secret.
+    Request {
+        name: String,
+        /// What to ask for, shown on the form.
+        #[arg(long)]
+        label: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum EnvironmentCommand {
     /// List pending nodes and accepted environments.
     List,
@@ -717,6 +742,7 @@ async fn main() -> Result<()> {
                 | Command::Messenger { .. }
                 | Command::Mcp { .. }
                 | Command::Environment { .. }
+                | Command::Secret { .. }
                 | Command::Instructions { .. }
                 | Command::AutoRespond { .. }
                 | Command::Timezone { .. }
@@ -905,6 +931,9 @@ async fn main() -> Result<()> {
             run::chat(store, &workspace, skills_dir.as_deref(), message).await
         }
         Command::Environment { command } => environment_command(&store, &command),
+        Command::Secret { bot, command } => {
+            secret_command(&store, &data_dir, app_key, &bot, &command)
+        }
         Command::Update { .. } | Command::Launcher { .. } | Command::Node { .. } => unreachable!(),
     }
 }
@@ -1810,6 +1839,91 @@ async fn mcp_command(store: &Arc<SqliteStorage>, command: McpCommand) -> Result<
 
 /// `environment` subcommands operate on the shared store — a running `serve`
 /// reconciles live node sessions on its next sweep.
+/// `secret` subcommands on a bot's store; the default bot's is the main
+/// `agent.db`, any other bot's is `bots/<id>/agent.db` (opened shared so a
+/// running `serve` keeps working).
+fn secret_command(
+    store: &Arc<SqliteStorage>,
+    data_dir: &Path,
+    app_key: Option<AppKey>,
+    bot: &str,
+    command: &SecretCommand,
+) -> Result<()> {
+    use std::io::{IsTerminal, Read};
+    use storage::{BotStore, SecretStore};
+    let bot_store = if bot == storage::DEFAULT_BOT_ID {
+        store.clone()
+    } else {
+        if !store.bots()?.iter().any(|known| known.id == bot) {
+            return Err(format!("unknown bot '{bot}'").into());
+        }
+        Arc::new(SqliteStorage::open_shared(
+            data_dir.join("bots").join(bot).join("agent.db"),
+            app_key,
+        )?)
+    };
+    match command {
+        SecretCommand::List => {
+            let secrets = bot_store.secrets()?;
+            if secrets.is_empty() {
+                println!("no secrets");
+            }
+            for secret in secrets {
+                println!("{}\tupdated {}", secret.name, secret.updated_at);
+            }
+        }
+        SecretCommand::Set { name } => {
+            if !storage::valid_secret_name(name) {
+                return Err(
+                    "name must be 1-64 of letters, digits, '_', '.' or '-', not starting with '.'"
+                        .into(),
+                );
+            }
+            // Piped input is read whole (a PEM keeps every line); only the
+            // final newline `echo` adds is dropped.
+            let value = if std::io::stdin().is_terminal() {
+                rpassword::prompt_password("Value: ")?
+            } else {
+                let mut all = String::new();
+                std::io::stdin().read_to_string(&mut all)?;
+                let end = all
+                    .strip_suffix("\r\n")
+                    .or_else(|| all.strip_suffix('\n'))
+                    .map_or(all.len(), str::len);
+                all.truncate(end);
+                all
+            };
+            let value = value.as_str();
+            if value.trim().is_empty() {
+                return Err("value cannot be empty".into());
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs() as i64;
+            bot_store.set_secret(name, value, now)?;
+            println!("saved '{name}'");
+        }
+        SecretCommand::Remove { name } => {
+            if !bot_store.remove_secret(name)? {
+                return Err(format!("no secret named '{name}'").into());
+            }
+            println!("removed '{name}'");
+        }
+        SecretCommand::Request { name, label } => {
+            let label = label.as_deref().map(str::trim).filter(|l| !l.is_empty());
+            let link = harness::secret::create_request(
+                bot_store.as_ref(),
+                store.as_ref(),
+                name,
+                label,
+            )
+            .map_err(|error| error.to_string())?;
+            println!("{}", link.url);
+        }
+    }
+    Ok(())
+}
+
 fn environment_command(store: &Arc<SqliteStorage>, command: &EnvironmentCommand) -> Result<()> {
     use storage::EnvironmentStore;
     match command {

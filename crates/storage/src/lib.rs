@@ -1610,15 +1610,133 @@ impl<T: WebhookStore + ?Sized> WebhookStore for Arc<T> {
     }
 }
 
-/// Redacts ephemeral callback credentials (`cbk_<43-char-token>` anywhere in
-/// text, as well as `/hooks/cb/<token>` paths) before persisting transcripts or
-/// memory rows so database snapshots never leak active callback tokens.
+/// Whether `name` can name a secret: 1-64 of `[A-Za-z0-9_.-]`, not starting
+/// with `.`. Secret names become file names, so `.` and `..` must never pass.
+pub fn valid_secret_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// A stored secret's metadata; the value leaves the store only through
+/// `SecretStore::secret_value`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretInfo {
+    pub name: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// An open request for the user to provide a secret through a one-time URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretRequest {
+    pub name: String,
+    pub label: Option<String>,
+    pub expires_at: i64,
+}
+
+/// Per-bot secrets, encrypted at rest, and the one-time requests that let a
+/// user provide one.
+pub trait SecretStore: Send + Sync {
+    fn secrets(&self) -> Result<Vec<SecretInfo>, StoreError>;
+    fn secret_value(&self, name: &str) -> Result<Option<String>, StoreError>;
+    /// Creates or overwrites a secret.
+    fn set_secret(&self, name: &str, value: &str, now: i64) -> Result<(), StoreError>;
+    fn remove_secret(&self, name: &str) -> Result<bool, StoreError>;
+    fn create_secret_request(
+        &self,
+        token_hash: &[u8],
+        name: &str,
+        label: Option<&str>,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<(), StoreError>;
+    /// The open, unexpired request for a token hash.
+    fn secret_request(
+        &self,
+        token_hash: &[u8],
+        now: i64,
+    ) -> Result<Option<SecretRequest>, StoreError>;
+    /// Stores the value, consumes the request, and queues a `secret` event for
+    /// the chat loop, in one transaction. Returns the secret's name, or `None`
+    /// when the request is unknown, used, or expired.
+    fn fulfill_secret_request(
+        &self,
+        token_hash: &[u8],
+        value: &str,
+        now: i64,
+    ) -> Result<Option<String>, StoreError>;
+}
+
+impl<T: SecretStore + ?Sized> SecretStore for Arc<T> {
+    fn secrets(&self) -> Result<Vec<SecretInfo>, StoreError> {
+        (**self).secrets()
+    }
+    fn secret_value(&self, name: &str) -> Result<Option<String>, StoreError> {
+        (**self).secret_value(name)
+    }
+    fn set_secret(&self, name: &str, value: &str, now: i64) -> Result<(), StoreError> {
+        (**self).set_secret(name, value, now)
+    }
+    fn remove_secret(&self, name: &str) -> Result<bool, StoreError> {
+        (**self).remove_secret(name)
+    }
+    fn create_secret_request(
+        &self,
+        token_hash: &[u8],
+        name: &str,
+        label: Option<&str>,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        (**self).create_secret_request(token_hash, name, label, expires_at, now)
+    }
+    fn secret_request(
+        &self,
+        token_hash: &[u8],
+        now: i64,
+    ) -> Result<Option<SecretRequest>, StoreError> {
+        (**self).secret_request(token_hash, now)
+    }
+    fn fulfill_secret_request(
+        &self,
+        token_hash: &[u8],
+        value: &str,
+        now: i64,
+    ) -> Result<Option<String>, StoreError> {
+        (**self).fulfill_secret_request(token_hash, value, now)
+    }
+}
+
+/// Redacts ephemeral capability credentials before persisting transcripts or
+/// memory rows, so database snapshots never leak a live link: callback tokens
+/// (`cbk_<43 chars>`, `/hooks/cb/<token>`) and secret-request tokens
+/// (`sec_<43 chars>`, also inside `/secret/` links), which would let their
+/// holder overwrite a secret. Secret tokens always carry their prefix, so
+/// ordinary `/secret/` paths are left alone.
 pub fn redact_callback_tokens(text: &str) -> std::borrow::Cow<'_, str> {
-    const URL_PREFIX: &str = "/hooks/cb/";
-    const TOKEN_PREFIX: &str = "cbk_";
+    let callbacks = redact_capability(text, Some("/hooks/cb/"), "cbk_");
+    if let std::borrow::Cow::Owned(redacted) =
+        redact_capability(callbacks.as_ref(), None, "sec_")
+    {
+        return std::borrow::Cow::Owned(redacted);
+    }
+    callbacks
+}
+
+/// Replaces `<url_prefix><token>` paths (when given) and standalone
+/// `<token_prefix><43 token chars>` credentials with `<redacted>`.
+fn redact_capability<'a>(
+    text: &'a str,
+    url_prefix: Option<&str>,
+    token_prefix: &str,
+) -> std::borrow::Cow<'a, str> {
     const TOKEN_LEN: usize = 43;
     let is_token_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
-    if !text.contains(URL_PREFIX) && !text.contains(TOKEN_PREFIX) {
+    if !url_prefix.is_some_and(|url| text.contains(url)) && !text.contains(token_prefix) {
         return std::borrow::Cow::Borrowed(text);
     }
     let mut out = String::with_capacity(text.len());
@@ -1626,8 +1744,8 @@ pub fn redact_callback_tokens(text: &str) -> std::borrow::Cow<'_, str> {
     let mut prev_is_token = false;
     let mut replaced = false;
     while !rest.is_empty() {
-        let next_url = rest.find(URL_PREFIX).map(|pos| (pos, true));
-        let next_tok = rest.find(TOKEN_PREFIX).map(|pos| (pos, false));
+        let next_url = url_prefix.and_then(|url| rest.find(url)).map(|pos| (pos, true));
+        let next_tok = rest.find(token_prefix).map(|pos| (pos, false));
         let next = match (next_url, next_tok) {
             (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
             (a, b) => a.or(b),
@@ -1642,7 +1760,7 @@ pub fn redact_callback_tokens(text: &str) -> std::borrow::Cow<'_, str> {
             !prev_is_token
         };
         if is_url {
-            let split = pos + URL_PREFIX.len();
+            let split = pos + url_prefix.map_or(0, str::len);
             out.push_str(&rest[..split]);
             let after = &rest[split..];
             let token_len = after.bytes().take_while(|&b| is_token_byte(b)).count();
@@ -1657,7 +1775,7 @@ pub fn redact_callback_tokens(text: &str) -> std::borrow::Cow<'_, str> {
             }
         } else {
             out.push_str(&rest[..pos]);
-            let after = &rest[pos + TOKEN_PREFIX.len()..];
+            let after = &rest[pos + token_prefix.len()..];
             let token_len = after.bytes().take_while(|&b| is_token_byte(b)).count();
             if boundary_ok && token_len == TOKEN_LEN {
                 out.push_str("<redacted>");
@@ -1665,7 +1783,7 @@ pub fn redact_callback_tokens(text: &str) -> std::borrow::Cow<'_, str> {
                 prev_is_token = false;
                 replaced = true;
             } else {
-                out.push_str(TOKEN_PREFIX);
+                out.push_str(token_prefix);
                 rest = after;
                 prev_is_token = true;
             }
@@ -1743,13 +1861,12 @@ fn pick_unique_key(base: String, reserved: &std::collections::HashSet<String>) -
     }
 }
 
-/// Returns true if `s` starts immediately with a `cbk_<43-char-token>`
-/// credential on a non-token end boundary.
+/// Returns true if `s` starts immediately with a `cbk_` or `sec_`
+/// `<43-char-token>` credential on a non-token end boundary.
 fn starts_with_callback_credential(s: &str) -> bool {
-    const TOKEN_PREFIX: &str = "cbk_";
     const TOKEN_LEN: usize = 43;
     let is_token_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
-    if let Some(after) = s.strip_prefix(TOKEN_PREFIX) {
+    if let Some(after) = s.strip_prefix("cbk_").or_else(|| s.strip_prefix("sec_")) {
         let len = after.bytes().take_while(|&b| is_token_byte(b)).count();
         return len == TOKEN_LEN;
     }
@@ -1826,7 +1943,7 @@ fn lossy_unescape_json_inner(inner: &str, peek_credentials: bool) -> String {
                 }
                 _ => {
                     let starts_cred = if peek_credentials {
-                        bytes[esc] == b'c' && {
+                        matches!(bytes[esc], b'c' | b's') && {
                             let mut end = (esc + 300).min(bytes.len());
                             while end < bytes.len() && !inner.is_char_boundary(end) {
                                 end += 1;
