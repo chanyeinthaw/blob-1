@@ -724,7 +724,8 @@ pub trait MemoryStore: Send + Sync {
     fn message_count(&self) -> Result<u64, StoreError>;
     fn node(&self, l: u32, i: u64) -> Result<Option<MemoryNode>, StoreError>;
     fn built_nodes(&self) -> Result<Vec<(u32, u64)>, StoreError>;
-    fn put_node(&self, node: MemoryNode, changes: &[ViewChange]) -> Result<(), StoreError>;
+    /// Stores built nodes (possibly none) and view changes in one transaction.
+    fn put_nodes(&self, nodes: &[MemoryNode], changes: &[ViewChange]) -> Result<(), StoreError>;
     fn view(&self, name: ViewName) -> Result<Option<MemoryView>, StoreError>;
 }
 
@@ -748,8 +749,8 @@ impl<T: MemoryStore + ?Sized> MemoryStore for std::sync::Arc<T> {
     fn built_nodes(&self) -> Result<Vec<(u32, u64)>, StoreError> {
         (**self).built_nodes()
     }
-    fn put_node(&self, node: MemoryNode, changes: &[ViewChange]) -> Result<(), StoreError> {
-        (**self).put_node(node, changes)
+    fn put_nodes(&self, nodes: &[MemoryNode], changes: &[ViewChange]) -> Result<(), StoreError> {
+        (**self).put_nodes(nodes, changes)
     }
     fn view(&self, name: ViewName) -> Result<Option<MemoryView>, StoreError> {
         (**self).view(name)

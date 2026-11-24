@@ -43,6 +43,10 @@ pub enum LlmError {
     Request(String),
     #[error("context overflow: {0}")]
     ContextOverflow(String),
+    /// The provider rejected the request on content policy; retrying the same
+    /// input won't help.
+    #[error("refused: {0}")]
+    Refused(String),
     #[error("rate limited: {message}")]
     RateLimited {
         message: String,

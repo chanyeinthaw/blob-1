@@ -153,20 +153,22 @@ impl MemoryStore for SqliteStorage {
         Ok(nodes)
     }
 
-    fn put_node(&self, node: MemoryNode, changes: &[ViewChange]) -> Result<(), StoreError> {
+    fn put_nodes(&self, nodes: &[MemoryNode], changes: &[ViewChange]) -> Result<(), StoreError> {
         let mut connection = self.lock();
         let tx = connection.transaction().map_err(backend)?;
-        let text = storage::redact_callback_tokens(&node.text);
-        tx.execute(
-            "INSERT INTO memory_nodes (l, i, text, size) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                node.l,
-                sql_integer(node.i)?,
-                text.as_ref(),
-                sql_integer(node.size)?
-            ],
-        )
-        .map_err(backend)?;
+        for node in nodes {
+            let text = storage::redact_callback_tokens(&node.text);
+            tx.execute(
+                "INSERT INTO memory_nodes (l, i, text, size) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    node.l,
+                    sql_integer(node.i)?,
+                    text.as_ref(),
+                    sql_integer(node.size)?
+                ],
+            )
+            .map_err(backend)?;
+        }
         save_views(&tx, changes)?;
         tx.commit().map_err(backend)
     }

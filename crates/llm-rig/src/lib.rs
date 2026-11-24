@@ -87,6 +87,16 @@ impl RigLlm {
                 classify_error(error.clone(), None, None),
                 self.scrub(error, session),
             )),
+            // A filtered reply is a refusal even without an error string; rig
+            // already ends such a turn as an error.
+            None if response.finish_reason() == Some(completion::FinishReason::ContentFilter) => {
+                Err(LlmError::Refused(
+                    "provider finish_reason: content_filter".into(),
+                ))
+            }
+            None if has_refusal_part(&response.raw) => Err(LlmError::Refused(
+                "provider returned a refusal content part".into(),
+            )),
             None => Ok(response),
         }
     }
@@ -98,6 +108,7 @@ fn with_message(error: LlmError, message: String) -> LlmError {
     match error {
         LlmError::Request(_) => LlmError::Request(message),
         LlmError::ContextOverflow(_) => LlmError::ContextOverflow(message),
+        LlmError::Refused(_) => LlmError::Refused(message),
         LlmError::QuotaExhausted(_) => LlmError::QuotaExhausted(message),
         LlmError::RateLimited { retry_after, .. } => LlmError::RateLimited {
             message,
@@ -600,6 +611,20 @@ static NON_OVERFLOW: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
+/// Whether an OpenAI Responses body holds a structured refusal: a `message`
+/// output item with a content part of type `refusal`. Rig flattens those
+/// parts into the reply text, so they're only visible in the raw body.
+fn has_refusal_part(raw: &serde_json::Value) -> bool {
+    raw.get("output")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("message"))
+        .filter_map(|item| item.get("content").and_then(serde_json::Value::as_array))
+        .flatten()
+        .any(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("refusal"))
+}
+
 fn classify_error(text: String, status: Option<u16>, retry_after: Option<Duration>) -> LlmError {
     let lower = text.to_lowercase();
     if status == Some(402)
@@ -643,6 +668,11 @@ fn classify_error(text: String, status: Option<u16>, retry_after: Option<Duratio
         }
     } else if status == Some(413) || (!NON_OVERFLOW.is_match(&text) && OVERFLOW.is_match(&text)) {
         LlmError::ContextOverflow(text)
+    } else if ["content_filter", "content_policy_violation"]
+        .iter()
+        .any(|code| lower.contains(code))
+    {
+        LlmError::Refused(text)
     } else {
         LlmError::Request(text)
     }

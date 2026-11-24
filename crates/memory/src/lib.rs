@@ -24,7 +24,7 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             node_bytes: 512,
-            jobs: 8,
+            jobs: 64,
             tries: 5,
             chat_high: 128_000,
             seen_high: 32_000,
@@ -156,27 +156,29 @@ fn render(
         .join("\n");
     format!("<chat>\n{lines}\n</chat>")
 }
+/// Unii's `fit`: once a view passes `high`, a batch merges the most due
+/// pairs (with built parents) down toward `high / 2`. After a node build
+/// (`next` false) the batch applies only whole, reaching
+/// `max(high / 2, size - high)`, so a batch still waiting on parents never
+/// rewrites the cached view piece by piece. A new message (`next` true)
+/// applies whatever a pending batch can merge.
 fn update_view(
     view: &mut MemoryView,
     nodes: &HashMap<Part, String>,
     count: u64,
     high: usize,
-    added: Option<(Part, &str)>,
     size: &mut usize,
+    next: bool,
 ) {
-    let get = |p: &Part| {
-        added
-            .filter(|(part, _)| part == p)
-            .map(|(_, text)| text)
-            .or_else(|| nodes.get(p).map(String::as_str))
-    };
-    let mut current_size = *size;
-    if current_size <= high && !view.batch {
+    let get = |p: &Part| nodes.get(p).map(String::as_str);
+    if *size <= high && !(next && view.batch) {
         return;
     }
+    let mut parts = view.parts.clone();
+    let mut current_size = *size;
     while current_size > high / 2 {
         let mut best: Option<(usize, u128, u64)> = None;
-        for (pos, pair) in view.parts.windows(2).enumerate() {
+        for (pos, pair) in parts.windows(2).enumerate() {
             let (l, i) = pair[0];
             if i % 2 != 0 || pair[1] != (l, i + 1) || l >= 63 {
                 continue;
@@ -196,56 +198,60 @@ fn update_view(
         let Some((pos, _, _)) = best else {
             break;
         };
-        let left = view.parts[pos];
-        let right = view.parts[pos + 1];
+        let left = parts[pos];
+        let right = parts[pos + 1];
         let parent = (left.0 + 1, left.1 / 2);
         current_size -= get(&left).map_or(0, str::len) + get(&right).map_or(0, str::len);
         current_size += get(&parent).map_or(0, str::len);
-        view.parts.splice(pos..=pos + 1, [parent]);
+        parts.splice(pos..=pos + 1, [parent]);
     }
-    view.batch = current_size > high / 2;
-    *size = current_size;
+    if next || current_size <= (high / 2).max(size.saturating_sub(high)) {
+        view.parts = parts;
+        *size = current_size;
+    }
+    view.batch = *size > high / 2;
 }
 
-fn plan_view(
+/// Appends `extra` lines to `view` and fits it (see `update_view`). Returns
+/// the new view (`None` when only `extra` was appended), its size, and the
+/// change to persist.
+#[allow(clippy::too_many_arguments)]
+fn refit(
     name: ViewName,
     view: &MemoryView,
+    extra: &[Part],
     size: usize,
     nodes: &HashMap<Part, String>,
     count: u64,
     high: usize,
-    added: (Part, &str),
+    next: bool,
 ) -> (Option<MemoryView>, usize, ViewChange) {
-    let (part, text) = added;
-    let mut size = size
-        + if view
-            .parts
-            .binary_search_by_key(&span(part).0, |p| span(*p).0)
-            .is_ok_and(|index| view.parts[index] == part)
-        {
-            text.len()
-        } else {
-            0
-        };
     let mut change = ViewChange {
         view: name,
         removed: vec![],
-        added: vec![],
+        added: extra.to_vec(),
         batch: None,
     };
-    if size <= high && !view.batch {
+    if size <= high && !(next && view.batch) {
         return (None, size, change);
     }
-    let mut next = view.clone();
-    update_view(&mut next, nodes, count, high, Some((part, text)), &mut size);
+    let mut grown = view.clone();
+    grown.parts.extend_from_slice(extra);
+    let mut size = size;
+    update_view(&mut grown, nodes, count, high, &mut size, next);
     let before: HashSet<_> = view.parts.iter().copied().collect();
-    let after: HashSet<_> = next.parts.iter().copied().collect();
+    let after: HashSet<_> = grown.parts.iter().copied().collect();
     change.removed = before.difference(&after).copied().collect();
     change.added = after.difference(&before).copied().collect();
-    if next.batch != view.batch {
-        change.batch = Some(next.batch);
-    }
-    (Some(next), size, change)
+    change.batch = (grown.batch != view.batch).then_some(grown.batch);
+    (Some(grown), size, change)
+}
+
+/// Whether part `p` is a line of `view` (parts are ordered by start).
+fn in_view(view: &MemoryView, p: Part) -> bool {
+    view.parts
+        .binary_search_by_key(&span(p).0, |q| span(*q).0)
+        .is_ok_and(|index| view.parts[index] == p)
 }
 
 impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
@@ -309,7 +315,10 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
                 changed: tokio::sync::Notify::new(),
             }),
         };
-        memory.pump();
+        // A crash can land between a node commit and its fit; fit the restored
+        // views before any job snapshots them, as Unii's `load` does.
+        memory.fit(&mut memory.lock());
+        memory.pump(false);
         Ok(memory)
     }
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -355,27 +364,48 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
         }
         let ids: Vec<_> = rows.iter().map(|row| row.i).collect();
         let added: Vec<_> = ids.iter().map(|&id| (0, id)).collect();
-        self.inner.store.append_messages(
-            &rows,
-            &[
-                ViewChange {
-                    view: ViewName::Chat,
-                    removed: vec![],
-                    added: added.clone(),
-                    batch: None,
-                },
-                ViewChange {
-                    view: ViewName::Seen,
-                    removed: vec![],
-                    added: added.clone(),
-                    batch: None,
-                },
-            ],
-        )?;
-        state.count += rows.len() as u64;
+        let count = state.count + rows.len() as u64;
+        // Each message appends its line, then a pending batch merges what it
+        // can (Unii's `push` → `fit(mem, true)`).
+        let (chat, chat_size, chat_change) = refit(
+            ViewName::Chat,
+            &state.chat,
+            &added,
+            state.chat_size,
+            &state.nodes,
+            count,
+            self.inner.config.chat_high,
+            true,
+        );
+        let (seen, seen_size, seen_change) = refit(
+            ViewName::Seen,
+            &state.seen,
+            &added,
+            state.seen_size,
+            &state.nodes,
+            count,
+            self.inner.config.seen_high,
+            true,
+        );
+        let merged = !chat_change.removed.is_empty();
+        self.inner
+            .store
+            .append_messages(&rows, &[chat_change, seen_change])?;
+        state.count = count;
         state.leaves.extend(ids.iter().copied());
-        state.chat.parts.extend(added.iter().copied());
-        state.seen.parts.extend(added);
+        match chat {
+            Some(chat) => state.chat = chat,
+            None => state.chat.parts.extend(added.iter().copied()),
+        }
+        match seen {
+            Some(seen) => state.seen = seen,
+            None => state.seen.parts.extend(added.iter().copied()),
+        }
+        state.chat_size = chat_size;
+        state.seen_size = seen_size;
+        if merged {
+            state.chat_generation += 1;
+        }
         state.failure_order.clear();
         let failed: Vec<_> = state.failed.drain().map(|(part, _)| part).collect();
         for part in failed {
@@ -385,12 +415,15 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
         }
         enqueue_leaves(&mut state, self.inner.config.jobs);
         drop(state);
-        self.pump();
+        self.pump(false);
         Ok(ids)
     }
     pub fn count(&self) -> Result<u64, MemoryError> {
         Ok(self.lock().count)
     }
+    /// Waits until every message before `before` has its own node, as Unii's
+    /// `settle` waits for the first unbuilt message. Merges are not awaited:
+    /// the view only changes in whole batches (see `update_view`).
     pub async fn settle(&self, before: u64) -> Result<(), MemoryError> {
         {
             let mut state = self.lock();
@@ -400,31 +433,25 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
             let notified = self.inner.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            self.pump();
+            self.pump(false);
             {
                 let mut state = self.lock();
-                if let Some(position) = state.failure_order.iter().position(|&part| {
-                    let (id, n) = span(part);
-                    id + n <= before
-                }) {
+                if let Some(position) = state
+                    .failure_order
+                    .iter()
+                    .position(|&(level, id)| level == 0 && id < before)
+                {
                     let part = state.failure_order.remove(position);
                     if let Some(error) = state.failed.remove(&part) {
-                        if part.0 > 0 {
-                            enqueue_parent(&mut state, (part.0 - 1, part.1 * 2));
-                        }
+                        // Queue the leaf again so other waiters see it retried
+                        // rather than unbuilt with no work behind it.
+                        enqueue_leaves(&mut state, self.inner.config.jobs);
+                        drop(state);
+                        self.inner.changed.notify_waiters();
                         return Err(error);
                     }
                 }
-                if state.leaves.range(..before).next().is_none()
-                    && !state.running.iter().any(|&part| {
-                        let (id, n) = span(part);
-                        id + n <= before
-                    })
-                    && !state.ready.iter().any(|&(_, Reverse(level), index)| {
-                        let (id, n) = span((level, index));
-                        id + n <= before
-                    })
-                {
+                if state.leaves.range(..before).next().is_none() {
                     return Ok(());
                 }
             }
@@ -527,135 +554,250 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
         }
     }
 
-    fn pump(&self) {
+    /// Unii's `pump`: start ready work until the window or the worker limit
+    /// stops it. Sources that already fit in a node need no model call and
+    /// are stored at once, a pass at a time, since storing one can make its
+    /// parent ready. The views are fitted once at the end, when anything was
+    /// stored or `fit` is set (after a model job, like Unii's `job`).
+    fn pump(&self, fit: bool) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let mut state = self.lock();
-        state.workers.retain(|worker| !worker.is_finished());
-        if state.closed {
-            return;
-        }
-        while state.running.len() < self.inner.config.jobs {
-            let Some(k) = state.ready.pop_first() else {
-                break;
-            };
-            let p = (k.1 .0, k.2);
-            if state.nodes.contains_key(&p)
-                || state.running.contains(&p)
-                || state.failed.contains_key(&p)
-            {
-                continue;
-            }
-            state.running.insert(p);
-            let memory = self.clone();
-            let worker = handle.spawn(async move {
-                memory.build(p).await;
-            });
-            state.workers.push(worker);
+        let changed = self.pump_locked(&mut state, &handle, fit);
+        drop(state);
+        if changed {
+            self.inner.changed.notify_waiters();
         }
     }
-    async fn build(&self, p: Part) {
-        let result = self.build_node(p).await;
+
+    /// `pump` with the state lock held; returns whether waiters should look again.
+    fn pump_locked(&self, state: &mut State, handle: &tokio::runtime::Handle, fit: bool) -> bool {
+        state.workers.retain(|worker| !worker.is_finished());
+        if state.closed {
+            return false;
+        }
+        let parked = state.failure_order.len();
+        let mut stored = false;
+        loop {
+            let free = self.starts(state, handle);
+            if free.is_empty() {
+                break;
+            }
+            stored |= self.store(state, free);
+        }
+        if stored || fit {
+            self.fit(state);
+        }
+        // A parked failure is news too: a waiter may be blocked on that leaf.
+        stored || fit || state.failure_order.len() > parked
+    }
+
+    /// One pass of Unii's `starts`: ready parts at or before the `jobs`-th
+    /// unbuilt message, oldest first and higher levels first. Only model
+    /// jobs count against `jobs`; short sources are returned to store.
+    fn starts(&self, state: &mut State, handle: &tokio::runtime::Handle) -> Vec<(Part, String)> {
+        let jobs = self.inner.config.jobs;
+        let end = state
+            .leaves
+            .iter()
+            .nth(jobs - 1)
+            .copied()
+            .unwrap_or(state.count);
+        let candidates: Vec<Ready> = state
+            .ready
+            .iter()
+            .take_while(|k| k.0 <= end)
+            .copied()
+            .collect();
+        let mut free = Vec::new();
+        for k in candidates {
+            if state.running.len() >= jobs {
+                break;
+            }
+            let p = (k.1 .0, k.2);
+            if state.running.contains(&p) {
+                continue;
+            }
+            state.ready.remove(&k);
+            if state.nodes.contains_key(&p) || state.failed.contains_key(&p) {
+                continue;
+            }
+            match self.source(state, p) {
+                Ok(source) if source.len() <= self.inner.config.node_bytes => {
+                    free.push((p, source));
+                }
+                Ok(source) => {
+                    // The context is taken now, as Unii's job builds its
+                    // prompt when started, before this pass stores anything.
+                    let view = render(&state.seen, &state.nodes, ctx(p), true);
+                    state.running.insert(p);
+                    let memory = self.clone();
+                    let worker = handle.spawn(async move {
+                        memory.build(p, source, view).await;
+                    });
+                    state.workers.push(worker);
+                }
+                Err(e) => {
+                    state.failure_order.push(p);
+                    state.failed.insert(p, e);
+                }
+            }
+        }
+        free
+    }
+
+    /// Unii's `store`: saves built nodes, counts each into the views it is a
+    /// line of, and queues parents whose halves are both built. Returns
+    /// whether any node was stored.
+    fn store(&self, state: &mut State, built: Vec<(Part, String)>) -> bool {
+        // Measure what SQLite keeps, so a reopened view counts the same bytes.
+        let built: Vec<(Part, String)> = built
+            .into_iter()
+            .map(|(p, text)| (p, storage::redact_callback_tokens(&text).into_owned()))
+            .collect();
+        let nodes: Vec<MemoryNode> = built
+            .iter()
+            .map(|(p, text)| MemoryNode {
+                l: p.0,
+                i: p.1,
+                size: text.len() as u64,
+                text: text.clone(),
+            })
+            .collect();
+        // The pass is stored as one group; a failed write parks all of it for retry.
+        if let Err(e) = self.inner.store.put_nodes(&nodes, &[]) {
+            let message = e.to_string();
+            let mut error = Some(MemoryError::from(e));
+            for (p, _) in built {
+                let e = error
+                    .take()
+                    .unwrap_or_else(|| MemoryError::Invalid(message.clone()));
+                state.failure_order.push(p);
+                state.failed.insert(p, e);
+            }
+            return false;
+        }
+        let mut stored = false;
+        for (p, text) in built {
+            if in_view(&state.chat, p) {
+                state.chat_size += text.len();
+            }
+            if in_view(&state.seen, p) {
+                state.seen_size += text.len();
+            }
+            state.nodes.insert(p, text);
+            if p.0 == 0 {
+                state.leaves.remove(&p.1);
+            }
+            enqueue_parent(state, p);
+            stored = true;
+        }
+        enqueue_leaves(state, self.inner.config.jobs);
+        stored
+    }
+
+    /// Unii's `fit` after builds (`next` false; see `update_view`), saving
+    /// any view change. A failed save leaves the views for the next fit.
+    fn fit(&self, state: &mut State) {
+        let (chat, chat_size, chat_change) = refit(
+            ViewName::Chat,
+            &state.chat,
+            &[],
+            state.chat_size,
+            &state.nodes,
+            state.count,
+            self.inner.config.chat_high,
+            false,
+        );
+        let (seen, seen_size, seen_change) = refit(
+            ViewName::Seen,
+            &state.seen,
+            &[],
+            state.seen_size,
+            &state.nodes,
+            state.count,
+            self.inner.config.seen_high,
+            false,
+        );
+        if chat.is_none() && seen.is_none() {
+            return;
+        }
+        let merged = !chat_change.removed.is_empty();
+        if self
+            .inner
+            .store
+            .put_nodes(&[], &[chat_change, seen_change])
+            .is_err()
+        {
+            return;
+        }
+        if let Some(chat) = chat {
+            state.chat = chat;
+        }
+        if let Some(seen) = seen {
+            state.seen = seen;
+        }
+        state.chat_size = chat_size;
+        state.seen_size = seen_size;
+        if merged {
+            state.chat_generation += 1;
+        }
+    }
+
+    /// A node's source: the message for a leaf, or its two halves' lines.
+    fn source(&self, state: &State, p: Part) -> Result<String, MemoryError> {
+        if p.0 == 0 {
+            let m = self
+                .inner
+                .store
+                .message(p.1)?
+                .ok_or_else(|| MemoryError::Invalid(format!("No message {}.", p.1)))?;
+            return Ok(show(&m));
+        }
+        let left = (p.0 - 1, p.1 * 2);
+        let right = (p.0 - 1, p.1 * 2 + 1);
+        Ok(format!(
+            "{}\n{}",
+            flat(&state.nodes[&left]),
+            flat(&state.nodes[&right])
+        ))
+    }
+
+    /// Unii's `job`: compacts one oversize source with the model, stores the
+    /// line, then pumps and fits.
+    async fn build(&self, p: Part, source: String, view: String) {
+        let result = self.compact(p, &source, &view).await;
+        let handle = tokio::runtime::Handle::current();
         let mut state = self.lock();
         state.running.remove(&p);
         match result {
             Ok(text) => {
-                let node = MemoryNode {
-                    l: p.0,
-                    i: p.1,
-                    size: text.len() as u64,
-                    text: text.clone(),
-                };
-                let (chat, chat_size, chat_change) = plan_view(
-                    ViewName::Chat,
-                    &state.chat,
-                    state.chat_size,
-                    &state.nodes,
-                    state.count,
-                    self.inner.config.chat_high,
-                    (p, &text),
-                );
-                let (seen, seen_size, seen_change) = plan_view(
-                    ViewName::Seen,
-                    &state.seen,
-                    state.seen_size,
-                    &state.nodes,
-                    state.count,
-                    self.inner.config.seen_high,
-                    (p, &text),
-                );
-                let result = self
-                    .inner
-                    .store
-                    .put_node(node, &[chat_change.clone(), seen_change])
-                    .map_err(MemoryError::from);
-                if result.is_ok() {
-                    state.nodes.insert(p, text);
-                    if let Some(chat) = chat {
-                        if !chat_change.removed.is_empty() {
-                            state.chat_generation += 1;
-                        }
-                        state.chat = chat;
-                    }
-                    if let Some(seen) = seen {
-                        state.seen = seen;
-                    }
-                    state.chat_size = chat_size;
-                    state.seen_size = seen_size;
-                    if p.0 == 0 {
-                        state.leaves.remove(&p.1);
-                    }
-                }
-                if let Err(e) = result {
-                    state.failure_order.push(p);
-                    state.failed.insert(p, e);
-                } else {
-                    enqueue_parent(&mut state, p);
-                    enqueue_leaves(&mut state, self.inner.config.jobs);
-                }
+                self.store(&mut state, vec![(p, text)]);
             }
             Err(e) => {
                 state.failure_order.push(p);
                 state.failed.insert(p, e);
             }
         }
+        // Store, pump and fit under one lock so a waiting turn never sees the
+        // node before its batch decision.
+        self.pump_locked(&mut state, &handle, true);
         drop(state);
         self.inner.changed.notify_waiters();
-        self.pump();
     }
-    async fn build_node(&self, p: Part) -> Result<String, MemoryError> {
-        let source = {
-            let state = self.lock();
-            let source = if p.0 == 0 {
-                let m = self
-                    .inner
-                    .store
-                    .message(p.1)?
-                    .ok_or_else(|| MemoryError::Invalid(format!("No message {}.", p.1)))?;
-                show(&m)
-            } else {
-                let left = (p.0 - 1, p.1 * 2);
-                let right = (p.0 - 1, p.1 * 2 + 1);
-                format!(
-                    "{}\n{}",
-                    flat(&state.nodes[&left]),
-                    flat(&state.nodes[&right])
-                )
-            };
-            source
-        };
-        if source.len() <= self.inner.config.node_bytes {
-            return Ok(source);
-        }
-        let view = {
-            let state = self.lock();
-            render(&state.seen, &state.nodes, ctx(p), true)
-        };
+
+    /// Unii's `build`: asks the model for one line, retrying while it is over
+    /// the limit, up to `tries`. Keeps the shortest line as is (a few bytes
+    /// over is fine: the view measures real sizes). A blank reply or a failed
+    /// retry stops the loop but keeps any earlier line; with no line at all,
+    /// a context overflow, refusal or blank reply cuts the source, and any
+    /// other error fails the node for a later retry.
+    async fn compact(&self, p: Part, source: &str, view: &str) -> Result<String, MemoryError> {
         let limit = self.inner.config.node_bytes;
         let ruler = "-".repeat(limit);
         let words = limit * 70 / 512;
-        let escaped_source = storage::escape(&source);
+        let escaped_source = storage::escape(source);
         let task = if p.0 == 0 {
             format!(
                 "Compaction: compress message {} into one line of at most {limit} bytes\n(about {words} words), the length of this ruler:\n{ruler}\n<input>\n{escaped_source}\n</input>",
@@ -684,22 +826,31 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
                     cache_key: None,
                     kind: Some(storage::UsageKind::Compaction),
                 })
-                .await?;
-            let answer = response.text.trim();
-            if !answer.is_empty() && shortest.as_ref().is_none_or(|s| answer.len() < s.len()) {
-                shortest = Some(answer.to_owned());
+                .await;
+            let answer = match response {
+                Ok(response) => response.text.trim().to_owned(),
+                // Overflow and refusal can never succeed on retry: Unii's
+                // terminal `fail`, which cuts the source rather than parking the node.
+                Err(llm::LlmError::ContextOverflow(_) | llm::LlmError::Refused(_)) => break,
+                Err(e) if shortest.is_none() => return Err(e.into()),
+                Err(_) => break,
+            };
+            if answer.is_empty() {
+                break;
             }
-            if !answer.is_empty() && answer.len() <= self.inner.config.node_bytes {
+            if shortest.as_ref().is_none_or(|s| answer.len() < s.len()) {
+                shortest = Some(answer.clone());
+            }
+            if answer.len() <= limit {
                 break;
             }
             prompt = format!(
                 "{base}\n\nToo long: your last line for this <input> was {} bytes,\nover the {limit}-byte limit. Write the whole line again, cutting just\nenough of the least valuable items to fit before this cut:\n{}| ← LIMIT",
                 answer.len(),
-                storage::escape(clip_bytes(answer, limit))
+                storage::escape(clip_bytes(&answer, limit))
             );
         }
-        let answer = shortest.unwrap_or_else(|| flat(&source));
-        Ok(clip_bytes(&answer, self.inner.config.node_bytes).to_owned())
+        Ok(shortest.unwrap_or_else(|| clip_bytes(&flat(source), limit).to_owned()))
     }
 }
 fn utc_date() -> Result<String, MemoryError> {
