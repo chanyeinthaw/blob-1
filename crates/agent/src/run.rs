@@ -1754,6 +1754,25 @@ pub struct BotRegistry {
     /// env name is unique per node, so one lock per env = one per node.
     skill_sync: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     bots: Arc<tokio::sync::RwLock<HashMap<String, BotEntry>>>,
+    /// Writes to web-visible bot data, fanned out to `/ws` clients.
+    changes: tokio::sync::broadcast::Sender<Change>,
+}
+
+/// A bot's web-visible data changed; `/ws` clients refetch `topic`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Change {
+    pub bot_id: String,
+    pub topic: &'static str,
+}
+
+/// The web data topic a bot-store table feeds, or `None` when no page shows it.
+fn change_topic(table: &str) -> Option<&'static str> {
+    match table {
+        "schedules" | "watches" | "checkin" | "clock" => Some("schedule"),
+        "usage_events" => Some("usage"),
+        "webhooks" => Some("webhooks"),
+        _ => None,
+    }
 }
 
 impl BotRegistry {
@@ -1779,7 +1798,14 @@ impl BotRegistry {
             nodes,
             skill_sync: Arc::new(dashmap::DashMap::new()),
             bots: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            changes: tokio::sync::broadcast::channel(256).0,
         }
+    }
+
+    /// Subscribes to bot data changes. Model tools, tasks, and the web all
+    /// write through the bot stores, so every source shows up here.
+    pub fn changes(&self) -> tokio::sync::broadcast::Receiver<Change> {
+        self.changes.subscribe()
     }
 
     fn bot_dir(&self, bot_id: &str) -> PathBuf {
@@ -1837,6 +1863,17 @@ impl BotRegistry {
             let pinned = harness::PinnedWorkspace::open(&ws)?;
             (store, ws, pinned)
         };
+        let changes = self.changes.clone();
+        let bot_id = bot.id.clone();
+        store.on_change(move |table| {
+            if let Some(topic) = change_topic(table) {
+                // No subscribers is the normal case without an open web UI.
+                let _ = changes.send(Change {
+                    bot_id: bot_id.clone(),
+                    topic,
+                });
+            }
+        })?;
         Ok(BotEntry {
             handle: BotHandle {
                 id: bot.id.clone(),

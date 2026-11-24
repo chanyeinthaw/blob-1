@@ -735,3 +735,15 @@ export const ReplyFrame = Schema.Union([
   }),
 ])
 export type ReplyFrame = typeof ReplyFrame.Type
+
+/** Topics of bot data the server pushes `changed` frames for. */
+export const ChangeTopic = Schema.Literals(['schedule', 'usage', 'webhooks'])
+export type ChangeTopic = typeof ChangeTopic.Type
+
+/** Server push on `/ws?changes=1`: a bot's data under `topic` changed, so refetch it. */
+export const ChangeFrame = Schema.Struct({
+  type: Schema.Literal('changed'),
+  botId: Schema.String,
+  topic: ChangeTopic,
+})
+export type ChangeFrame = typeof ChangeFrame.Type

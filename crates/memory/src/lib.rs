@@ -391,6 +391,11 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
     pub fn count(&self) -> Result<u64, MemoryError> {
         Ok(self.lock().count)
     }
+    /// Waits until every message before `before` has its leaf summary, so
+    /// `view` shows them all. Pair merges only shrink the view (until one is
+    /// built, the view keeps its two children), so they finish in the
+    /// background instead of holding up the caller's turn, unless the chat
+    /// view is over `chat_high`: then pending merges are awaited too.
     pub async fn settle(&self, before: u64) -> Result<(), MemoryError> {
         {
             let mut state = self.lock();
@@ -403,9 +408,16 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
             self.pump();
             {
                 let mut state = self.lock();
+                // Leaf failures always matter; a failed merge only does when
+                // the view is over budget, since no ancestor can shrink it.
+                let over_budget = state.chat_size > self.inner.config.chat_high;
                 if let Some(position) = state.failure_order.iter().position(|&part| {
                     let (id, n) = span(part);
-                    id + n <= before
+                    if part.0 == 0 {
+                        id < before
+                    } else {
+                        over_budget && id + n <= before
+                    }
                 }) {
                     let part = state.failure_order.remove(position);
                     if let Some(error) = state.failed.remove(&part) {
@@ -415,15 +427,20 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
                         return Err(error);
                     }
                 }
-                if state.leaves.range(..before).next().is_none()
-                    && !state.running.iter().any(|&part| {
-                        let (id, n) = span(part);
-                        id + n <= before
-                    })
-                    && !state.ready.iter().any(|&(_, Reverse(level), index)| {
-                        let (id, n) = span((level, index));
-                        id + n <= before
-                    })
+                let leaves_done = state.leaves.range(..before).next().is_none()
+                    && !state
+                        .running
+                        .iter()
+                        .any(|&(level, id)| level == 0 && id < before);
+                let merges_pending = state.running.iter().any(|&part| {
+                    let (id, n) = span(part);
+                    id + n <= before
+                }) || state.ready.iter().any(|&(_, Reverse(level), index)| {
+                    let (id, n) = span((level, index));
+                    id + n <= before
+                });
+                if leaves_done
+                    && (state.chat_size <= self.inner.config.chat_high || !merges_pending)
                 {
                     return Ok(());
                 }
@@ -536,10 +553,22 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
         if state.closed {
             return;
         }
-        while state.running.len() < self.inner.config.jobs {
-            let Some(k) = state.ready.pop_first() else {
+        let jobs = self.inner.config.jobs;
+        while state.running.len() < jobs {
+            // Leaves first: `settle` waits on them, while merges only shrink
+            // the view. Merges never take the last slot (with more than one),
+            // so a new leaf can always start without waiting behind a merge chain.
+            let merges_running = state.running.iter().filter(|p| p.0 > 0).count();
+            let leaf = state.ready.iter().find(|k| k.1 .0 == 0).copied();
+            let next = leaf.or_else(|| {
+                (jobs == 1 || merges_running + 1 < jobs)
+                    .then(|| state.ready.first().copied())
+                    .flatten()
+            });
+            let Some(k) = next else {
                 break;
             };
+            state.ready.remove(&k);
             let p = (k.1 .0, k.2);
             if state.nodes.contains_key(&p)
                 || state.running.contains(&p)

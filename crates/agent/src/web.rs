@@ -6,7 +6,7 @@ use axum::{
     body::Body,
     extract::{
         ws::{CloseFrame, Message, WebSocket},
-        Path as AxumPath, Query, State, WebSocketUpgrade,
+        Path as AxumPath, Query, RawQuery, State, WebSocketUpgrade,
     },
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     response::{IntoResponse, Redirect, Response},
@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use storage::{
     BotStore, CallbackStore, Checkin, CheckinStore, ConfigStore, McpServer, McpStore, McpTransport,
@@ -259,6 +259,7 @@ async fn logout(State(store): State<Context>, headers: HeaderMap) -> Response {
 async fn ws(
     State(store): State<Context>,
     headers: HeaderMap,
+    RawQuery(query): RawQuery,
     upgrade: WebSocketUpgrade,
 ) -> Response {
     let cookie = match authenticated(&store, &headers) {
@@ -273,8 +274,11 @@ async fn ws(
     if !origin_ok(origin.as_ref(), &headers, store.public_url.as_ref()) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    // Clients opt in to `changed` frames so tabs running an older build,
+    // which close on unknown frames, keep working until they reload.
+    let push_changes = query.as_deref() == Some("changes=1");
     let mut response = upgrade
-        .on_upgrade(move |socket| socket_loop(socket, store, headers))
+        .on_upgrade(move |socket| socket_loop(socket, store, headers, push_changes))
         .into_response();
     response.headers_mut().insert(header::SET_COOKIE, cookie);
     response
@@ -1828,7 +1832,7 @@ async fn handle(
         .await
         .map_err(|e| e.to_string())
 }
-async fn socket_loop(socket: WebSocket, ctx: Context, headers: HeaderMap) {
+async fn socket_loop(socket: WebSocket, ctx: Context, headers: HeaderMap, push_changes: bool) {
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let writer = tokio::spawn(async move {
@@ -1837,6 +1841,13 @@ async fn socket_loop(socket: WebSocket, ctx: Context, headers: HeaderMap) {
                 break;
             }
         }
+    });
+    let pusher = push_changes.then(|| {
+        tokio::spawn(push_changes_loop(
+            ctx.clone(),
+            headers.clone(),
+            tx.clone(),
+        ))
     });
     while let Some(Ok(message)) = receiver.next().await {
         let text = match message {
@@ -1877,7 +1888,52 @@ async fn socket_loop(socket: WebSocket, ctx: Context, headers: HeaderMap) {
         });
     }
     drop(tx);
+    if let Some(pusher) = pusher {
+        pusher.abort();
+    }
     writer.abort();
+}
+
+/// Forwards bot data changes as `{"type":"changed","botId","topic"}` frames.
+/// A burst (one row per write, a schedule plus its watch, a run's usage rows)
+/// collapses into one frame per bot and topic after a short quiet window,
+/// which also lets the triggering transaction commit before clients refetch.
+async fn push_changes_loop(
+    ctx: Context,
+    headers: HeaderMap,
+    tx: tokio::sync::mpsc::UnboundedSender<Message>,
+) {
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+    let mut changes = ctx.bots.changes();
+    loop {
+        let first = match changes.recv().await {
+            Ok(change) => change,
+            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Closed) => return,
+        };
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let mut batch = std::collections::BTreeSet::from([first]);
+        loop {
+            match changes.try_recv() {
+                Ok(change) => {
+                    batch.insert(change);
+                }
+                Err(TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        // Only a still-valid session hears about changes; the request path
+        // closes the socket on its next frame.
+        if !matches!(authenticated(&ctx, &headers), Ok(Some(_))) {
+            continue;
+        }
+        for change in batch {
+            let frame = json!({"type": "changed", "botId": change.bot_id, "topic": change.topic});
+            if tx.send(Message::Text(frame.to_string().into())).is_err() {
+                return;
+            }
+        }
+    }
 }
 const PUBLIC_FILE_CHUNK_BYTES: usize = 64 * 1024;
 

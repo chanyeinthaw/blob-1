@@ -2,9 +2,9 @@ import { Api, apiLayer } from '@blob-1/client/api'
 import { mockTransport } from '@blob-1/client/mock'
 import { sessionLive, sessionMock } from '@blob-1/client/session'
 import { wsTransport } from '@blob-1/client/ws'
-import type { RequestPayload, RequestType } from '@blob-1/contracts'
+import type { ChangeTopic, RequestPayload, RequestType } from '@blob-1/contracts'
 import { AtomMachine } from '@typeonce/effect-machine/reactivity'
-import { Effect, Layer } from 'effect'
+import { Effect, Layer, Stream } from 'effect'
 import { Atom } from 'effect/reactivity'
 
 import { notifyLive } from './notify'
@@ -100,3 +100,33 @@ export function machineAtomsForBot(scopeKey: string): BoundMachineAtoms {
   }
   return bound
 }
+
+const changeCountFamily = Atom.family((key: string) => {
+  const sep = key.lastIndexOf(':')
+  const botId = key.slice(0, sep)
+  const topic = key.slice(sep + 1)
+  return AppRuntime.atom(
+    Stream.unwrap(
+      Effect.map(Api, api =>
+        api.changes.pipe(
+          Stream.filter(
+            change =>
+              change.type === 'resync' || (change.botId === botId && change.topic === topic),
+          ),
+          Stream.scan(
+            () => 0,
+            (count: number) => count + 1,
+          ),
+        ),
+      ),
+    ),
+  ).pipe(Atom.keepAlive)
+})
+
+/**
+ * Counts server `changed` pushes for a bot and topic, plus reconnects, starting
+ * at 0. Data atoms read it with `get` so the model's edits refetch them without
+ * a page reload.
+ */
+export const changeCountAtom = (instanceKey: string, topic: ChangeTopic) =>
+  changeCountFamily(`${botIdFromInstanceKey(instanceKey)}:${topic}`)

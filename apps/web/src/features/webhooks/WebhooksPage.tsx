@@ -5,7 +5,7 @@ import { MachineState, useMachineResult } from '@typeonce/effect-machine-react'
 import { Option } from 'effect'
 import { AsyncResult } from 'effect/reactivity'
 import { Copy, Plus, RefreshCw, Trash2, Webhook as WebhookIcon } from 'lucide-react'
-import { type FormEvent, useEffect, useState } from 'react'
+import { type FormEvent, useCallback, useEffect, useState } from 'react'
 import { toast } from 'sonner'
 
 import { ConfirmDialog } from '~/components/ConfirmDialog'
@@ -18,7 +18,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '~/components/ui/tooltip
 import { useBotInstanceKey, useBotsRoot } from '~/features/bots/CreateBotDialog'
 import { machineAtomsForBot } from '~/lib/runtime'
 import { createPersistentMachineContext } from '~/lib/shellMachines'
-import { matchCached } from '~/lib/useBackgroundRefresh'
+import { matchCached, useChangeRefresh } from '~/lib/useBackgroundRefresh'
 
 import { WebhooksEvents, type WebhooksInput, WebhooksMachine } from './webhooksMachine'
 import { webhooksPageAtomFor } from './webhooksState'
@@ -88,7 +88,7 @@ export function WebhooksPage(props: WebhooksPageProps) {
     ),
     onSuccess: payload => (
       <WebhooksOwner.Provider input={payload} scopeKey={instanceKey}>
-        <WebhooksContent botId={props.botId} botName={botName} />
+        <WebhooksContent botId={props.botId} botName={botName} instanceKey={instanceKey} />
       </WebhooksOwner.Provider>
     ),
   })
@@ -97,6 +97,7 @@ export function WebhooksPage(props: WebhooksPageProps) {
 interface WebhooksContentProps {
   readonly botId: string
   readonly botName: string
+  readonly instanceKey: string
 }
 
 function WebhooksContent(props: WebhooksContentProps) {
@@ -105,6 +106,8 @@ function WebhooksContent(props: WebhooksContentProps) {
   useEffect(() => {
     send(WebhooksEvents.Refresh())
   }, [send])
+  const refresh = useCallback(() => send(WebhooksEvents.Refresh()), [send])
+  useChangeRefresh(props.instanceKey, 'webhooks', refresh)
 
   const isRefreshing = AsyncResult.getOrElse(
     useMachineResult(AtomMachine.matches(machine, 'Refresh.Working')),

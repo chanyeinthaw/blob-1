@@ -12,7 +12,7 @@ import { AtomMachine } from '@typeonce/effect-machine/reactivity'
 import { MachineState, useMachineResult } from '@typeonce/effect-machine-react'
 import { AsyncResult } from 'effect/reactivity'
 import { ChevronLeft, ChevronRight, Clock, Eye, Globe, Plus, Repeat, Trash2 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import { ConfirmDialog } from '~/components/ConfirmDialog'
 import {
@@ -49,7 +49,7 @@ import { ToggleGroup, ToggleGroupItem } from '~/components/ui/toggle-group'
 import { useBotInstanceKey, useBotsRoot } from '~/features/bots/CreateBotDialog'
 import { machineAtomsForBot } from '~/lib/runtime'
 import { createPersistentMachineContext } from '~/lib/shellMachines'
-import { matchCached } from '~/lib/useBackgroundRefresh'
+import { matchCached, useChangeRefresh } from '~/lib/useBackgroundRefresh'
 import { cn } from '~/lib/utils'
 
 import { MonthCalendar, WeekCalendar } from './CalendarGrid'
@@ -158,6 +158,7 @@ function SchedulesMount(props: {
   const [range] = useState(() => initialWeekRange(props.state.timezone))
   return (
     <SchedulesOwner.Provider input={{ state: props.state, range }} scopeKey={props.instanceKey}>
+      <ChangeRefreshWatcher instanceKey={props.instanceKey} />
       <SchedulesWorkspace
         botId={props.botId}
         botName={props.botName}
@@ -340,6 +341,15 @@ function earliestDueTimestamp(data: ScheduleState): number | null {
     }
   }
   return earliest
+}
+
+/** Refreshes the schedules machine when the server pushes a change (model tools, tasks, other tabs). */
+function ChangeRefreshWatcher(props: { readonly instanceKey: string }) {
+  const machine = SchedulesOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  const refresh = useCallback(() => send(SchedulesEvents.Refresh()), [send])
+  useChangeRefresh(props.instanceKey, 'schedule', refresh)
+  return null
 }
 
 function DueRefreshWatcher(props: { readonly data: ScheduleState; readonly nowSeconds: number }) {

@@ -97,6 +97,8 @@ export const WebhooksStates = Machine.state({
     inFlightWrites: Schema.Finite,
     mutationSeq: Schema.Finite,
     createSeq: Schema.Finite,
+    /** A refresh was requested; `Refresh` runs it once no fetch or write is in flight. */
+    refreshQueued: Schema.Boolean,
   },
   states: {
     Refresh: {
@@ -151,8 +153,15 @@ export const WebhooksMachine = Machine.make({
     inFlightWrites: 0,
     mutationSeq: 0,
     createSeq: 0,
+    refreshQueued: false,
   }),
   on: {
+    // Queued so a server push during a fetch or local write is retained and
+    // replayed once the machine is idle.
+    Refresh: {
+      update: 'root',
+      data: ({ root }) => ({ ...root, refreshQueued: true }),
+    },
     SetEnabled: {
       update: 'root',
       data: ({ root, event }) => {
@@ -174,12 +183,15 @@ export const WebhooksMachine = Machine.make({
       initial: { target: 'Refresh.Idle' },
       states: {
         Idle: {
-          on: {
-            Refresh: {
-              target: 'Refresh.Working',
-              guard: ({ root }) => root.inFlightWrites === 0 && root.toggleJobs.length === 0,
-              data: ({ root }) => ({ mutationSeq: root.mutationSeq }),
-            },
+          always: {
+            guard: ({ root }) =>
+              root.refreshQueued && root.inFlightWrites === 0 && root.toggleJobs.length === 0,
+            target: 'Refresh.Working',
+            update: 'root',
+            data: ({ root }) => ({
+              target: { mutationSeq: root.mutationSeq },
+              update: { ...root, refreshQueued: false },
+            }),
           },
         },
         Working: {
@@ -189,13 +201,16 @@ export const WebhooksMachine = Machine.make({
               target: 'Refresh.Idle',
               update: 'root',
               data: ({ root, state, output }) => {
+                if (output === null) {
+                  return { target: undefined, update: root }
+                }
                 if (
-                  output === null ||
                   state.mutationSeq !== root.mutationSeq ||
                   root.inFlightWrites > 0 ||
                   root.toggleJobs.length > 0
                 ) {
-                  return { target: undefined, update: root }
+                  // A local write superseded this snapshot; fetch again once writes finish.
+                  return { target: undefined, update: { ...root, refreshQueued: true } }
                 }
                 return {
                   target: undefined,

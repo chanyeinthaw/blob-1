@@ -50,6 +50,18 @@ function scheduleDefinitionsChanged(
   return false
 }
 
+/** The check-in to show: a queued or in-flight local edit wins over the server's. */
+function effectiveCheckin(
+  pending: PendingCheckin | null,
+  inFlight: PendingEdit | null,
+  server: ScheduleState['checkin'],
+): ScheduleState['checkin'] {
+  if (pending !== null) return pending.kind === 'set' ? pending.config : null
+  if (inFlight?.kind === 'setCheckin') return inFlight.config
+  if (inFlight?.kind === 'clearCheckin') return null
+  return server
+}
+
 function applyScheduleState<
   T extends {
     readonly serverData: ScheduleState
@@ -59,30 +71,24 @@ function applyScheduleState<
     readonly inFlightEdit: PendingEdit | null
     readonly mutationSeq: number
     readonly occurrencesVersion: number
+    readonly refreshQueued: boolean
   },
 >(root: T, next: ScheduleState, isMutation: boolean): T {
   const effectiveTimezone =
     root.pendingTimezone ??
     (root.inFlightEdit?.kind === 'timezone' ? root.inFlightEdit.timezone : next.timezone)
-  const effectiveCheckin =
-    root.pendingCheckin !== null
-      ? root.pendingCheckin.kind === 'set'
-        ? root.pendingCheckin.config
-        : null
-      : root.inFlightEdit?.kind === 'setCheckin'
-        ? root.inFlightEdit.config
-        : root.inFlightEdit?.kind === 'clearCheckin'
-          ? null
-          : next.checkin
   return {
     ...root,
     serverData: next,
     data: {
       ...next,
       timezone: effectiveTimezone,
-      checkin: effectiveCheckin,
+      checkin: effectiveCheckin(root.pendingCheckin, root.inFlightEdit, next.checkin),
     },
     mutationSeq: isMutation ? root.mutationSeq + 1 : root.mutationSeq,
+    // A write's reply can be older than a snapshot fetched after a push
+    // while it was in flight; one follow-up fetch reconciles them.
+    refreshQueued: isMutation || root.refreshQueued,
     occurrencesVersion: scheduleDefinitionsChanged(root.serverData.schedules, next.schedules)
       ? root.occurrencesVersion + 1
       : root.occurrencesVersion,
@@ -195,6 +201,8 @@ export const SchedulesStates = Machine.state({
     mutationSeq: Schema.Finite,
     /** Incremented when schedule definitions change so `Range` reloads the visible range. */
     occurrencesVersion: Schema.Finite,
+    /** A refresh was requested; `Sync` runs it as soon as no fetch is in flight. */
+    refreshQueued: Schema.Boolean,
     scheduleDialogOpen: Schema.Boolean,
     schedulePrefillWhen: Schema.NullOr(Schema.String),
     selectedScheduleId: Schema.NullOr(Schema.String),
@@ -303,12 +311,19 @@ export const SchedulesMachine = Machine.make({
     visibleRange: input.range,
     mutationSeq: 0,
     occurrencesVersion: 0,
+    refreshQueued: false,
     scheduleDialogOpen: false,
     schedulePrefillWhen: null,
     selectedScheduleId: null,
     watchDialogOpen: false,
   }),
   on: {
+    // Queued rather than handled by `Sync.Idle`, so a push that lands mid-fetch
+    // still triggers one trailing refresh instead of being dropped.
+    Refresh: {
+      update: 'root',
+      data: ({ root }) => ({ ...root, refreshQueued: true }),
+    },
     SetTimezone: {
       update: 'root',
       data: ({ root, event }) => ({
@@ -455,11 +470,19 @@ export const SchedulesMachine = Machine.make({
       initial: { target: 'Sync.Idle' },
       states: {
         Idle: {
-          on: {
-            Refresh: {
-              target: 'Sync.Working',
-              data: ({ root }) => ({ mutationSeq: root.mutationSeq }),
-            },
+          // Waits out local edits so the fetch can't race an in-flight write.
+          always: {
+            guard: ({ root }) =>
+              root.refreshQueued &&
+              root.inFlightEdit === null &&
+              root.pendingTimezone === null &&
+              root.pendingCheckin === null,
+            target: 'Sync.Working',
+            update: 'root',
+            data: ({ root }) => ({
+              target: { mutationSeq: root.mutationSeq },
+              update: { ...root, refreshQueued: false },
+            }),
           },
         },
         Working: {
@@ -471,9 +494,12 @@ export const SchedulesMachine = Machine.make({
               data: ({ root, state, output }) => ({
                 target: undefined,
                 update:
-                  output === null || state.mutationSeq !== root.mutationSeq
+                  output === null
                     ? root
-                    : applyScheduleState(root, output, false),
+                    : state.mutationSeq !== root.mutationSeq
+                      ? // A local edit superseded this snapshot; fetch again once it settles.
+                        { ...root, refreshQueued: true }
+                      : applyScheduleState(root, output, false),
               }),
             },
           },

@@ -1,6 +1,7 @@
 import { Context, Effect, Layer, Ref, Schema, Stream } from 'effect'
 
 import {
+  type ChangeFrame,
   type ReplyFrame,
   type ReplyPayload,
   type RequestFrame,
@@ -13,6 +14,12 @@ export class ApiError extends Schema.TaggedError<ApiError>()('ApiError', {
   message: Schema.String,
 }) {}
 
+/**
+ * A server `changed` push, or `resync` after the socket reconnects: pushes
+ * missed while offline are lost, so everything shown may be stale.
+ */
+export type DataChange = ChangeFrame | { readonly type: 'resync' }
+
 export type ApiClient = Readonly<{
   request: <K extends RequestType>(
     type: K,
@@ -20,6 +27,8 @@ export type ApiClient = Readonly<{
   ) => Effect.Effect<ReplyPayload<K>, ApiError>
   status: Stream.Stream<boolean>
   unauthorized: Stream.Stream<boolean>
+  /** Server pushes that a bot's data changed; refetch what the topic covers. */
+  changes: Stream.Stream<DataChange>
 }>
 
 export class Api extends Context.Service<Api, ApiClient>()('@blob-1/client/api') {}
@@ -28,6 +37,7 @@ export type TransportService = Readonly<{
   send: (frame: RequestFrame) => Effect.Effect<ReplyFrame, ApiError>
   status: Stream.Stream<boolean>
   unauthorized: Stream.Stream<boolean>
+  changes: Stream.Stream<DataChange>
 }>
 
 export class Transport extends Context.Service<Transport, TransportService>()(
@@ -62,6 +72,7 @@ const makeApi = Effect.gen(function* () {
     request,
     status: transport.status,
     unauthorized: transport.unauthorized,
+    changes: transport.changes,
   })
 })
 

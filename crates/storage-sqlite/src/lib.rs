@@ -428,6 +428,20 @@ impl SqliteStorage {
         })
     }
 
+    /// Calls `on_table` with the table name of every row this connection
+    /// inserts, updates, or deletes. It runs inside SQLite while the write is
+    /// in progress, so it must not block or touch this store.
+    pub fn on_change(
+        &self,
+        mut on_table: impl FnMut(&str) + Send + 'static,
+    ) -> Result<(), StoreError> {
+        self.lock()
+            .update_hook(Some(
+                move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| on_table(table),
+            ))
+            .map_err(backend)
+    }
+
     fn lock(&self) -> MutexGuard<'_, Connection> {
         self.connection
             .lock()

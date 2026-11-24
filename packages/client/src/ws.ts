@@ -1,9 +1,10 @@
-import { Effect, Layer, Schema, Stream, SubscriptionRef } from 'effect'
+import { Effect, Layer, PubSub, Schema, Stream, SubscriptionRef } from 'effect'
 
-import { ApiError, Transport } from './api.ts'
-import { ReplyFrame, type RequestFrame } from '@blob-1/contracts'
+import { ApiError, type DataChange, Transport } from './api.ts'
+import { ChangeFrame, ReplyFrame, type RequestFrame } from '@blob-1/contracts'
 
-const decodeReplyFrame = Schema.decodeUnknownSync(ReplyFrame)
+/** Everything the server sends on `/ws`: request replies and `changed` pushes. */
+const decodeServerFrame = Schema.decodeUnknownSync(Schema.Union([ChangeFrame, ReplyFrame]))
 
 type Pending = Readonly<{
   frame: RequestFrame
@@ -15,11 +16,13 @@ export const wsTransport: Layer.Layer<Transport> = Layer.effect(
   Effect.gen(function* () {
     const connected = yield* SubscriptionRef.make(false)
     const unauthorized = yield* SubscriptionRef.make(false)
+    const changes = yield* PubSub.unbounded<DataChange>()
     const pending = new Map<string, Pending>()
     let socket: WebSocket | undefined
     let reconnectTimer: ReturnType<typeof setTimeout> | undefined
     let attempts = 0
     let stopped = true
+    let everOpened = false
 
     const setConnected = (value: boolean) => Effect.runSync(SubscriptionRef.set(connected, value))
     const setUnauthorized = (value: boolean) =>
@@ -33,7 +36,7 @@ export const wsTransport: Layer.Layer<Transport> = Layer.effect(
 
     const connect = () => {
       const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const current = new WebSocket(`${protocol}//${location.host}/ws`)
+      const current = new WebSocket(`${protocol}//${location.host}/ws?changes=1`)
       socket = current
       let opened = false
 
@@ -43,6 +46,10 @@ export const wsTransport: Layer.Layer<Transport> = Layer.effect(
           return
         }
         opened = true
+        if (everOpened) {
+          PubSub.publishUnsafe(changes, { type: 'resync' })
+        }
+        everOpened = true
         attempts = 0
         setUnauthorized(false)
         setConnected(true)
@@ -52,8 +59,12 @@ export const wsTransport: Layer.Layer<Transport> = Layer.effect(
       })
       current.addEventListener('message', event => {
         try {
-          const data: unknown = JSON.parse(String(event.data))
-          const reply = decodeReplyFrame(data)
+          const frame = decodeServerFrame(JSON.parse(String(event.data)))
+          if ('topic' in frame) {
+            PubSub.publishUnsafe(changes, frame)
+            return
+          }
+          const reply = frame
           const request = pending.get(reply.id)
           if (request !== undefined) {
             pending.delete(reply.id)
@@ -142,6 +153,7 @@ export const wsTransport: Layer.Layer<Transport> = Layer.effect(
         ),
       ),
       unauthorized: SubscriptionRef.changes(unauthorized).pipe(Stream.filter(Boolean)),
+      changes: Stream.fromPubSub(changes),
     })
   }),
 )

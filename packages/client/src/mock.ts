@@ -1974,6 +1974,7 @@ export const mockTransport: Layer.Layer<Transport> = Layer.effect(
       send: frame => latency.pipe(Effect.andThen(serve(rootRef, frame))),
       status: Stream.make(true),
       unauthorized: Stream.empty,
+      changes: Stream.never,
     })
   }),
 )
