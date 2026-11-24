@@ -7,6 +7,7 @@ import type {
   Weekday,
 } from '@blob-1/contracts'
 import { useAtomRefresh, useAtomSet, useAtomValue } from '@effect/atom-react'
+import { Link } from '@tanstack/react-router'
 import { AtomMachine } from '@typeonce/effect-machine/reactivity'
 import { MachineState, useMachineResult } from '@typeonce/effect-machine-react'
 import { AsyncResult } from 'effect/reactivity'
@@ -18,10 +19,10 @@ import {
   EmptyLine,
   FieldError,
   FieldRow,
-  Page,
+  focusRingClassName,
   PageError,
-  panelClassName,
 } from '~/components/layout/Page'
+import { SplitDetail } from '~/components/layout/SplitPage'
 import { Picker } from '~/components/Picker'
 import { Button } from '~/components/ui/button'
 import {
@@ -45,7 +46,8 @@ import { Slider } from '~/components/ui/slider'
 import { Switch } from '~/components/ui/switch'
 import { Textarea } from '~/components/ui/textarea'
 import { ToggleGroup, ToggleGroupItem } from '~/components/ui/toggle-group'
-import { MachineAtoms } from '~/lib/runtime'
+import { useBotInstanceKey, useBotsRoot } from '~/features/bots/CreateBotDialog'
+import { machineAtomsForBot } from '~/lib/runtime'
 import { createPersistentMachineContext } from '~/lib/shellMachines'
 import { matchCached } from '~/lib/useBackgroundRefresh'
 import { cn } from '~/lib/utils'
@@ -62,11 +64,12 @@ import {
   toZonedDate,
 } from './calendarMath'
 import { SchedulesEvents, type SchedulesInput, SchedulesMachine } from './schedulesMachine'
-import { schedulesPageAtom } from './schedulesState'
+import { schedulesPageAtomFor } from './schedulesState'
 
 const SchedulesOwner = createPersistentMachineContext(
   'schedules',
-  ({ input }: { input: SchedulesInput }) => MachineAtoms.make(SchedulesMachine, input),
+  ({ input, scopeKey }: { readonly input: SchedulesInput; readonly scopeKey: string }) =>
+    machineAtomsForBot(scopeKey).make(SchedulesMachine, input),
 )
 
 const toggleItemClassName =
@@ -146,39 +149,79 @@ function initialWeekRange(timeZone: string) {
   )
 }
 
-function SchedulesMount(props: { readonly state: ScheduleState }) {
+function SchedulesMount(props: {
+  readonly botId: string
+  readonly instanceKey: string
+  readonly botName: string
+  readonly state: ScheduleState
+}) {
   const [range] = useState(() => initialWeekRange(props.state.timezone))
   return (
-    <SchedulesOwner.Provider input={{ state: props.state, range }}>
-      <SchedulesWorkspace initialTimezone={props.state.timezone} />
+    <SchedulesOwner.Provider input={{ state: props.state, range }} scopeKey={props.instanceKey}>
+      <SchedulesWorkspace
+        botId={props.botId}
+        botName={props.botName}
+        initialTimezone={props.state.timezone}
+      />
     </SchedulesOwner.Provider>
   )
 }
 
-export function SchedulesPage() {
-  const loaded = useAtomValue(schedulesPageAtom)
-  const retry = useAtomRefresh(schedulesPageAtom)
+interface SchedulesPageProps {
+  readonly botId: string
+}
+
+export function SchedulesPage(props: SchedulesPageProps) {
+  const instanceKey = useBotInstanceKey(props.botId)
+  const atom = schedulesPageAtomFor(instanceKey)
+  const loaded = useAtomValue(atom)
+  const retry = useAtomRefresh(atom)
+  const bots = useBotsRoot()?.bots ?? []
+  const botName = bots.find(entry => entry.id === props.botId)?.name ?? props.botId
 
   return matchCached(loaded, {
     onInitial: () => (
-      <Page title="Schedules">
+      <SplitDetail
+        title="Schedules"
+        isListView={false}
+        backTo="/settings/bots/$botId"
+        backParams={{ botId: props.botId }}
+        backLabel={botName}
+      >
         <EmptyLine>Loading…</EmptyLine>
-      </Page>
+      </SplitDetail>
     ),
     onFailure: failure => (
-      <Page title="Schedules">
+      <SplitDetail
+        title="Schedules"
+        isListView={false}
+        backTo="/settings/bots/$botId"
+        backParams={{ botId: props.botId }}
+        backLabel={botName}
+      >
         <PageError cause={failure.cause} onRetry={retry} />
-      </Page>
+      </SplitDetail>
     ),
-    onSuccess: value => <SchedulesMount state={value} />,
+    onSuccess: value => (
+      <SchedulesMount
+        botId={props.botId}
+        instanceKey={instanceKey}
+        botName={botName}
+        state={value}
+      />
+    ),
   })
 }
 
 interface SchedulesWorkspaceProps {
+  readonly botId: string
+  readonly botName: string
   readonly initialTimezone: string
 }
 
 interface CalendarToolbarProps {
+  readonly botId: string
+  readonly botName: string
   readonly title: string
   readonly timezone: string
   readonly view: CalendarView
@@ -196,6 +239,17 @@ interface CalendarToolbarProps {
 function CalendarToolbar(props: CalendarToolbarProps) {
   return (
     <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border/80 px-4 py-2.5">
+      <Link
+        to="/settings/bots/$botId"
+        params={{ botId: props.botId }}
+        aria-label={`Back to ${props.botName}`}
+        className={cn(
+          '-ml-1.5 grid size-8 shrink-0 place-items-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground md:hidden',
+          focusRingClassName,
+        )}
+      >
+        <ChevronLeft className="size-4" />
+      </Link>
       <Button size="sm" variant="secondary" onClick={props.onToday}>
         Today
       </Button>
@@ -305,9 +359,11 @@ function DueRefreshWatcher(props: { readonly data: ScheduleState; readonly nowSe
 function SchedulesWorkspace(props: SchedulesWorkspaceProps) {
   const machine = SchedulesOwner.useMachine()
   const send = useAtomSet(machine.send)
+  const { initialTimezone } = props
   useEffect(() => {
     send(SchedulesEvents.Refresh())
-  }, [send])
+    send(SchedulesEvents.LoadRange(initialWeekRange(initialTimezone)))
+  }, [initialTimezone, send])
   const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000))
   const [view, setView] = useState<CalendarView>('week')
   const [previewHours, setPreviewHours] = useState<readonly [number, number] | null>(null)
@@ -362,10 +418,12 @@ function SchedulesWorkspace(props: SchedulesWorkspaceProps) {
         const liveCheckin = applyPreviewHours(data.checkin, previewHours)
 
         return (
-          <div className={cn(panelClassName, 'flex-col md:flex-row')}>
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-background md:flex-row">
             <DueRefreshWatcher data={data} nowSeconds={nowSeconds} />
             <div className="flex h-[46dvh] min-h-[300px] max-h-[420px] min-w-0 flex-col md:h-auto md:max-h-none md:min-h-0 md:flex-1">
               <CalendarToolbar
+                botId={props.botId}
+                botName={props.botName}
                 title={title}
                 timezone={data.timezone}
                 view={view}

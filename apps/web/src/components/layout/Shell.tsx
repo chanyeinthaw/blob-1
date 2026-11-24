@@ -1,54 +1,76 @@
+import type { BotSummary } from '@blob-1/contracts'
 import { useAtomMount, useAtomSet, useAtomValue } from '@effect/atom-react'
-import { Link, type LinkProps, Navigate, useNavigate } from '@tanstack/react-router'
+import { Link, type LinkProps, Navigate, useNavigate, useRouterState } from '@tanstack/react-router'
 import { AsyncResult } from 'effect/reactivity'
-import {
-  CalendarClock,
-  Cloud,
-  Cpu,
-  Home,
-  LogOut,
-  MessagesSquare,
-  Plug,
-  Zap,
-  type LucideIcon,
-} from 'lucide-react'
-import { type ReactNode, useEffect } from 'react'
+import { Cloud, Cpu, LogOut, Plug, Plus, type LucideIcon } from 'lucide-react'
+import { type ReactNode, useEffect, useState } from 'react'
 import { toast } from 'sonner'
 
 import { BlobTile } from '~/components/BlobMark'
 import { ConfirmDialog } from '~/components/ConfirmDialog'
 import { Tooltip, TooltipContent, TooltipTrigger } from '~/components/ui/tooltip'
-import { discordPageAtom } from '~/features/chat/discordState'
-import { generalPageAtom } from '~/features/general/generalState'
-import { usageAtomFor } from '~/features/general/usageState'
+import { botsListAtom } from '~/features/bots/botsState'
+import { BotsEvents } from '~/features/bots/botsMachine'
+import { BotsOwner, CreateBotDialog, useBotsRoot } from '~/features/bots/CreateBotDialog'
 import { mcpPageAtom } from '~/features/mcp/mcpState'
-import { modelsPageAtom } from '~/features/models/modelsState'
+import { modelsCatalogAtom } from '~/features/models/modelsState'
 import { providersPageAtom } from '~/features/providers/providersState'
-import { schedulesPageAtom } from '~/features/schedules/schedulesState'
 import { connectionAtom, signOutAtom, unauthorizedAtom } from '~/features/session/connection'
-import { webhooksPageAtom } from '~/features/webhooks/webhooksState'
 import { clearSignedIn } from '~/lib/session'
 import { ShellMachinesProvider } from '~/lib/shellMachines'
 import { cn } from '~/lib/utils'
 
 import { focusRingClassName } from './Page'
 
-interface NavItem {
+interface GlobalNavItem {
   readonly label: string
   readonly mobileLabel: string
   readonly to: NonNullable<LinkProps['to']>
   readonly icon: LucideIcon
 }
 
-const navItems: ReadonlyArray<NavItem> = [
-  { label: 'General', mobileLabel: 'General', to: '/settings/general', icon: Home },
-  { label: 'Schedules', mobileLabel: 'Schedules', to: '/settings/schedules', icon: CalendarClock },
-  { label: 'Chat platforms', mobileLabel: 'Chat', to: '/settings/chat', icon: MessagesSquare },
-  { label: 'MCP', mobileLabel: 'MCP', to: '/settings/mcp', icon: Plug },
-  { label: 'Webhooks', mobileLabel: 'Webhooks', to: '/settings/webhooks', icon: Zap },
-  { label: 'Models', mobileLabel: 'Models', to: '/settings/models', icon: Cpu },
+const globalNavItems: ReadonlyArray<GlobalNavItem> = [
   { label: 'Providers', mobileLabel: 'Providers', to: '/settings/providers', icon: Cloud },
+  { label: 'Model catalog', mobileLabel: 'Models', to: '/settings/models', icon: Cpu },
+  { label: 'MCP', mobileLabel: 'MCP', to: '/settings/mcp', icon: Plug },
 ]
+
+function botInitials(name: string): string {
+  const parts = name
+    .trim()
+    .split(/[\s-]+/)
+    .filter(Boolean)
+  if (parts.length === 0) return '?'
+  if (parts.length === 1) return parts[0]!.slice(0, 2).toUpperCase()
+  return `${parts[0]![0] ?? ''}${parts[1]![0] ?? ''}`.toUpperCase()
+}
+
+function botDotClass(bot: BotSummary): string {
+  if (!bot.enabled) return 'bg-ring'
+  switch (bot.connection.state) {
+    case 'online':
+      return 'bg-ok'
+    case 'error':
+      return 'bg-destructive'
+    case 'connecting':
+    case 'off':
+      return 'bg-ring'
+  }
+}
+
+function botTooltipLabel(bot: BotSummary): string {
+  if (!bot.enabled) return `${bot.name} (Paused)`
+  switch (bot.connection.state) {
+    case 'online':
+      return `${bot.name} · Online`
+    case 'connecting':
+      return `${bot.name} · Connecting…`
+    case 'error':
+      return `${bot.name} · Error`
+    case 'off':
+      return bot.name
+  }
+}
 
 interface ConnectionInfo {
   readonly label: string
@@ -137,13 +159,90 @@ function RailTooltip(props: RailTooltipProps) {
   )
 }
 
-function Rail() {
+function useBotsRoster(): ReadonlyArray<BotSummary> {
+  return useBotsRoot()?.bots ?? []
+}
+
+function activeBotIdFromPath(pathname: string): string | null {
+  const match = /^\/settings\/bots\/([^/]+)/.exec(pathname)
+  return match?.[1] ?? null
+}
+
+interface RailProps {
+  readonly onCreateBot: () => void
+}
+
+function Rail(props: RailProps) {
   const signOut = useSignOut()
+  const bots = useBotsRoster()
+  const pathname = useRouterState({ select: state => state.location.pathname })
+  const activeBotId = activeBotIdFromPath(pathname)
+
   return (
     <header className="fixed inset-y-0 left-0 z-20 hidden w-16 flex-col items-center py-3 md:flex">
-      <BlobTile />
-      <nav aria-label="Settings" className="mt-4 flex flex-col items-center gap-1">
-        {navItems.map(item => (
+      <nav aria-label="Bots" className="flex flex-col items-center gap-2">
+        {bots.map(bot => {
+          const isActive = activeBotId === bot.id
+          return (
+            <RailTooltip key={bot.id} label={botTooltipLabel(bot)}>
+              <TooltipTrigger
+                render={
+                  <Link
+                    to="/settings/bots/$botId/general"
+                    params={{ botId: bot.id }}
+                    aria-label={bot.name}
+                    className={cn(
+                      'relative grid size-10 place-items-center rounded-2xl transition-all',
+                      focusRingClassName,
+                      isActive
+                        ? 'ring-2 ring-foreground ring-offset-2 ring-offset-shelf'
+                        : 'opacity-80 hover:opacity-100',
+                      !bot.enabled && 'opacity-50',
+                    )}
+                  />
+                }
+              >
+                {bot.isDefault ? (
+                  <BlobTile className="size-10 rounded-2xl" />
+                ) : (
+                  <span className="grid size-10 place-items-center rounded-2xl bg-card text-xs font-semibold tracking-tight text-foreground shadow-xs ring-1 ring-border">
+                    {botInitials(bot.name)}
+                  </span>
+                )}
+                <span
+                  aria-hidden="true"
+                  className={cn(
+                    'absolute -right-0.5 -bottom-0.5 size-2.5 rounded-full ring-2 ring-shelf',
+                    botDotClass(bot),
+                  )}
+                />
+              </TooltipTrigger>
+            </RailTooltip>
+          )
+        })}
+        <RailTooltip label="New bot">
+          <TooltipTrigger
+            render={
+              <button
+                type="button"
+                aria-label="New bot"
+                onClick={props.onCreateBot}
+                className={cn(
+                  'grid size-9 cursor-pointer place-items-center rounded-full border border-dashed border-border text-muted-foreground transition-colors hover:border-foreground/40 hover:bg-border/40 hover:text-foreground',
+                  focusRingClassName,
+                )}
+              />
+            }
+          >
+            <Plus className="size-4" />
+          </TooltipTrigger>
+        </RailTooltip>
+      </nav>
+
+      <div aria-hidden="true" className="my-3 h-px w-6 bg-border" />
+
+      <nav aria-label="Global settings" className="flex flex-col items-center gap-1">
+        {globalNavItems.map(item => (
           <RailTooltip key={item.label} label={item.label}>
             <TooltipTrigger
               render={
@@ -168,6 +267,7 @@ function Rail() {
           </RailTooltip>
         ))}
       </nav>
+
       <div className="mt-auto flex flex-col items-center gap-2">
         <DesktopConnectionDot />
         <ConfirmDialog
@@ -196,8 +296,16 @@ function Rail() {
   )
 }
 
-function MobileHeader() {
+interface MobileHeaderProps {
+  readonly onCreateBot: () => void
+}
+
+function MobileHeader(props: MobileHeaderProps) {
   const signOut = useSignOut()
+  const bots = useBotsRoster()
+  const pathname = useRouterState({ select: state => state.location.pathname })
+  const activeBotId = activeBotIdFromPath(pathname)
+
   return (
     <>
       <header className="bg-shelf pt-[env(safe-area-inset-top)] md:hidden">
@@ -229,16 +337,50 @@ function MobileHeader() {
       </header>
       <div className="sticky top-0 z-20 border-b border-border/70 bg-shelf md:hidden">
         <nav
-          aria-label="Settings"
-          className="scrollbar-hide flex items-center justify-between gap-0.5 overflow-x-auto py-2 pr-[max(0.75rem,env(safe-area-inset-right))] pl-[max(0.75rem,env(safe-area-inset-left))] min-[375px]:gap-1 min-[375px]:pr-[max(1rem,env(safe-area-inset-right))] min-[375px]:pl-[max(1rem,env(safe-area-inset-left))] sm:justify-start sm:gap-1.5"
+          aria-label="Bots and global settings"
+          className="scrollbar-hide flex items-center gap-1 overflow-x-auto py-2 pr-[max(0.75rem,env(safe-area-inset-right))] pl-[max(0.75rem,env(safe-area-inset-left))]"
         >
-          {navItems.map(item => (
+          {bots.map(bot => {
+            const isActive = activeBotId === bot.id
+            return (
+              <Link
+                key={bot.id}
+                to="/settings/bots/$botId"
+                params={{ botId: bot.id }}
+                className={cn(
+                  'flex h-9 shrink-0 items-center gap-1.5 rounded-full px-3 text-xs font-medium transition-colors',
+                  focusRingClassName,
+                  isActive
+                    ? 'bg-background text-foreground shadow-xs ring-1 ring-border'
+                    : 'text-muted-foreground hover:bg-border/50 hover:text-foreground',
+                )}
+              >
+                <span
+                  aria-hidden="true"
+                  className={cn('size-1.5 rounded-full', botDotClass(bot))}
+                />
+                {bot.name}
+              </Link>
+            )
+          })}
+          <button
+            type="button"
+            aria-label="New bot"
+            onClick={props.onCreateBot}
+            className={cn(
+              'grid size-8 shrink-0 cursor-pointer place-items-center rounded-full border border-dashed border-border text-muted-foreground',
+              focusRingClassName,
+            )}
+          >
+            <Plus className="size-3.5" />
+          </button>
+          <span aria-hidden="true" className="mx-1 h-4 w-px shrink-0 bg-border" />
+          {globalNavItems.map(item => (
             <Link
               key={item.label}
               to={item.to}
-              {...(item.label !== item.mobileLabel ? { 'aria-label': item.label } : {})}
               className={cn(
-                'flex h-9 shrink-0 items-center gap-1.5 rounded-full px-2 text-xs font-medium transition-colors min-[375px]:px-2.5 min-[375px]:text-[13px] sm:px-3.5 sm:text-sm',
+                'flex h-9 shrink-0 items-center gap-1.5 rounded-full px-3 text-xs font-medium transition-colors',
                 focusRingClassName,
               )}
               inactiveProps={{
@@ -248,7 +390,7 @@ function MobileHeader() {
                 className: 'bg-background text-foreground shadow-xs ring-1 ring-border',
               }}
             >
-              <item.icon className="hidden size-4 sm:block" />
+              <item.icon className="size-3.5" />
               {item.mobileLabel}
             </Link>
           ))}
@@ -258,15 +400,11 @@ function MobileHeader() {
   )
 }
 
-function SettingsPrefetch() {
-  useAtomMount(generalPageAtom)
-  useAtomMount(usageAtomFor(7))
-  useAtomMount(schedulesPageAtom)
-  useAtomMount(discordPageAtom)
-  useAtomMount(mcpPageAtom)
-  useAtomMount(webhooksPageAtom)
-  useAtomMount(modelsPageAtom)
+function GlobalPrefetch() {
+  useAtomMount(botsListAtom)
   useAtomMount(providersPageAtom)
+  useAtomMount(modelsCatalogAtom)
+  useAtomMount(mcpPageAtom)
   return null
 }
 
@@ -278,23 +416,82 @@ function UnauthorizedRedirect() {
   return unauthorized ? <Navigate to="/login" replace /> : null
 }
 
+const DEFAULT_FALLBACK_BOTS: ReadonlyArray<BotSummary> = [
+  {
+    id: 'default',
+    name: 'Blob-1',
+    enabled: true,
+    isDefault: true,
+    createdAt: 0,
+    generation: 0,
+    mainModel: null,
+    connection: { state: 'off' },
+  },
+]
+
+interface ShellInnerProps {
+  readonly children: ReactNode
+}
+
+function BotsPoller() {
+  const machine = BotsOwner.useMachine()
+  const send = useAtomSet(machine.send)
+
+  useEffect(() => {
+    send(BotsEvents.Refresh())
+    const interval = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        send(BotsEvents.Refresh())
+      }
+    }, 5000)
+    const onFocus = () => send(BotsEvents.Refresh())
+    window.addEventListener('focus', onFocus)
+    return () => {
+      window.clearInterval(interval)
+      window.removeEventListener('focus', onFocus)
+    }
+  }, [send])
+
+  return null
+}
+
+function ShellInner(props: ShellInnerProps) {
+  const [createOpen, setCreateOpen] = useState(false)
+  return (
+    <div className="flex min-h-dvh flex-col bg-shelf">
+      <GlobalPrefetch />
+      <BotsPoller />
+      <Rail onCreateBot={() => setCreateOpen(true)} />
+      <MobileHeader onCreateBot={() => setCreateOpen(true)} />
+      <main className="flex min-w-0 flex-1 flex-col md:ml-16 md:h-dvh md:max-h-dvh md:min-h-0">
+        {props.children}
+      </main>
+      <CreateBotDialog open={createOpen} onOpenChange={setCreateOpen} />
+      <UnauthorizedRedirect />
+    </div>
+  )
+}
+
 interface ShellProps {
   readonly children: ReactNode
 }
 
-/** The signed-in frame: icon rail on desktop, header with a sticky tab strip on mobile. */
+/** The signed-in frame: bot & global icon rail on desktop, bot/global strip on mobile. */
 export function Shell(props: ShellProps) {
+  const botsResult = useAtomValue(botsListAtom)
+  const initialBots = AsyncResult.match(botsResult, {
+    onInitial: () => DEFAULT_FALLBACK_BOTS,
+    onFailure: () => DEFAULT_FALLBACK_BOTS,
+    onSuccess: ({ value }) => value,
+  })
   return (
     <ShellMachinesProvider>
-      <div className="flex min-h-dvh flex-col bg-shelf">
-        <SettingsPrefetch />
-        <Rail />
-        <MobileHeader />
-        <main className="flex min-w-0 flex-1 flex-col md:ml-16 md:h-dvh md:max-h-dvh md:min-h-0">
-          {props.children}
-        </main>
-        <UnauthorizedRedirect />
-      </div>
+      <BotsOwner.Provider
+        input={initialBots}
+        scopeKey={AsyncResult.isSuccess(botsResult) ? 'loaded' : 'initial'}
+      >
+        <ShellInner>{props.children}</ShellInner>
+      </BotsOwner.Provider>
     </ShellMachinesProvider>
   )
 }

@@ -153,11 +153,12 @@ function UsageSummaryBody(props: UsageSummaryBodyProps) {
 }
 
 interface UsageCardProps {
+  readonly instanceKey: string
   readonly days: UsageRange
 }
 
 function UsageCard(props: UsageCardProps) {
-  const atom = usageAtomFor(props.days)
+  const atom = usageAtomFor(props.instanceKey, props.days)
   const result = useAtomValue(atom)
   const refresh = useAtomRefresh(atom)
   useBackgroundRefresh(refresh, AsyncResult.isSuccess(result))
@@ -181,8 +182,12 @@ function UsageCard(props: UsageCardProps) {
   })
 }
 
+interface UsageSectionProps {
+  readonly instanceKey: string
+}
+
 /** Compact token and cache usage summary with a 24h / 7d / 30d window toggle. */
-export function UsageSection() {
+export function UsageSection(props: UsageSectionProps) {
   const [days, setDays] = useState<UsageRange>(7)
 
   return (
@@ -211,7 +216,7 @@ export function UsageSection() {
         </ToggleGroup>
       }
     >
-      <UsageCard key={days} days={days} />
+      <UsageCard key={`${props.instanceKey}:${days}`} instanceKey={props.instanceKey} days={days} />
     </Section>
   )
 }

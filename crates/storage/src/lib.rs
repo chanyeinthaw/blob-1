@@ -1539,6 +1539,12 @@ pub trait WebhookStore: Send + Sync {
     fn remove_webhook(&self, id: &str) -> Result<bool, StoreError>;
     fn webhook_by_token_hash(&self, token_hash: &[u8]) -> Result<Option<Webhook>, StoreError>;
     fn touch_webhook(&self, id: &str, triggered_at: i64) -> Result<(), StoreError>;
+    fn enqueue_webhook_event(
+        &self,
+        token_hash: &[u8],
+        now: i64,
+        payload: &str,
+    ) -> Result<Option<String>, StoreError>;
 }
 
 impl<T: WebhookStore + ?Sized> WebhookStore for Arc<T> {
@@ -1571,6 +1577,15 @@ impl<T: WebhookStore + ?Sized> WebhookStore for Arc<T> {
 
     fn touch_webhook(&self, id: &str, triggered_at: i64) -> Result<(), StoreError> {
         (**self).touch_webhook(id, triggered_at)
+    }
+
+    fn enqueue_webhook_event(
+        &self,
+        token_hash: &[u8],
+        now: i64,
+        payload: &str,
+    ) -> Result<Option<String>, StoreError> {
+        (**self).enqueue_webhook_event(token_hash, now, payload)
     }
 }
 
@@ -2018,6 +2033,154 @@ pub fn redact_json_str(raw: &str) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Owned(out)
     } else {
         std::borrow::Cow::Borrowed(raw)
+    }
+}
+
+pub const DEFAULT_BOT_ID: &str = "default";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bot {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub generation: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BotModels {
+    pub main: Option<ModelRef>,
+    pub main_reasoning: ReasoningLevel,
+    pub compaction: Option<ModelRef>,
+    pub compaction_reasoning: Option<ReasoningLevel>,
+    pub utility: Option<(ModelRef, Option<ReasoningLevel>)>,
+    pub decision: Option<ModelRef>,
+}
+
+impl Default for BotModels {
+    fn default() -> Self {
+        Self {
+            main: None,
+            main_reasoning: ReasoningLevel::Medium,
+            compaction: None,
+            compaction_reasoning: None,
+            utility: None,
+            decision: None,
+        }
+    }
+}
+
+pub trait BotStore: Send + Sync {
+    fn bots(&self) -> Result<Vec<Bot>, StoreError>;
+    fn bot(&self, id: &str) -> Result<Option<Bot>, StoreError>;
+    fn create_bot(&self, id: &str, name: &str, created_at: i64) -> Result<Bot, StoreError>;
+    fn update_bot(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<Option<Bot>, StoreError>;
+    fn remove_bot(&self, id: &str) -> Result<bool, StoreError>;
+    fn bot_models(&self, bot_id: &str) -> Result<BotModels, StoreError>;
+    fn set_bot_main_model(
+        &self,
+        bot_id: &str,
+        model: Option<&ModelRef>,
+        reasoning: ReasoningLevel,
+    ) -> Result<(), StoreError>;
+    fn set_bot_compaction_model(
+        &self,
+        bot_id: &str,
+        model: Option<&ModelRef>,
+        reasoning: Option<ReasoningLevel>,
+    ) -> Result<(), StoreError>;
+    fn set_bot_utility_model(
+        &self,
+        bot_id: &str,
+        model: Option<(&ModelRef, Option<ReasoningLevel>)>,
+    ) -> Result<(), StoreError>;
+    fn set_bot_decision_model(
+        &self,
+        bot_id: &str,
+        model: Option<&ModelRef>,
+    ) -> Result<(), StoreError>;
+    fn provider_in_use_by_bot(&self, provider: &ProviderId) -> Result<Option<String>, StoreError>;
+    fn bot_disabled_mcp_servers(&self, bot_id: &str) -> Result<Vec<String>, StoreError>;
+    fn set_bot_mcp_server_enabled(
+        &self,
+        bot_id: &str,
+        server_id: &str,
+        enabled: bool,
+    ) -> Result<(), StoreError>;
+}
+
+impl<T: BotStore + ?Sized> BotStore for Arc<T> {
+    fn bots(&self) -> Result<Vec<Bot>, StoreError> {
+        (**self).bots()
+    }
+    fn bot(&self, id: &str) -> Result<Option<Bot>, StoreError> {
+        (**self).bot(id)
+    }
+    fn create_bot(&self, id: &str, name: &str, created_at: i64) -> Result<Bot, StoreError> {
+        (**self).create_bot(id, name, created_at)
+    }
+    fn update_bot(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<Option<Bot>, StoreError> {
+        (**self).update_bot(id, name, enabled)
+    }
+    fn remove_bot(&self, id: &str) -> Result<bool, StoreError> {
+        (**self).remove_bot(id)
+    }
+    fn bot_models(&self, bot_id: &str) -> Result<BotModels, StoreError> {
+        (**self).bot_models(bot_id)
+    }
+    fn set_bot_main_model(
+        &self,
+        bot_id: &str,
+        model: Option<&ModelRef>,
+        reasoning: ReasoningLevel,
+    ) -> Result<(), StoreError> {
+        (**self).set_bot_main_model(bot_id, model, reasoning)
+    }
+    fn set_bot_compaction_model(
+        &self,
+        bot_id: &str,
+        model: Option<&ModelRef>,
+        reasoning: Option<ReasoningLevel>,
+    ) -> Result<(), StoreError> {
+        (**self).set_bot_compaction_model(bot_id, model, reasoning)
+    }
+    fn set_bot_utility_model(
+        &self,
+        bot_id: &str,
+        model: Option<(&ModelRef, Option<ReasoningLevel>)>,
+    ) -> Result<(), StoreError> {
+        (**self).set_bot_utility_model(bot_id, model)
+    }
+    fn set_bot_decision_model(
+        &self,
+        bot_id: &str,
+        model: Option<&ModelRef>,
+    ) -> Result<(), StoreError> {
+        (**self).set_bot_decision_model(bot_id, model)
+    }
+    fn provider_in_use_by_bot(&self, provider: &ProviderId) -> Result<Option<String>, StoreError> {
+        (**self).provider_in_use_by_bot(provider)
+    }
+    fn bot_disabled_mcp_servers(&self, bot_id: &str) -> Result<Vec<String>, StoreError> {
+        (**self).bot_disabled_mcp_servers(bot_id)
+    }
+    fn set_bot_mcp_server_enabled(
+        &self,
+        bot_id: &str,
+        server_id: &str,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        (**self).set_bot_mcp_server_enabled(bot_id, server_id, enabled)
     }
 }
 

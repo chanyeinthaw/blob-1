@@ -1,13 +1,7 @@
-import { createFileRoute, useMatchRoute } from '@tanstack/react-router'
-
-import { ChatPlatformsPage } from '~/features/chat/ChatPlatformsPage'
+import { createFileRoute, redirect } from '@tanstack/react-router'
 
 export const Route = createFileRoute('/settings/chat')({
-  component: ChatPlatformsRoute,
+  beforeLoad: () => {
+    throw redirect({ to: '/settings/bots/$botId/discord', params: { botId: 'default' } })
+  },
 })
-
-/** Desktop shows the list and Discord together; on mobile `/settings/chat` is the list alone. */
-function ChatPlatformsRoute() {
-  const matchRoute = useMatchRoute()
-  return <ChatPlatformsPage isListView={matchRoute({ to: '/settings/chat' }) !== false} />
-}

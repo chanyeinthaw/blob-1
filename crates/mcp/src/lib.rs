@@ -731,6 +731,15 @@ impl Mcp {
     /// title when the server provides them, else its tool count. Connects
     /// lazily and in parallel; failures are reported as unavailable.
     pub async fn describe(&self) -> Vec<(String, String)> {
+        self.describe_filtered(&|_| true).await
+    }
+
+    /// Like `describe`, but skips servers rejected by `allowed` before opening
+    /// any peer connection.
+    pub async fn describe_filtered(
+        &self,
+        allowed: &(dyn Fn(&str) -> bool + Send + Sync),
+    ) -> Vec<(String, String)> {
         if self.sync().await.is_err() {
             return Vec::new();
         }
@@ -740,7 +749,7 @@ impl Mcp {
                 .lock()
                 .await
                 .values()
-                .filter(|entry| entry.config.enabled)
+                .filter(|entry| entry.config.enabled && allowed(&entry.config.id))
                 .map(|entry| entry.config.id.clone())
                 .collect()
         };

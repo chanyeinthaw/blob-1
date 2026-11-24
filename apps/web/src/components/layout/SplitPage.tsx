@@ -8,6 +8,7 @@ import { focusRingClassName, panelClassName, scrollClassName } from './Page'
 
 interface SplitPageProps {
   readonly title: string
+  readonly titleExtra?: ReactNode
   readonly items: ReactNode
   /** On mobile the list and the detail are separate screens; this picks the list. */
   readonly isListView: boolean
@@ -35,8 +36,11 @@ export function SplitPage(props: SplitPageProps) {
           props.isListView ? 'flex flex-1' : 'hidden',
         )}
       >
-        <div className="flex shrink-0 items-center px-5 pt-5 pb-4 md:min-h-16 md:px-5 md:py-4">
-          <h1 className="text-2xl font-semibold tracking-tight md:text-lg">{props.title}</h1>
+        <div className="flex shrink-0 items-center justify-between gap-2 px-5 pt-5 pb-4 md:min-h-16 md:px-5 md:py-4">
+          <h1 className="truncate text-2xl font-semibold tracking-tight md:text-lg">
+            {props.title}
+          </h1>
+          {props.titleExtra}
         </div>
         <nav aria-label={props.title} className="flex flex-col gap-1 px-2 pb-6 md:px-3">
           {props.items}
@@ -47,12 +51,27 @@ export function SplitPage(props: SplitPageProps) {
   )
 }
 
+interface SplitGroupLabelProps {
+  readonly children: ReactNode
+}
+
+/** Subtle section header inside a `SplitPage` sidebar. */
+export function SplitGroupLabel(props: SplitGroupLabelProps) {
+  return (
+    <p className="mt-4 mb-1 px-3 text-[11px] font-medium tracking-wider text-muted-foreground/80 uppercase">
+      {props.children}
+    </p>
+  )
+}
+
 interface SplitDetailProps {
   readonly title: string
   readonly isListView: boolean
   readonly backTo: NonNullable<LinkProps['to']>
+  readonly backParams?: LinkProps['params']
   readonly backLabel: string
   readonly actions?: ReactNode
+  readonly wide?: boolean
   readonly children: ReactNode
 }
 
@@ -66,12 +85,20 @@ export function SplitDetail(props: SplitDetailProps) {
     prevIsListView.current = props.isListView
   }, [props.isListView])
 
+  const columnWidth = props.wide === true ? 'max-w-[1120px]' : 'max-w-[720px]'
+
   return (
     <section className="flex min-w-0 flex-1 flex-col group-data-[list-view=true]/split:hidden md:group-data-[list-view=true]/split:flex">
       <div className="shrink-0 px-5 pt-5 pb-4 md:px-8 md:py-4">
-        <div className="flex w-full max-w-[720px] flex-wrap items-center gap-x-1.5 gap-y-2 md:min-h-8 md:gap-x-3">
+        <div
+          className={cn(
+            'flex w-full flex-wrap items-center gap-x-1.5 gap-y-2 md:min-h-8 md:gap-x-3',
+            columnWidth,
+          )}
+        >
           <Link
             to={props.backTo}
+            {...(props.backParams !== undefined ? { params: props.backParams } : {})}
             aria-label={`Back to ${props.backLabel}`}
             className={cn(
               '-ml-2.5 grid size-10 shrink-0 place-items-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground md:hidden',
@@ -105,7 +132,7 @@ export function SplitDetail(props: SplitDetailProps) {
         </div>
       </div>
       <div className={cn(scrollClassName, 'md:px-8')}>
-        <div className="w-full max-w-[720px]">{props.children}</div>
+        <div className={cn('w-full', columnWidth)}>{props.children}</div>
       </div>
     </section>
   )
@@ -113,6 +140,7 @@ export function SplitDetail(props: SplitDetailProps) {
 
 interface SplitItemProps {
   readonly to: NonNullable<LinkProps['to']>
+  readonly params?: LinkProps['params']
   readonly label: string
   readonly icon: ReactNode
   readonly isActive: boolean
@@ -123,6 +151,7 @@ export function SplitItem(props: SplitItemProps) {
   return (
     <Link
       to={props.to}
+      {...(props.params !== undefined ? { params: props.params } : {})}
       className={cn(
         'flex h-12 items-center gap-3 rounded-xl px-3 text-sm font-medium transition-colors hover:bg-border/50 md:h-9',
         focusRingClassName,

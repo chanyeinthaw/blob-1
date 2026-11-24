@@ -19,6 +19,7 @@ const NO_KEY: &str = "set BLOB_1_APP_KEY";
 /// The `BLOB_1_APP_KEY` passphrase; any non-empty string. It derives a
 /// per-database key (argon2id over a random stored salt) that encrypts
 /// secrets at rest; the passphrase itself is never stored.
+#[derive(Clone)]
 pub struct AppKey(String);
 
 impl AppKey {

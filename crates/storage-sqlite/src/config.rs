@@ -202,9 +202,49 @@ impl ConfigStore for SqliteStorage {
     }
 
     fn remove_provider(&self, id: &ProviderId) -> Result<(), StoreError> {
-        self.lock()
-            .execute("DELETE FROM providers WHERE id = ?1", [&id.0])
+        let mut conn = self.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(backend)?;
+        let default_in_use: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM settings WHERE id = 1 AND (default_provider = ?1 OR compaction_provider = ?1)
+                    UNION ALL
+                    SELECT 1 FROM utility_model WHERE id = 1 AND provider = ?1
+                    UNION ALL
+                    SELECT 1 FROM decision_model WHERE id = 1 AND provider = ?1
+                )",
+                [&id.0],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        if default_in_use {
+            return Err(StoreError::Backend(
+                format!("Provider {} is used by a model slot on bot 'default'", id.0).into(),
+            ));
+        }
+        let bot_in_use: Option<String> = tx
+            .query_row(
+                "SELECT bot_id FROM bot_models
+                 WHERE default_provider = ?1
+                    OR compaction_provider = ?1
+                    OR utility_provider = ?1
+                    OR decision_provider = ?1
+                 LIMIT 1",
+                [&id.0],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        if let Some(bot_id) = bot_in_use {
+            return Err(StoreError::Backend(
+                format!("Provider {} is used by a model slot on bot '{bot_id}'", id.0).into(),
+            ));
+        }
+        tx.execute("DELETE FROM providers WHERE id = ?1", [&id.0])
+            .map_err(backend)?;
+        tx.commit().map_err(backend)?;
         Ok(())
     }
 

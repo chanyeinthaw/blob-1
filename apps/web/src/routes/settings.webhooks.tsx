@@ -1,7 +1,7 @@
-import { createFileRoute } from '@tanstack/react-router'
-
-import { WebhooksPage } from '~/features/webhooks/WebhooksPage'
+import { createFileRoute, redirect } from '@tanstack/react-router'
 
 export const Route = createFileRoute('/settings/webhooks')({
-  component: WebhooksPage,
+  beforeLoad: () => {
+    throw redirect({ to: '/settings/bots/$botId/webhooks', params: { botId: 'default' } })
+  },
 })

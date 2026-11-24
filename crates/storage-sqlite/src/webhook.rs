@@ -118,6 +118,44 @@ impl WebhookStore for SqliteStorage {
             .map_err(backend)?;
         Ok(())
     }
+
+    fn enqueue_webhook_event(
+        &self,
+        token_hash: &[u8],
+        now: i64,
+        payload: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let mut conn = self.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        let row: Option<(String, String)> = tx
+            .query_row(
+                "SELECT id, name FROM webhooks WHERE token_hash = ?1 AND enabled = 1",
+                [token_hash],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(backend)?;
+        let Some((id, name)) = row else {
+            tx.commit().map_err(backend)?;
+            return Ok(None);
+        };
+        let redacted_payload = storage::redact_json_str(payload);
+        tx.execute(
+            "INSERT INTO pending_events (source, name, for_token, payload, created_at)
+             VALUES ('webhook', ?1, NULL, ?2, ?3)",
+            params![&name, redacted_payload.as_ref(), now],
+        )
+        .map_err(backend)?;
+        tx.execute(
+            "UPDATE webhooks SET last_triggered_at = ?2 WHERE id = ?1",
+            params![&id, now],
+        )
+        .map_err(backend)?;
+        tx.commit().map_err(backend)?;
+        Ok(Some(name))
+    }
 }
 
 impl CallbackStore for SqliteStorage {

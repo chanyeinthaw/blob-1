@@ -193,7 +193,7 @@ where
 
         let skills = self.environment.skill_catalog().await?;
         let mcp_servers = match &self.mcp_tools {
-            Some(tools) => tools.mcp().describe().await,
+            Some(tools) => tools.describe().await,
             None => Vec::new(),
         };
         let system = prompt::build(&self.paths.workspace, &skills, &mcp_servers);

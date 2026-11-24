@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use base64::Engine;
 use environment::{Image, ToolSpec};
 use rmcp::model::*;
@@ -36,6 +38,7 @@ impl Outcome {
 /// across turns and tool calls instead of mutating the `tools` array mid-turn.
 pub struct SessionTools {
     mcp: Mcp,
+    allowed: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
 }
 
 const BUILTINS: &[ToolSpec] = &[
@@ -194,11 +197,39 @@ fn outcome_of(result: &CallToolResult) -> Outcome {
 
 impl SessionTools {
     pub fn new(mcp: Mcp) -> Self {
-        Self { mcp }
+        Self { mcp, allowed: None }
+    }
+
+    pub fn with_filter(mcp: Mcp, allowed: Arc<dyn Fn(&str) -> bool + Send + Sync>) -> Self {
+        Self {
+            mcp,
+            allowed: Some(allowed),
+        }
+    }
+
+    fn is_allowed(&self, server: &str) -> bool {
+        self.allowed.as_ref().is_none_or(|f| f(server))
+    }
+
+    fn check_server(&self, server: &str) -> Result<(), String> {
+        if self.is_allowed(server) {
+            Ok(())
+        } else {
+            Err(format!("MCP server {server} is disabled for this bot"))
+        }
     }
 
     pub fn mcp(&self) -> &Mcp {
         &self.mcp
+    }
+
+    /// Describes only enabled servers permitted by this session's filter,
+    /// without opening peers for disallowed servers.
+    pub async fn describe(&self) -> Vec<(String, String)> {
+        match &self.allowed {
+            Some(allowed) => self.mcp.describe_filtered(allowed.as_ref()).await,
+            None => self.mcp.describe().await,
+        }
     }
 
     /// Static `mcp_*` built-ins when at least one MCP server is enabled.
@@ -240,14 +271,22 @@ impl SessionTools {
     }
 
     async fn enabled_ids(&self) -> Vec<String> {
-        self.mcp.enabled_ids().await
+        self.mcp
+            .enabled_ids()
+            .await
+            .into_iter()
+            .filter(|id| self.is_allowed(id))
+            .collect()
     }
 
     async fn search(&self, arguments: &serde_json::Value) -> Result<Outcome, String> {
         let args = parse_search_args(arguments)?;
         let terms = terms(args.query.as_deref().unwrap_or_default());
         let ids: Vec<String> = match args.server {
-            Some(id) => vec![id],
+            Some(id) => {
+                self.check_server(&id)?;
+                vec![id]
+            }
             None => self.enabled_ids().await,
         };
         let mut scored: Vec<(usize, String, Tool)> = Vec::new();
@@ -312,6 +351,7 @@ impl SessionTools {
 
     async fn call(&self, arguments: &serde_json::Value) -> Result<Outcome, String> {
         let server = required(arguments, "server")?;
+        self.check_server(server)?;
         let tool = required(arguments, "tool")?;
         let args_json = match arguments.get("arguments") {
             None | Some(serde_json::Value::Null) => "{}".to_string(),
@@ -331,7 +371,10 @@ impl SessionTools {
         let filter = arg(arguments, "server");
         let query = terms(arg(arguments, "query").unwrap_or_default());
         let ids: Vec<String> = match filter {
-            Some(id) => vec![id.to_string()],
+            Some(id) => {
+                self.check_server(id)?;
+                vec![id.to_string()]
+            }
             None => self.enabled_ids().await,
         };
         let mut lines = Vec::new();
@@ -398,6 +441,7 @@ impl SessionTools {
             (Ok(server), Ok(uri)) => (server, uri),
             (Err(error), _) | (_, Err(error)) => return Err(error),
         };
+        self.check_server(server)?;
         let result = self
             .mcp
             .request(server, REQUEST_TIMEOUT, |peer| async move {
@@ -435,7 +479,10 @@ impl SessionTools {
         let filter = arg(arguments, "server");
         let query = terms(arg(arguments, "query").unwrap_or_default());
         let ids: Vec<String> = match filter {
-            Some(id) => vec![id.to_string()],
+            Some(id) => {
+                self.check_server(id)?;
+                vec![id.to_string()]
+            }
             None => self.enabled_ids().await,
         };
         let mut lines = Vec::new();
@@ -498,6 +545,7 @@ impl SessionTools {
             (Ok(server), Ok(name)) => (server, name),
             (Err(error), _) | (_, Err(error)) => return Err(error),
         };
+        self.check_server(server)?;
         let args = arguments
             .get("arguments")
             .and_then(|value| value.as_object().cloned());

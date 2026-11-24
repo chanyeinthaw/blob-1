@@ -1,7 +1,7 @@
 import { request } from '@blob-1/client/api'
 import { Atom } from 'effect/reactivity'
 
-import { AppRuntime } from '~/lib/runtime'
+import { AppRuntime, botScopeFromInstanceKey } from '~/lib/runtime'
 
 export type UsageRange = 1 | 7 | 30
 
@@ -14,14 +14,13 @@ export const USAGE_RANGES: ReadonlyArray<{
   { days: 30, label: '30d' },
 ]
 
-const makeUsageAtom = (days: UsageRange) =>
-  AppRuntime.atom(request('usage.get', { days })).pipe(Atom.keepAlive)
+const usageAtomFamily = Atom.family((key: string) => {
+  const sep = key.lastIndexOf(':')
+  const scope = botScopeFromInstanceKey(key.slice(0, sep))
+  const days = Number(key.slice(sep + 1))
+  return AppRuntime.atom(request('usage.get', { ...scope, days })).pipe(Atom.keepAlive)
+})
 
-const usageAtoms = {
-  1: makeUsageAtom(1),
-  7: makeUsageAtom(7),
-  30: makeUsageAtom(30),
-}
-
-/** Returns the cached keep-alive usage atom for the given window in days. */
-export const usageAtomFor = (days: UsageRange) => usageAtoms[days]
+/** Returns the cached keep-alive usage atom for a bot instance and time window in days. */
+export const usageAtomFor = (instanceKey: string, days: UsageRange) =>
+  usageAtomFamily(`${instanceKey}:${days}`)

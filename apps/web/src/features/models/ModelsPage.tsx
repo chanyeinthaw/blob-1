@@ -7,11 +7,21 @@ import {
   type Slot,
 } from '@blob-1/contracts'
 import { useAtomRefresh, useAtomSet, useAtomValue } from '@effect/atom-react'
+import { Link } from '@tanstack/react-router'
 import { MachineState } from '@typeonce/effect-machine-react'
 import { ChevronDown, Plus, Search, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 
-import { EmptyLine, focusRingClassName, Page, PageError } from '~/components/layout/Page'
+import {
+  EmptyLine,
+  FieldRow,
+  focusRingClassName,
+  Page,
+  PageError,
+  Section,
+} from '~/components/layout/Page'
+import { SplitDetail } from '~/components/layout/SplitPage'
+import { Picker } from '~/components/Picker'
 import { Button } from '~/components/ui/button'
 import {
   DropdownMenu,
@@ -25,7 +35,8 @@ import {
 import { Input } from '~/components/ui/input'
 import { Switch } from '~/components/ui/switch'
 import { Tooltip, TooltipContent, TooltipTrigger } from '~/components/ui/tooltip'
-import { MachineAtoms } from '~/lib/runtime'
+import { useBotInstanceKey, useBotsRoot } from '~/features/bots/CreateBotDialog'
+import { machineAtomsForBot } from '~/lib/runtime'
 import { createPersistentMachineContext } from '~/lib/shellMachines'
 import { matchCached } from '~/lib/useBackgroundRefresh'
 import { cn } from '~/lib/utils'
@@ -39,10 +50,12 @@ import {
   ModelsMachine,
   parseContextLimit,
 } from './modelsMachine'
-import { modelsPageAtom } from './modelsState'
+import { modelsCatalogAtom, modelsPageAtomFor } from './modelsState'
 
-const ModelsOwner = createPersistentMachineContext('models', ({ input }: { input: ModelsInput }) =>
-  MachineAtoms.make(ModelsMachine, input),
+const ModelsOwner = createPersistentMachineContext(
+  'models',
+  ({ input, scopeKey }: { readonly input: ModelsInput; readonly scopeKey: string }) =>
+    machineAtomsForBot(scopeKey).make(ModelsMachine, input),
 )
 
 const PAGE_SIZE = 25
@@ -127,27 +140,331 @@ const gridClassName = (showProvider: boolean): string =>
     ? 'sm:grid-cols-[minmax(0,1fr)_104px_132px_48px_44px]'
     : 'sm:grid-cols-[minmax(0,1fr)_132px_48px_44px]'
 
-/** The models settings page: a filterable catalog of every provider's models. */
+/** Global Model catalog: context limits and image capabilities across all providers. */
 export function ModelsPage() {
-  const result = useAtomValue(modelsPageAtom)
-  const retry = useAtomRefresh(modelsPageAtom)
+  const result = useAtomValue(modelsCatalogAtom)
+  const retry = useAtomRefresh(modelsCatalogAtom)
   return matchCached(result, {
     onInitial: () => (
-      <Page title="Models" wide>
+      <Page title="Model catalog" wide>
         <EmptyLine>Loading…</EmptyLine>
       </Page>
     ),
     onFailure: failure => (
-      <Page title="Models" wide>
+      <Page title="Model catalog" wide>
         <PageError cause={failure.cause} onRetry={retry} />
       </Page>
     ),
     onSuccess: value => (
-      <ModelsOwner.Provider input={value}>
+      <ModelsOwner.Provider input={value} scopeKey="default@0">
         <ModelsLoaded />
       </ModelsOwner.Provider>
     ),
   })
+}
+
+interface BotModelsPageProps {
+  readonly botId: string
+}
+
+/** Per-bot Models page: assigns Main, Compaction, Utility, and Decision roles from the shared catalog. */
+export function BotModelsPage(props: BotModelsPageProps) {
+  const instanceKey = useBotInstanceKey(props.botId)
+  const atom = modelsPageAtomFor(instanceKey)
+  const result = useAtomValue(atom)
+  const retry = useAtomRefresh(atom)
+  const bots = useBotsRoot()?.bots ?? []
+  const botName = bots.find(entry => entry.id === props.botId)?.name ?? props.botId
+
+  const wrap = (children: React.ReactNode) => (
+    <SplitDetail
+      title="Models"
+      isListView={false}
+      backTo="/settings/bots/$botId"
+      backParams={{ botId: props.botId }}
+      backLabel={botName}
+      actions={
+        <Button variant="outline" size="sm" render={<Link to="/settings/models" />}>
+          Model catalog
+        </Button>
+      }
+    >
+      {children}
+    </SplitDetail>
+  )
+
+  return matchCached(result, {
+    onInitial: () => wrap(<EmptyLine>Loading…</EmptyLine>),
+    onFailure: failure => wrap(<PageError cause={failure.cause} onRetry={retry} />),
+    onSuccess: value => (
+      <ModelsOwner.Provider input={value} scopeKey={instanceKey}>
+        {wrap(<BotModelRoles />)}
+      </ModelsOwner.Provider>
+    ),
+  })
+}
+
+const NONE_MODEL = '\0none'
+
+const slotKeyOf = (slot: { readonly provider: string; readonly model: string } | null): string =>
+  slot === null || slot.provider === '' || slot.model === ''
+    ? NONE_MODEL
+    : `${slot.provider}/${slot.model}`
+
+const parseSlotKey = (
+  value: string,
+): { readonly provider: string; readonly model: string } | null => {
+  if (value === NONE_MODEL) return null
+  const slash = value.indexOf('/')
+  if (slash <= 0) return null
+  return { provider: value.slice(0, slash), model: value.slice(slash + 1) }
+}
+
+function BotModelRoles() {
+  const machine = ModelsOwner.useMachine()
+  const send = useAtomSet(machine.send)
+
+  useEffect(() => {
+    send(ModelsEvents.Refresh())
+  }, [send])
+
+  return (
+    <MachineState machine={machine} path="">
+      {({ value }) => {
+        const { shown, roleStatuses } = value
+        const all = entriesOf(shown)
+        const llmOptions = all
+          .filter(entry => entry.api !== 'decision')
+          .map(entry => ({
+            value: `${entry.provider}/${entry.info.id}`,
+            label: entry.info.id,
+            hint: entry.provider,
+          }))
+        const decisionOptions = all
+          .filter(entry => entry.api === 'decision')
+          .map(entry => ({
+            value: `${entry.provider}/${entry.info.id}`,
+            label: entry.info.id,
+            hint: entry.provider,
+          }))
+        const reasoningOptions = Reasoning.literals.map(level => ({
+          value: level,
+          label: level,
+          hint: null,
+        }))
+
+        const mainValue = slotKeyOf(shown.main)
+        const compactionValue = slotKeyOf(shown.compaction)
+        const utilityValue = slotKeyOf(shown.utility)
+        const decisionValue = slotKeyOf(shown.decision)
+
+        return (
+          <div className="space-y-6">
+            {llmOptions.length === 0 && decisionOptions.length === 0 ? (
+              <EmptyLine>
+                No models discovered yet.{' '}
+                <Link to="/settings/providers" className="underline underline-offset-4">
+                  Add a provider
+                </Link>
+              </EmptyLine>
+            ) : (
+              <Section title="Roles">
+                <div className="divide-y divide-border/60 rounded-2xl border border-border bg-card px-4 py-1 shadow-xs">
+                  <div className="py-2">
+                    <FieldRow id="bot-model-main" label="Main">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <div className="min-w-0 flex-1">
+                          <Picker
+                            id="bot-model-main"
+                            value={mainValue === NONE_MODEL ? '' : mainValue}
+                            options={llmOptions}
+                            placeholder="Choose a main model"
+                            onChange={next => {
+                              const parsed = parseSlotKey(next)
+                              if (parsed === null) return
+                              send(
+                                ModelsEvents.AssignMain({
+                                  slot: {
+                                    provider: parsed.provider,
+                                    model: parsed.model,
+                                    reasoning: shown.main.reasoning,
+                                  },
+                                }),
+                              )
+                            }}
+                          />
+                        </div>
+                        <div className="w-28 shrink-0">
+                          <Picker
+                            id="bot-model-main-reasoning"
+                            value={shown.main.reasoning}
+                            options={reasoningOptions}
+                            placeholder="Reasoning"
+                            disabled={mainValue === NONE_MODEL}
+                            onChange={next => {
+                              const level = Reasoning.literals.find(l => l === next)
+                              if (level === undefined || mainValue === NONE_MODEL) return
+                              send(
+                                ModelsEvents.AssignMain({
+                                  slot: { ...shown.main, reasoning: level },
+                                }),
+                              )
+                            }}
+                          />
+                        </div>
+                      </div>
+                      {roleStatuses.main ? (
+                        <p className="mt-1 text-xs text-muted-foreground">{roleStatuses.main}</p>
+                      ) : null}
+                    </FieldRow>
+                  </div>
+
+                  <div className="py-2">
+                    <FieldRow id="bot-model-compaction" label="Compaction">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <div className="min-w-0 flex-1">
+                          <Picker
+                            id="bot-model-compaction"
+                            value={compactionValue}
+                            options={[
+                              { value: NONE_MODEL, label: 'Use main model', hint: null },
+                              ...llmOptions,
+                            ]}
+                            placeholder="Use main model"
+                            onChange={next => {
+                              const parsed = parseSlotKey(next)
+                              send(
+                                ModelsEvents.AssignCompaction({
+                                  slot:
+                                    parsed === null
+                                      ? null
+                                      : {
+                                          provider: parsed.provider,
+                                          model: parsed.model,
+                                          reasoning: shown.compaction?.reasoning ?? 'medium',
+                                        },
+                                }),
+                              )
+                            }}
+                          />
+                        </div>
+                        {shown.compaction !== null ? (
+                          <div className="w-28 shrink-0">
+                            <Picker
+                              id="bot-model-compaction-reasoning"
+                              value={shown.compaction.reasoning}
+                              options={reasoningOptions}
+                              placeholder="Reasoning"
+                              onChange={next => {
+                                const level = Reasoning.literals.find(l => l === next)
+                                if (level === undefined || shown.compaction === null) return
+                                send(
+                                  ModelsEvents.AssignCompaction({
+                                    slot: { ...shown.compaction, reasoning: level },
+                                  }),
+                                )
+                              }}
+                            />
+                          </div>
+                        ) : null}
+                      </div>
+                      {roleStatuses.compaction ? (
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          {roleStatuses.compaction}
+                        </p>
+                      ) : null}
+                    </FieldRow>
+                  </div>
+
+                  <div className="py-2">
+                    <FieldRow id="bot-model-utility" label="Utility">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <div className="min-w-0 flex-1">
+                          <Picker
+                            id="bot-model-utility"
+                            value={utilityValue}
+                            options={[
+                              { value: NONE_MODEL, label: 'Off', hint: null },
+                              ...llmOptions,
+                            ]}
+                            placeholder="Off"
+                            onChange={next => {
+                              const parsed = parseSlotKey(next)
+                              send(
+                                ModelsEvents.AssignUtility({
+                                  slot:
+                                    parsed === null
+                                      ? null
+                                      : {
+                                          provider: parsed.provider,
+                                          model: parsed.model,
+                                          reasoning: shown.utility?.reasoning ?? 'low',
+                                        },
+                                }),
+                              )
+                            }}
+                          />
+                        </div>
+                        {shown.utility !== null ? (
+                          <div className="w-28 shrink-0">
+                            <Picker
+                              id="bot-model-utility-reasoning"
+                              value={shown.utility.reasoning}
+                              options={reasoningOptions}
+                              placeholder="Reasoning"
+                              onChange={next => {
+                                const level = Reasoning.literals.find(l => l === next)
+                                if (level === undefined || shown.utility === null) return
+                                send(
+                                  ModelsEvents.AssignUtility({
+                                    slot: { ...shown.utility, reasoning: level },
+                                  }),
+                                )
+                              }}
+                            />
+                          </div>
+                        ) : null}
+                      </div>
+                      {roleStatuses.utility ? (
+                        <p className="mt-1 text-xs text-muted-foreground">{roleStatuses.utility}</p>
+                      ) : null}
+                    </FieldRow>
+                  </div>
+
+                  <div className="py-2">
+                    <FieldRow id="bot-model-decision" label="Decision">
+                      <Picker
+                        id="bot-model-decision"
+                        value={decisionValue}
+                        options={[
+                          { value: NONE_MODEL, label: 'Off', hint: null },
+                          ...decisionOptions,
+                        ]}
+                        placeholder="Off"
+                        onChange={next => {
+                          const parsed = parseSlotKey(next)
+                          send(
+                            ModelsEvents.AssignDecision({
+                              slot: parsed,
+                            }),
+                          )
+                        }}
+                      />
+                      {roleStatuses.decision ? (
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          {roleStatuses.decision}
+                        </p>
+                      ) : null}
+                    </FieldRow>
+                  </div>
+                </div>
+              </Section>
+            )}
+          </div>
+        )
+      }}
+    </MachineState>
+  )
 }
 
 function ModelsLoaded() {
@@ -159,7 +476,7 @@ function ModelsLoaded() {
   const [filters, setFilters] = useState<Filters>({
     query: '',
     providerFilter: '',
-    inUseOnly: true,
+    inUseOnly: false,
     visibleCount: PAGE_SIZE,
   })
   const apply = (change: Partial<Filters>) =>
@@ -168,7 +485,7 @@ function ModelsLoaded() {
     setFilters(current => ({ ...current, visibleCount: current.visibleCount + PAGE_SIZE }))
   return (
     <Page
-      title="Models"
+      title="Model catalog"
       wide
       wideActions
       actions={<FilterBar filters={filters} onChange={apply} />}

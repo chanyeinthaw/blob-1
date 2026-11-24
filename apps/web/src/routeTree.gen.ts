@@ -22,8 +22,16 @@ import { Route as SettingsModelsRouteImport } from './routes/settings.models'
 import { Route as SettingsProvidersRouteImport } from './routes/settings.providers'
 import { Route as SettingsSchedulesRouteImport } from './routes/settings.schedules'
 import { Route as SettingsWebhooksRouteImport } from './routes/settings.webhooks'
+import { Route as SettingsBotsBotIdRouteImport } from './routes/settings.bots.$botId'
 import { Route as SettingsChatIndexRouteImport } from './routes/settings.chat.index'
 import { Route as SettingsChatDiscordRouteImport } from './routes/settings.chat.discord'
+import { Route as SettingsBotsBotIdIndexRouteImport } from './routes/settings.bots.$botId.index'
+import { Route as SettingsBotsBotIdDiscordRouteImport } from './routes/settings.bots.$botId.discord'
+import { Route as SettingsBotsBotIdGeneralRouteImport } from './routes/settings.bots.$botId.general'
+import { Route as SettingsBotsBotIdMcpRouteImport } from './routes/settings.bots.$botId.mcp'
+import { Route as SettingsBotsBotIdModelsRouteImport } from './routes/settings.bots.$botId.models'
+import { Route as SettingsBotsBotIdSchedulesRouteImport } from './routes/settings.bots.$botId.schedules'
+import { Route as SettingsBotsBotIdWebhooksRouteImport } from './routes/settings.bots.$botId.webhooks'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -90,6 +98,11 @@ const SettingsWebhooksRoute = SettingsWebhooksRouteImport.update({
   path: '/webhooks',
   getParentRoute: () => SettingsRoute,
 } as any)
+const SettingsBotsBotIdRoute = SettingsBotsBotIdRouteImport.update({
+  id: '/bots/$botId',
+  path: '/bots/$botId',
+  getParentRoute: () => SettingsRoute,
+} as any)
 const SettingsChatIndexRoute = SettingsChatIndexRouteImport.update({
   id: '/',
   path: '/',
@@ -100,6 +113,45 @@ const SettingsChatDiscordRoute = SettingsChatDiscordRouteImport.update({
   path: '/discord',
   getParentRoute: () => SettingsChatRoute,
 } as any)
+const SettingsBotsBotIdIndexRoute = SettingsBotsBotIdIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => SettingsBotsBotIdRoute,
+} as any)
+const SettingsBotsBotIdDiscordRoute =
+  SettingsBotsBotIdDiscordRouteImport.update({
+    id: '/discord',
+    path: '/discord',
+    getParentRoute: () => SettingsBotsBotIdRoute,
+  } as any)
+const SettingsBotsBotIdGeneralRoute =
+  SettingsBotsBotIdGeneralRouteImport.update({
+    id: '/general',
+    path: '/general',
+    getParentRoute: () => SettingsBotsBotIdRoute,
+  } as any)
+const SettingsBotsBotIdMcpRoute = SettingsBotsBotIdMcpRouteImport.update({
+  id: '/mcp',
+  path: '/mcp',
+  getParentRoute: () => SettingsBotsBotIdRoute,
+} as any)
+const SettingsBotsBotIdModelsRoute = SettingsBotsBotIdModelsRouteImport.update({
+  id: '/models',
+  path: '/models',
+  getParentRoute: () => SettingsBotsBotIdRoute,
+} as any)
+const SettingsBotsBotIdSchedulesRoute =
+  SettingsBotsBotIdSchedulesRouteImport.update({
+    id: '/schedules',
+    path: '/schedules',
+    getParentRoute: () => SettingsBotsBotIdRoute,
+  } as any)
+const SettingsBotsBotIdWebhooksRoute =
+  SettingsBotsBotIdWebhooksRouteImport.update({
+    id: '/webhooks',
+    path: '/webhooks',
+    getParentRoute: () => SettingsBotsBotIdRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -115,8 +167,16 @@ export interface FileRoutesByFullPath {
   '/settings/schedules': typeof SettingsSchedulesRoute
   '/settings/webhooks': typeof SettingsWebhooksRoute
   '/settings/': typeof SettingsIndexRoute
+  '/settings/bots/$botId': typeof SettingsBotsBotIdRouteWithChildren
   '/settings/chat/discord': typeof SettingsChatDiscordRoute
   '/settings/chat/': typeof SettingsChatIndexRoute
+  '/settings/bots/$botId/discord': typeof SettingsBotsBotIdDiscordRoute
+  '/settings/bots/$botId/general': typeof SettingsBotsBotIdGeneralRoute
+  '/settings/bots/$botId/mcp': typeof SettingsBotsBotIdMcpRoute
+  '/settings/bots/$botId/models': typeof SettingsBotsBotIdModelsRoute
+  '/settings/bots/$botId/schedules': typeof SettingsBotsBotIdSchedulesRoute
+  '/settings/bots/$botId/webhooks': typeof SettingsBotsBotIdWebhooksRoute
+  '/settings/bots/$botId/': typeof SettingsBotsBotIdIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -132,6 +192,13 @@ export interface FileRoutesByTo {
   '/settings': typeof SettingsIndexRoute
   '/settings/chat/discord': typeof SettingsChatDiscordRoute
   '/settings/chat': typeof SettingsChatIndexRoute
+  '/settings/bots/$botId/discord': typeof SettingsBotsBotIdDiscordRoute
+  '/settings/bots/$botId/general': typeof SettingsBotsBotIdGeneralRoute
+  '/settings/bots/$botId/mcp': typeof SettingsBotsBotIdMcpRoute
+  '/settings/bots/$botId/models': typeof SettingsBotsBotIdModelsRoute
+  '/settings/bots/$botId/schedules': typeof SettingsBotsBotIdSchedulesRoute
+  '/settings/bots/$botId/webhooks': typeof SettingsBotsBotIdWebhooksRoute
+  '/settings/bots/$botId': typeof SettingsBotsBotIdIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -148,8 +215,16 @@ export interface FileRoutesById {
   '/settings/schedules': typeof SettingsSchedulesRoute
   '/settings/webhooks': typeof SettingsWebhooksRoute
   '/settings/': typeof SettingsIndexRoute
+  '/settings/bots/$botId': typeof SettingsBotsBotIdRouteWithChildren
   '/settings/chat/discord': typeof SettingsChatDiscordRoute
   '/settings/chat/': typeof SettingsChatIndexRoute
+  '/settings/bots/$botId/discord': typeof SettingsBotsBotIdDiscordRoute
+  '/settings/bots/$botId/general': typeof SettingsBotsBotIdGeneralRoute
+  '/settings/bots/$botId/mcp': typeof SettingsBotsBotIdMcpRoute
+  '/settings/bots/$botId/models': typeof SettingsBotsBotIdModelsRoute
+  '/settings/bots/$botId/schedules': typeof SettingsBotsBotIdSchedulesRoute
+  '/settings/bots/$botId/webhooks': typeof SettingsBotsBotIdWebhooksRoute
+  '/settings/bots/$botId/': typeof SettingsBotsBotIdIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -167,8 +242,16 @@ export interface FileRouteTypes {
     | '/settings/schedules'
     | '/settings/webhooks'
     | '/settings/'
+    | '/settings/bots/$botId'
     | '/settings/chat/discord'
     | '/settings/chat/'
+    | '/settings/bots/$botId/discord'
+    | '/settings/bots/$botId/general'
+    | '/settings/bots/$botId/mcp'
+    | '/settings/bots/$botId/models'
+    | '/settings/bots/$botId/schedules'
+    | '/settings/bots/$botId/webhooks'
+    | '/settings/bots/$botId/'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -184,6 +267,13 @@ export interface FileRouteTypes {
     | '/settings'
     | '/settings/chat/discord'
     | '/settings/chat'
+    | '/settings/bots/$botId/discord'
+    | '/settings/bots/$botId/general'
+    | '/settings/bots/$botId/mcp'
+    | '/settings/bots/$botId/models'
+    | '/settings/bots/$botId/schedules'
+    | '/settings/bots/$botId/webhooks'
+    | '/settings/bots/$botId'
   id:
     | '__root__'
     | '/'
@@ -199,8 +289,16 @@ export interface FileRouteTypes {
     | '/settings/schedules'
     | '/settings/webhooks'
     | '/settings/'
+    | '/settings/bots/$botId'
     | '/settings/chat/discord'
     | '/settings/chat/'
+    | '/settings/bots/$botId/discord'
+    | '/settings/bots/$botId/general'
+    | '/settings/bots/$botId/mcp'
+    | '/settings/bots/$botId/models'
+    | '/settings/bots/$botId/schedules'
+    | '/settings/bots/$botId/webhooks'
+    | '/settings/bots/$botId/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -302,6 +400,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SettingsWebhooksRouteImport
       parentRoute: typeof SettingsRoute
     }
+    '/settings/bots/$botId': {
+      id: '/settings/bots/$botId'
+      path: '/bots/$botId'
+      fullPath: '/settings/bots/$botId'
+      preLoaderRoute: typeof SettingsBotsBotIdRouteImport
+      parentRoute: typeof SettingsRoute
+    }
     '/settings/chat/': {
       id: '/settings/chat/'
       path: '/'
@@ -315,6 +420,55 @@ declare module '@tanstack/react-router' {
       fullPath: '/settings/chat/discord'
       preLoaderRoute: typeof SettingsChatDiscordRouteImport
       parentRoute: typeof SettingsChatRoute
+    }
+    '/settings/bots/$botId/': {
+      id: '/settings/bots/$botId/'
+      path: '/'
+      fullPath: '/settings/bots/$botId/'
+      preLoaderRoute: typeof SettingsBotsBotIdIndexRouteImport
+      parentRoute: typeof SettingsBotsBotIdRoute
+    }
+    '/settings/bots/$botId/discord': {
+      id: '/settings/bots/$botId/discord'
+      path: '/discord'
+      fullPath: '/settings/bots/$botId/discord'
+      preLoaderRoute: typeof SettingsBotsBotIdDiscordRouteImport
+      parentRoute: typeof SettingsBotsBotIdRoute
+    }
+    '/settings/bots/$botId/general': {
+      id: '/settings/bots/$botId/general'
+      path: '/general'
+      fullPath: '/settings/bots/$botId/general'
+      preLoaderRoute: typeof SettingsBotsBotIdGeneralRouteImport
+      parentRoute: typeof SettingsBotsBotIdRoute
+    }
+    '/settings/bots/$botId/mcp': {
+      id: '/settings/bots/$botId/mcp'
+      path: '/mcp'
+      fullPath: '/settings/bots/$botId/mcp'
+      preLoaderRoute: typeof SettingsBotsBotIdMcpRouteImport
+      parentRoute: typeof SettingsBotsBotIdRoute
+    }
+    '/settings/bots/$botId/models': {
+      id: '/settings/bots/$botId/models'
+      path: '/models'
+      fullPath: '/settings/bots/$botId/models'
+      preLoaderRoute: typeof SettingsBotsBotIdModelsRouteImport
+      parentRoute: typeof SettingsBotsBotIdRoute
+    }
+    '/settings/bots/$botId/schedules': {
+      id: '/settings/bots/$botId/schedules'
+      path: '/schedules'
+      fullPath: '/settings/bots/$botId/schedules'
+      preLoaderRoute: typeof SettingsBotsBotIdSchedulesRouteImport
+      parentRoute: typeof SettingsBotsBotIdRoute
+    }
+    '/settings/bots/$botId/webhooks': {
+      id: '/settings/bots/$botId/webhooks'
+      path: '/webhooks'
+      fullPath: '/settings/bots/$botId/webhooks'
+      preLoaderRoute: typeof SettingsBotsBotIdWebhooksRouteImport
+      parentRoute: typeof SettingsBotsBotIdRoute
     }
   }
 }
@@ -333,6 +487,29 @@ const SettingsChatRouteWithChildren = SettingsChatRoute._addFileChildren(
   SettingsChatRouteChildren,
 )
 
+interface SettingsBotsBotIdRouteChildren {
+  SettingsBotsBotIdDiscordRoute: typeof SettingsBotsBotIdDiscordRoute
+  SettingsBotsBotIdGeneralRoute: typeof SettingsBotsBotIdGeneralRoute
+  SettingsBotsBotIdMcpRoute: typeof SettingsBotsBotIdMcpRoute
+  SettingsBotsBotIdModelsRoute: typeof SettingsBotsBotIdModelsRoute
+  SettingsBotsBotIdSchedulesRoute: typeof SettingsBotsBotIdSchedulesRoute
+  SettingsBotsBotIdWebhooksRoute: typeof SettingsBotsBotIdWebhooksRoute
+  SettingsBotsBotIdIndexRoute: typeof SettingsBotsBotIdIndexRoute
+}
+
+const SettingsBotsBotIdRouteChildren: SettingsBotsBotIdRouteChildren = {
+  SettingsBotsBotIdDiscordRoute: SettingsBotsBotIdDiscordRoute,
+  SettingsBotsBotIdGeneralRoute: SettingsBotsBotIdGeneralRoute,
+  SettingsBotsBotIdMcpRoute: SettingsBotsBotIdMcpRoute,
+  SettingsBotsBotIdModelsRoute: SettingsBotsBotIdModelsRoute,
+  SettingsBotsBotIdSchedulesRoute: SettingsBotsBotIdSchedulesRoute,
+  SettingsBotsBotIdWebhooksRoute: SettingsBotsBotIdWebhooksRoute,
+  SettingsBotsBotIdIndexRoute: SettingsBotsBotIdIndexRoute,
+}
+
+const SettingsBotsBotIdRouteWithChildren =
+  SettingsBotsBotIdRoute._addFileChildren(SettingsBotsBotIdRouteChildren)
+
 interface SettingsRouteChildren {
   SettingsChatRoute: typeof SettingsChatRouteWithChildren
   SettingsDiscordRoute: typeof SettingsDiscordRoute
@@ -344,6 +521,7 @@ interface SettingsRouteChildren {
   SettingsSchedulesRoute: typeof SettingsSchedulesRoute
   SettingsWebhooksRoute: typeof SettingsWebhooksRoute
   SettingsIndexRoute: typeof SettingsIndexRoute
+  SettingsBotsBotIdRoute: typeof SettingsBotsBotIdRouteWithChildren
 }
 
 const SettingsRouteChildren: SettingsRouteChildren = {
@@ -357,6 +535,7 @@ const SettingsRouteChildren: SettingsRouteChildren = {
   SettingsSchedulesRoute: SettingsSchedulesRoute,
   SettingsWebhooksRoute: SettingsWebhooksRoute,
   SettingsIndexRoute: SettingsIndexRoute,
+  SettingsBotsBotIdRoute: SettingsBotsBotIdRouteWithChildren,
 }
 
 const SettingsRouteWithChildren = SettingsRoute._addFileChildren(

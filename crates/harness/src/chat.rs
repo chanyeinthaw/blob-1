@@ -220,6 +220,7 @@ pub(crate) struct Inner<E, S, M, F: Models> {
     pub share: Option<crate::ShareTools>,
     pub callback: Option<crate::CallbackTools>,
     pub mcp: Option<mcp::Mcp>,
+    pub mcp_filter: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
     pub config: Arc<dyn ConfigStore>,
     pub pulses: Mutex<Vec<(u64, tokio::task::Id)>>,
     pub schedule_gate: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -323,6 +324,7 @@ where
                 share: None,
                 callback: None,
                 mcp: None,
+                mcp_filter: None,
                 config: Arc::clone(&config),
                 pulses: Mutex::new(Vec::new()),
                 schedule_gate: None,
@@ -363,6 +365,20 @@ where
         let inner = Arc::get_mut(&mut self.inner).expect("unshared chat");
         inner.mcp = Some(mcp);
         self
+    }
+
+    pub fn with_mcp_filter(
+        mut self,
+        filter: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner).expect("unshared chat");
+        inner.mcp_filter = Some(filter);
+        self
+    }
+
+    /// Stops and joins background memory compaction workers owned by this harness.
+    pub async fn shutdown(&self) {
+        self.inner.memory.shutdown().await;
     }
 
     pub fn steer(&self, text: String) {
@@ -541,7 +557,10 @@ where
         let (llm, _, _) = self.inner.models.connect(None, None)?;
         let skills = self.inner.environment.skill_catalog().await?;
         let mcp_servers = match &self.inner.mcp {
-            Some(mcp) => mcp.describe().await,
+            Some(mcp) => match &self.inner.mcp_filter {
+                Some(allowed) => mcp.describe_filtered(allowed.as_ref()).await,
+                None => mcp.describe().await,
+            },
             None => Vec::new(),
         };
         let instructions = self

@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use environment::{Environment, SkillBundle};
@@ -6,8 +7,8 @@ use environment_local::LocalEnvironment;
 use harness::{ChatHarness, EnvironmentPaths, Models};
 use messenger::Messenger;
 use storage::{
-    CallbackStore, ConfigStore, McpStore, MessengerStore, Provider, ReasoningLevel, SkillStore,
-    UsageEvent, UsageKind, UsageStore,
+    Bot, BotStore, CallbackStore, ConfigStore, McpStore, MessengerStore, Provider, ReasoningLevel,
+    SkillStore, UsageEvent, UsageKind, UsageStore, DEFAULT_BOT_ID,
 };
 use storage_sqlite::SqliteStorage;
 use tokio::signal::unix::{signal, SignalKind};
@@ -20,7 +21,9 @@ use crate::{api_key, Result};
 /// once per change.
 #[derive(Clone)]
 struct ModelFactory {
-    store: Arc<SqliteStorage>,
+    global_store: Arc<SqliteStorage>,
+    usage_store: Arc<SqliteStorage>,
+    bot_id: String,
     cache: Arc<Mutex<Cache>>,
 }
 
@@ -46,8 +49,18 @@ struct Working {
 
 impl ModelFactory {
     fn new(store: Arc<SqliteStorage>) -> Self {
+        Self::new_for_bot(store.clone(), store, DEFAULT_BOT_ID.to_owned())
+    }
+
+    fn new_for_bot(
+        global_store: Arc<SqliteStorage>,
+        usage_store: Arc<SqliteStorage>,
+        bot_id: String,
+    ) -> Self {
         Self {
-            store,
+            global_store,
+            usage_store,
+            bot_id,
             cache: Arc::new(Mutex::new(Cache::default())),
         }
     }
@@ -57,15 +70,13 @@ impl ModelFactory {
     fn fingerprint(&self) -> std::result::Result<u64, harness::HarnessError> {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.store.settings()?.hash(&mut hasher);
-        self.store.utility_model()?.hash(&mut hasher);
-        self.store.decision_model()?.hash(&mut hasher);
-        for provider in self.store.providers()? {
+        self.global_store.bot_models(&self.bot_id)?.hash(&mut hasher);
+        for provider in self.global_store.providers()? {
             provider.hash(&mut hasher);
-            self.store
+            self.global_store
                 .provider_key_fingerprint(&provider.id)?
                 .hash(&mut hasher);
-            self.store.models(&provider.id)?.hash(&mut hasher);
+            self.global_store.models(&provider.id)?.hash(&mut hasher);
         }
         Ok(hasher.finish())
     }
@@ -75,18 +86,18 @@ impl harness::Models for ModelFactory {
     type Llm = Model;
 
     fn list(&self, search: Option<&str>) -> std::result::Result<String, harness::HarnessError> {
-        let settings = self.store.settings()?;
-        let default = settings
-            .default_model
+        let bm = self.global_store.bot_models(&self.bot_id)?;
+        let default = bm
+            .main
             .ok_or_else(|| harness::HarnessError::Compaction("no default model".into()))?;
         let mut lines = vec![
             format!(
                 "default: provider={} model={} reasoning={}",
                 default.provider.0,
                 default.model,
-                settings.reasoning.as_str()
+                bm.main_reasoning.as_str()
             ),
-            match settings.compaction_model {
+            match bm.compaction {
                 Some(model) => format!(
                     "compaction: provider={} model={}",
                     model.provider.0, model.model
@@ -96,11 +107,11 @@ impl harness::Models for ModelFactory {
             "provider  model  context  reasoning  input".into(),
         ];
         let search = search.unwrap_or("").to_lowercase();
-        for provider in self.store.providers()? {
+        for provider in self.global_store.providers()? {
             if provider.api.is_decision() {
                 continue;
             }
-            for model in self.store.models(&provider.id)? {
+            for model in self.global_store.models(&provider.id)? {
                 if !provider.id.0.to_lowercase().contains(&search)
                     && !model.id.to_lowercase().contains(&search)
                 {
@@ -160,7 +171,7 @@ impl harness::Models for ModelFactory {
                 model.to_owned(),
                 match reasoning {
                     Some(reasoning) => reasoning,
-                    None => self.store.settings()?.reasoning,
+                    None => self.global_store.bot_models(&self.bot_id)?.main_reasoning,
                 },
             ),
             None => {
@@ -181,7 +192,7 @@ impl harness::Models for ModelFactory {
                     return Ok((
                         Model::main(
                             main.llm,
-                            self.store.clone(),
+                            self.usage_store.clone(),
                             UsageKind::Chat,
                             &main.selection.provider,
                             &main.selection.model,
@@ -190,12 +201,12 @@ impl harness::Models for ModelFactory {
                         main.selection,
                     ));
                 }
-                let key = api_key(&self.store, &main.provider)
+                let key = api_key(&self.global_store, &main.provider)
                     .map_err(|error| harness::HarnessError::Compaction(error.to_string()))?;
                 return Ok((
                     Model::main(
                         llm_rig::connect(&main.provider, &key, &main.model, reasoning),
-                        self.store.clone(),
+                        self.usage_store.clone(),
                         UsageKind::Chat,
                         &main.selection.provider,
                         &main.selection.model,
@@ -210,7 +221,7 @@ impl harness::Models for ModelFactory {
         };
         let unknown = || harness::HarnessError::UnknownModel(format!("{provider_id} {model_id}"));
         let provider = self
-            .store
+            .global_store
             .providers()?
             .into_iter()
             .find(|p| p.id.0 == provider_id)
@@ -223,17 +234,17 @@ impl harness::Models for ModelFactory {
         }
         check_base_url(&provider).map_err(harness::HarnessError::Compaction)?;
         let model = self
-            .store
+            .global_store
             .models(&provider.id)?
             .into_iter()
             .find(|m| m.id == model_id)
             .ok_or_else(unknown)?;
-        let key = api_key(&self.store, &provider)
+        let key = api_key(&self.global_store, &provider)
             .map_err(|error| harness::HarnessError::Compaction(error.to_string()))?;
         Ok((
             Model::main(
                 llm_rig::connect(&provider, &key, &model, reasoning),
-                self.store.clone(),
+                self.usage_store.clone(),
                 UsageKind::Chat,
                 &provider_id,
                 &model_id,
@@ -253,7 +264,12 @@ impl harness::Models for ModelFactory {
         let mut cache = self.cache.lock().expect("model cache poisoned");
         if cache.fingerprint != Some(fingerprint) {
             cache.fingerprint = Some(fingerprint);
-            let attempt = resolve(&self.store, cache.main.as_ref());
+            let attempt = resolve(
+                &self.global_store,
+                &self.usage_store,
+                &self.bot_id,
+                cache.main.as_ref(),
+            );
             // A role that fails to resolve keeps its last working model; each
             // distinct error is logged once per settings change.
             let mut logged: Vec<String> = Vec::new();
@@ -311,7 +327,7 @@ impl harness::Models for ModelFactory {
         Ok(harness::Current {
             main: Model::main(
                 main.llm.clone(),
-                self.store.clone(),
+                self.usage_store.clone(),
                 UsageKind::Chat,
                 &main.selection.provider,
                 &main.selection.model,
@@ -320,7 +336,7 @@ impl harness::Models for ModelFactory {
             compactor: cache.compactor.clone().unwrap_or_else(|| {
                 Model::main(
                     main.llm.clone(),
-                    self.store.clone(),
+                    self.usage_store.clone(),
                     UsageKind::Compaction,
                     &main.selection.provider,
                     &main.selection.model,
@@ -481,19 +497,14 @@ pub struct LiveChat {
     outbox: Arc<tokio::sync::Notify>,
 }
 
-/// Validated live chat handle holding a read lock across callback consumption
+/// Validated live chat handle holding a read lock across durable outbox commit
 /// and notification so shutdown cannot race between `prepare` and `wake`.
 pub struct PreparedInject {
-    guard: tokio::sync::OwnedRwLockReadGuard<Option<(Arc<Chat>, ModelFactory)>>,
+    _guard: tokio::sync::OwnedRwLockReadGuard<Option<(Arc<Chat>, ModelFactory)>>,
     outbox: Arc<tokio::sync::Notify>,
 }
 
 impl PreparedInject {
-    pub fn deliver(self, text: String, meta: Option<storage::Meta>) {
-        let (chat, _) = self.guard.as_ref().expect("LiveChat verified in prepare");
-        chat.steer_message(text, meta);
-    }
-
     pub fn wake(self) {
         self.outbox.notify_one();
     }
@@ -519,14 +530,9 @@ impl LiveChat {
         };
         models.current()?;
         Ok(PreparedInject {
-            guard,
+            _guard: guard,
             outbox: self.outbox.clone(),
         })
-    }
-
-    pub async fn inject(&self, text: String, meta: Option<storage::Meta>) -> Result<()> {
-        self.prepare().await?.deliver(text, meta);
-        Ok(())
     }
 }
 
@@ -634,7 +640,8 @@ fn resolve_main(store: &SqliteStorage, settings: &storage::Settings) -> Resolve<
 }
 
 fn resolve_summarizer(
-    store: &Arc<SqliteStorage>,
+    global_store: &Arc<SqliteStorage>,
+    usage_store: &Arc<SqliteStorage>,
     settings: &storage::Settings,
     main: &Resolve<Working>,
     cached: Option<&Working>,
@@ -642,14 +649,14 @@ fn resolve_summarizer(
     let Some(selected) = &settings.compaction_model else {
         return Ok(None);
     };
-    let (provider, stored) = resolve_model(store, selected)?;
+    let (provider, stored) = resolve_model(global_store, selected)?;
     if provider.api.is_decision() {
         return Err(format!(
             "decision provider {} cannot be used as the compaction model",
             provider.id.0
         ));
     }
-    let key = api_key(store, &provider).map_err(|error| error.to_string())?;
+    let key = api_key(global_store, &provider).map_err(|error| error.to_string())?;
     let llm = RecordedLlm::new(
         llm_rig::connect(
             &provider,
@@ -657,7 +664,7 @@ fn resolve_summarizer(
             &stored,
             settings.compaction_reasoning.unwrap_or(settings.reasoning),
         ),
-        store.clone(),
+        usage_store.clone(),
         UsageKind::Compaction,
         &provider.id.0,
         &stored.id,
@@ -675,7 +682,7 @@ fn resolve_summarizer(
         Some(main) => {
             let secondary = RecordedLlm::new(
                 main.llm.clone(),
-                store.clone(),
+                usage_store.clone(),
                 UsageKind::Compaction,
                 &main.selection.provider,
                 &main.selection.model,
@@ -687,18 +694,22 @@ fn resolve_summarizer(
     Ok(Some((model, window)))
 }
 
-fn resolve_compactor(store: &Arc<SqliteStorage>, settings: &storage::Settings) -> Resolve<Model> {
+fn resolve_compactor(
+    global_store: &Arc<SqliteStorage>,
+    usage_store: &Arc<SqliteStorage>,
+    settings: &storage::Settings,
+) -> Resolve<Model> {
     let Some(selected) = &settings.default_model else {
         return Err("no default model; run `agent model set <provider>/<model>`".into());
     };
-    let (provider, stored) = resolve_model(store, selected)?;
+    let (provider, stored) = resolve_model(global_store, selected)?;
     if provider.api.is_decision() {
         return Err(format!(
             "decision provider {} cannot be used as the compaction model",
             provider.id.0
         ));
     }
-    let key = api_key(store, &provider).map_err(|error| error.to_string())?;
+    let key = api_key(global_store, &provider).map_err(|error| error.to_string())?;
     Ok(Model::main(
         llm_rig::connect(
             &provider,
@@ -706,16 +717,21 @@ fn resolve_compactor(store: &Arc<SqliteStorage>, settings: &storage::Settings) -
             &stored,
             settings.compaction_reasoning.unwrap_or(settings.reasoning),
         ),
-        store.clone(),
+        usage_store.clone(),
         UsageKind::Compaction,
         &provider.id.0,
         &stored.id,
     ))
 }
 
-fn resolve(store: &Arc<SqliteStorage>, cached: Option<&Working>) -> Attempt {
-    let settings = match store.settings() {
-        Ok(settings) => settings,
+fn resolve(
+    global_store: &Arc<SqliteStorage>,
+    usage_store: &Arc<SqliteStorage>,
+    bot_id: &str,
+    cached: Option<&Working>,
+) -> Attempt {
+    let bm = match global_store.bot_models(bot_id) {
+        Ok(bm) => bm,
         Err(error) => {
             let error = error.to_string();
             return Attempt {
@@ -727,27 +743,31 @@ fn resolve(store: &Arc<SqliteStorage>, cached: Option<&Working>) -> Attempt {
             };
         }
     };
-    let main = resolve_main(store, &settings);
-    let summarizer = resolve_summarizer(store, &settings, &main, cached);
+    let settings = storage::Settings {
+        default_model: bm.main,
+        reasoning: bm.main_reasoning,
+        compaction_model: bm.compaction,
+        compaction_reasoning: bm.compaction_reasoning,
+    };
+    let main = resolve_main(global_store, &settings);
+    let summarizer = resolve_summarizer(global_store, usage_store, &settings, &main, cached);
     let compactor = match &summarizer {
         Ok(Some((model, _))) => Ok(model.clone()),
-        Ok(None) => resolve_compactor(store, &settings),
+        Ok(None) => resolve_compactor(global_store, usage_store, &settings),
         Err(error) => Err(error.clone()),
     };
     let utility = (|| -> Resolve<Option<RecordedLlm>> {
-        let Some((selected, reasoning)) =
-            store.utility_model().map_err(|error| error.to_string())?
-        else {
+        let Some((selected, reasoning)) = bm.utility else {
             return Ok(None);
         };
-        let (provider, model) = resolve_model(store, &selected)?;
+        let (provider, model) = resolve_model(global_store, &selected)?;
         if provider.api.is_decision() {
             return Err(format!(
                 "decision provider {} cannot be used as the utility LLM",
                 provider.id.0
             ));
         }
-        let key = api_key(store, &provider).map_err(|error| error.to_string())?;
+        let key = api_key(global_store, &provider).map_err(|error| error.to_string())?;
         Ok(Some(RecordedLlm::new(
             llm_rig::connect(
                 &provider,
@@ -755,27 +775,27 @@ fn resolve(store: &Arc<SqliteStorage>, cached: Option<&Working>) -> Attempt {
                 &model,
                 reasoning.unwrap_or(ReasoningLevel::Low),
             ),
-            store.clone(),
+            usage_store.clone(),
             UsageKind::Utility,
             &provider.id.0,
             &model.id,
         )))
     })();
     let decision = (|| -> Resolve<Option<RecordedDecision>> {
-        let Some(selected) = store.decision_model().map_err(|error| error.to_string())? else {
+        let Some(selected) = bm.decision else {
             return Ok(None);
         };
-        let (provider, model) = resolve_model(store, &selected)?;
+        let (provider, model) = resolve_model(global_store, &selected)?;
         if !provider.api.is_decision() {
             return Err(format!(
                 "provider {} is not a decision provider",
                 provider.id.0
             ));
         }
-        let key = api_key(store, &provider).map_err(|error| error.to_string())?;
+        let key = api_key(global_store, &provider).map_err(|error| error.to_string())?;
         Ok(Some(RecordedDecision::new(
             llm_rig::connect_decision(&provider, &key, &model),
-            store.clone(),
+            usage_store.clone(),
             &provider.id.0,
             &model.id,
         )))
@@ -789,11 +809,11 @@ fn resolve(store: &Arc<SqliteStorage>, cached: Option<&Working>) -> Attempt {
     }
 }
 
-async fn environment(
+async fn sync_shared_skills(
     store: &Arc<SqliteStorage>,
     workspace: &Path,
     skills_dir: Option<&Path>,
-) -> Result<LocalEnvironment> {
+) -> Result<()> {
     let environment = LocalEnvironment::new(workspace, skills_dir.map(Path::to_path_buf))?;
     let manifest = environment.managed_skills().await?;
     let skills = store.skills()?;
@@ -824,40 +844,51 @@ async fn environment(
     for name in environment.apply_skills(put, remove).await? {
         eprintln!("skill {name} skipped: a user-owned skill with this name exists");
     }
-    Ok(environment)
+    Ok(())
 }
 
 async fn chat_harness(
-    store: Arc<SqliteStorage>,
+    global_store: Arc<SqliteStorage>,
+    bot_store: Arc<SqliteStorage>,
+    bot_id: String,
     workspace: &Path,
     pinned_workspace: harness::PinnedWorkspace,
     skills_dir: Option<&Path>,
     models: ModelFactory,
     mcp: mcp::Mcp,
 ) -> Result<Chat> {
-    let environment = environment(&store, workspace, skills_dir).await?;
+    let environment = LocalEnvironment::new(workspace, skills_dir.map(Path::to_path_buf))?;
     let memory = memory::Memory::open(
-        store.clone(),
+        bot_store.clone(),
         Compactor(models.clone()),
         memory::MemoryConfig::default(),
     )?;
+    let filter_store = global_store.clone();
+    let filter_bot = bot_id;
+    let mcp_filter: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(move |server_id: &str| {
+        match filter_store.bot_disabled_mcp_servers(&filter_bot) {
+            Ok(disabled) => !disabled.iter().any(|id| id == server_id),
+            Err(_) => false,
+        }
+    });
     Ok(ChatHarness::new(
         environment,
-        store.clone(),
+        bot_store.clone(),
         memory,
         EnvironmentPaths {
             workspace: workspace.to_path_buf(),
         },
         models,
-        store.clone(),
+        bot_store.clone(),
     )
     .with_share(harness::ShareTools::new(
-        store.clone(),
-        store.clone(),
+        bot_store.clone(),
+        global_store.clone(),
         pinned_workspace,
     ))
-    .with_callback(harness::CallbackTools::new(store.clone(), store))
-    .with_mcp(mcp))
+    .with_callback(harness::CallbackTools::new(bot_store, global_store))
+    .with_mcp(mcp)
+    .with_mcp_filter(mcp_filter))
 }
 
 pub async fn chat(
@@ -876,8 +907,19 @@ pub async fn chat(
     let mcp = mcp::Mcp::new(store.clone());
     let mcp_shutdown = mcp.clone();
     std::fs::create_dir_all(workspace)?;
+    sync_shared_skills(&store, workspace, skills_dir).await?;
     let pinned_workspace = harness::PinnedWorkspace::open(workspace)?;
-    let harness = chat_harness(store, workspace, pinned_workspace, skills_dir, models, mcp).await?;
+    let harness = chat_harness(
+        store.clone(),
+        store,
+        DEFAULT_BOT_ID.to_owned(),
+        workspace,
+        pinned_workspace,
+        skills_dir,
+        models,
+        mcp,
+    )
+    .await?;
     let mut failure = None;
     let signal_text = tokio::select! {
         answer = harness.run(&prompt) => {
@@ -1606,8 +1648,433 @@ async fn admit_batch(
     Ok(())
 }
 
-pub async fn serve(
+/// Validates a bot slug (`^[a-z0-9][a-z0-9-]{0,31}$`).
+pub fn valid_bot_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 32
+        && id.as_bytes()[0].is_ascii_alphanumeric()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+#[derive(Clone)]
+pub struct BotHandle {
+    pub id: String,
+    pub generation: i64,
+    pub store: Arc<SqliteStorage>,
+    pub workspace: harness::PinnedWorkspace,
+    pub discord: Arc<messenger_discord::Discord>,
+    pub live_chat: LiveChat,
+}
+
+struct BotEntry {
+    handle: BotHandle,
+    workspace_path: PathBuf,
+    running: Option<(tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>)>,
+}
+
+/// Manages every bot running inside one `blob-1 serve` process. The `'default'`
+/// bot uses the root `agent.db` and `workspace/` in place; additional bots live
+/// under `<data_dir>/bots/<id>/{agent.db, workspace/}` while sharing global
+/// providers, model catalog, and the MCP connection pool.
+#[derive(Clone)]
+pub struct BotRegistry {
+    global_store: Arc<SqliteStorage>,
+    data_dir: PathBuf,
+    app_key: Option<storage_sqlite::AppKey>,
+    root_workspace: PathBuf,
+    root_pinned_workspace: harness::PinnedWorkspace,
+    skills_dir: Option<PathBuf>,
+    mcp: mcp::Mcp,
+    bots: Arc<tokio::sync::RwLock<HashMap<String, BotEntry>>>,
+}
+
+impl BotRegistry {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        global_store: Arc<SqliteStorage>,
+        data_dir: PathBuf,
+        app_key: Option<storage_sqlite::AppKey>,
+        root_workspace: PathBuf,
+        root_pinned_workspace: harness::PinnedWorkspace,
+        skills_dir: Option<PathBuf>,
+        mcp: mcp::Mcp,
+    ) -> Self {
+        Self {
+            global_store,
+            data_dir,
+            app_key,
+            root_workspace,
+            root_pinned_workspace,
+            skills_dir,
+            mcp,
+            bots: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn bot_dir(&self, bot_id: &str) -> PathBuf {
+        self.data_dir.join("bots").join(bot_id)
+    }
+
+    fn open_entry(&self, bot: &Bot) -> Result<BotEntry> {
+        let (store, workspace_path, workspace) = if bot.id == DEFAULT_BOT_ID {
+            (
+                self.global_store.clone(),
+                self.root_workspace.clone(),
+                self.root_pinned_workspace.clone(),
+            )
+        } else {
+            let dir = self.bot_dir(&bot.id);
+            // Recovery: a delete rollback that could not move the directory back
+            // leaves the real data in `.trash-<id>-<gen>-*`. Restore it before
+            // creating anything so a restart never shadows it with a fresh DB.
+            // The generation in the name keeps a recreated slug from picking up
+            // a prior instance's archive.
+            if !dir.exists() {
+                let prefix = format!(".trash-{}-{}-", bot.id, bot.generation);
+                if let Ok(entries) = std::fs::read_dir(self.data_dir.join("bots")) {
+                    for entry in entries.flatten() {
+                        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                            match std::fs::rename(entry.path(), &dir) {
+                                Ok(()) => eprintln!(
+                                    "recovered bot '{}' directory from {}",
+                                    bot.id,
+                                    entry.path().display()
+                                ),
+                                // A matching archive exists but could not be moved
+                                // back — opening a fresh DB would shadow it.
+                                Err(error) => {
+                                    return Err(format!(
+                                        "failed to recover bot '{}' directory from {}: {error}",
+                                        bot.id,
+                                        entry.path().display()
+                                    )
+                                    .into())
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            let ws = dir.join("workspace");
+            std::fs::create_dir_all(&ws)?;
+            let ws = ws.canonicalize()?;
+            let store = Arc::new(SqliteStorage::open(
+                dir.join("agent.db"),
+                self.app_key.clone(),
+            )?);
+            let pinned = harness::PinnedWorkspace::open(&ws)?;
+            (store, ws, pinned)
+        };
+        Ok(BotEntry {
+            handle: BotHandle {
+                id: bot.id.clone(),
+                generation: bot.generation,
+                store,
+                workspace,
+                discord: Arc::new(messenger_discord::Discord::new()),
+                live_chat: LiveChat::default(),
+            },
+            workspace_path,
+            running: None,
+        })
+    }
+
+    fn spawn_bot_loop(&self, entry: &mut BotEntry) {
+        if let Some((_, task)) = &entry.running {
+            if !task.is_finished() {
+                return;
+            }
+        }
+        entry.running = None;
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let global_store = self.global_store.clone();
+        let bot_store = entry.handle.store.clone();
+        let bot_id = entry.handle.id.clone();
+        let ws_path = entry.workspace_path.clone();
+        let pinned = entry.handle.workspace.clone();
+        let skills_dir = self.skills_dir.clone();
+        let discord = entry.handle.discord.clone();
+        let mcp = self.mcp.clone();
+        let live_chat = entry.handle.live_chat.clone();
+        let task = tokio::spawn(async move {
+            let result = serve_bot(
+                global_store,
+                bot_store,
+                bot_id.clone(),
+                &ws_path,
+                pinned,
+                skills_dir.as_deref(),
+                discord.clone(),
+                rx,
+                mcp,
+                live_chat,
+            )
+            .await;
+            discord.disconnect();
+            if let Err(error) = result {
+                eprintln!("bot {bot_id} stopped with error: {error}");
+            }
+        });
+        entry.running = Some((tx, task));
+    }
+
+    pub async fn start_all(&self) -> Result<()> {
+        sync_shared_skills(
+            &self.global_store,
+            &self.root_workspace,
+            self.skills_dir.as_deref(),
+        )
+        .await?;
+        let bots = self.global_store.bots()?;
+        let mut map = self.bots.write().await;
+        for bot in bots {
+            let mut entry = self.open_entry(&bot)?;
+            if bot.enabled {
+                self.spawn_bot_loop(&mut entry);
+            }
+            map.insert(bot.id, entry);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub async fn register_default_for_test(&self) -> Result<()> {
+        let bots = self.global_store.bots()?;
+        let mut map = self.bots.write().await;
+        for bot in bots {
+            let entry = self.open_entry(&bot)?;
+            map.insert(bot.id, entry);
+        }
+        Ok(())
+    }
+
+    pub async fn get(&self, bot_id: &str) -> Result<BotHandle> {
+        let map = self.bots.read().await;
+        map.get(bot_id)
+            .map(|e| e.handle.clone())
+            .ok_or_else(|| format!("Unknown bot {bot_id}").into())
+    }
+
+    pub async fn all_handles(&self) -> Vec<BotHandle> {
+        self.bots
+            .read()
+            .await
+            .values()
+            .map(|e| e.handle.clone())
+            .collect()
+    }
+
+    pub async fn create(&self, id: &str, name: &str) -> Result<Bot> {
+        if !valid_bot_id(id) {
+            return Err(
+                "Bot ID must be 1–32 lowercase letters, digits, or '-' (starting with a letter or digit)"
+                    .into(),
+            );
+        }
+        if id == DEFAULT_BOT_ID {
+            return Err("Bot ID 'default' is reserved".into());
+        }
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 64 {
+            return Err("Bot name must be 1–64 characters".into());
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(1);
+        let mut map = self.bots.write().await;
+        if map.contains_key(id) {
+            return Err(format!("Bot {id} already exists").into());
+        }
+        let bot_dir = self.bot_dir(id);
+        if bot_dir.exists() {
+            return Err(format!(
+                "Directory for bot '{id}' already exists on disk; remove it before reusing this ID"
+            )
+            .into());
+        }
+        let max_created = self
+            .global_store
+            .bots()?
+            .into_iter()
+            .map(|b| b.created_at)
+            .max()
+            .unwrap_or(0);
+        let created_at = now_ms.max(max_created + 1);
+        let bot = self.global_store.create_bot(id, name, created_at)?;
+        let mut entry = match self.open_entry(&bot) {
+            Ok(entry) => entry,
+            Err(error) => {
+                let _ = self.global_store.remove_bot(id);
+                let _ = std::fs::remove_dir_all(&bot_dir);
+                return Err(error);
+            }
+        };
+        let _ = entry
+            .handle
+            .store
+            .set_instructions(Some(&format!("# Identity\n\nYou are {name}")));
+        self.spawn_bot_loop(&mut entry);
+        map.insert(bot.id.clone(), entry);
+        Ok(bot)
+    }
+
+    pub async fn update(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<Bot> {
+        if let Some(name) = name {
+            let trimmed = name.trim();
+            if trimmed.is_empty() || trimmed.chars().count() > 64 {
+                return Err("Bot name must be 1–64 characters".into());
+            }
+        }
+        let mut stop_task = None;
+        let updated = {
+            let mut map = self.bots.write().await;
+            let Some(entry) = map.get_mut(id) else {
+                return Err(format!("Unknown bot {id}").into());
+            };
+            let trimmed_name = name.map(str::trim);
+            let Some(bot) = self.global_store.update_bot(id, trimmed_name, enabled)? else {
+                return Err(format!("Unknown bot {id}").into());
+            };
+            if bot.enabled {
+                self.spawn_bot_loop(entry);
+            } else if let Some((tx, task)) = entry.running.take() {
+                let _ = tx.send(true);
+                stop_task = Some(task);
+            }
+            bot
+        };
+        if let Some(task) = stop_task {
+            let _ = task.await;
+        }
+        Ok(updated)
+    }
+
+    pub async fn remove(&self, id: &str) -> Result<()> {
+        if id == DEFAULT_BOT_ID {
+            return Err("Cannot remove the default bot".into());
+        }
+        let removed = {
+            let mut map = self.bots.write().await;
+            map.remove(id)
+        };
+        let Some(mut entry) = removed else {
+            return Err(format!("Unknown bot {id}").into());
+        };
+        if let Some((tx, task)) = entry.running.take() {
+            let _ = tx.send(true);
+            let _ = task.await;
+        }
+        entry.handle.discord.disconnect();
+        entry.handle.live_chat.close().await;
+        let generation = entry.handle.generation;
+        drop(entry);
+
+        // Atomically move the bot directory out of the live namespace BEFORE
+        // deleting the roster row so a recreated slug can never inherit stale data.
+        // The generation in the trash name lets a later open recover this exact
+        // instance (and only this instance) after a failed rollback.
+        let dir = self.bot_dir(id);
+        let trash = if dir.exists() {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let target = self
+                .data_dir
+                .join("bots")
+                .join(format!(".trash-{id}-{generation}-{nonce}"));
+            if let Err(error) = std::fs::rename(&dir, &target) {
+                self.restore_entry(id).await;
+                return Err(format!("Failed to archive bot directory for '{id}': {error}").into());
+            }
+            Some(target)
+        } else {
+            None
+        };
+        if let Err(error) = self.global_store.remove_bot(id) {
+            let mut restored = trash.is_none();
+            if let Some(trash_dir) = &trash {
+                match std::fs::rename(trash_dir, &dir) {
+                    Ok(()) => restored = true,
+                    Err(restore_err) => eprintln!(
+                        "warning: failed to restore bot directory {} after DB error: {restore_err}; data remains at {}",
+                        dir.display(),
+                        trash_dir.display()
+                    ),
+                }
+            }
+            // Reopen only when the bot's data is actually back at its live path —
+            // opening otherwise would shadow the archived database with a fresh one.
+            if restored {
+                self.restore_entry(id).await;
+            }
+            return Err(error.into());
+        }
+        if let Some(trash_dir) = trash {
+            if let Err(error) = std::fs::remove_dir_all(&trash_dir) {
+                eprintln!(
+                    "warning: failed to clean up deleted bot archive {}: {error}",
+                    trash_dir.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Reopens a bot whose removal rolled back, keeping the roster row live.
+    /// Failures leave the row without a registry entry (logged; a restart reopens it).
+    async fn restore_entry(&self, id: &str) {
+        match self.global_store.bot(id) {
+            Ok(Some(bot)) => match self.open_entry(&bot) {
+                Ok(mut reopened) => {
+                    if bot.enabled {
+                        self.spawn_bot_loop(&mut reopened);
+                    }
+                    self.bots.write().await.insert(bot.id, reopened);
+                }
+                Err(error) => {
+                    eprintln!("warning: failed to reopen bot '{id}' after rollback: {error}")
+                }
+            },
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("warning: failed to reload bot '{id}' after rollback: {error}")
+            }
+        }
+    }
+
+    pub async fn shutdown_all(&self) {
+        let tasks: Vec<tokio::task::JoinHandle<()>> = {
+            let mut map = self.bots.write().await;
+            map.values_mut()
+                .filter_map(|entry| {
+                    entry.running.take().map(|(tx, task)| {
+                        let _ = tx.send(true);
+                        task
+                    })
+                })
+                .collect()
+        };
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_bot(
+    global_store: Arc<SqliteStorage>,
     store: Arc<SqliteStorage>,
+    bot_id: String,
     workspace: &Path,
     pinned_workspace: harness::PinnedWorkspace,
     skills_dir: Option<&Path>,
@@ -1616,9 +2083,11 @@ pub async fn serve(
     mcp: mcp::Mcp,
     live_chat: LiveChat,
 ) -> Result<()> {
-    let models = ModelFactory::new(store.clone());
+    let models = ModelFactory::new_for_bot(global_store.clone(), store.clone(), bot_id.clone());
     let harness = chat_harness(
+        global_store.clone(),
         store.clone(),
+        bot_id.clone(),
         workspace,
         pinned_workspace.clone(),
         skills_dir,
@@ -1655,6 +2124,8 @@ pub async fn serve(
     // uncached ID could inherit a parent channel rule.
     {
         let filter_store = store.clone();
+        let filter_global = global_store.clone();
+        let filter_bot = bot_id.clone();
         discord.set_pre_filter(Arc::new(
             move |author: &str,
                   guild: Option<&str>,
@@ -1691,10 +2162,9 @@ pub async fn serve(
                         false
                     }
                 };
-                let has_utility = match (filter_store.utility_model(), filter_store.decision_model())
-                {
-                    (Ok(u), Ok(d)) => u.is_some() || d.is_some(),
-                    (Err(error), _) | (_, Err(error)) => {
+                let has_utility = match filter_global.bot_models(&filter_bot) {
+                    Ok(bm) => bm.utility.is_some() || bm.decision.is_some(),
+                    Err(error) => {
                         eprintln!("{error}");
                         false
                     }
@@ -1733,8 +2203,7 @@ pub async fn serve(
     }
     let (tx, mut rx) = tokio::sync::mpsc::channel(128);
     let listener_discord = discord.clone();
-    let listener = tokio::spawn(async move { listener_discord.listen(tx).await });
-    crate::runtime::mark_ready();
+    let mut listener = Some(tokio::spawn(async move { listener_discord.listen(tx).await }));
     let supervisor = {
         let store = store.clone();
         let models = models.clone();
@@ -2153,7 +2622,7 @@ pub async fn serve(
     let outbox_notify = live_chat.outbox_notify();
     let loop_result: Result<()> = tokio::select! {
         result = async {
-    loop {
+    'serve: loop {
         // Register outbox listener BEFORE querying SQLite so a callback commit +
         // `notify_one()` racing with an empty query can never miss a wakeup.
         let outbox_wait = outbox_notify.notified();
@@ -2179,7 +2648,7 @@ pub async fn serve(
             tokio::select! {
                 value = admitted_rx.recv() => match value {
                     Some(next) => { let (text, meta) = next?; Some((text, Some(meta))) },
-                    None => return match listener.await? { Err(error) => Err(error.into()), Ok(()) => Err("discord listener stopped".into()) },
+                    None => break match listener.take().expect("listener running").await? { Err(error) => Err(error.into()), Ok(()) => Err("discord listener stopped".into()) },
                 },
                 _ = &mut outbox_wait => continue,
                 _ = async {
@@ -2188,13 +2657,7 @@ pub async fn serve(
                     }
                     harness.work().await
                 } => None,
-                _ = shutdown.changed() => {
-                    live_chat.close().await;
-                    listener.abort();
-                    admission.abort();
-                    supervisor.abort();
-                    return Ok(());
-                },
+                _ = shutdown.changed() => break Ok(()),
             }
         };
         turn_active.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2208,6 +2671,7 @@ pub async fn serve(
         while let Some((text, meta)) = pending.pop_front() {
             harness.steer_message(text, meta);
         }
+        let mut shutting_down = false;
         loop {
             tokio::select! {
                 result = &mut run => {
@@ -2228,16 +2692,22 @@ pub async fn serve(
                 },
                 value = admitted_rx.recv() => match value {
                     Some(next) => { let (text, meta) = next?; harness.steer_message(text, Some(meta)); },
-                    None => return match listener.await? { Err(error) => Err(error.into()), Ok(()) => Err("discord listener stopped".into()) },
+                    None => {
+                        let listener_err = match listener.take().expect("listener running").await? {
+                            Err(error) => Err(error.into()),
+                            Ok(()) => Err("discord listener stopped".into()),
+                        };
+                        break 'serve listener_err;
+                    },
                 },
                 _ = shutdown.changed() => {
-                    live_chat.close().await;
-                    listener.abort();
-                    admission.abort();
-                    supervisor.abort();
-                    return Ok(());
+                    shutting_down = true;
+                    break;
                 },
             }
+        }
+        if shutting_down {
+            break Ok(());
         }
         messengers.quiet();
         for (text, meta) in harness.take_steering().into_iter().rev() {
@@ -2254,6 +2724,16 @@ pub async fn serve(
         _ = harness.run_schedules() => unreachable!(),
     };
     live_chat.close().await;
+    discord.disconnect();
+    if let Some(listener) = listener.take() {
+        listener.abort();
+        let _ = listener.await;
+    }
+    admission.abort();
+    supervisor.abort();
+    let _ = admission.await;
+    let _ = supervisor.await;
+    harness.shutdown().await;
     loop_result
 }
 

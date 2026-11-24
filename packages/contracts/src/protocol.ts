@@ -143,6 +143,31 @@ export const DiscordConnection = Schema.Union([
 ])
 export type DiscordConnection = typeof DiscordConnection.Type
 
+export const BotSummary = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  enabled: Schema.Boolean,
+  isDefault: Schema.Boolean,
+  createdAt: Schema.Finite,
+  /** Monotonic generation: never reused for a recreated slug, so it identifies one bot instance. */
+  generation: Schema.Finite,
+  mainModel: Schema.NullOr(Schema.String),
+  connection: DiscordConnection,
+})
+export type BotSummary = typeof BotSummary.Type
+
+export const BotMcpServer = Schema.Struct({
+  id: Schema.String,
+  enabledGlobal: Schema.Boolean,
+  enabledForBot: Schema.Boolean,
+})
+export type BotMcpServer = typeof BotMcpServer.Type
+
+export const BotMcpState = Schema.Struct({
+  servers: Schema.Array(BotMcpServer),
+})
+export type BotMcpState = typeof BotMcpState.Type
+
 export const DiscordInteractionScope = Schema.Literals(['channel', 'user', 'server'])
 export type DiscordInteractionScope = typeof DiscordInteractionScope.Type
 
@@ -267,6 +292,14 @@ export const McpAddPayload = Schema.Union([
 ])
 
 const NoPayload = Schema.Struct({})
+const BotScopedPayload = Schema.Struct({
+  botId: Schema.optional(Schema.String),
+  botGeneration: Schema.optional(Schema.Finite),
+})
+const botIdField = {
+  botId: Schema.optional(Schema.String),
+  botGeneration: Schema.optional(Schema.Finite),
+} as const
 
 export const Weekday = Schema.Literals(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'])
 export type Weekday = typeof Weekday.Type
@@ -329,20 +362,44 @@ export const ScheduleState = Schema.Struct({
 export type ScheduleState = typeof ScheduleState.Type
 
 export const requests = {
-  'general.get': { payload: NoPayload, reply: GeneralSettings },
+  'bots.list': { payload: NoPayload, reply: Schema.Array(BotSummary) },
+  'bots.create': {
+    payload: Schema.Struct({ id: Schema.String, name: Schema.String }),
+    reply: Schema.Array(BotSummary),
+  },
+  'bots.update': {
+    payload: Schema.Struct({
+      id: Schema.String,
+      name: Schema.optional(Schema.NullOr(Schema.String)),
+      enabled: Schema.optional(Schema.NullOr(Schema.Boolean)),
+      botGeneration: Schema.optional(Schema.Finite),
+    }),
+    reply: Schema.Array(BotSummary),
+  },
+  'bots.remove': {
+    payload: Schema.Struct({ id: Schema.String, botGeneration: Schema.optional(Schema.Finite) }),
+    reply: Schema.Array(BotSummary),
+  },
+  'bot.mcp.get': { payload: BotScopedPayload, reply: BotMcpState },
+  'bot.mcp.setEnabled': {
+    payload: Schema.Struct({ ...botIdField, id: Schema.String, enabled: Schema.Boolean }),
+    reply: BotMcpState,
+  },
+  'general.get': { payload: BotScopedPayload, reply: GeneralSettings },
   'general.setAutoRespond': {
-    payload: Schema.Struct({ enabled: Schema.Boolean }),
+    payload: Schema.Struct({ ...botIdField, enabled: Schema.Boolean }),
     reply: GeneralSettings,
   },
-  'instructions.get': { payload: NoPayload, reply: Instructions },
+  'instructions.get': { payload: BotScopedPayload, reply: Instructions },
   'instructions.set': {
-    payload: Schema.Struct({ text: Schema.String }),
+    payload: Schema.Struct({ ...botIdField, text: Schema.String }),
     reply: Instructions,
   },
-  'instructions.reset': { payload: NoPayload, reply: Instructions },
-  'models.get': { payload: NoPayload, reply: Models },
+  'instructions.reset': { payload: BotScopedPayload, reply: Instructions },
+  'models.get': { payload: BotScopedPayload, reply: Models },
   'models.setMain': {
     payload: Schema.Struct({
+      ...botIdField,
       provider: Schema.String,
       model: Schema.String,
       reasoning: Reasoning,
@@ -350,19 +407,20 @@ export const requests = {
     reply: Models,
   },
   'models.setCompaction': {
-    payload: Schema.Struct({ slot: Schema.NullOr(Slot) }),
+    payload: Schema.Struct({ ...botIdField, slot: Schema.NullOr(Slot) }),
     reply: Models,
   },
   'models.setUtility': {
-    payload: Schema.Struct({ slot: Schema.NullOr(Slot) }),
+    payload: Schema.Struct({ ...botIdField, slot: Schema.NullOr(Slot) }),
     reply: Models,
   },
   'models.setDecision': {
-    payload: Schema.Struct({ slot: Schema.NullOr(DecisionSlot) }),
+    payload: Schema.Struct({ ...botIdField, slot: Schema.NullOr(DecisionSlot) }),
     reply: Models,
   },
   'models.setContextLimit': {
     payload: Schema.Struct({
+      ...botIdField,
       provider: Schema.String,
       model: Schema.String,
       limit: Schema.NullOr(Schema.Finite),
@@ -371,6 +429,7 @@ export const requests = {
   },
   'models.setImages': {
     payload: Schema.Struct({
+      ...botIdField,
       provider: Schema.String,
       model: Schema.String,
       images: Schema.Boolean,
@@ -403,27 +462,28 @@ export const requests = {
     payload: Schema.Struct({ id: Schema.String }),
     reply: Schema.Array(Provider),
   },
-  'discord.get': { payload: NoPayload, reply: Discord },
-  'discord.directory': { payload: NoPayload, reply: DiscordDirectory },
+  'discord.get': { payload: BotScopedPayload, reply: Discord },
+  'discord.directory': { payload: BotScopedPayload, reply: DiscordDirectory },
   'discord.allow': {
-    payload: Schema.Struct({ user: Schema.String }),
+    payload: Schema.Struct({ ...botIdField, user: Schema.String }),
     reply: Discord,
   },
   'discord.disallow': {
-    payload: Schema.Struct({ user: Schema.String }),
+    payload: Schema.Struct({ ...botIdField, user: Schema.String }),
     reply: Discord,
   },
   'discord.setHome': {
-    payload: Schema.Struct({ home: Home }),
+    payload: Schema.Struct({ ...botIdField, home: Home }),
     reply: Discord,
   },
   'discord.setToken': {
-    payload: Schema.Struct({ token: Schema.String }),
+    payload: Schema.Struct({ ...botIdField, token: Schema.String }),
     reply: Discord,
   },
-  'discord.clearToken': { payload: NoPayload, reply: Discord },
+  'discord.clearToken': { payload: BotScopedPayload, reply: Discord },
   'discord.setInteractionMode': {
     payload: Schema.Struct({
+      ...botIdField,
       scope: DiscordInteractionScope,
       guildId: Schema.NullOr(Schema.String),
       targetId: Schema.String,
@@ -433,6 +493,7 @@ export const requests = {
   },
   'discord.clearInteractionMode': {
     payload: Schema.Struct({
+      ...botIdField,
       scope: DiscordInteractionScope,
       guildId: Schema.NullOr(Schema.String),
       targetId: Schema.String,
@@ -441,12 +502,14 @@ export const requests = {
   },
   'discord.setDefaultInteractionMode': {
     payload: Schema.Struct({
+      ...botIdField,
       mode: DiscordInteractionMode,
     }),
     reply: Discord,
   },
   'discord.setReplyMode': {
     payload: Schema.Struct({
+      ...botIdField,
       scope: DiscordReplyScope,
       targetId: Schema.String,
       mode: DiscordReplyMode,
@@ -455,6 +518,7 @@ export const requests = {
   },
   'discord.clearReplyMode': {
     payload: Schema.Struct({
+      ...botIdField,
       scope: DiscordReplyScope,
       targetId: Schema.String,
     }),
@@ -462,18 +526,21 @@ export const requests = {
   },
   'discord.setDefaultReplyMode': {
     payload: Schema.Struct({
+      ...botIdField,
       mode: DiscordReplyMode,
     }),
     reply: Discord,
   },
   'discord.setDefaultAccess': {
     payload: Schema.Struct({
+      ...botIdField,
       effect: DiscordAccessEffect,
     }),
     reply: Discord,
   },
   'discord.setAccessRule': {
     payload: Schema.Struct({
+      ...botIdField,
       userId: Schema.NullOr(Schema.String),
       scope: DiscordAccessScope,
       scopeId: Schema.NullOr(Schema.String),
@@ -483,6 +550,7 @@ export const requests = {
   },
   'discord.removeAccessRule': {
     payload: Schema.Struct({
+      ...botIdField,
       userId: Schema.NullOr(Schema.String),
       scope: DiscordAccessScope,
       scopeId: Schema.NullOr(Schema.String),
@@ -503,9 +571,10 @@ export const requests = {
     payload: Schema.Struct({ id: Schema.String }),
     reply: Schema.Struct({ url: Schema.String }),
   },
-  'schedule.get': { payload: NoPayload, reply: ScheduleState },
+  'schedule.get': { payload: BotScopedPayload, reply: ScheduleState },
   'schedule.occurrences': {
     payload: Schema.Struct({
+      ...botIdField,
       start: Schema.Finite,
       end: Schema.Finite,
       cursor: Schema.optional(Schema.NullOr(ScheduleOccurrenceCursor)),
@@ -513,11 +582,12 @@ export const requests = {
     reply: ScheduleOccurrencesPage,
   },
   'schedule.setTimezone': {
-    payload: Schema.Struct({ timezone: Schema.String }),
+    payload: Schema.Struct({ ...botIdField, timezone: Schema.String }),
     reply: ScheduleState,
   },
   'schedule.add': {
     payload: Schema.Struct({
+      ...botIdField,
       text: Schema.String,
       kind: ScheduleKind,
       when: Schema.String,
@@ -526,43 +596,50 @@ export const requests = {
     reply: ScheduleState,
   },
   'schedule.remove': {
-    payload: Schema.Struct({ id: Schema.String }),
+    payload: Schema.Struct({ ...botIdField, id: Schema.String }),
     reply: ScheduleState,
   },
   'checkin.set': {
-    payload: CheckinConfig,
+    payload: Schema.Struct({
+      ...botIdField,
+      every: Schema.Finite,
+      days: Schema.Array(Weekday),
+      startHour: Schema.Finite,
+      endHour: Schema.Finite,
+    }),
     reply: ScheduleState,
   },
-  'checkin.clear': { payload: NoPayload, reply: ScheduleState },
+  'checkin.clear': { payload: BotScopedPayload, reply: ScheduleState },
   'watch.add': {
     payload: Schema.Struct({
+      ...botIdField,
       text: Schema.String,
       until: Schema.NullOr(Schema.String),
     }),
     reply: ScheduleState,
   },
   'watch.remove': {
-    payload: Schema.Struct({ id: Schema.String }),
+    payload: Schema.Struct({ ...botIdField, id: Schema.String }),
     reply: ScheduleState,
   },
   'usage.get': {
-    payload: Schema.Struct({ days: Schema.Finite }),
+    payload: Schema.Struct({ ...botIdField, days: Schema.Finite }),
     reply: UsageSummary,
   },
   'webhooks.list': {
-    payload: NoPayload,
+    payload: BotScopedPayload,
     reply: WebhooksPayload,
   },
   'webhooks.create': {
-    payload: Schema.Struct({ name: Schema.String }),
+    payload: Schema.Struct({ ...botIdField, name: Schema.String }),
     reply: WebhooksPayload,
   },
   'webhooks.setEnabled': {
-    payload: Schema.Struct({ id: Schema.String, enabled: Schema.Boolean }),
+    payload: Schema.Struct({ ...botIdField, id: Schema.String, enabled: Schema.Boolean }),
     reply: WebhooksPayload,
   },
   'webhooks.remove': {
-    payload: Schema.Struct({ id: Schema.String }),
+    payload: Schema.Struct({ ...botIdField, id: Schema.String }),
     reply: WebhooksPayload,
   },
 }

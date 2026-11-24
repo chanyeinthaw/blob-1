@@ -6,6 +6,7 @@ use chacha20poly1305::XChaCha20Poly1305;
 use rusqlite::Connection;
 use storage::StoreError;
 
+mod bot;
 mod checkin;
 mod config;
 mod crypto;
@@ -139,6 +140,46 @@ CREATE TABLE IF NOT EXISTS models (
 
 CREATE TABLE IF NOT EXISTS utility_model (id INTEGER PRIMARY KEY CHECK (id = 1), provider TEXT NOT NULL, model TEXT NOT NULL, reasoning TEXT CHECK (reasoning IN ('off','low','medium','high','xhigh','max')), FOREIGN KEY (provider, model) REFERENCES models (provider, id) ON DELETE CASCADE) STRICT;
 CREATE TABLE IF NOT EXISTS decision_model (id INTEGER PRIMARY KEY CHECK (id = 1), provider TEXT NOT NULL, model TEXT NOT NULL, FOREIGN KEY (provider, model) REFERENCES models (provider, id) ON DELETE CASCADE) STRICT;
+
+CREATE TABLE IF NOT EXISTS bots (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    created_at INTEGER NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0
+) STRICT;
+INSERT OR IGNORE INTO bots (id, name, enabled, created_at) VALUES ('default', 'Blob-1', 1, 0);
+
+CREATE TABLE IF NOT EXISTS bot_sequence (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    next_gen INTEGER NOT NULL DEFAULT 1
+) STRICT;
+INSERT OR IGNORE INTO bot_sequence (id, next_gen) VALUES (1, 1);
+
+CREATE TABLE IF NOT EXISTS bot_models (
+    bot_id TEXT PRIMARY KEY REFERENCES bots (id) ON DELETE CASCADE,
+    default_provider TEXT,
+    default_model TEXT,
+    reasoning TEXT NOT NULL DEFAULT 'medium' CHECK (reasoning IN ('off','low','medium','high','xhigh','max')),
+    compaction_provider TEXT,
+    compaction_model TEXT,
+    compaction_reasoning TEXT CHECK (compaction_reasoning IN ('off','low','medium','high','xhigh','max')),
+    utility_provider TEXT,
+    utility_model TEXT,
+    utility_reasoning TEXT CHECK (utility_reasoning IN ('off','low','medium','high','xhigh','max')),
+    decision_provider TEXT,
+    decision_model TEXT,
+    FOREIGN KEY (default_provider, default_model) REFERENCES models (provider, id) ON DELETE SET NULL,
+    FOREIGN KEY (compaction_provider, compaction_model) REFERENCES models (provider, id) ON DELETE SET NULL,
+    FOREIGN KEY (utility_provider, utility_model) REFERENCES models (provider, id) ON DELETE SET NULL,
+    FOREIGN KEY (decision_provider, decision_model) REFERENCES models (provider, id) ON DELETE SET NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS bot_mcp_disabled (
+    bot_id TEXT NOT NULL REFERENCES bots (id) ON DELETE CASCADE,
+    server_id TEXT NOT NULL REFERENCES mcp_servers (id) ON DELETE CASCADE,
+    PRIMARY KEY (bot_id, server_id)
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS mcp_servers (
     id TEXT PRIMARY KEY,
@@ -349,6 +390,7 @@ impl SqliteStorage {
         ensure_reply_modes_v2(&mut connection, &mut require_exclusive)?;
         ensure_unified_access(&mut connection, &mut require_exclusive)?;
         ensure_settings_auto_respond(&mut connection, &mut require_exclusive)?;
+        ensure_bots_generation(&mut connection, &mut require_exclusive)?;
         migrate_identity_to_instructions(&mut connection, &mut require_exclusive)?;
         let key = match app_key {
             Some(app_key) => Some(crypto::setup(&connection, &app_key)?),
@@ -1011,6 +1053,38 @@ fn ensure_settings_auto_respond(
             "ALTER TABLE settings ADD COLUMN auto_respond INTEGER NOT NULL DEFAULT 1 CHECK (auto_respond IN (0, 1));",
         )
         .map_err(backend)?;
+    }
+    tx.commit().map_err(backend)?;
+    Ok(())
+}
+
+/// Adds `bots.generation` to databases created before bot generations existed.
+/// Existing rows get generation 0; `bot_sequence` starts at 1 so new and
+/// recreated bots always get a fresh, never-reused generation.
+fn ensure_bots_generation(
+    connection: &mut Connection,
+    require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let has_column = |conn: &Connection| -> Result<bool, StoreError> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name = 'generation')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(backend)
+    };
+    if has_column(connection)? {
+        return Ok(());
+    }
+    require_exclusive(
+        "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
+    )?;
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    if !has_column(&tx)? {
+        tx.execute_batch("ALTER TABLE bots ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;")
+            .map_err(backend)?;
     }
     tx.commit().map_err(backend)?;
     Ok(())

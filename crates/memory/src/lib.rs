@@ -48,6 +48,8 @@ struct State {
     leaves: BTreeSet<u64>,
     ready: BTreeSet<Ready>,
     running: HashSet<Part>,
+    workers: Vec<tokio::task::JoinHandle<()>>,
+    closed: bool,
     failed: HashMap<Part, MemoryError>,
     failure_order: Vec<Part>,
     chat: MemoryView,
@@ -269,6 +271,8 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
             leaves,
             ready: BTreeSet::new(),
             running: HashSet::new(),
+            workers: Vec::new(),
+            closed: false,
             failed: HashMap::new(),
             failure_order: Vec::new(),
             chat: store.view(ViewName::Chat)?.unwrap_or_default(),
@@ -509,11 +513,29 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
             .message(id)?
             .map_or_else(|| format!("No message {id}."), |m| m.date))
     }
+    /// Stops spawning new compaction workers and aborts + joins all active ones
+    /// so reopening the same bot database never races with a leftover compaction pass.
+    pub async fn shutdown(&self) {
+        let workers = {
+            let mut state = self.lock();
+            state.closed = true;
+            std::mem::take(&mut state.workers)
+        };
+        for handle in workers {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
     fn pump(&self) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let mut state = self.lock();
+        state.workers.retain(|worker| !worker.is_finished());
+        if state.closed {
+            return;
+        }
         while state.running.len() < self.inner.config.jobs {
             let Some(k) = state.ready.pop_first() else {
                 break;
@@ -527,9 +549,10 @@ impl<S: MemoryStore + 'static, C: llm::Source + 'static> Memory<S, C> {
             }
             state.running.insert(p);
             let memory = self.clone();
-            handle.spawn(async move {
+            let worker = handle.spawn(async move {
                 memory.build(p).await;
             });
+            state.workers.push(worker);
         }
     }
     async fn build(&self, p: Part) {

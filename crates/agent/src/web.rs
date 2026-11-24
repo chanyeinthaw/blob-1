@@ -25,9 +25,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use storage::{
-    CallbackStore, Checkin, CheckinStore, ConfigStore, McpServer, McpStore, McpTransport,
+    BotStore, CallbackStore, Checkin, CheckinStore, ConfigStore, McpServer, McpStore, McpTransport,
     MessengerStore, PublicFileStore, ReasoningLevel, ScheduleStore, UsageStore, WatchStore,
-    WebAuthStore, WebhookStore,
+    WebAuthStore, WebhookStore, DEFAULT_BOT_ID,
 };
 use storage_sqlite::SqliteStorage;
 
@@ -35,12 +35,10 @@ const LIFETIME: i64 = 30 * 86400;
 const COOKIE: &str = "blob_session";
 struct WebContext {
     store: Arc<SqliteStorage>,
-    discord: Arc<messenger_discord::Discord>,
+    bots: crate::run::BotRegistry,
     settings_lock: tokio::sync::Mutex<()>,
     mcp: mcp::Mcp,
     public_url: Option<url::Url>,
-    workspace: harness::PinnedWorkspace,
-    live_chat: crate::run::LiveChat,
 }
 impl WebContext {
     fn secure_cookie(&self) -> bool {
@@ -105,21 +103,17 @@ pub fn public_url(raw: &str) -> crate::Result<url::Url> {
 pub async fn serve(
     listener: tokio::net::TcpListener,
     store: Arc<SqliteStorage>,
-    discord: Arc<messenger_discord::Discord>,
+    bots: crate::run::BotRegistry,
     mcp: mcp::Mcp,
     shutdown: tokio::sync::watch::Receiver<bool>,
     public_url: Option<url::Url>,
-    workspace: harness::PinnedWorkspace,
-    live_chat: crate::run::LiveChat,
 ) -> crate::Result<()> {
     let store = Arc::new(WebContext {
         store,
-        discord,
+        bots,
         settings_lock: tokio::sync::Mutex::new(()),
         mcp,
         public_url,
-        workspace,
-        live_chat,
     });
     let app = Router::new()
         .route("/api/session", get(session))
@@ -397,10 +391,15 @@ fn str_map(payload: &Value, key: &str) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-fn general_reply(store: &SqliteStorage) -> crate::Result<Value> {
+fn general_reply(
+    global_store: &SqliteStorage,
+    bot_store: &SqliteStorage,
+    bot_id: &str,
+) -> crate::Result<Value> {
+    let bm = global_store.bot_models(bot_id)?;
     Ok(json!({
-        "autoRespond": store.auto_respond()?,
-        "hasUtilityModel": store.utility_model()?.is_some() || store.decision_model()?.is_some(),
+        "autoRespond": bot_store.auto_respond()?,
+        "hasUtilityModel": bm.utility.is_some() || bm.decision.is_some(),
     }))
 }
 
@@ -411,38 +410,85 @@ fn instructions_reply(store: &SqliteStorage) -> crate::Result<Value> {
         "isDefault": instructions.is_none()
     }))
 }
-fn models_reply(store: &SqliteStorage) -> crate::Result<Value> {
-    let settings = store.settings()?;
+fn models_reply(global_store: &SqliteStorage, bot_id: &str) -> crate::Result<Value> {
+    let bm = global_store.bot_models(bot_id)?;
     let slot = |model: storage::ModelRef, reasoning: ReasoningLevel| json!({"provider":model.provider.0,"model":model.model,"reasoning":reasoning.as_str()});
-    let main = settings
-        .default_model
-        .map(|m| slot(m, settings.reasoning))
-        .unwrap_or_else(
-            || json!({"provider":"","model":"","reasoning":settings.reasoning.as_str()}),
-        );
-    let compaction = settings.compaction_model.map(|m| {
-        slot(
-            m,
-            settings.compaction_reasoning.unwrap_or(settings.reasoning),
-        )
-    });
-    let utility = store
-        .utility_model()?
+    let main = bm
+        .main
+        .map(|m| slot(m, bm.main_reasoning))
+        .unwrap_or_else(|| json!({"provider":"","model":"","reasoning":bm.main_reasoning.as_str()}));
+    let compaction = bm
+        .compaction
+        .map(|m| slot(m, bm.compaction_reasoning.unwrap_or(bm.main_reasoning)));
+    let utility = bm
+        .utility
         .map(|(m, r)| slot(m, r.unwrap_or(ReasoningLevel::Low)));
-    let decision = store
-        .decision_model()?
+    let decision = bm
+        .decision
         .map(|m| json!({"provider": m.provider.0, "model": m.model}));
     let mut providers = Vec::new();
-    for p in store.providers()? {
+    for p in global_store.providers()? {
         let api = match p.api {
             storage::ProviderApi::OpenAiResponses => "responses",
             storage::ProviderApi::OpenAiCompletions => "completions",
             storage::ProviderApi::Decision => "decision",
         };
-        let models: Vec<Value> = store.models(&p.id)?.into_iter().map(|m| json!({"id":m.id,"context":m.context_window,"limit":m.context_limit,"images":m.images})).collect();
+        let models: Vec<Value> = global_store.models(&p.id)?.into_iter().map(|m| json!({"id":m.id,"context":m.context_window,"limit":m.context_limit,"images":m.images})).collect();
         providers.push(json!({"id":p.id.0,"api":api,"models":models}));
     }
     Ok(json!({"main":main,"compaction":compaction,"utility":utility,"decision":decision,"providers":providers}))
+}
+
+async fn bots_reply(ctx: &WebContext) -> crate::Result<Value> {
+    let bots = ctx.store.bots()?;
+    let mut out = Vec::with_capacity(bots.len());
+    for bot in bots {
+        let bm = ctx.store.bot_models(&bot.id)?;
+        let main_model = bm.main.map(|m| format!("{}/{}", m.provider.0, m.model));
+        let connection = match ctx.bots.get(&bot.id).await {
+            Ok(handle) => connection_json(handle.discord.connection()),
+            Err(_) => json!({"state": "off"}),
+        };
+        out.push(json!({
+            "id": bot.id,
+            "name": bot.name,
+            "enabled": bot.enabled,
+            "isDefault": bot.id == DEFAULT_BOT_ID,
+            "createdAt": bot.created_at,
+            "generation": bot.generation,
+            "mainModel": main_model,
+            "connection": connection,
+        }));
+    }
+    Ok(json!(out))
+}
+
+fn bot_mcp_reply(global_store: &SqliteStorage, bot_id: &str) -> crate::Result<Value> {
+    let servers = global_store.mcp_servers()?;
+    let disabled = global_store.bot_disabled_mcp_servers(bot_id)?;
+    let items: Vec<Value> = servers
+        .into_iter()
+        .map(|s| {
+            let enabled_for_bot = !disabled.iter().any(|id| id == &s.id);
+            json!({
+                "id": s.id,
+                "enabledGlobal": s.enabled,
+                "enabledForBot": enabled_for_bot,
+            })
+        })
+        .collect();
+    Ok(json!({ "servers": items }))
+}
+
+fn connection_json(conn: messenger_discord::Connection) -> Value {
+    match conn {
+        messenger_discord::Connection::Off => json!({"state":"off"}),
+        messenger_discord::Connection::Connecting => json!({"state":"connecting"}),
+        messenger_discord::Connection::Online { bot } => json!({"state":"online","bot":bot}),
+        messenger_discord::Connection::Error { message } => {
+            json!({"state":"error","message":message})
+        }
+    }
 }
 fn providers_reply(store: &SqliteStorage) -> crate::Result<Value> {
     let mut result = Vec::new();
@@ -593,8 +639,8 @@ fn schedule_reply(store: &SqliteStorage) -> crate::Result<Value> {
     }))
 }
 
-fn discord_reply(ctx: &Context) -> crate::Result<Value> {
-    let store = &ctx.store;
+fn discord_reply(bot: &crate::run::BotHandle) -> crate::Result<Value> {
+    let store = &bot.store;
     let home = match store.home()? {
         Some(h) if h.messenger == "discord" => match h.target.strip_prefix("dm:") {
             Some(user) => json!({"kind":"dm","user":user}),
@@ -602,14 +648,7 @@ fn discord_reply(ctx: &Context) -> crate::Result<Value> {
         },
         _ => json!({"kind":"none"}),
     };
-    let connection = match ctx.discord.connection() {
-        messenger_discord::Connection::Off => json!({"state":"off"}),
-        messenger_discord::Connection::Connecting => json!({"state":"connecting"}),
-        messenger_discord::Connection::Online { bot } => json!({"state":"online","bot":bot}),
-        messenger_discord::Connection::Error { message } => {
-            json!({"state":"error","message":message})
-        }
-    };
+    let connection = connection_json(bot.discord.connection());
     let defaults = store.messenger_defaults("discord")?;
     Ok(json!({
         "allowed": store.allowed_users("discord")?,
@@ -632,38 +671,147 @@ fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
 fn numeric(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
+async fn resolve_bot(
+    ctx: &WebContext,
+    payload: &Value,
+    bot_id: &str,
+) -> crate::Result<crate::run::BotHandle> {
+    let bot = ctx.bots.get(bot_id).await?;
+    check_bot_generation(payload, bot.generation, bot_id)?;
+    Ok(bot)
+}
+
+/// Rejects a write aimed at a bot instance that was deleted and recreated with the same slug.
+fn check_bot_generation(payload: &Value, actual: i64, bot_id: &str) -> crate::Result<()> {
+    if let Some(gen_val) = payload.get("botGeneration") {
+        let Some(expected) = gen_val.as_i64() else {
+            return Err("Invalid botGeneration".into());
+        };
+        if actual != expected {
+            return Err(format!("Bot '{bot_id}' was replaced; reload to continue").into());
+        }
+    }
+    Ok(())
+}
+
+/// Re-checks `botGeneration` against the persisted roster while `settings_lock`
+/// is held, closing the window where remove+recreate ran during the lock wait.
+/// `resolved` is the generation of the handle resolved before the lock; when a
+/// request omits `botGeneration` it is the only tie to the original instance.
+fn recheck_bot_generation(
+    global: &SqliteStorage,
+    payload: &Value,
+    bot_id: &str,
+    resolved: Option<i64>,
+) -> crate::Result<()> {
+    let current = global.bot(bot_id)?.map(|bot| bot.generation).unwrap_or(-1);
+    check_bot_generation(payload, current, bot_id)?;
+    if resolved.is_some_and(|gen| gen != current) {
+        return Err(format!("Bot '{bot_id}' was replaced; reload to continue").into());
+    }
+    Ok(())
+}
+
 async fn dispatch(
     ctx: &Context,
     request_type: &str,
     payload: &Value,
     headers: &HeaderMap,
 ) -> crate::Result<Value> {
-    let store = &ctx.store;
+    let global = &ctx.store;
+    let bot_id = payload
+        .get("botId")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_BOT_ID);
     {
         let invalid = || format!("Invalid {request_type} payload");
         let get = |key| field(payload, key).map_err(|_| invalid());
         match request_type {
-            "general.get" => general_reply(store),
-            "general.setAutoRespond" => {
+            "bots.list" => bots_reply(ctx).await,
+            "bots.create" => {
+                let id = get("id")?.trim();
+                let name = get("name")?.trim();
+                let _guard = ctx.settings_lock.lock().await;
+                ctx.bots.create(id, name).await?;
+                bots_reply(ctx).await
+            }
+            "bots.update" => {
+                let id = get("id")?;
+                let name = match payload.get("name") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(s)) => Some(s.as_str()),
+                    Some(_) => return Err(invalid().into()),
+                };
+                let enabled = match payload.get("enabled") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Bool(b)) => Some(*b),
+                    Some(_) => return Err(invalid().into()),
+                };
+                let _guard = ctx.settings_lock.lock().await;
+                recheck_bot_generation(global, payload, id, None)?;
+                ctx.bots.update(id, name, enabled).await?;
+                bots_reply(ctx).await
+            }
+            "bots.remove" => {
+                let id = get("id")?;
+                let _guard = ctx.settings_lock.lock().await;
+                recheck_bot_generation(global, payload, id, None)?;
+                ctx.bots.remove(id).await?;
+                bots_reply(ctx).await
+            }
+            "bot.mcp.get" => {
+                resolve_bot(ctx, payload, bot_id).await?;
+                bot_mcp_reply(global, bot_id)
+            }
+            "bot.mcp.setEnabled" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let id = get("id")?;
                 let enabled = payload
                     .get("enabled")
                     .and_then(Value::as_bool)
                     .ok_or_else(invalid)?;
-                store.set_auto_respond(enabled)?;
-                general_reply(store)
+                if !global.mcp_servers()?.iter().any(|s| s.id == id) {
+                    return Err(format!("no MCP server '{id}'").into());
+                }
+                let _guard = ctx.settings_lock.lock().await;
+                recheck_bot_generation(global, payload, bot_id, Some(bot.generation))?;
+                global.set_bot_mcp_server_enabled(bot_id, id, enabled)?;
+                bot_mcp_reply(global, bot_id)
             }
-            "instructions.get" => instructions_reply(store),
+            "general.get" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                general_reply(global, &bot.store, bot_id)
+            }
+            "general.setAutoRespond" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let enabled = payload
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(invalid)?;
+                bot.store.set_auto_respond(enabled)?;
+                general_reply(global, &bot.store, bot_id)
+            }
+            "instructions.get" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                instructions_reply(&bot.store)
+            }
             "instructions.set" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
                 let text = get("text")?;
-                crate::set_instructions(store, text)?;
-                instructions_reply(store)
+                crate::set_instructions(&bot.store, text)?;
+                instructions_reply(&bot.store)
             }
             "instructions.reset" => {
-                store.set_instructions(None)?;
-                instructions_reply(store)
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                bot.store.set_instructions(None)?;
+                instructions_reply(&bot.store)
             }
-            "models.get" => models_reply(store),
+            "models.get" => {
+                resolve_bot(ctx, payload, bot_id).await?;
+                models_reply(global, bot_id)
+            }
             "models.setMain" | "models.setCompaction" | "models.setUtility" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
                 let data = if request_type == "models.setMain" {
                     payload
                 } else {
@@ -678,59 +826,64 @@ async fn dispatch(
                         .map_err(|_| invalid())?
                         .parse()
                         .map_err(|_| invalid())?;
-                    crate::known_model(store, &format!("{provider}/{model}"))
-                        .map_err(|_| "Unknown model")?;
-                    Some((format!("{provider}/{model}"), reasoning))
+                    let (prov, m) =
+                        crate::known_model_with_provider(global, &format!("{provider}/{model}"))
+                            .map_err(|_| "Unknown model")?;
+                    if prov.api.is_decision() {
+                        return Err("Decision models can only be used in the Decision slot".into());
+                    }
+                    Some((
+                        storage::ModelRef {
+                            provider: m.provider,
+                            model: m.id,
+                        },
+                        reasoning,
+                    ))
                 };
                 let _guard = ctx.settings_lock.lock().await;
+                recheck_bot_generation(global, payload, bot_id, Some(bot.generation))?;
                 match request_type {
                     "models.setMain" => {
                         let (model, reasoning) = selected.ok_or_else(invalid)?;
-                        let (provider, model) = crate::known_model_with_provider(store, &model)?;
-                        if provider.api.is_decision() {
-                            return Err("Decision models can only be used in the Decision slot".into());
-                        }
-                        let mut settings = store.settings()?;
-                        settings.default_model = Some(storage::ModelRef {
-                            provider: model.provider,
-                            model: model.id,
-                        });
-                        settings.reasoning = reasoning;
-                        store.save_settings(settings)?;
+                        global.set_bot_main_model(bot_id, Some(&model), reasoning)?;
                     }
                     "models.setCompaction" => {
-                        let (model, reasoning) = selected
-                            .map(|(m, r)| (m, Some(r)))
-                            .unwrap_or(("-".into(), None));
-                        crate::model_command(
-                            store,
-                            crate::ModelCommand::Compaction { model, reasoning },
-                        )?;
+                        let (model, reasoning) = match selected {
+                            Some((m, r)) => (Some(m), Some(r)),
+                            None => (None, None),
+                        };
+                        global.set_bot_compaction_model(bot_id, model.as_ref(), reasoning)?;
                     }
                     _ => {
-                        let (model, reasoning) = selected
-                            .map(|(m, r)| (m, Some(r)))
-                            .unwrap_or(("off".into(), None));
-                        crate::model_command(
-                            store,
-                            crate::ModelCommand::Utility { model, reasoning },
-                        )?;
+                        let value = selected.as_ref().map(|(m, r)| (m, Some(*r)));
+                        global.set_bot_utility_model(bot_id, value)?;
                     }
                 }
-                models_reply(store)
+                models_reply(global, bot_id)
             }
             "models.setDecision" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
                 let data = payload.get("slot").ok_or_else(invalid)?;
-                let model = if data.is_null() {
-                    "off".to_owned()
+                let selected = if data.is_null() {
+                    None
                 } else {
                     let provider = field(data, "provider").map_err(|_| invalid())?;
                     let model = field(data, "model").map_err(|_| invalid())?;
-                    format!("{provider}/{model}")
+                    let (prov, m) =
+                        crate::known_model_with_provider(global, &format!("{provider}/{model}"))
+                            .map_err(|_| "Unknown model")?;
+                    if !prov.api.is_decision() {
+                        return Err("only decision providers can be used in the Decision slot".into());
+                    }
+                    Some(storage::ModelRef {
+                        provider: m.provider,
+                        model: m.id,
+                    })
                 };
                 let _guard = ctx.settings_lock.lock().await;
-                crate::model_command(store, crate::ModelCommand::Decision { model })?;
-                models_reply(store)
+                recheck_bot_generation(global, payload, bot_id, Some(bot.generation))?;
+                global.set_bot_decision_model(bot_id, selected.as_ref())?;
+                models_reply(global, bot_id)
             }
             "models.setContextLimit" | "models.setImages" => {
                 let provider = get("provider")?;
@@ -766,11 +919,11 @@ async fn dispatch(
                     }
                 };
                 let model_name = format!("{provider}/{model}");
-                crate::known_model(store, &model_name).map_err(|_| "Unknown model")?;
-                crate::model_command(store, command)?;
-                models_reply(store)
+                crate::known_model(global, &model_name).map_err(|_| "Unknown model")?;
+                crate::model_command(global, command)?;
+                models_reply(global, bot_id)
             }
-            "providers.list" => providers_reply(store),
+            "providers.list" => providers_reply(global),
             "providers.add" => {
                 let id = get("id")?.trim();
                 let base_url = get("baseUrl")?.trim();
@@ -818,7 +971,7 @@ async fn dispatch(
                 if id.contains('/') {
                     return Err("Provider ID cannot contain '/'".into());
                 }
-                if store.providers()?.iter().any(|p| p.id.0 == id) {
+                if global.providers()?.iter().any(|p| p.id.0 == id) {
                     return Err(format!("Provider {id} already exists").into());
                 }
                 if !crate::run::valid_http_url(base_url) {
@@ -833,7 +986,7 @@ async fn dispatch(
                     );
                 }
                 let provider_id = storage::ProviderId(id.into());
-                store.save_provider(
+                global.save_provider(
                     storage::Provider {
                         id: provider_id.clone(),
                         api,
@@ -851,10 +1004,10 @@ async fn dispatch(
                         Vec::new()
                     };
                     if !seeded.is_empty() {
-                        store.replace_models(&provider_id, seeded)?;
+                        global.replace_models(&provider_id, seeded)?;
                     }
                 }
-                providers_reply(store)
+                providers_reply(global)
             }
             "providers.setKey" => {
                 let id = get("id")?;
@@ -870,44 +1023,37 @@ async fn dispatch(
                     }
                     _ => return Err(invalid().into()),
                 };
-                store.set_provider_api_key(&storage::ProviderId(id.into()), api_key)?;
-                providers_reply(store)
+                global.set_provider_api_key(&storage::ProviderId(id.into()), api_key)?;
+                providers_reply(global)
             }
             "providers.remove" | "providers.refresh" => {
                 let id = get("id")?;
-                let provider = store
+                let provider = global
                     .providers()?
                     .into_iter()
                     .find(|p| p.id.0 == id)
                     .ok_or_else(|| format!("Unknown provider {id}"))?;
                 if request_type == "providers.refresh" {
-                    crate::refresh_provider(store, &provider).await?;
+                    crate::refresh_provider(global, &provider).await?;
                 } else {
                     let _guard = ctx.settings_lock.lock().await;
-                    let s = store.settings()?;
-                    let utility = store.utility_model()?;
-                    let decision = store.decision_model()?;
-                    if s.default_model
-                        .as_ref()
-                        .is_some_and(|m| m.provider == provider.id)
-                        || s.compaction_model
-                            .as_ref()
-                            .is_some_and(|m| m.provider == provider.id)
-                        || utility
-                            .as_ref()
-                            .is_some_and(|(m, _)| m.provider == provider.id)
-                        || decision
-                            .as_ref()
-                            .is_some_and(|m| m.provider == provider.id)
-                    {
-                        return Err(format!("Provider {id} is used by a model slot").into());
+                    if let Some(used_by) = global.provider_in_use_by_bot(&provider.id)? {
+                        return Err(
+                            format!("Provider {id} is used by a model slot on bot '{used_by}'")
+                                .into(),
+                        );
                     }
-                    crate::provider(store, crate::ProviderCommand::Remove { id: id.into() })?;
+                    crate::provider(global, crate::ProviderCommand::Remove { id: id.into() })?;
                 }
-                providers_reply(store)
+                providers_reply(global)
             }
-            "discord.get" => discord_reply(ctx),
+            "discord.get" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                discord_reply(&bot)
+            }
             "discord.allow" | "discord.disallow" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let store = &bot.store;
                 let user = get("user")?;
                 if !numeric(user) {
                     return Err("User id must be numeric".into());
@@ -938,9 +1084,10 @@ async fn dispatch(
                     )
                     .await?;
                 }
-                discord_reply(ctx)
+                discord_reply(&bot)
             }
             "discord.setToken" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
                 let token = get("token")?.trim().to_owned();
                 if token.is_empty() {
                     return Err("Token is required".into());
@@ -948,18 +1095,22 @@ async fn dispatch(
                 if let Err(error) = messenger_discord::validate_token(&token).await {
                     return Err(error.into());
                 }
-                store.set_messenger_token("discord", Some(&token))?;
-                if !ctx.discord.uses_token(&token) {
-                    ctx.discord.connecting();
+                bot.store.set_messenger_token("discord", Some(&token))?;
+                let enabled = global.bot(bot_id)?.is_some_and(|b| b.enabled);
+                if enabled && !bot.discord.uses_token(&token) {
+                    bot.discord.connecting();
                 }
-                discord_reply(ctx)
+                discord_reply(&bot)
             }
             "discord.clearToken" => {
-                store.set_messenger_token("discord", None)?;
-                ctx.discord.disconnect();
-                discord_reply(ctx)
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                bot.store.set_messenger_token("discord", None)?;
+                bot.discord.disconnect();
+                discord_reply(&bot)
             }
             "discord.setHome" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let store = &bot.store;
                 let home = payload.get("home").ok_or_else(invalid)?;
                 match field(home, "kind").map_err(|_| invalid())? {
                     "none" => crate::set_home(store, None)?,
@@ -984,9 +1135,11 @@ async fn dispatch(
                     }
                     _ => return Err(invalid().into()),
                 }
-                discord_reply(ctx)
+                discord_reply(&bot)
             }
             "discord.setInteractionMode" | "discord.clearInteractionMode" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let store = &bot.store;
                 let scope = match get("scope")? {
                     "channel" => storage::InteractionScope::Channel,
                     "user" => storage::InteractionScope::User,
@@ -1037,19 +1190,22 @@ async fn dispatch(
                     let guild_ref = guild_id.filter(|g| !g.is_empty());
                     store.clear_interaction_mode("discord", scope, guild_ref, target)?;
                 }
-                discord_reply(ctx)
+                discord_reply(&bot)
             }
             "discord.setDefaultInteractionMode" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
                 let mode = match get("mode")? {
                     "mention-only" => storage::InteractionMode::MentionOnly,
                     "always" => storage::InteractionMode::Always,
                     "auto" => storage::InteractionMode::Auto,
                     _ => return Err(invalid().into()),
                 };
-                store.set_default_interaction_mode("discord", mode)?;
-                discord_reply(ctx)
+                bot.store.set_default_interaction_mode("discord", mode)?;
+                discord_reply(&bot)
             }
             "discord.setReplyMode" | "discord.clearReplyMode" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let store = &bot.store;
                 let scope = match get("scope")? {
                     "channel" => storage::ReplyScope::Channel,
                     "server" => storage::ReplyScope::Server,
@@ -1073,28 +1229,32 @@ async fn dispatch(
                     }
                     store.clear_reply_mode("discord", scope, target)?;
                 }
-                discord_reply(ctx)
+                discord_reply(&bot)
             }
             "discord.setDefaultReplyMode" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
                 let mode = match get("mode")? {
                     "auto" => storage::ReplyMode::Auto,
                     "thread" => storage::ReplyMode::Thread,
                     "direct" => storage::ReplyMode::Direct,
                     _ => return Err(invalid().into()),
                 };
-                store.set_default_reply_mode("discord", mode)?;
-                discord_reply(ctx)
+                bot.store.set_default_reply_mode("discord", mode)?;
+                discord_reply(&bot)
             }
             "discord.setDefaultAccess" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
                 let effect = match get("effect")? {
                     "allow" => storage::AccessEffect::Allow,
                     "block" => storage::AccessEffect::Block,
                     _ => return Err(invalid().into()),
                 };
-                store.set_default_access("discord", effect)?;
-                discord_reply(ctx)
+                bot.store.set_default_access("discord", effect)?;
+                discord_reply(&bot)
             }
             "discord.setAccessRule" | "discord.removeAccessRule" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let store = &bot.store;
                 let user_id = match payload.get("userId") {
                     None | Some(Value::Null) => None,
                     Some(Value::String(s)) => Some(s.as_str()),
@@ -1152,10 +1312,12 @@ async fn dispatch(
                     }
                     store.remove_access_rule("discord", user_id, scope, scope_id)?;
                 }
-                discord_reply(ctx)
+                discord_reply(&bot)
             }
             "discord.directory" => {
-                let (guilds, mut channels, people) = match ctx.discord.directory().await {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let store = &bot.store;
+                let (guilds, mut channels, people) = match bot.discord.directory().await {
                     Ok(result) => result,
                     Err(error) => {
                         eprintln!("discord directory: {error}");
@@ -1192,7 +1354,7 @@ async fn dispatch(
                 }
                 for cid in extra_ids {
                     if !channels.iter().any(|(id, _, _, _, _)| id == &cid) {
-                        if let Ok(Some(resolved)) = ctx.discord.resolve_channel(&cid, &guilds).await
+                        if let Ok(Some(resolved)) = bot.discord.resolve_channel(&cid, &guilds).await
                         {
                             channels.push(resolved);
                         }
@@ -1232,7 +1394,7 @@ async fn dispatch(
                     },
                     _ => return Err(invalid().into()),
                 };
-                store.save_mcp_server(&McpServer {
+                global.save_mcp_server(&McpServer {
                     id: id.to_string(),
                     transport,
                     enabled: true,
@@ -1242,7 +1404,7 @@ async fn dispatch(
             }
             "mcp.remove" => {
                 let id = get("id")?;
-                store.remove_mcp_server(id)?;
+                global.remove_mcp_server(id)?;
                 Ok(mcp_reply(&ctx.mcp).await?)
             }
             "mcp.setEnabled" => {
@@ -1251,13 +1413,13 @@ async fn dispatch(
                     .get("enabled")
                     .and_then(Value::as_bool)
                     .ok_or_else(invalid)?;
-                let mut server = store
+                let mut server = global
                     .mcp_servers()?
                     .into_iter()
                     .find(|server| server.id == id)
                     .ok_or_else(|| format!("no MCP server '{id}'"))?;
                 server.enabled = enabled;
-                store.save_mcp_server(&server)?;
+                global.save_mcp_server(&server)?;
                 if enabled {
                     let mcp = ctx.mcp.clone();
                     let id_owned = id.to_owned();
@@ -1269,7 +1431,7 @@ async fn dispatch(
             }
             "mcp.login" => {
                 let id = get("id")?;
-                let server = store
+                let server = global
                     .mcp_servers()?
                     .into_iter()
                     .find(|server| server.id == id)
@@ -1280,8 +1442,12 @@ async fn dispatch(
                 let origin = request_origin(ctx, headers).ok_or("missing Host header")?;
                 Ok(json!({"url": format!("{origin}/api/mcp/login?id={id}")}))
             }
-            "schedule.get" => Ok(schedule_reply(store)?),
+            "schedule.get" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                Ok(schedule_reply(&bot.store)?)
+            }
             "schedule.occurrences" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
                 let start = payload
                     .get("start")
                     .and_then(Value::as_i64)
@@ -1304,15 +1470,18 @@ async fn dispatch(
                         Some((at, id))
                     }
                 };
-                Ok(occurrences_reply(store, start, end, cursor)?)
+                Ok(occurrences_reply(&bot.store, start, end, cursor)?)
             }
             "schedule.setTimezone" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
                 let tz = harness::schedule::validate_timezone(get("timezone")?.trim())
                     .map_err(|_| "Invalid timezone".to_string())?;
-                store.set_timezone(&tz)?;
-                Ok(schedule_reply(store)?)
+                bot.store.set_timezone(&tz)?;
+                Ok(schedule_reply(&bot.store)?)
             }
             "schedule.add" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let store = &bot.store;
                 let text = get("text")?.trim().to_string();
                 if text.is_empty() {
                     return Err("Task is required".into());
@@ -1345,10 +1514,12 @@ async fn dispatch(
                 Ok(schedule_reply(store)?)
             }
             "schedule.remove" => {
-                harness::schedule::remove(store.as_ref(), get("id")?)?;
-                Ok(schedule_reply(store)?)
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                harness::schedule::remove(bot.store.as_ref(), get("id")?)?;
+                Ok(schedule_reply(&bot.store)?)
             }
             "checkin.set" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
                 let every = payload
                     .get("every")
                     .and_then(Value::as_i64)
@@ -1389,19 +1560,22 @@ async fn dispatch(
                 if start_hour >= end_hour || end_hour > 24 {
                     return Err("End hour must be after start hour".into());
                 }
-                store.set_checkin(&Checkin {
+                bot.store.set_checkin(&Checkin {
                     every,
                     days,
                     start_hour,
                     end_hour,
                 })?;
-                Ok(schedule_reply(store)?)
+                Ok(schedule_reply(&bot.store)?)
             }
             "checkin.clear" => {
-                store.clear_checkin()?;
-                Ok(schedule_reply(store)?)
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                bot.store.clear_checkin()?;
+                Ok(schedule_reply(&bot.store)?)
             }
             "watch.add" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let store = &bot.store;
                 let text = get("text")?.trim().to_string();
                 let until = match payload.get("until") {
                     None | Some(Value::Null) => None,
@@ -1422,17 +1596,19 @@ async fn dispatch(
                 Ok(schedule_reply(store)?)
             }
             "watch.remove" => {
-                harness::watch::remove(store.as_ref(), get("id")?)?;
-                Ok(schedule_reply(store)?)
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                harness::watch::remove(bot.store.as_ref(), get("id")?)?;
+                Ok(schedule_reply(&bot.store)?)
             }
             "usage.get" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
                 let days = payload
                     .get("days")
                     .and_then(Value::as_u64)
                     .unwrap_or(7)
                     .clamp(1, 90);
                 let since = now().saturating_sub((days as i64) * 86_400);
-                let summary = store.usage_summary(since)?;
+                let summary = bot.store.usage_summary(since)?;
                 Ok(json!({
                     "days": days,
                     "totals": {
@@ -1465,8 +1641,12 @@ async fn dispatch(
                     })).collect::<Vec<_>>(),
                 }))
             }
-            "webhooks.list" => Ok(webhooks_reply(ctx)?),
+            "webhooks.list" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                Ok(webhooks_reply(ctx, &bot.store)?)
+            }
             "webhooks.create" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
                 let name = get("name")?.trim().to_string();
                 if name.is_empty() {
                     return Err("Webhook name is required".into());
@@ -1481,26 +1661,29 @@ async fn dispatch(
                 let id = hex::encode(id_bytes);
                 let token = hex::encode(token_bytes);
                 let token_hash = Sha256::digest(token.as_bytes());
-                store.create_webhook(&id, &name, &token, &token_hash, now())?;
-                Ok(webhooks_reply(ctx)?)
+                bot.store
+                    .create_webhook(&id, &name, &token, &token_hash, now())?;
+                Ok(webhooks_reply(ctx, &bot.store)?)
             }
             "webhooks.setEnabled" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
                 let id = get("id")?;
                 let enabled = payload
                     .get("enabled")
                     .and_then(Value::as_bool)
                     .ok_or_else(invalid)?;
-                if !store.set_webhook_enabled(id, enabled)? {
+                if !bot.store.set_webhook_enabled(id, enabled)? {
                     return Err("Webhook not found".into());
                 }
-                Ok(webhooks_reply(ctx)?)
+                Ok(webhooks_reply(ctx, &bot.store)?)
             }
             "webhooks.remove" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
                 let id = get("id")?;
-                if !store.remove_webhook(id)? {
+                if !bot.store.remove_webhook(id)? {
                     return Err("Webhook not found".into());
                 }
-                Ok(webhooks_reply(ctx)?)
+                Ok(webhooks_reply(ctx, &bot.store)?)
             }
             _ => Err(format!("Unknown request: {request_type}").into()),
         }
@@ -1586,16 +1769,26 @@ async fn public_file_named(
 }
 
 async fn serve_public_file(ctx: &WebContext, id: &str, head_only: bool) -> Response {
-    let record = match ctx.store.public_file(id) {
-        Ok(Some(record)) => record,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let handles = ctx.bots.all_handles().await;
+    let mut found = None;
+    for bot in handles {
+        match bot.store.public_file(id) {
+            Ok(Some(record)) => {
+                found = Some((bot, record));
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    }
+    let Some((bot, record)) = found else {
+        return StatusCode::NOT_FOUND.into_response();
     };
     // Reject links recorded under a different --workspace.
-    if ctx.workspace.canonical_path() != record.workspace {
+    if bot.workspace.canonical_path() != record.workspace {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let workspace = ctx.workspace.clone();
+    let workspace = bot.workspace.clone();
     let rel_path = record.path.clone();
     let opened =
         tokio::task::spawn_blocking(move || -> Result<(std::fs::File, u64), StatusCode> {
@@ -1670,8 +1863,8 @@ async fn serve_public_file(ctx: &WebContext, id: &str, head_only: bool) -> Respo
 
 const MAX_WEBHOOK_BODY_BYTES: usize = 64 * 1024;
 
-fn webhooks_reply(ctx: &WebContext) -> crate::Result<Value> {
-    let webhooks = ctx.store.webhooks()?;
+fn webhooks_reply(ctx: &WebContext, store: &SqliteStorage) -> crate::Result<Value> {
+    let webhooks = store.webhooks()?;
     let public_url = ctx
         .public_url
         .as_ref()
@@ -1695,20 +1888,24 @@ async fn inbound_webhook(
     body: Body,
 ) -> Response {
     let token_hash = Sha256::digest(token.as_bytes());
-    match ctx.store.webhook_by_token_hash(&token_hash) {
-        Ok(Some(hook)) if hook.enabled => {}
-        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let handles = ctx.bots.all_handles().await;
+    let mut owner = None;
+    for bot in handles {
+        match bot.store.webhook_by_token_hash(&token_hash) {
+            Ok(Some(hook)) if hook.enabled => {
+                owner = Some(bot);
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
     }
+    let Some(bot) = owner else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let bytes = match axum::body::to_bytes(body, MAX_WEBHOOK_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-    };
-    // Revalidate token and enabled state after body upload before admitting.
-    let hook = match ctx.store.webhook_by_token_hash(&token_hash) {
-        Ok(Some(hook)) if hook.enabled => hook,
-        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let text = String::from_utf8_lossy(&bytes).trim().to_owned();
     let payload = if text.is_empty() {
@@ -1716,25 +1913,22 @@ async fn inbound_webhook(
     } else {
         text
     };
-    if let Err(error) = ctx
-        .live_chat
-        .inject(
-            payload,
-            Some(storage::Meta::Event {
-                source: "webhook".into(),
-                name: hook.name,
-                for_message: None,
-            }),
-        )
-        .await
-    {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "ok": false, "error": error.to_string() })),
-        )
-            .into_response();
+    let prepared = match bot.live_chat.prepare().await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "ok": false, "error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    match bot.store.enqueue_webhook_event(&token_hash, now(), &payload) {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
-    let _ = ctx.store.touch_webhook(&hook.id, now());
+    prepared.wake();
     (StatusCode::ACCEPTED, Json(json!({ "ok": true }))).into_response()
 }
 
@@ -1744,11 +1938,22 @@ async fn inbound_callback(
     body: Body,
 ) -> Response {
     let token_hash = Sha256::digest(token.as_bytes());
-    match ctx.store.has_active_callback(&token_hash, now()) {
-        Ok(true) => {}
-        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let handles = ctx.bots.all_handles().await;
+    let mut owner = None;
+    let ts = now();
+    for bot in handles {
+        match bot.store.has_active_callback(&token_hash, ts) {
+            Ok(true) => {
+                owner = Some(bot);
+                break;
+            }
+            Ok(false) => {}
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
     }
+    let Some(bot) = owner else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let bytes = match axum::body::to_bytes(body, MAX_WEBHOOK_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
@@ -1763,7 +1968,7 @@ async fn inbound_callback(
     // transient 503 or shutdown never burns the caller's token. Once consumed,
     // the event is durably committed to `pending_events` in the same SQLite
     // transaction before returning 202 Accepted, surviving crashes or restarts.
-    let prepared = match ctx.live_chat.prepare().await {
+    let prepared = match bot.live_chat.prepare().await {
         Ok(prepared) => prepared,
         Err(error) => {
             return (
@@ -1773,7 +1978,7 @@ async fn inbound_callback(
                 .into_response();
         }
     };
-    let cb = match ctx.store.consume_callback(&token_hash, now(), &payload) {
+    let cb = match bot.store.consume_callback(&token_hash, now(), &payload) {
         Ok(Some(cb)) => cb,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -1891,14 +2096,23 @@ mod public_file_tests {
             })
             .unwrap();
 
+        let mcp = mcp::Mcp::new(store.clone());
+        let bots = crate::run::BotRegistry::new(
+            store.clone(),
+            dir.clone(),
+            None,
+            workspace.clone(),
+            pinned,
+            None,
+            mcp.clone(),
+        );
+        bots.register_default_for_test().await.unwrap();
         let ctx = WebContext {
             store: store.clone(),
-            discord: Arc::new(messenger_discord::Discord::new()),
+            bots,
             settings_lock: tokio::sync::Mutex::new(()),
-            mcp: mcp::Mcp::new(store.clone()),
+            mcp,
             public_url: Some(public_url("https://blob-1.example.com").unwrap()),
-            workspace: pinned,
-            live_chat: crate::run::LiveChat::default(),
         };
 
         let md_resp = serve_public_file(&ctx, &md_id, false).await;
@@ -1969,7 +2183,8 @@ mod public_file_tests {
         let workspace = dir.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let key = storage_sqlite::AppKey::new("test-key".into());
-        let store = Arc::new(SqliteStorage::open(dir.join("agent.db"), Some(key)).unwrap());
+        let store =
+            Arc::new(SqliteStorage::open(dir.join("agent.db"), Some(key.clone())).unwrap());
         let pinned = harness::PinnedWorkspace::open(&workspace).unwrap();
 
         let token = "secret-hook-token";
@@ -1978,14 +2193,23 @@ mod public_file_tests {
             .create_webhook("h1", "ci", token, &hash, now())
             .unwrap();
 
+        let mcp = mcp::Mcp::new(store.clone());
+        let bots = crate::run::BotRegistry::new(
+            store.clone(),
+            dir.clone(),
+            Some(key),
+            workspace.clone(),
+            pinned,
+            None,
+            mcp.clone(),
+        );
+        bots.register_default_for_test().await.unwrap();
         let ctx = Arc::new(WebContext {
             store: store.clone(),
-            discord: Arc::new(messenger_discord::Discord::new()),
+            bots,
             settings_lock: tokio::sync::Mutex::new(()),
-            mcp: mcp::Mcp::new(store.clone()),
+            mcp,
             public_url: Some(public_url("https://blob-1.example.com").unwrap()),
-            workspace: pinned,
-            live_chat: crate::run::LiveChat::default(),
         });
 
         // Unknown token -> 404.

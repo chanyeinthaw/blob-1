@@ -677,9 +677,9 @@ async fn main() -> Result<()> {
                 | Command::Watch { .. }
                 | Command::Checkin { .. }
         ) {
-            SqliteStorage::open_shared(path, app_key)?
+            SqliteStorage::open_shared(path, app_key.clone())?
         } else {
-            SqliteStorage::open(path, app_key)?
+            SqliteStorage::open(path, app_key.clone())?
         },
     );
 
@@ -797,62 +797,44 @@ async fn main() -> Result<()> {
             let listener = tokio::net::TcpListener::bind(addr).await?;
             std::fs::create_dir_all(&workspace)?;
             let workspace = workspace.canonicalize()?;
-            let web_store = store.clone();
-            let discord = Arc::new(messenger_discord::Discord::new());
-            let discord_for_web = discord.clone();
+            let pinned_workspace = harness::PinnedWorkspace::open(&workspace)?;
             let mcp = mcp::Mcp::new(store.clone());
             let mcp_for_web = mcp.clone();
             let mcp_shutdown = mcp.clone();
+            let registry = run::BotRegistry::new(
+                store.clone(),
+                data_dir.clone(),
+                app_key.clone(),
+                workspace.clone(),
+                pinned_workspace.clone(),
+                skills_dir.clone(),
+                mcp,
+            );
+            registry.start_all().await?;
+            runtime::mark_ready();
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             let shutdown_tx = Arc::new(shutdown_tx);
-            let harness_shutdown = shutdown_rx.clone();
             let mut interrupt =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
             let mut terminate =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-            let stop = shutdown_tx.clone();
-            std::fs::create_dir_all(&workspace)?;
-            let pinned_workspace = harness::PinnedWorkspace::open(&workspace)?;
-            let harness_workspace = pinned_workspace.clone();
-            let live_chat = run::LiveChat::default();
-            let harness_live_chat = live_chat.clone();
-            let harness_task = tokio::spawn(async move {
-                let result = run::serve(
-                    store,
-                    &workspace,
-                    harness_workspace,
-                    skills_dir.as_deref(),
-                    discord,
-                    harness_shutdown,
-                    mcp,
-                    harness_live_chat,
-                )
-                .await;
-                let _ = stop.send(true);
-                result
-            });
             let signal_tx = shutdown_tx.clone();
             tokio::spawn(async move {
                 tokio::select! { _ = interrupt.recv() => {}, _ = terminate.recv() => {} }
                 let _ = signal_tx.send(true);
             });
-            web::serve(
+            let web_result = web::serve(
                 listener,
-                web_store,
-                discord_for_web,
+                store,
+                registry.clone(),
                 mcp_for_web,
                 shutdown_rx,
                 public_url,
-                pinned_workspace,
-                live_chat,
             )
-            .await?;
-            let result = match harness_task.await {
-                Ok(result) => result,
-                Err(error) => Err(error.into()),
-            };
+            .await;
+            registry.shutdown_all().await;
             mcp_shutdown.shutdown().await;
-            result
+            web_result
         }
         Command::Provider { command } => provider(&store, command),
         Command::Models { command } => models(&store, command).await,

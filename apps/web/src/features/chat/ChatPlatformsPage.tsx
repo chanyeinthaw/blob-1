@@ -16,7 +16,7 @@ interface ChatPlatformsPageProps {
 /** Chat platforms with their settings; Discord is the only platform today. */
 export function ChatPlatformsPage(props: ChatPlatformsPageProps) {
   return (
-    <DiscordSettingsOwner>
+    <DiscordSettingsOwner botId="default">
       {loadState => (
         <SplitPage
           title="Chat platforms"

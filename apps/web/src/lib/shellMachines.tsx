@@ -56,30 +56,40 @@ export function ShellMachinesProvider(props: { readonly children: ReactNode }) {
 
 /**
  * Like `createMachineContext`, but retains one typed machine instance per
- * signed-in `ShellScope` across route transitions so pending saves finish cleanly.
+ * `(ShellScope, scopeKey)` across route transitions so pending saves finish cleanly.
  */
 export function createPersistentMachineContext<A extends AtomMachine.MachineAtom.Any, Input>(
   key: string,
-  create: (options: { readonly input: Input }) => A,
+  create: (options: { readonly input: Input; readonly scopeKey: string }) => A,
 ) {
   const Context = createContext<A | null>(null)
-  const instances = new WeakMap<ShellScope, A>()
+  const instances = new WeakMap<ShellScope, Map<string, A>>()
 
-  function Provider(props: { readonly input: Input; readonly children: ReactNode }) {
+  function Provider(props: {
+    readonly input: Input
+    readonly scopeKey?: string
+    readonly children: ReactNode
+  }) {
     const scope = useContext(ShellScopeContext)
     const registry = useContext(RegistryContext)
-    const [machine] = useState<A>(() => {
-      if (scope === null) {
-        return create({ input: props.input })
+    const instanceKey = props.scopeKey ?? 'default'
+
+    const [fallback] = useState<Map<string, A>>(() => new Map())
+    const bucket = (() => {
+      if (scope === null) return fallback
+      let map = instances.get(scope)
+      if (map === undefined) {
+        map = new Map<string, A>()
+        instances.set(scope, map)
       }
-      const existing = instances.get(scope)
-      if (existing !== undefined) {
-        return existing
-      }
-      const created = create({ input: props.input })
-      instances.set(scope, created)
-      return created
-    })
+      return map
+    })()
+
+    let machine = bucket.get(instanceKey)
+    if (machine === undefined) {
+      machine = create({ input: props.input, scopeKey: instanceKey })
+      bucket.set(instanceKey, machine)
+    }
 
     useEffect(() => {
       if (scope !== null) {

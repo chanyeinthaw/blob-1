@@ -1,7 +1,7 @@
-import { createFileRoute } from '@tanstack/react-router'
-
-import { GeneralPage } from '~/features/general/GeneralPage'
+import { createFileRoute, redirect } from '@tanstack/react-router'
 
 export const Route = createFileRoute('/settings/general')({
-  component: GeneralPage,
+  beforeLoad: () => {
+    throw redirect({ to: '/settings/bots/$botId/general', params: { botId: 'default' } })
+  },
 })

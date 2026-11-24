@@ -35,17 +35,19 @@ import {
 import { Input } from '~/components/ui/input'
 import { ToggleGroup, ToggleGroupItem } from '~/components/ui/toggle-group'
 import { Tooltip, TooltipContent, TooltipTrigger } from '~/components/ui/tooltip'
-import { MachineAtoms } from '~/lib/runtime'
+import { useBotInstanceKey } from '~/features/bots/CreateBotDialog'
+import { machineAtomsForBot } from '~/lib/runtime'
 import { createPersistentMachineContext } from '~/lib/shellMachines'
 import { matchCached } from '~/lib/useBackgroundRefresh'
 import { cn } from '~/lib/utils'
 
 import { DiscordEvents, type DiscordInput, DiscordMachine } from './discordMachine'
-import { discordPageAtom } from './discordState'
+import { discordPageAtomFor } from './discordState'
 
 const DiscordOwner = createPersistentMachineContext(
   'discord',
-  ({ input }: { input: DiscordInput }) => MachineAtoms.make(DiscordMachine, input),
+  ({ input, scopeKey }: { readonly input: DiscordInput; readonly scopeKey: string }) =>
+    machineAtomsForBot(scopeKey).make(DiscordMachine, input),
 )
 
 interface Status {
@@ -73,18 +75,21 @@ export type DiscordLoadState =
   | { readonly kind: 'failed'; readonly cause: Cause.Cause<ApiError>; readonly onRetry: () => void }
 
 interface DiscordOwnerProps {
+  readonly botId: string
   readonly children: (state: DiscordLoadState) => React.ReactNode
 }
 
 /** Loads Discord settings and owns their machine for the subtree. */
 export function DiscordSettingsOwner(props: DiscordOwnerProps) {
-  const result = useAtomValue(discordPageAtom)
-  const retry = useAtomRefresh(discordPageAtom)
+  const instanceKey = useBotInstanceKey(props.botId)
+  const atom = discordPageAtomFor(instanceKey)
+  const result = useAtomValue(atom)
+  const retry = useAtomRefresh(atom)
   return matchCached(result, {
     onInitial: () => props.children({ kind: 'loading' }),
     onFailure: failure => props.children({ kind: 'failed', cause: failure.cause, onRetry: retry }),
     onSuccess: value => (
-      <DiscordOwner.Provider input={value}>
+      <DiscordOwner.Provider input={value} scopeKey={instanceKey}>
         <DiscordSyncBridge />
         {props.children({ kind: 'loaded' })}
       </DiscordOwner.Provider>

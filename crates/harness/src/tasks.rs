@@ -446,7 +446,11 @@ where
         session = session.with_callback_tools(callback.clone());
     }
     if let Some(mcp) = &inner.mcp {
-        session = session.with_mcp_tools(Arc::new(mcp::SessionTools::new(mcp.clone())));
+        let tools = match &inner.mcp_filter {
+            Some(filter) => mcp::SessionTools::with_filter(mcp.clone(), Arc::clone(filter)),
+            None => mcp::SessionTools::new(mcp.clone()),
+        };
+        session = session.with_mcp_tools(Arc::new(tools));
     }
     Arc::new(session)
 }

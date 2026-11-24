@@ -9,21 +9,24 @@ import { type FormEvent, useEffect, useState } from 'react'
 import { toast } from 'sonner'
 
 import { ConfirmDialog } from '~/components/ConfirmDialog'
-import { EmptyLine, FieldError, Page, PageError } from '~/components/layout/Page'
+import { EmptyLine, FieldError, PageError } from '~/components/layout/Page'
+import { SplitDetail } from '~/components/layout/SplitPage'
 import { Button } from '~/components/ui/button'
 import { Input } from '~/components/ui/input'
 import { Switch } from '~/components/ui/switch'
 import { Tooltip, TooltipContent, TooltipTrigger } from '~/components/ui/tooltip'
-import { MachineAtoms } from '~/lib/runtime'
+import { useBotInstanceKey, useBotsRoot } from '~/features/bots/CreateBotDialog'
+import { machineAtomsForBot } from '~/lib/runtime'
 import { createPersistentMachineContext } from '~/lib/shellMachines'
 import { matchCached } from '~/lib/useBackgroundRefresh'
 
 import { WebhooksEvents, type WebhooksInput, WebhooksMachine } from './webhooksMachine'
-import { webhooksPageAtom } from './webhooksState'
+import { webhooksPageAtomFor } from './webhooksState'
 
 const WebhooksOwner = createPersistentMachineContext(
   'webhooks',
-  ({ input }: { input: WebhooksInput }) => MachineAtoms.make(WebhooksMachine, input),
+  ({ input, scopeKey }: { readonly input: WebhooksInput; readonly scopeKey: string }) =>
+    machineAtomsForBot(scopeKey).make(WebhooksMachine, input),
 )
 
 function buildEndpointUrl(publicUrl: string | null, token: string): string {
@@ -45,30 +48,58 @@ function formatLastTriggered(timestampSecs: number | null): string {
   })
 }
 
-/** The Webhooks settings page. */
-export function WebhooksPage() {
-  const result = useAtomValue(webhooksPageAtom)
-  const retry = useAtomRefresh(webhooksPageAtom)
+interface WebhooksPageProps {
+  readonly botId: string
+}
+
+/** The Webhooks settings page for a bot. */
+export function WebhooksPage(props: WebhooksPageProps) {
+  const instanceKey = useBotInstanceKey(props.botId)
+  const atom = webhooksPageAtomFor(instanceKey)
+  const result = useAtomValue(atom)
+  const retry = useAtomRefresh(atom)
+  const bots = useBotsRoot()?.bots ?? []
+  const botName = bots.find(entry => entry.id === props.botId)?.name ?? props.botId
+
   return matchCached(result, {
     onInitial: () => (
-      <Page title="Webhooks" wide>
+      <SplitDetail
+        title="Webhooks"
+        wide
+        isListView={false}
+        backTo="/settings/bots/$botId"
+        backParams={{ botId: props.botId }}
+        backLabel={botName}
+      >
         <EmptyLine>Loading…</EmptyLine>
-      </Page>
+      </SplitDetail>
     ),
     onFailure: failure => (
-      <Page title="Webhooks" wide>
+      <SplitDetail
+        title="Webhooks"
+        wide
+        isListView={false}
+        backTo="/settings/bots/$botId"
+        backParams={{ botId: props.botId }}
+        backLabel={botName}
+      >
         <PageError cause={failure.cause} onRetry={retry} />
-      </Page>
+      </SplitDetail>
     ),
     onSuccess: payload => (
-      <WebhooksOwner.Provider input={payload}>
-        <WebhooksContent />
+      <WebhooksOwner.Provider input={payload} scopeKey={instanceKey}>
+        <WebhooksContent botId={props.botId} botName={botName} />
       </WebhooksOwner.Provider>
     ),
   })
 }
 
-function WebhooksContent() {
+interface WebhooksContentProps {
+  readonly botId: string
+  readonly botName: string
+}
+
+function WebhooksContent(props: WebhooksContentProps) {
   const machine = WebhooksOwner.useMachine()
   const send = useAtomSet(machine.send)
   useEffect(() => {
@@ -81,9 +112,13 @@ function WebhooksContent() {
   )
 
   return (
-    <Page
+    <SplitDetail
       title="Webhooks"
       wide
+      isListView={false}
+      backTo="/settings/bots/$botId"
+      backParams={{ botId: props.botId }}
+      backLabel={props.botName}
       actions={
         <>
           <span aria-live="polite" className="text-xs text-muted-foreground empty:sr-only">
@@ -126,7 +161,7 @@ function WebhooksContent() {
           </div>
         )}
       </MachineState>
-    </Page>
+    </SplitDetail>
   )
 }
 

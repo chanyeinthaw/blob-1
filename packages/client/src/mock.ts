@@ -2,6 +2,8 @@ import { Array, Duration, Effect, Layer, Random, Ref, Schema, Stream, Struct } f
 
 import { Transport } from './api.ts'
 import {
+  type BotMcpState,
+  type BotSummary,
   type CheckinConfig,
   type DecisionSlot,
   Discord,
@@ -47,6 +49,7 @@ type ProviderRecord = Readonly<{
 type State = Readonly<{
   instructions: string | null
   autoRespond: boolean
+  botEnabled: boolean
   main: Slot
   compaction: Slot | null
   utility: Slot | null
@@ -79,6 +82,7 @@ const NUMERIC_ID = /^\d+$/
 const seedState = (): State => ({
   instructions: null,
   autoRespond: true,
+  botEnabled: true,
   main: { provider: 'cpa1', model: 'gpt-6.1-terra', reasoning: 'medium' },
   compaction: { provider: 'cpa1', model: 'gpt-6-luna', reasoning: 'medium' },
   utility: { provider: 'cpa1', model: 'gpt-6-luna', reasoning: 'low' },
@@ -381,7 +385,8 @@ const discordReply = (state: State): Discord => ({
   accessRules: state.accessRules,
   home: state.home,
   token: state.hasToken ? 'set' : 'missing',
-  connection: state.hasToken ? { state: 'online', bot: 'Blob-1' } : { state: 'off' },
+  connection:
+    state.hasToken && state.botEnabled ? { state: 'online', bot: 'Blob-1' } : { state: 'off' },
   interactionModes: state.interactionModes,
   defaultInteractionMode: state.defaultInteractionMode,
   replyModes: state.replyModes,
@@ -884,13 +889,127 @@ const transition = (
     Effect.tap(next => Ref.set(state, next)),
   )
 
-type Handler<K extends RequestType> = (
+const DEFAULT_BOT_ID = 'default'
+const VALID_BOT_ID = /^[a-z0-9][a-z0-9-]{0,31}$/
+
+type BotRecord = Readonly<{
+  id: string
+  name: string
+  enabled: boolean
+  createdAt: number
+  generation: number
+  disabledMcp: ReadonlyArray<string>
+  state: State
+}>
+
+type MockRoot = Readonly<{
+  providers: ReadonlyArray<ProviderRecord>
+  mcpServers: ReadonlyArray<McpServer>
+  bots: ReadonlyArray<BotRecord>
+  /** Monotonic instance id so a recreated slug never reuses a prior generation. */
+  nextGeneration: number
+}>
+
+const emptyBotState = (name: string, base: State): State => ({
+  ...base,
+  instructions: `# Identity\n\nYou are ${name}`,
+  autoRespond: true,
+  main: { provider: '', model: '', reasoning: 'medium' },
+  compaction: null,
+  utility: null,
+  decision: null,
+  defaultAccess: 'block',
+  accessRules: [],
+  home: { kind: 'none' },
+  hasToken: false,
+  interactionModes: [],
+  defaultInteractionMode: 'mention-only',
+  replyModes: [],
+  defaultReplyMode: 'auto',
+  schedules: [],
+  nextScheduleId: 1,
+  checkin: null,
+  watches: [],
+  nextWatchId: 1,
+  webhooks: [],
+  nextWebhookId: 1,
+})
+
+const seedRoot = (): MockRoot => {
+  const initial = seedState()
+  return {
+    providers: initial.providers,
+    mcpServers: initial.mcpServers,
+    bots: [
+      {
+        id: DEFAULT_BOT_ID,
+        name: 'Blob-1',
+        enabled: true,
+        createdAt: 0,
+        generation: 0,
+        disabledMcp: [],
+        state: initial,
+      },
+    ],
+    nextGeneration: 1,
+  }
+}
+
+const botsReply = (root: MockRoot): ReadonlyArray<BotSummary> =>
+  root.bots.map(bot => ({
+    id: bot.id,
+    name: bot.name,
+    enabled: bot.enabled,
+    isDefault: bot.id === DEFAULT_BOT_ID,
+    createdAt: bot.createdAt,
+    generation: bot.generation,
+    mainModel:
+      bot.state.main.provider !== '' && bot.state.main.model !== ''
+        ? `${bot.state.main.provider}/${bot.state.main.model}`
+        : null,
+    connection:
+      bot.enabled && bot.state.hasToken ? { state: 'online', bot: bot.name } : { state: 'off' },
+  }))
+
+const botMcpReply = (root: MockRoot, botId: string): Effect.Effect<BotMcpState, string> => {
+  const bot = root.bots.find(entry => entry.id === botId)
+  if (bot === undefined) return Effect.fail(`Unknown bot ${botId}`)
+  return Effect.succeed({
+    servers: root.mcpServers.map(server => ({
+      id: server.id,
+      enabledGlobal: server.enabled,
+      enabledForBot: !bot.disabledMcp.includes(server.id),
+    })),
+  })
+}
+
+const providerInUseByBot = (root: MockRoot, providerId: string): string | null => {
+  for (const bot of root.bots) {
+    const s = bot.state
+    if (
+      s.main.provider === providerId ||
+      s.compaction?.provider === providerId ||
+      s.utility?.provider === providerId ||
+      s.decision?.provider === providerId
+    ) {
+      return bot.id
+    }
+  }
+  return null
+}
+
+type LegacyRequestType = Exclude<
+  RequestType,
+  'bots.list' | 'bots.create' | 'bots.update' | 'bots.remove' | 'bot.mcp.get' | 'bot.mcp.setEnabled'
+>
+
+type Handler<K extends LegacyRequestType> = (
   payload: RequestPayload<K>,
   state: Ref.Ref<State>,
 ) => Effect.Effect<ReplyPayload<K>, string>
 
 // oxlint-disable-next-line anti-slop/no-known-value-widening -- the mapped type keeps each handler tied to its request type for generic dispatch
-const handlers: { readonly [K in RequestType]: Handler<K> } = {
+const handlers: { readonly [K in LegacyRequestType]: Handler<K> } = {
   'general.get': (_payload, state) => Ref.get(state).pipe(Effect.map(generalReply)),
 
   'general.setAutoRespond': ({ enabled }, state) =>
@@ -1342,22 +1461,298 @@ const replyError = (id: string, error: string): ReplyFrame => ({
   error,
 })
 
+const toggleDisabledServer = (
+  list: ReadonlyArray<string>,
+  id: string,
+  enabled: boolean,
+): ReadonlyArray<string> =>
+  enabled ? list.filter(entry => entry !== id) : list.includes(id) ? list : [...list, id]
+
+const botControlHandlers = {
+  'bots.list': (_payload: RequestPayload<'bots.list'>, rootRef: Ref.Ref<MockRoot>) =>
+    Ref.get(rootRef).pipe(Effect.map(botsReply)),
+
+  'bots.create': (
+    { id: rawId, name: rawName }: RequestPayload<'bots.create'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const id = rawId.trim()
+      const name = rawName.trim()
+      if (!VALID_BOT_ID.test(id)) {
+        return yield* Effect.fail(
+          "Bot ID must be 1–32 lowercase letters, digits, or '-' (starting with a letter or digit)",
+        )
+      }
+      if (id === DEFAULT_BOT_ID) return yield* Effect.fail("Bot ID 'default' is reserved")
+      if (name === '' || name.length > 64) {
+        return yield* Effect.fail('Bot name must be 1–64 characters')
+      }
+      if (root.bots.some(bot => bot.id === id)) {
+        return yield* Effect.fail(`Bot ${id} already exists`)
+      }
+      const maxCreated = root.bots.reduce((max, bot) => Math.max(max, bot.createdAt), 0)
+      const createdAt = Math.max(Date.now(), maxCreated + 1)
+      const next: MockRoot = {
+        ...root,
+        bots: [
+          ...root.bots,
+          {
+            id,
+            name,
+            enabled: true,
+            createdAt,
+            generation: root.nextGeneration,
+            disabledMcp: [],
+            state: emptyBotState(name, seedState()),
+          },
+        ],
+        nextGeneration: root.nextGeneration + 1,
+      }
+      yield* Ref.set(rootRef, next)
+      return botsReply(next)
+    }),
+
+  'bots.update': (
+    { id, name, enabled, botGeneration }: RequestPayload<'bots.update'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const existing = root.bots.find(bot => bot.id === id)
+      if (existing === undefined) return yield* Effect.fail(`Unknown bot ${id}`)
+      yield* checkGeneration(existing, botGeneration)
+      const nextName = name !== undefined && name !== null ? name.trim() : existing.name
+      if (nextName === '' || nextName.length > 64) {
+        return yield* Effect.fail('Bot name must be 1–64 characters')
+      }
+      const nextEnabled = enabled !== undefined && enabled !== null ? enabled : existing.enabled
+      const next: MockRoot = Struct.evolve(root, {
+        bots: bots =>
+          bots.map(bot =>
+            bot.id === id
+              ? Struct.evolve(bot, { name: () => nextName, enabled: () => nextEnabled })
+              : bot,
+          ),
+      })
+      yield* Ref.set(rootRef, next)
+      return botsReply(next)
+    }),
+
+  'bots.remove': (
+    { id, botGeneration }: RequestPayload<'bots.remove'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      if (id === DEFAULT_BOT_ID) return yield* Effect.fail('Cannot remove the default bot')
+      const existing = root.bots.find(bot => bot.id === id)
+      if (existing === undefined) return yield* Effect.fail(`Unknown bot ${id}`)
+      yield* checkGeneration(existing, botGeneration)
+      const next: MockRoot = Struct.evolve(root, {
+        bots: bots => bots.filter(bot => bot.id !== id),
+      })
+      yield* Ref.set(rootRef, next)
+      return botsReply(next)
+    }),
+
+  'bot.mcp.get': (
+    { botId, botGeneration }: RequestPayload<'bot.mcp.get'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const resolved = botId ?? DEFAULT_BOT_ID
+      const bot = root.bots.find(entry => entry.id === resolved)
+      if (bot !== undefined) yield* checkGeneration(bot, botGeneration)
+      return yield* botMcpReply(root, resolved)
+    }),
+
+  'bot.mcp.setEnabled': (
+    { botId: rawBotId, botGeneration, id, enabled }: RequestPayload<'bot.mcp.setEnabled'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const botId = rawBotId ?? DEFAULT_BOT_ID
+      const target = root.bots.find(bot => bot.id === botId)
+      if (target === undefined) {
+        return yield* Effect.fail(`Unknown bot ${botId}`)
+      }
+      yield* checkGeneration(target, botGeneration)
+      if (!root.mcpServers.some(server => server.id === id)) {
+        return yield* Effect.fail(`no MCP server '${id}'`)
+      }
+      const next: MockRoot = Struct.evolve(root, {
+        bots: bots =>
+          bots.map(bot =>
+            bot.id === botId
+              ? Struct.evolve(bot, { disabledMcp: list => toggleDisabledServer(list, id, enabled) })
+              : bot,
+          ),
+      })
+      yield* Ref.set(rootRef, next)
+      return yield* botMcpReply(next, botId)
+    }),
+} satisfies {
+  readonly [
+    K in
+      | 'bots.list'
+      | 'bots.create'
+      | 'bots.update'
+      | 'bots.remove'
+      | 'bot.mcp.get'
+      | 'bot.mcp.setEnabled'
+  ]: (
+    payload: RequestPayload<K>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) => Effect.Effect<ReplyPayload<K>, string>
+}
+
+const botIdOf = (payload: { readonly botId?: string | undefined }): string =>
+  payload.botId !== undefined && payload.botId !== '' ? payload.botId : DEFAULT_BOT_ID
+
+const botGenerationOf = (payload: RequestPayload<LegacyRequestType>): number | undefined =>
+  'botGeneration' in payload ? payload.botGeneration : undefined
+
+/** Rejects writes aimed at a bot instance that was deleted and recreated with the same slug. */
+const checkGeneration = (
+  bot: BotRecord,
+  botGeneration: number | undefined,
+): Effect.Effect<void, string> =>
+  botGeneration === undefined || bot.generation === botGeneration
+    ? Effect.void
+    : Effect.fail(`Bot '${bot.id}' was replaced; reload to continue`)
+
+const runBotScoped = <K extends LegacyRequestType>(
+  rootRef: Ref.Ref<MockRoot>,
+  type: K,
+  decoded: RequestPayload<K>,
+): Effect.Effect<ReplyPayload<K>, string> =>
+  Effect.gen(function* () {
+    const root = yield* Ref.get(rootRef)
+    const botId = 'botId' in decoded ? botIdOf(decoded) : DEFAULT_BOT_ID
+    const bot = root.bots.find(entry => entry.id === botId)
+    if (bot === undefined) return yield* Effect.fail(`Unknown bot ${botId}`)
+    yield* checkGeneration(bot, botGenerationOf(decoded))
+    const projected: State = {
+      ...bot.state,
+      botEnabled: bot.enabled,
+      providers: root.providers,
+      mcpServers: root.mcpServers,
+    }
+    const tempRef = yield* Ref.make(projected)
+    const reply = yield* handlers[type](decoded, tempRef)
+    const updated = yield* Ref.get(tempRef)
+    const nextRoot: MockRoot = {
+      ...root,
+      providers: updated.providers,
+      mcpServers: updated.mcpServers,
+      bots: root.bots.map(entry =>
+        entry.id === botId ? Struct.evolve(entry, { state: () => updated }) : entry,
+      ),
+    }
+    yield* Ref.set(rootRef, nextRoot)
+    return reply
+  })
+
+const removeProviderAcrossBots = (
+  payload: RequestPayload<'providers.remove'>,
+  rootRef: Ref.Ref<MockRoot>,
+): Effect.Effect<ReplyPayload<'providers.remove'>, string> =>
+  Effect.gen(function* () {
+    const root = yield* Ref.get(rootRef)
+    const usedBy = providerInUseByBot(root, payload.id)
+    if (usedBy !== null) {
+      return yield* Effect.fail(`Provider ${payload.id} is used by a model slot on bot '${usedBy}'`)
+    }
+    return yield* runBotScoped(rootRef, 'providers.remove', payload)
+  })
+
+type RootHandler<K extends RequestType> = (
+  payload: RequestPayload<K>,
+  rootRef: Ref.Ref<MockRoot>,
+) => Effect.Effect<ReplyPayload<K>, string>
+
+const wrapLegacy =
+  <K extends LegacyRequestType>(type: K): RootHandler<K> =>
+  (payload, rootRef) =>
+    runBotScoped(rootRef, type, payload)
+
+// oxlint-disable-next-line anti-slop/no-known-value-widening -- mapped table keeps each handler bound to its request type
+const allHandlers: { readonly [K in RequestType]: RootHandler<K> } = {
+  ...botControlHandlers,
+  'general.get': wrapLegacy('general.get'),
+  'general.setAutoRespond': wrapLegacy('general.setAutoRespond'),
+  'instructions.get': wrapLegacy('instructions.get'),
+  'instructions.set': wrapLegacy('instructions.set'),
+  'instructions.reset': wrapLegacy('instructions.reset'),
+  'models.get': wrapLegacy('models.get'),
+  'models.setMain': wrapLegacy('models.setMain'),
+  'models.setCompaction': wrapLegacy('models.setCompaction'),
+  'models.setUtility': wrapLegacy('models.setUtility'),
+  'models.setDecision': wrapLegacy('models.setDecision'),
+  'models.setContextLimit': wrapLegacy('models.setContextLimit'),
+  'models.setImages': wrapLegacy('models.setImages'),
+  'providers.list': wrapLegacy('providers.list'),
+  'providers.add': wrapLegacy('providers.add'),
+  'providers.setKey': wrapLegacy('providers.setKey'),
+  'providers.remove': removeProviderAcrossBots,
+  'providers.refresh': wrapLegacy('providers.refresh'),
+  'discord.get': wrapLegacy('discord.get'),
+  'discord.directory': wrapLegacy('discord.directory'),
+  'discord.allow': wrapLegacy('discord.allow'),
+  'discord.disallow': wrapLegacy('discord.disallow'),
+  'discord.setHome': wrapLegacy('discord.setHome'),
+  'discord.setToken': wrapLegacy('discord.setToken'),
+  'discord.clearToken': wrapLegacy('discord.clearToken'),
+  'discord.setInteractionMode': wrapLegacy('discord.setInteractionMode'),
+  'discord.clearInteractionMode': wrapLegacy('discord.clearInteractionMode'),
+  'discord.setDefaultInteractionMode': wrapLegacy('discord.setDefaultInteractionMode'),
+  'discord.setReplyMode': wrapLegacy('discord.setReplyMode'),
+  'discord.clearReplyMode': wrapLegacy('discord.clearReplyMode'),
+  'discord.setDefaultReplyMode': wrapLegacy('discord.setDefaultReplyMode'),
+  'discord.setDefaultAccess': wrapLegacy('discord.setDefaultAccess'),
+  'discord.setAccessRule': wrapLegacy('discord.setAccessRule'),
+  'discord.removeAccessRule': wrapLegacy('discord.removeAccessRule'),
+  'mcp.list': wrapLegacy('mcp.list'),
+  'mcp.add': wrapLegacy('mcp.add'),
+  'mcp.remove': wrapLegacy('mcp.remove'),
+  'mcp.setEnabled': wrapLegacy('mcp.setEnabled'),
+  'mcp.login': wrapLegacy('mcp.login'),
+  'schedule.get': wrapLegacy('schedule.get'),
+  'schedule.occurrences': wrapLegacy('schedule.occurrences'),
+  'schedule.setTimezone': wrapLegacy('schedule.setTimezone'),
+  'schedule.add': wrapLegacy('schedule.add'),
+  'schedule.remove': wrapLegacy('schedule.remove'),
+  'checkin.set': wrapLegacy('checkin.set'),
+  'checkin.clear': wrapLegacy('checkin.clear'),
+  'watch.add': wrapLegacy('watch.add'),
+  'watch.remove': wrapLegacy('watch.remove'),
+  'usage.get': wrapLegacy('usage.get'),
+  'webhooks.list': wrapLegacy('webhooks.list'),
+  'webhooks.create': wrapLegacy('webhooks.create'),
+  'webhooks.setEnabled': wrapLegacy('webhooks.setEnabled'),
+  'webhooks.remove': wrapLegacy('webhooks.remove'),
+}
+
 const dispatch = <K extends RequestType>(
-  state: Ref.Ref<State>,
+  rootRef: Ref.Ref<MockRoot>,
   frame: RequestFrame,
   type: K,
 ): Effect.Effect<ReplyFrame> =>
   // oxlint-disable-next-line effect-local/no-inline-schema-compile -- the payload schema depends on the request type
   Schema.decodeUnknownEffect(requests[type].payload)(frame.payload).pipe(
     Effect.mapError(() => `Invalid ${type} payload`),
-    Effect.flatMap(decoded => handlers[type](decoded, state)),
+    Effect.flatMap(decoded => allHandlers[type](decoded, rootRef)),
     Effect.map(reply => replyOk(frame.id, reply)),
     Effect.catch(error => Effect.succeed(replyError(frame.id, error))),
   )
 
-const serve = (state: Ref.Ref<State>, frame: RequestFrame): Effect.Effect<ReplyFrame> =>
+const serve = (rootRef: Ref.Ref<MockRoot>, frame: RequestFrame): Effect.Effect<ReplyFrame> =>
   isRequestType(frame.type)
-    ? dispatch(state, frame, frame.type)
+    ? dispatch(rootRef, frame, frame.type)
     : Effect.succeed(replyError(frame.id, `Unknown request ${frame.type}`))
 
 const latency = Random.nextIntBetween(150, 351).pipe(
@@ -1367,10 +1762,10 @@ const latency = Random.nextIntBetween(150, 351).pipe(
 export const mockTransport: Layer.Layer<Transport> = Layer.effect(
   Transport,
   Effect.gen(function* () {
-    const state = yield* Ref.make(seedState())
+    const rootRef = yield* Ref.make(seedRoot())
 
     return Transport.of({
-      send: frame => latency.pipe(Effect.andThen(serve(state, frame))),
+      send: frame => latency.pipe(Effect.andThen(serve(rootRef, frame))),
       status: Stream.make(true),
       unauthorized: Stream.empty,
     })
