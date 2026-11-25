@@ -33,7 +33,7 @@ Where each feature lives: code, CLI, model tools and storage.
 - Tables: `web_password`, `web_sessions`, `public_url`, `public_files`, `usage_events`, `webhooks`, `callbacks`, `pending_events`.
 - Usage telemetry: every completion in `run.rs` records `usage_events` (`chat`, `task`, `utility`, `compaction`, provider, model, input/cached/output tokens); surfaced via `usage.get` on each bot's **General** page (`/settings/bots/$botId/general`).
 - Webhooks: `/settings/bots/$botId/webhooks` (`webhooks.list`, `webhooks.create`, `webhooks.setEnabled`, `webhooks.remove`) manages capability-token inbound webhooks; tokens are encrypted at rest in `webhooks.token` with SHA-256 `token_hash` lookup.
-- Discord settings live under each bot's **Platforms → Discord** page at `/settings/bots/$botId/discord` (legacy `/settings/chat/discord` redirects to `default`): token Replace/Remove, connection status (`off` / `connecting` / `online` with the bot name / `error` with a short message), unified access rules, Discord-wide interaction and reply defaults, per-channel, per-person and per-server interaction-mode overrides and the home channel or DM. Discord is the only chat platform today. Web token saves reject a token already configured on another bot so two bots don't share one Discord account.
+- Discord settings live under each bot's **Platforms → Discord** page at `/settings/bots/$botId/discord` (legacy `/settings/chat/discord` redirects to `default`): token Replace/Remove, connection status (`off` / `connecting` / `online` with the bot name / `error` with a short message), unified access rules, Discord-wide interaction and reply defaults, and per-channel, per-person and per-server interaction-mode overrides. Its home channel or DM is set in the General page's **Home** section. Discord and the built-in web chat (see Web chat) are the chat platforms. Web token saves reject a token already configured on another bot so two bots don't share one Discord account.
 - Model and provider changes apply to the running bot without a restart: each turn, spawned task, compaction pass and utility call resolves from current settings; a run already in progress keeps its model, a task keeps the model it was spawned with for its lifetime, and a role whose settings no longer resolve keeps its last working model. The `model`, `models`, `provider` and `reasoning` commands run while `serve` holds the data directory; `serve`, `chat` and `skill` still need it exclusively.
 - The mock transport is enabled only with `VITE_MOCK=1`.
 
@@ -121,11 +121,23 @@ One-shot generation and fast classification: one request, no tools, no memory, n
 
 - Code: `crates/harness/src/schedule.rs` (`run_schedules`), `crates/storage-sqlite/src/schedule.rs`, `apps/web/src/features/schedules/`
 - One-off (`at`) or recurring (`cron`) jobs with their own timezone and optional `to` or `reply`
-- Fires as `<scheduled id due [late] [to] [for] [home]>` while `serve` runs; a missed job fires once, marked late
+- Fires as `<scheduled id due [late] [to] [for] [home]>` while `serve` runs; a missed job fires once, marked late. `home="home"` means home destinations are set: `send` with `to: "home"` delivers to every one, succeeding when at least one gets it and naming any that failed
 - Tools: `schedule`, `unschedule`, `schedules`
 - Web protocol: `schedule.get`, `schedule.occurrences`, `schedule.setTimezone`, `schedule.add`, `schedule.remove` (`/settings/schedules`)
-- CLI: `agent schedule add | list | remove`, `agent timezone show | set`, `agent home show | set | clear`
-- Tables: `schedules`, `clock`, `home`
+- Homes: at most one per messenger (`homes` table; the old single-row `home` migrates on open). both are set in each bot's General page **Home** section: a **Web chat** switch (`general.setWebHome`) and Discord's channel or DM picker (`discord.setHome`); new bots start with the web chat as home. Due jobs wait for Discord only when a Discord token is set and the web chat is not a home
+- CLI: `agent schedule add | list | remove`, `agent timezone show | set`, `agent home show | set <messenger> [target] | clear <messenger>` (`set web` or `set discord <channel id|dm:user id>`)
+- Tables: `schedules`, `clock`, `homes`
+
+## Web chat
+
+Each bot's default page is a chat with it, built in as the `web` messenger.
+
+- Code: `crates/agent/src/webchat.rs` (`WebChat`, a `Messenger`), `crates/storage-sqlite/src/webchat.rs`, `crates/agent/src/web.rs` (`chat.history`, `chat.send`), `apps/web/src/features/webchat/`
+- One conversation per bot, at `/settings/bots/$botId/chat`; the rail opens each bot's last opened page, the chat by default. The header's bot name opens settings, whose sidebar has a back arrow to the chat
+- The owner's messages reach the bot as `<message messenger="web">` from a fixed "Owner", always addressed, with no access rules or modes; the bot answers with `send` (text only: files are refused). `history` and `search` add nothing, since every web message is already in memory
+- Status: the typing pulse shows animated dots; a task working on the owner's message (the `Working` mark) shows "Working on a task…". Both and new messages reach open pages as `chat` changes
+- UI: centered message bubbles (the bot's as Markdown via `react-markdown` + `remark-gfm`, no raw HTML), older pages load on scroll up, a scroll-to-bottom button when scrolled up, and a floating composer (Enter sends, Shift+Enter adds a line)
+- Tables: `web_messages`
 
 ## Watches and check-ins
 

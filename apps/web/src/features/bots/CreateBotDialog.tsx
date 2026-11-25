@@ -75,7 +75,7 @@ function CreateBotForm(props: CreateBotFormProps) {
     onClose()
     send(BotsEvents.ClearCreateState())
     void navigate({
-      to: '/settings/bots/$botId/general',
+      to: '/settings/bots/$botId/chat',
       params: { botId: lastCreatedId },
     })
   }, [lastCreatedId, navigate, onClose, send])

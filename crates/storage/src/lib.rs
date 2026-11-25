@@ -338,8 +338,11 @@ pub trait WebAuthStore: Send + Sync {
 pub trait ConfigStore: Send + Sync {
     fn timezone(&self) -> Result<String, StoreError>;
     fn set_timezone(&self, timezone: &str) -> Result<(), StoreError>;
-    fn home(&self) -> Result<Option<Home>, StoreError>;
-    fn set_home(&self, home: Option<&Home>) -> Result<(), StoreError>;
+    /// Home destinations, at most one per messenger; `send` to `home`
+    /// delivers to all of them.
+    fn homes(&self) -> Result<Vec<Home>, StoreError>;
+    /// Sets (`Some`) or clears (`None`) the home for one messenger.
+    fn set_home(&self, messenger: &str, target: Option<&str>) -> Result<(), StoreError>;
     fn instructions(&self) -> Result<Option<String>, StoreError>;
     fn set_instructions(&self, text: Option<&str>) -> Result<(), StoreError>;
     fn auto_respond(&self) -> Result<bool, StoreError>;
@@ -455,8 +458,9 @@ pub struct Quote {
 pub enum Meta {
     Checkin {
         time: String,
-        #[serde(default)]
-        home: Option<u64>,
+        /// Whether any home destination is set: `send` with `to: "home"`.
+        #[serde(default, deserialize_with = "home_flag")]
+        home: bool,
     },
     Scheduled {
         id: String,
@@ -468,8 +472,8 @@ pub enum Meta {
         to: Option<u64>,
         #[serde(rename = "for", default)]
         for_message: Option<String>,
-        #[serde(default)]
-        home: Option<u64>,
+        #[serde(default, deserialize_with = "home_flag")]
+        home: bool,
     },
     Report {
         task: String,
@@ -529,6 +533,30 @@ impl ReportStatus {
             Self::Crashed => "crashed",
         }
     }
+}
+
+fn home_attribute(home: bool) -> &'static str {
+    if home {
+        " home=\"home\""
+    } else {
+        ""
+    }
+}
+
+/// Reads a stored `home`: a flag now, a destination id (any home) or null in
+/// rows written before homes became a list.
+fn home_flag<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Flag(bool),
+        Destination(#[allow(dead_code)] u64),
+    }
+    Ok(match Option::<Stored>::deserialize(deserializer)? {
+        Some(Stored::Flag(flag)) => flag,
+        Some(Stored::Destination(_)) => true,
+        None => false,
+    })
 }
 
 pub fn escape(text: &str) -> String {
@@ -591,7 +619,7 @@ impl Meta {
             return format!(
                 "<checkin time=\"{}\"{}>\n{body}\n</checkin>",
                 attribute(time),
-                home.map_or_else(String::new, |v| format!(" home=\"d{v}\""))
+                home_attribute(*home)
             );
         }
         let body = escape(body);
@@ -603,7 +631,7 @@ impl Meta {
                 late.as_ref().map_or_else(String::new, |v| format!(" late=\"{}\"", attribute(v))),
                 to.map_or_else(String::new, |v| format!(" to=\"d{v}\"")),
                 for_attribute(for_message),
-                home.map_or_else(String::new, |v| format!(" home=\"d{v}\""))
+                home_attribute(*home)
             ),
             Self::Report { task, status, for_message } => format!(
                 "<report task=\"{}\" status=\"{}\"{}>\n{body}\n</report>",
@@ -1607,6 +1635,36 @@ impl<T: WebhookStore + ?Sized> WebhookStore for Arc<T> {
         payload: &str,
     ) -> Result<Option<String>, StoreError> {
         (**self).enqueue_webhook_event(token_hash, now, payload)
+    }
+}
+
+/// One message in a bot's web chat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebMessage {
+    pub id: i64,
+    /// `true` for the bot's messages, `false` for the owner's.
+    pub bot: bool,
+    pub text: String,
+    pub created_at: i64,
+}
+
+/// A bot's single web chat conversation.
+pub trait WebChatStore: Send + Sync {
+    fn add_web_message(&self, bot: bool, text: &str, now: i64) -> Result<i64, StoreError>;
+    fn web_message(&self, id: i64) -> Result<Option<WebMessage>, StoreError>;
+    /// Up to `limit` messages before id `before` (or the newest), oldest first.
+    fn web_messages(&self, before: Option<i64>, limit: u32) -> Result<Vec<WebMessage>, StoreError>;
+}
+
+impl<T: WebChatStore + ?Sized> WebChatStore for Arc<T> {
+    fn add_web_message(&self, bot: bool, text: &str, now: i64) -> Result<i64, StoreError> {
+        (**self).add_web_message(bot, text, now)
+    }
+    fn web_message(&self, id: i64) -> Result<Option<WebMessage>, StoreError> {
+        (**self).web_message(id)
+    }
+    fn web_messages(&self, before: Option<i64>, limit: u32) -> Result<Vec<WebMessage>, StoreError> {
+        (**self).web_messages(before, limit)
     }
 }
 

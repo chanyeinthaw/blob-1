@@ -21,6 +21,7 @@ mod skill;
 mod usage;
 mod watch;
 mod web_auth;
+mod webchat;
 mod webhook;
 
 pub use crypto::AppKey;
@@ -33,6 +34,8 @@ CREATE TABLE IF NOT EXISTS watches (id INTEGER PRIMARY KEY AUTOINCREMENT, text T
 CREATE TABLE IF NOT EXISTS checkin (id INTEGER PRIMARY KEY CHECK (id = 1), every INTEGER NOT NULL, days TEXT NOT NULL, start_hour INTEGER NOT NULL, end_hour INTEGER NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS clock (id INTEGER PRIMARY KEY CHECK (id = 1), timezone TEXT NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS home (id INTEGER PRIMARY KEY CHECK (id = 1), messenger TEXT NOT NULL, target TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS homes (messenger TEXT PRIMARY KEY, target TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS web_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, bot INTEGER NOT NULL CHECK (bot IN (0, 1)), text TEXT NOT NULL, created_at INTEGER NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, at TEXT, cron TEXT, timezone TEXT NOT NULL, to_dest INTEGER, reply TEXT, next_due INTEGER NOT NULL, CHECK ((at IS NULL) != (cron IS NULL))) STRICT;
 
 CREATE TABLE IF NOT EXISTS memory_messages (i INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('user','assistant','tool','echo','work')), text TEXT NOT NULL, size INTEGER NOT NULL, date TEXT NOT NULL, more INTEGER NOT NULL CHECK (more IN (0,1)), meta TEXT) STRICT;
@@ -327,6 +330,13 @@ impl SqliteStorage {
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(backend)?;
+        // A brand-new database starts with the web chat as its home; later
+        // opens never re-add it, so an owner who clears it keeps it cleared.
+        let fresh: bool = connection
+            .query_row("SELECT NOT EXISTS(SELECT 1 FROM sqlite_master)", [], |row| {
+                row.get(0)
+            })
+            .map_err(backend)?;
         connection
             .pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))
             .map_err(backend)?;
@@ -425,6 +435,15 @@ impl SqliteStorage {
         ensure_environments_enrollment(&mut connection, &mut require_exclusive)?;
         ensure_model_enabled(&mut connection, &mut require_exclusive)?;
         migrate_identity_to_instructions(&mut connection, &mut require_exclusive)?;
+        migrate_home_to_homes(&mut connection, &mut require_exclusive)?;
+        if fresh {
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO homes (messenger, target) VALUES ('web', 'dm:owner')",
+                    [],
+                )
+                .map_err(backend)?;
+        }
         let key = match app_key {
             Some(app_key) => Some(crypto::setup(&connection, &app_key)?),
             None => None,
@@ -1307,6 +1326,32 @@ fn ensure_model_enabled(
     }
     tx.commit().map_err(backend)?;
     Ok(())
+}
+
+/// Moves the old single `home` row into `homes` (one per messenger), then
+/// deletes it so a cleared home can't come back on the next open.
+fn migrate_home_to_homes(
+    connection: &mut Connection,
+    require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let legacy: bool = connection
+        .query_row("SELECT EXISTS(SELECT 1 FROM home)", [], |row| row.get(0))
+        .map_err(backend)?;
+    if !legacy {
+        return Ok(());
+    }
+    // An older server still reading `home` must not see it move under it.
+    require_exclusive(
+        "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
+    )?;
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             INSERT OR IGNORE INTO homes (messenger, target) SELECT messenger, target FROM home WHERE id = 1;
+             DELETE FROM home;
+             COMMIT;",
+        )
+        .map_err(backend)
 }
 
 /// Copies any row verbatim from the legacy `identity` table into `instructions`

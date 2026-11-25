@@ -8,6 +8,8 @@ import { focusRingClassName, panelClassName, scrollClassName } from './Page'
 
 interface SplitPageProps {
   readonly title: string
+  /** Rendered before the title, e.g. a back button. */
+  readonly titleLeading?: ReactNode
   readonly titleExtra?: ReactNode
   readonly items: ReactNode
   /** On mobile the list and the detail are separate screens; this picks the list. */
@@ -36,8 +38,9 @@ export function SplitPage(props: SplitPageProps) {
           props.isListView ? 'flex flex-1' : 'hidden',
         )}
       >
-        <div className="flex shrink-0 items-center justify-between gap-2 px-5 pt-5 pb-4 md:min-h-16 md:px-5 md:py-4">
-          <h1 className="truncate text-2xl font-semibold tracking-tight md:text-lg">
+        <div className="flex shrink-0 items-center gap-2 px-5 pt-5 pb-4 md:min-h-16 md:px-5 md:py-4">
+          {props.titleLeading}
+          <h1 className="mr-auto truncate text-2xl font-semibold tracking-tight md:text-lg">
             {props.title}
           </h1>
           {props.titleExtra}

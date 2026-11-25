@@ -39,7 +39,7 @@ export function SignInScreen() {
 
 function SignedInRedirect() {
   markSignedIn()
-  return <Navigate to="/settings/general" replace />
+  return <Navigate to="/settings/bots/$botId/chat" params={{ botId: 'default' }} replace />
 }
 
 function SignInForm() {

@@ -322,37 +322,23 @@ pub fn execute<S: ScheduleStore + MessengerStore + MemoryStore>(
     }
 }
 
-async fn home<S: MessengerStore>(
-    store: &S,
+/// Whether a home destination is set on a running messenger, so the model
+/// can `send` to `home`.
+fn has_home(
     config: &dyn ConfigStore,
     messengers: Option<&crate::Messengers>,
     label: &str,
-) -> Option<u64> {
-    let result: Result<Option<u64>> = async {
-        let Some(messengers) = messengers else {
-            return Ok(None);
-        };
-        let Some(home) = config.home()? else {
-            return Ok(None);
-        };
-        let messenger = messengers.find(&home.messenger)?;
-        let place = if let Some(user) = home.target.strip_prefix("dm:") {
-            messenger.direct(user).await?
-        } else {
-            storage::Place {
-                channel: home.target,
-                thread: None,
-                dm: false,
-            }
-        };
-        Ok(Some(store.destination(&home.messenger, &place)?))
-    }
-    .await;
-    match result {
-        Ok(value) => value,
+) -> bool {
+    let Some(messengers) = messengers else {
+        return false;
+    };
+    match config.homes() {
+        Ok(homes) => homes
+            .iter()
+            .any(|home| messengers.find(&home.messenger).is_ok()),
         Err(error) => {
             eprintln!("{label}: {error}");
-            None
+            false
         }
     }
 }
@@ -413,15 +399,13 @@ where
                                 .iter()
                                 .any(|watch| watch.to_dest.is_none() && watch.reply.is_none())
                             {
-                                home(
-                                    &self.inner.store,
+                                has_home(
                                     self.config.as_ref(),
                                     self.inner.messengers.as_ref(),
                                     "checkin",
                                 )
-                                .await
                             } else {
-                                None
+                                false
                             };
                             let report = crate::tasks::Report {
                                 meta: Meta::Checkin { time, home },
@@ -458,15 +442,13 @@ where
                         .ok_or("invalid schedule timestamp")?;
                     let tz: Tz = job.timezone.parse()?;
                     let home = if job.to_dest.is_none() && job.reply.is_none() {
-                        home(
-                            &self.inner.store,
+                        has_home(
                             self.config.as_ref(),
                             self.inner.messengers.as_ref(),
                             &format!("schedule s{}", job.id),
                         )
-                        .await
                     } else {
-                        None
+                        false
                     };
                     let now = Utc::now();
                     let next = job

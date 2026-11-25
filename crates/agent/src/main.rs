@@ -15,6 +15,7 @@ mod nodes;
 mod run;
 mod runtime;
 mod service;
+mod webchat;
 mod web;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -268,9 +269,12 @@ enum TimezoneCommand {
 
 #[derive(Subcommand)]
 enum HomeCommand {
+    /// List home destinations, one per messenger.
     Show,
-    Set { messenger: String, target: String },
-    Clear,
+    /// Set a messenger's home: a Discord channel id or dm:<user id>, or `web`.
+    Set { messenger: String, target: Option<String> },
+    /// Clear a messenger's home.
+    Clear { messenger: String },
 }
 
 #[derive(Subcommand)]
@@ -859,14 +863,14 @@ async fn main() -> Result<()> {
         Command::Home { command } => {
             match command {
                 HomeCommand::Show => {
-                    if let Some(home) = store.home()? {
+                    for home in store.homes()? {
                         println!("{} {}", home.messenger, home.target);
                     }
                 }
                 HomeCommand::Set { messenger, target } => {
-                    set_home(&store, Some(storage::Home { messenger, target }))?
+                    set_home(&store, &messenger, Some(target.as_deref().unwrap_or("")))?
                 }
-                HomeCommand::Clear => set_home(&store, None)?,
+                HomeCommand::Clear { messenger } => set_home(&store, &messenger, None)?,
             }
             Ok(())
         }
@@ -981,17 +985,26 @@ async fn main() -> Result<()> {
     }
 }
 
-fn set_home(store: &SqliteStorage, home: Option<storage::Home>) -> Result<()> {
-    if let Some(home) = &home {
-        if home.messenger != "discord" {
-            return Err("home messenger must be discord".into());
+/// Sets or clears one messenger's home. Discord takes a numeric channel id
+/// or `dm:<user id>`; the web chat has one conversation, so its target is
+/// fixed.
+fn set_home(store: &SqliteStorage, messenger: &str, target: Option<&str>) -> Result<()> {
+    let target = match (messenger, target) {
+        (_, None) => None,
+        ("web", Some(_)) => Some(crate::webchat::HOME_TARGET),
+        ("discord", Some(target)) => {
+            let id = target.strip_prefix("dm:").unwrap_or(target);
+            if !id.bytes().all(|b| b.is_ascii_digit()) || id.parse::<u64>().map_or(true, |id| id == 0)
+            {
+                return Err(
+                    "discord home must be a numeric channel id or dm:<numeric user id>".into(),
+                );
+            }
+            Some(target)
         }
-        let id = home.target.strip_prefix("dm:").unwrap_or(&home.target);
-        if !id.bytes().all(|b| b.is_ascii_digit()) || id.parse::<u64>().map_or(true, |id| id == 0) {
-            return Err("home target must be a numeric channel id or dm:<numeric user id>".into());
-        }
-    }
-    store.set_home(home.as_ref())?;
+        _ => return Err("home messenger must be discord or web".into()),
+    };
+    store.set_home(messenger, target)?;
     Ok(())
 }
 

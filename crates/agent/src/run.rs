@@ -1736,6 +1736,7 @@ pub struct BotHandle {
     pub store: Arc<SqliteStorage>,
     pub workspace: harness::PinnedWorkspace,
     pub discord: Arc<messenger_discord::Discord>,
+    pub webchat: Arc<crate::webchat::WebChat>,
     pub live_chat: LiveChat,
 }
 
@@ -1792,6 +1793,7 @@ fn change_topic(table: &str) -> Option<&'static str> {
         "usage_events" => Some("usage"),
         "webhooks" => Some("webhooks"),
         "secrets" => Some("secrets"),
+        "web_messages" => Some("chat"),
         _ => None,
     }
 }
@@ -1895,6 +1897,16 @@ impl BotRegistry {
                 });
             }
         })?;
+        let webchat = Arc::new(crate::webchat::WebChat::new(store.clone(), {
+            let changes = self.changes.clone();
+            let bot_id = bot.id.clone();
+            move || {
+                let _ = changes.send(Change {
+                    bot_id: bot_id.clone(),
+                    topic: "chat",
+                });
+            }
+        }));
         Ok(BotEntry {
             handle: BotHandle {
                 id: bot.id.clone(),
@@ -1902,6 +1914,7 @@ impl BotRegistry {
                 store,
                 workspace,
                 discord: Arc::new(messenger_discord::Discord::new()),
+                webchat,
                 live_chat: LiveChat::default(),
             },
             workspace_path,
@@ -1929,6 +1942,7 @@ impl BotRegistry {
         let pinned = entry.handle.workspace.clone();
         let skills_dir = self.skills_dir.clone();
         let discord = entry.handle.discord.clone();
+        let webchat = entry.handle.webchat.clone();
         let mcp = self.mcp.clone();
         let live_chat = entry.handle.live_chat.clone();
         let nodes = self.nodes.clone();
@@ -2056,6 +2070,7 @@ impl BotRegistry {
                         environment,
                         env_watch,
                         discord.clone(),
+                        webchat.clone(),
                         rx.clone(),
                         mcp.clone(),
                         live_chat.clone(),
@@ -2415,6 +2430,7 @@ pub async fn serve_bot(
     environment: Arc<dyn environment::Environment>,
     env_online: Option<tokio::sync::watch::Receiver<bool>>,
     discord: Arc<messenger_discord::Discord>,
+    webchat: Arc<crate::webchat::WebChat>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     mcp: mcp::Mcp,
     live_chat: LiveChat,
@@ -2432,7 +2448,10 @@ pub async fn serve_bot(
     )
     .await?;
     let outgoing: Arc<dyn messenger::Messenger> = discord.clone();
-    let messengers = harness::Messengers::new(vec![outgoing.clone()], store.clone());
+    let messengers = harness::Messengers::new(
+        vec![outgoing.clone(), webchat.clone() as Arc<dyn messenger::Messenger>],
+        store.clone(),
+    );
     let messengers = match pinned_workspace {
         Some(pinned) => messengers.with_workspace(pinned),
         None => messengers,
@@ -2447,12 +2466,19 @@ pub async fn serve_bot(
             .with_schedule_gate({
                 let models = models.clone();
                 let discord = discord.clone();
+                let store = store.clone();
+                // Due jobs wait for Discord only when it is configured and
+                // the web chat isn't a home: with a web home, jobs can always
+                // report somewhere.
                 move || {
                     models.current().is_ok()
-                        && matches!(
+                        && (matches!(
                             discord.connection(),
                             messenger_discord::Connection::Online { .. }
-                        )
+                        ) || store.messenger_token("discord").ok().flatten().is_none()
+                            || store.homes().is_ok_and(|homes| {
+                                homes.iter().any(|h| h.messenger == crate::webchat::NAME)
+                            }))
                 }
             }),
     );
@@ -2593,6 +2619,45 @@ pub async fn serve_bot(
         })
     };
     let (admitted_tx, mut admitted_rx) = tokio::sync::mpsc::channel(128);
+    // Web chat posts skip Discord's admission rules: the owner is always
+    // addressing the bot, so each goes straight to the chat loop.
+    let web_posts = webchat.attach();
+    let web_admission = {
+        let store = store.clone();
+        let messengers = messengers.clone();
+        let admitted = admitted_tx.clone();
+        let mut posts = web_posts;
+        tokio::spawn(async move {
+            while let Some(post) = posts.recv().await {
+                let place = crate::webchat::place();
+                let admitted_post = store
+                    .destination(crate::webchat::NAME, &place)
+                    .map(|to| {
+                        messengers.live(crate::webchat::NAME, to, place.clone());
+                        (
+                            post.text,
+                            storage::Meta::Message {
+                                messenger: crate::webchat::NAME.into(),
+                                place,
+                                message: post.id,
+                                author: crate::webchat::owner(),
+                                to,
+                                inline: true,
+                                unaddressed: false,
+                                location: "web chat".into(),
+                                earlier: None,
+                                quote: None,
+                                attachments: Vec::new(),
+                            },
+                        )
+                    })
+                    .map_err(Into::into);
+                if admitted.send(admitted_post).await.is_err() {
+                    break;
+                }
+            }
+        })
+    };
     let turn_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let admission_store = store.clone();
     let admission_discord = discord.clone();
@@ -3085,6 +3150,8 @@ pub async fn serve_bot(
         _ = harness.run_schedules() => unreachable!(),
     };
     live_chat.close().await;
+    webchat.detach();
+    web_admission.abort();
     discord.disconnect();
     if let Some(listener) = listener.take() {
         listener.abort();

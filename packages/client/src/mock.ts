@@ -31,6 +31,8 @@ import {
   type RequestType,
   type ScheduleItem,
   type ScheduleState,
+  type ChatMessage,
+  type ChatPage,
   type Secret,
   type SecretRequestLink,
   type SecretsPayload,
@@ -80,6 +82,8 @@ type State = Readonly<{
   webhooks: ReadonlyArray<Webhook>
   nextWebhookId: number
   secrets: ReadonlyArray<Secret>
+  webHome: boolean
+  chat: ReadonlyArray<ChatMessage>
 }>
 
 const DEFAULT_INSTRUCTIONS = '# Identity\n\nYou are Blob-1'
@@ -179,12 +183,27 @@ const seedState = (): State => ({
   ],
   nextWebhookId: 3,
   secrets: [],
+  webHome: true,
+  chat: [],
 })
 
 const generalReply = (state: State): GeneralSettings => ({
   autoRespond: state.autoRespond,
   hasUtilityModel: state.utility !== null || state.decision !== null,
+  webHome: state.webHome,
 })
+
+const CHAT_PAGE = 50
+
+const chatReply = (state: State, before: number | null): ChatPage => {
+  const older = before === null ? state.chat : state.chat.filter(message => message.id < before)
+  return {
+    messages: older.slice(-CHAT_PAGE),
+    hasMore: older.length > CHAT_PAGE,
+    working: false,
+    typingUntil: null,
+  }
+}
 
 const instructionsReply = (state: State): Instructions => ({
   text: state.instructions ?? DEFAULT_INSTRUCTIONS,
@@ -1095,6 +1114,31 @@ const handlers: { readonly [K in LegacyRequestType]: Handler<K> } = {
       Effect.succeed(Struct.evolve(current, { autoRespond: () => enabled })),
     ).pipe(Effect.map(generalReply)),
 
+  'general.setWebHome': ({ enabled }, state) =>
+    transition(state, current =>
+      Effect.succeed(Struct.evolve(current, { webHome: () => enabled })),
+    ).pipe(Effect.map(generalReply)),
+
+  'chat.history': ({ before }, state) =>
+    Ref.get(state).pipe(Effect.map(current => chatReply(current, before))),
+
+  // The mock bot echoes each message, so the page has replies to render.
+  'chat.send': ({ text }, state) =>
+    transition(state, current => {
+      if (text.trim() === '') return Effect.fail('Message is empty')
+      const now = Math.floor(Date.now() / 1000)
+      const next = (current.chat.at(-1)?.id ?? 0) + 1
+      return Effect.succeed(
+        Struct.evolve(current, {
+          chat: list => [
+            ...list,
+            { id: next, bot: false, text, createdAt: now },
+            { id: next + 1, bot: true, text: `You said: **${text}**`, createdAt: now },
+          ],
+        }),
+      )
+    }).pipe(Effect.map(current => chatReply(current, null))),
+
   'instructions.get': (_payload, state) => Ref.get(state).pipe(Effect.map(instructionsReply)),
 
   'instructions.set': ({ text }, state) =>
@@ -1957,6 +2001,9 @@ const allHandlers: { readonly [K in RequestType]: RootHandler<K> } = {
   ...botControlHandlers,
   'general.get': wrapLegacy('general.get'),
   'general.setAutoRespond': wrapLegacy('general.setAutoRespond'),
+  'general.setWebHome': wrapLegacy('general.setWebHome'),
+  'chat.history': wrapLegacy('chat.history'),
+  'chat.send': wrapLegacy('chat.send'),
   'instructions.get': wrapLegacy('instructions.get'),
   'instructions.set': wrapLegacy('instructions.set'),
   'instructions.reset': wrapLegacy('instructions.reset'),

@@ -1,11 +1,12 @@
 import type { BotSummary } from '@blob-1/contracts'
 import { useAtomMount, useAtomSet } from '@effect/atom-react'
-import { Outlet, useNavigate, useRouterState } from '@tanstack/react-router'
-import { CalendarClock, Cpu, Home, KeyRound, Plug, Zap } from 'lucide-react'
+import { Link, Outlet, useNavigate, useRouterState } from '@tanstack/react-router'
+import { CalendarClock, ChevronLeft, Cpu, Home, KeyRound, Plug, Zap } from 'lucide-react'
 import { useEffect } from 'react'
 
 import { DiscordIcon } from '~/components/DiscordIcon'
 import { SplitGroupLabel, SplitItem, SplitPage } from '~/components/layout/SplitPage'
+import { focusRingClassName } from '~/components/layout/Page'
 import { Badge } from '~/components/ui/badge'
 import { discordPageAtomFor } from '~/features/chat/discordState'
 import { generalPageAtomFor } from '~/features/general/generalState'
@@ -68,7 +69,7 @@ export function BotShellPage(props: BotShellPageProps) {
     if (lastRemovedId !== props.botId) return
     send(BotsEvents.ClearRemovedState())
     void navigate({
-      to: '/settings/bots/$botId/general',
+      to: '/settings/bots/$botId/chat',
       params: { botId: 'default' },
       replace: true,
     })
@@ -79,11 +80,34 @@ export function BotShellPage(props: BotShellPageProps) {
   const isActive = (segment: string) =>
     pathname === `${base}/${segment}` || pathname.startsWith(`${base}/${segment}/`)
 
+  // The chat is the bot's own full page; settings get the sidebar.
+  if (isActive('chat')) {
+    return (
+      <>
+        <BotPrefetch instanceKey={instanceKey} />
+        <Outlet key={instanceKey} />
+      </>
+    )
+  }
+
   return (
     <>
       <BotPrefetch instanceKey={instanceKey} />
       <SplitPage
         title={botName}
+        titleLeading={
+          <Link
+            to="/settings/bots/$botId/chat"
+            params={{ botId: props.botId }}
+            aria-label={`Back to ${botName} chat`}
+            className={cn(
+              '-ml-1.5 grid size-7 shrink-0 place-items-center rounded-full text-muted-foreground transition-colors hover:bg-border/50 hover:text-foreground',
+              focusRingClassName,
+            )}
+          >
+            <ChevronLeft className="size-4" />
+          </Link>
+        }
         titleExtra={
           bot !== undefined && !bot.enabled ? (
             <Badge variant="outline" className="shrink-0 text-muted-foreground">

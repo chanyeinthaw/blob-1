@@ -168,7 +168,6 @@ export function DiscordSettings() {
       <AccessSection />
       <InteractionModeSection />
       <ReplyModeSection />
-      <HomeSection />
     </div>
   )
 }
@@ -1933,14 +1932,15 @@ const homeKinds: ReadonlyArray<{ readonly kind: HomeKind; readonly label: string
   { kind: 'dm', label: 'Direct message' },
 ]
 
-function HomeSection() {
+/** Discord's home channel or DM picker; shown in the General page's Home section. */
+export function DiscordHomeFields() {
   const machine = DiscordOwner.useMachine()
   const isSaving = AsyncResult.getOrElse(
     useMachineResult(AtomMachine.matches(machine, 'HomeChannel.Saving')),
     () => false,
   )
   return (
-    <Section title="Home channel">
+    <>
       <MachineState machine={machine} path="">
         {({ value }) => (
           <HomeForm
@@ -1952,7 +1952,7 @@ function HomeSection() {
         )}
       </MachineState>
       <HomeFeedback />
-    </Section>
+    </>
   )
 }
 

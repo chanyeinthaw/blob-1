@@ -9,8 +9,26 @@ export type Instructions = typeof Instructions.Type
 export const GeneralSettings = Schema.Struct({
   autoRespond: Schema.Boolean,
   hasUtilityModel: Schema.Boolean,
+  webHome: Schema.Boolean,
 })
 export type GeneralSettings = typeof GeneralSettings.Type
+
+export const ChatMessage = Schema.Struct({
+  id: Schema.Finite,
+  bot: Schema.Boolean,
+  text: Schema.String,
+  createdAt: Schema.Finite,
+})
+export type ChatMessage = typeof ChatMessage.Type
+
+/** A page of a bot's web chat, oldest first, with the bot's live status. */
+export const ChatPage = Schema.Struct({
+  messages: Schema.Array(ChatMessage),
+  hasMore: Schema.Boolean,
+  working: Schema.Boolean,
+  typingUntil: Schema.NullOr(Schema.Finite),
+})
+export type ChatPage = typeof ChatPage.Type
 
 export const UsageKind = Schema.Literals(['chat', 'task', 'utility', 'compaction'])
 export type UsageKind = typeof UsageKind.Type
@@ -463,6 +481,18 @@ export const requests = {
     payload: Schema.Struct({ ...botIdField, enabled: Schema.Boolean }),
     reply: GeneralSettings,
   },
+  'general.setWebHome': {
+    payload: Schema.Struct({ ...botIdField, enabled: Schema.Boolean }),
+    reply: GeneralSettings,
+  },
+  'chat.history': {
+    payload: Schema.Struct({ ...botIdField, before: Schema.NullOr(Schema.Finite) }),
+    reply: ChatPage,
+  },
+  'chat.send': {
+    payload: Schema.Struct({ ...botIdField, text: Schema.String }),
+    reply: ChatPage,
+  },
   'instructions.get': { payload: BotScopedPayload, reply: Instructions },
   'instructions.set': {
     payload: Schema.Struct({ ...botIdField, text: Schema.String }),
@@ -773,7 +803,7 @@ export const ReplyFrame = Schema.Union([
 export type ReplyFrame = typeof ReplyFrame.Type
 
 /** Topics of bot data the server pushes `changed` frames for. */
-export const ChangeTopic = Schema.Literals(['schedule', 'usage', 'webhooks', 'secrets'])
+export const ChangeTopic = Schema.Literals(['schedule', 'usage', 'webhooks', 'secrets', 'chat'])
 export type ChangeTopic = typeof ChangeTopic.Type
 
 /** Server push on `/ws?changes=1`: a bot's data under `topic` changed, so refetch it. */

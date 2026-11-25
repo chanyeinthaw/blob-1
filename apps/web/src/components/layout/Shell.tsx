@@ -165,23 +165,33 @@ function activeBotIdFromPath(pathname: string): string | null {
   return match?.[1] ?? null
 }
 
-/** Keeps a bot switch on the same settings sub-page; falls back to General elsewhere. */
-function botSwitchTarget(pathname: string): NonNullable<LinkProps['to']> {
-  const sub = /^\/settings\/bots\/[^/]+\/([^/]+)/.exec(pathname)?.[1]
-  switch (sub) {
-    case 'discord':
-      return '/settings/bots/$botId/discord'
-    case 'mcp':
-      return '/settings/bots/$botId/mcp'
-    case 'models':
-      return '/settings/bots/$botId/models'
-    case 'schedules':
-      return '/settings/bots/$botId/schedules'
-    case 'webhooks':
-      return '/settings/bots/$botId/webhooks'
-    default:
-      return '/settings/bots/$botId/general'
-  }
+const BOT_PAGES = {
+  chat: '/settings/bots/$botId/chat',
+  general: '/settings/bots/$botId/general',
+  models: '/settings/bots/$botId/models',
+  schedules: '/settings/bots/$botId/schedules',
+  webhooks: '/settings/bots/$botId/webhooks',
+  secrets: '/settings/bots/$botId/secrets',
+  mcp: '/settings/bots/$botId/mcp',
+  discord: '/settings/bots/$botId/discord',
+} as const satisfies Record<string, NonNullable<LinkProps['to']>>
+type BotPage = keyof typeof BOT_PAGES
+
+const isBotPage = (page: string | undefined): page is BotPage =>
+  page !== undefined && Object.hasOwn(BOT_PAGES, page)
+
+/** Each bot's last opened page, so switching back returns there (chat by default). */
+const lastBotPage = new Map<string, BotPage>()
+
+/** Records the bot page in `pathname`, if it is one. */
+function rememberBotPage(pathname: string) {
+  const match = /^\/settings\/bots\/([^/]+)\/([^/]+)/.exec(pathname)
+  const [, botId, page] = match ?? []
+  if (botId !== undefined && isBotPage(page)) lastBotPage.set(botId, page)
+}
+
+function botSwitchTarget(botId: string): NonNullable<LinkProps['to']> {
+  return BOT_PAGES[lastBotPage.get(botId) ?? 'chat']
 }
 
 interface RailProps {
@@ -192,10 +202,12 @@ function Rail(props: RailProps) {
   const signOut = useSignOut()
   const bots = useBotsRoster()
   const pathname = useRouterState({ select: state => state.location.pathname })
+  // Idempotent: keeps the current bot's page for the links below.
+  rememberBotPage(pathname)
   const activeBotId = activeBotIdFromPath(pathname)
 
   return (
-    <header className="fixed inset-y-0 left-0 z-20 hidden w-16 flex-col items-center py-3 md:flex">
+    <header className="fixed inset-y-0 left-0 z-20 hidden w-16 flex-col items-center pt-5 pb-3 md:flex">
       <nav aria-label="Bots" className="flex flex-col items-center gap-2">
         {bots.map(bot => {
           const isActive = activeBotId === bot.id
@@ -204,7 +216,7 @@ function Rail(props: RailProps) {
               <TooltipTrigger
                 render={
                   <Link
-                    to={botSwitchTarget(pathname)}
+                    to={botSwitchTarget(bot.id)}
                     params={{ botId: bot.id }}
                     aria-label={bot.name}
                     className={cn(
@@ -314,6 +326,8 @@ function MobileHeader(props: MobileHeaderProps) {
   const signOut = useSignOut()
   const bots = useBotsRoster()
   const pathname = useRouterState({ select: state => state.location.pathname })
+  // Idempotent: keeps the current bot's page for the links below.
+  rememberBotPage(pathname)
   const activeBotId = activeBotIdFromPath(pathname)
 
   return (
@@ -355,7 +369,7 @@ function MobileHeader(props: MobileHeaderProps) {
             return (
               <Link
                 key={bot.id}
-                to={botSwitchTarget(pathname)}
+                to={botSwitchTarget(bot.id)}
                 params={{ botId: bot.id }}
                 className={cn(
                   'flex h-9 shrink-0 items-center gap-1.5 rounded-full px-3 text-xs font-medium transition-colors',
@@ -475,7 +489,7 @@ function ShellInner(props: ShellInnerProps) {
       <BotsPoller />
       <Rail onCreateBot={() => setCreateOpen(true)} />
       <MobileHeader onCreateBot={() => setCreateOpen(true)} />
-      <main className="flex min-w-0 flex-1 flex-col md:ml-16 md:h-dvh md:max-h-dvh md:min-h-0">
+      <main className="flex min-w-0 flex-1 flex-col md:ml-16 md:h-dvh md:max-h-dvh md:min-h-0 md:py-2">
         {props.children}
       </main>
       <CreateBotDialog open={createOpen} onOpenChange={setCreateOpen} />

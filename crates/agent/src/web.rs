@@ -420,6 +420,7 @@ fn general_reply(
     Ok(json!({
         "autoRespond": bot_store.auto_respond()?,
         "hasUtilityModel": bm.utility.is_some() || bm.decision.is_some(),
+        "webHome": bot_store.homes()?.iter().any(|h| h.messenger == crate::webchat::NAME),
     }))
 }
 
@@ -674,12 +675,12 @@ fn schedule_reply(store: &SqliteStorage) -> crate::Result<Value> {
 
 fn discord_reply(bot: &crate::run::BotHandle) -> crate::Result<Value> {
     let store = &bot.store;
-    let home = match store.home()? {
-        Some(h) if h.messenger == "discord" => match h.target.strip_prefix("dm:") {
+    let home = match store.homes()?.into_iter().find(|h| h.messenger == "discord") {
+        Some(h) => match h.target.strip_prefix("dm:") {
             Some(user) => json!({"kind":"dm","user":user}),
             None => json!({"kind":"channel","id":h.target}),
         },
-        _ => json!({"kind":"none"}),
+        None => json!({"kind":"none"}),
     };
     let connection = connection_json(bot.discord.connection());
     let defaults = store.messenger_defaults("discord")?;
@@ -873,6 +874,15 @@ async fn dispatch(
                     .and_then(Value::as_bool)
                     .ok_or_else(invalid)?;
                 bot.store.set_auto_respond(enabled)?;
+                general_reply(global, &bot.store, bot_id)
+            }
+            "general.setWebHome" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let enabled = payload
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(invalid)?;
+                crate::set_home(&bot.store, crate::webchat::NAME, enabled.then_some(""))?;
                 general_reply(global, &bot.store, bot_id)
             }
             "instructions.get" => {
@@ -1244,7 +1254,7 @@ async fn dispatch(
                 let store = &bot.store;
                 let home = payload.get("home").ok_or_else(invalid)?;
                 match field(home, "kind").map_err(|_| invalid())? {
-                    "none" => crate::set_home(store, None)?,
+                    "none" => crate::set_home(store, "discord", None)?,
                     kind @ ("channel" | "dm") => {
                         let id = field(home, if kind == "channel" { "id" } else { "user" })
                             .map_err(|_| invalid())?;
@@ -1256,13 +1266,7 @@ async fn dispatch(
                         } else {
                             id.into()
                         };
-                        crate::set_home(
-                            store,
-                            Some(storage::Home {
-                                messenger: "discord".into(),
-                                target,
-                            }),
-                        )?;
+                        crate::set_home(store, "discord", Some(&target))?;
                     }
                     _ => return Err(invalid().into()),
                 }
@@ -1819,6 +1823,22 @@ async fn dispatch(
                 }
                 Ok(webhooks_reply(ctx, &bot.store)?)
             }
+            "chat.history" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let before = payload.get("before").and_then(Value::as_i64);
+                Ok(chat_reply(&bot, before)?)
+            }
+            "chat.send" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                // Refuse before storing when the bot can't answer (stopped,
+                // paused, or no working model), as callbacks do.
+                bot.live_chat
+                    .prepare()
+                    .await
+                    .map_err(|error| format!("The bot can't reply right now: {error}"))?;
+                bot.webchat.post(get("text")?)?;
+                Ok(chat_reply(&bot, None)?)
+            }
             "secrets.list" => {
                 let bot = resolve_bot(ctx, payload, bot_id).await?;
                 Ok(secrets_reply(ctx, &bot.store)?)
@@ -2088,6 +2108,28 @@ async fn serve_public_file(ctx: &WebContext, id: &str, head_only: bool) -> Respo
 }
 
 const MAX_WEBHOOK_BODY_BYTES: usize = 64 * 1024;
+
+/// Web chat messages per page.
+const CHAT_PAGE: u32 = 50;
+
+/// A page of the bot's web chat (the newest, or those before `before`) plus
+/// whether a task is working and until when the bot shows as typing.
+fn chat_reply(bot: &crate::run::BotHandle, before: Option<i64>) -> crate::Result<Value> {
+    use storage::WebChatStore;
+    let messages = bot.store.web_messages(before, CHAT_PAGE)?;
+    let (working, typing_until) = bot.webchat.status();
+    Ok(json!({
+        "hasMore": messages.len() == CHAT_PAGE as usize,
+        "messages": messages.into_iter().map(|m| json!({
+            "id": m.id,
+            "bot": m.bot,
+            "text": m.text,
+            "createdAt": m.created_at,
+        })).collect::<Vec<_>>(),
+        "working": working,
+        "typingUntil": typing_until,
+    }))
+}
 
 const SECRET_NAME_RULE: &str =
     "Secret name must be 1-64 of letters, digits, '_', '.' or '-', not starting with '.'";

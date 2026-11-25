@@ -27,6 +27,7 @@ import { Route as SettingsBotsBotIdRouteImport } from './routes/settings.bots.$b
 import { Route as SettingsChatIndexRouteImport } from './routes/settings.chat.index'
 import { Route as SettingsChatDiscordRouteImport } from './routes/settings.chat.discord'
 import { Route as SettingsBotsBotIdIndexRouteImport } from './routes/settings.bots.$botId.index'
+import { Route as SettingsBotsBotIdChatRouteImport } from './routes/settings.bots.$botId.chat'
 import { Route as SettingsBotsBotIdDiscordRouteImport } from './routes/settings.bots.$botId.discord'
 import { Route as SettingsBotsBotIdGeneralRouteImport } from './routes/settings.bots.$botId.general'
 import { Route as SettingsBotsBotIdMcpRouteImport } from './routes/settings.bots.$botId.mcp'
@@ -125,6 +126,11 @@ const SettingsBotsBotIdIndexRoute = SettingsBotsBotIdIndexRouteImport.update({
   path: '/',
   getParentRoute: () => SettingsBotsBotIdRoute,
 } as any)
+const SettingsBotsBotIdChatRoute = SettingsBotsBotIdChatRouteImport.update({
+  id: '/chat',
+  path: '/chat',
+  getParentRoute: () => SettingsBotsBotIdRoute,
+} as any)
 const SettingsBotsBotIdDiscordRoute =
   SettingsBotsBotIdDiscordRouteImport.update({
     id: '/discord',
@@ -184,6 +190,7 @@ export interface FileRoutesByFullPath {
   '/settings/bots/$botId': typeof SettingsBotsBotIdRouteWithChildren
   '/settings/chat/discord': typeof SettingsChatDiscordRoute
   '/settings/chat/': typeof SettingsChatIndexRoute
+  '/settings/bots/$botId/chat': typeof SettingsBotsBotIdChatRoute
   '/settings/bots/$botId/discord': typeof SettingsBotsBotIdDiscordRoute
   '/settings/bots/$botId/general': typeof SettingsBotsBotIdGeneralRoute
   '/settings/bots/$botId/mcp': typeof SettingsBotsBotIdMcpRoute
@@ -208,6 +215,7 @@ export interface FileRoutesByTo {
   '/settings': typeof SettingsIndexRoute
   '/settings/chat/discord': typeof SettingsChatDiscordRoute
   '/settings/chat': typeof SettingsChatIndexRoute
+  '/settings/bots/$botId/chat': typeof SettingsBotsBotIdChatRoute
   '/settings/bots/$botId/discord': typeof SettingsBotsBotIdDiscordRoute
   '/settings/bots/$botId/general': typeof SettingsBotsBotIdGeneralRoute
   '/settings/bots/$botId/mcp': typeof SettingsBotsBotIdMcpRoute
@@ -236,6 +244,7 @@ export interface FileRoutesById {
   '/settings/bots/$botId': typeof SettingsBotsBotIdRouteWithChildren
   '/settings/chat/discord': typeof SettingsChatDiscordRoute
   '/settings/chat/': typeof SettingsChatIndexRoute
+  '/settings/bots/$botId/chat': typeof SettingsBotsBotIdChatRoute
   '/settings/bots/$botId/discord': typeof SettingsBotsBotIdDiscordRoute
   '/settings/bots/$botId/general': typeof SettingsBotsBotIdGeneralRoute
   '/settings/bots/$botId/mcp': typeof SettingsBotsBotIdMcpRoute
@@ -265,6 +274,7 @@ export interface FileRouteTypes {
     | '/settings/bots/$botId'
     | '/settings/chat/discord'
     | '/settings/chat/'
+    | '/settings/bots/$botId/chat'
     | '/settings/bots/$botId/discord'
     | '/settings/bots/$botId/general'
     | '/settings/bots/$botId/mcp'
@@ -289,6 +299,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/settings/chat/discord'
     | '/settings/chat'
+    | '/settings/bots/$botId/chat'
     | '/settings/bots/$botId/discord'
     | '/settings/bots/$botId/general'
     | '/settings/bots/$botId/mcp'
@@ -316,6 +327,7 @@ export interface FileRouteTypes {
     | '/settings/bots/$botId'
     | '/settings/chat/discord'
     | '/settings/chat/'
+    | '/settings/bots/$botId/chat'
     | '/settings/bots/$botId/discord'
     | '/settings/bots/$botId/general'
     | '/settings/bots/$botId/mcp'
@@ -460,6 +472,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SettingsBotsBotIdIndexRouteImport
       parentRoute: typeof SettingsBotsBotIdRoute
     }
+    '/settings/bots/$botId/chat': {
+      id: '/settings/bots/$botId/chat'
+      path: '/chat'
+      fullPath: '/settings/bots/$botId/chat'
+      preLoaderRoute: typeof SettingsBotsBotIdChatRouteImport
+      parentRoute: typeof SettingsBotsBotIdRoute
+    }
     '/settings/bots/$botId/discord': {
       id: '/settings/bots/$botId/discord'
       path: '/discord'
@@ -527,6 +546,7 @@ const SettingsChatRouteWithChildren = SettingsChatRoute._addFileChildren(
 )
 
 interface SettingsBotsBotIdRouteChildren {
+  SettingsBotsBotIdChatRoute: typeof SettingsBotsBotIdChatRoute
   SettingsBotsBotIdDiscordRoute: typeof SettingsBotsBotIdDiscordRoute
   SettingsBotsBotIdGeneralRoute: typeof SettingsBotsBotIdGeneralRoute
   SettingsBotsBotIdMcpRoute: typeof SettingsBotsBotIdMcpRoute
@@ -538,6 +558,7 @@ interface SettingsBotsBotIdRouteChildren {
 }
 
 const SettingsBotsBotIdRouteChildren: SettingsBotsBotIdRouteChildren = {
+  SettingsBotsBotIdChatRoute: SettingsBotsBotIdChatRoute,
   SettingsBotsBotIdDiscordRoute: SettingsBotsBotIdDiscordRoute,
   SettingsBotsBotIdGeneralRoute: SettingsBotsBotIdGeneralRoute,
   SettingsBotsBotIdMcpRoute: SettingsBotsBotIdMcpRoute,

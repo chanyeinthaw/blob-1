@@ -38,10 +38,18 @@ export async function requireSession() {
 /** Route guard: skips the sign-in screen for a signed-in browser. */
 export async function skipSignInWhenSignedIn() {
   if (confirmedSignedIn) {
-    throw redirect({ to: '/settings/general', replace: true })
+    throw redirect({
+      to: '/settings/bots/$botId/chat',
+      params: { botId: 'default' },
+      replace: true,
+    })
   }
   if ((await Effect.runPromise(sessionState)) === 'signedIn') {
     confirmedSignedIn = true
-    throw redirect({ to: '/settings/general', replace: true })
+    throw redirect({
+      to: '/settings/bots/$botId/chat',
+      params: { botId: 'default' },
+      replace: true,
+    })
   }
 }

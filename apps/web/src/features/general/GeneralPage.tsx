@@ -40,6 +40,7 @@ import { cn } from '~/lib/utils'
 
 import { GeneralEvents, type GeneralInput, GeneralMachine } from './generalMachine'
 import { generalPageAtomFor } from './generalState'
+import { DiscordHomeFields, DiscordSettingsOwner } from '~/features/chat/DiscordSettings'
 import {
   InstructionsEvents,
   type InstructionsInput,
@@ -105,6 +106,7 @@ export function GeneralPage(props: GeneralPageProps) {
                   <InstructionsEditor />
                 </Section>
                 <AutoRespondSection botId={props.botId} />
+                <HomeSection botId={props.botId} />
                 <UsageSection instanceKey={instanceKey} />
               </div>
               <UnsavedGuard />
@@ -285,6 +287,47 @@ function EnvironmentSelect(props: EnvironmentSelectProps) {
         ))}
       </SelectContent>
     </Select>
+  )
+}
+
+interface HomeSectionProps {
+  readonly botId: string
+}
+
+/** Where scheduled jobs and check-ins report with no other destination: every home set here. */
+function HomeSection(props: HomeSectionProps) {
+  const machine = GeneralOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  return (
+    <Section title="Home">
+      <div className="space-y-3 rounded-2xl border border-border bg-card px-4 py-3.5 shadow-xs">
+        <MachineState machine={machine} path="">
+          {({ value, states }) => (
+            <div className="flex items-center justify-between gap-4">
+              <p className="text-sm font-medium text-foreground">Web chat</p>
+              <Switch
+                aria-label="Web chat home"
+                disabled={states.WebHome.state.path === 'WebHome.Saving'}
+                checked={value.webHome}
+                onCheckedChange={enabled => send(GeneralEvents.SetWebHome({ enabled }))}
+              />
+            </div>
+          )}
+        </MachineState>
+        <div className="border-t border-border/60 pt-3">
+          <p className="mb-1 text-sm font-medium text-foreground">Discord</p>
+          <DiscordSettingsOwner botId={props.botId}>
+            {loadState =>
+              loadState.kind === 'loaded' ? (
+                <DiscordHomeFields />
+              ) : loadState.kind === 'failed' ? (
+                <PageError cause={loadState.cause} onRetry={loadState.onRetry} />
+              ) : null
+            }
+          </DiscordSettingsOwner>
+        </div>
+      </div>
+    </Section>
   )
 }
 

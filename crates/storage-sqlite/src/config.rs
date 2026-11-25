@@ -28,27 +28,26 @@ impl ConfigStore for SqliteStorage {
         Ok(())
     }
 
-    fn home(&self) -> Result<Option<storage::Home>, StoreError> {
+    fn homes(&self) -> Result<Vec<storage::Home>, StoreError> {
         self.lock()
-            .query_row(
-                "SELECT messenger, target FROM home WHERE id = 1",
-                [],
-                |row| {
-                    Ok(storage::Home {
-                        messenger: row.get(0)?,
-                        target: row.get(1)?,
-                    })
-                },
-            )
-            .optional()
+            .prepare("SELECT messenger, target FROM homes ORDER BY messenger")
+            .map_err(backend)?
+            .query_map([], |row| {
+                Ok(storage::Home {
+                    messenger: row.get(0)?,
+                    target: row.get(1)?,
+                })
+            })
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
             .map_err(backend)
     }
 
-    fn set_home(&self, home: Option<&storage::Home>) -> Result<(), StoreError> {
+    fn set_home(&self, messenger: &str, target: Option<&str>) -> Result<(), StoreError> {
         let connection = self.lock();
-        match home {
-            Some(home) => connection.execute("INSERT INTO home (id, messenger, target) VALUES (1, ?1, ?2) ON CONFLICT (id) DO UPDATE SET messenger = excluded.messenger, target = excluded.target", params![home.messenger, home.target]),
-            None => connection.execute("DELETE FROM home WHERE id = 1", []),
+        match target {
+            Some(target) => connection.execute("INSERT INTO homes (messenger, target) VALUES (?1, ?2) ON CONFLICT (messenger) DO UPDATE SET target = excluded.target", params![messenger, target]),
+            None => connection.execute("DELETE FROM homes WHERE messenger = ?1", [messenger]),
         }.map_err(backend)?;
         Ok(())
     }

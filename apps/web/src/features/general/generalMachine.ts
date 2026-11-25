@@ -18,6 +18,14 @@ const saveAutoRespond = Effect.fn('GeneralSettings.setAutoRespond')(function* (e
     .pipe(Effect.catch(error => notify.error(error.message).pipe(Effect.as(null))))
 })
 
+const saveWebHome = Effect.fn('GeneralSettings.setWebHome')(function* (enabled: boolean) {
+  const api = yield* Api
+  const notify = yield* Notify
+  return yield* api
+    .request('general.setWebHome', { enabled })
+    .pipe(Effect.catch(error => notify.error(error.message).pipe(Effect.as(null))))
+})
+
 export const GeneralInput = GeneralSettings
 export type GeneralInput = typeof GeneralInput.Type
 
@@ -27,6 +35,7 @@ export const GeneralStates = Machine.state({
     serverAutoRespond: Schema.Boolean,
     autoRespond: Schema.Boolean,
     hasUtilityModel: Schema.Boolean,
+    webHome: Schema.Boolean,
     inFlightSave: Schema.Boolean,
     mutationSeq: Schema.Finite,
   },
@@ -43,11 +52,18 @@ export const GeneralStates = Machine.state({
         Refreshing: { fields: { mutationSeq: Schema.Finite } },
       },
     },
+    WebHome: {
+      states: {
+        Idle: {},
+        Saving: { fields: { enabled: Schema.Boolean } },
+      },
+    },
   },
 })
 
 export const GeneralEvents = Machine.events({
   SetAutoRespond: { enabled: Schema.Boolean },
+  SetWebHome: { enabled: Schema.Boolean },
   Refresh: {},
 })
 
@@ -57,12 +73,13 @@ export const GeneralMachine = Machine.make({
   root: GeneralStates,
   events: GeneralEvents,
   input: GeneralInput,
-  effects: { saveAutoRespond, fetchGeneral },
+  effects: { saveAutoRespond, saveWebHome, fetchGeneral },
 }).handle({
   root: ({ input }) => ({
     serverAutoRespond: input.autoRespond,
     autoRespond: input.autoRespond,
     hasUtilityModel: input.hasUtilityModel,
+    webHome: input.webHome,
     inFlightSave: false,
     mutationSeq: 0,
   }),
@@ -145,6 +162,41 @@ export const GeneralMachine = Machine.make({
         },
       },
     },
+    WebHome: {
+      initial: { target: 'WebHome.Idle' },
+      states: {
+        Idle: {
+          on: {
+            SetWebHome: {
+              target: 'WebHome.Saving',
+              update: 'root',
+              data: ({ root, event }) => ({
+                target: { enabled: event.enabled },
+                update: { ...root, webHome: event.enabled, mutationSeq: root.mutationSeq + 1 },
+              }),
+            },
+          },
+        },
+        Saving: {
+          invoke: {
+            src: 'saveWebHome',
+            input: ({ state }) => state.enabled,
+            onDone: {
+              target: 'WebHome.Idle',
+              update: 'root',
+              data: ({ root, state, output }) => ({
+                target: undefined,
+                update: {
+                  ...root,
+                  webHome: output === null ? !state.enabled : output.webHome,
+                  mutationSeq: root.mutationSeq + 1,
+                },
+              }),
+            },
+          },
+        },
+      },
+    },
     Sync: {
       initial: { target: 'Sync.Idle' },
       states: {
@@ -176,6 +228,7 @@ export const GeneralMachine = Machine.make({
                           serverAutoRespond: output.autoRespond,
                           autoRespond: output.autoRespond,
                           hasUtilityModel: output.hasUtilityModel,
+                          webHome: output.webHome,
                         },
               }),
             },

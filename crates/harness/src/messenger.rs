@@ -18,8 +18,8 @@ const MAX_SEND_TOTAL_BYTES: u64 = 25 * 1024 * 1024;
 
 pub const SEND: ToolSpec = ToolSpec {
     name: Cow::Borrowed("send"),
-    description: Cow::Borrowed("Send a message to people on a messenger. Give exactly one of reply (an m-token from a <message> tag: answers that message) or to (a d-token or messenger URL such as a Discord channel link: posts plainly in that conversation), and text and/or files. At most 300 characters of text; split longer text into several sends. files: relative workspace file paths to attach (max 10 files, 10 MiB each, 25 MiB total). mention: user ids to mention; the system adds the mentions."),
-    input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"text":{"type":"string","description":"Message text (at most 300 characters; optional when files are attached)"},"reply":{"type":"string","description":"m-token of the message to reply to"},"to":{"type":"string","description":"d-token of the conversation, or a messenger URL such as a Discord channel or message link"},"mention":{"type":"array","items":{"type":"string"},"description":"User ids to mention"},"thread":{"type":"boolean","description":"thread: true moves the conversation into a thread started from the message you reply to; use it when an inline exchange turns into real work"},"files":{"type":"array","items":{"type":"string"},"maxItems":10,"description":"Relative paths to workspace files to attach (max 10 files, 10 MiB per file, 25 MiB total)"}}}"#),
+    description: Cow::Borrowed("Send a message to people on a messenger. Give exactly one of reply (an m-token from a <message> tag: answers that message) or to (a d-token, home for every home destination, or a messenger URL such as a Discord channel link: posts plainly in that conversation), and text and/or files. At most 300 characters of text; split longer text into several sends. files: relative workspace file paths to attach (max 10 files, 10 MiB each, 25 MiB total). mention: user ids to mention; the system adds the mentions."),
+    input_schema: Cow::Borrowed(r#"{"type":"object","properties":{"text":{"type":"string","description":"Message text (at most 300 characters; optional when files are attached)"},"reply":{"type":"string","description":"m-token of the message to reply to"},"to":{"type":"string","description":"d-token of the conversation, home for every home destination, or a messenger URL such as a Discord channel or message link"},"mention":{"type":"array","items":{"type":"string"},"description":"User ids to mention"},"thread":{"type":"boolean","description":"thread: true moves the conversation into a thread started from the message you reply to; use it when an inline exchange turns into real work"},"files":{"type":"array","items":{"type":"string"},"maxItems":10,"description":"Relative paths to workspace files to attach (max 10 files, 10 MiB per file, 25 MiB total)"}}}"#),
 };
 pub const LOOKUP: &[ToolSpec] = &[
     ToolSpec {
@@ -44,8 +44,8 @@ pub const LOOKUP: &[ToolSpec] = &[
     },
 ];
 
-trait Store: MessengerStore + MemoryStore {}
-impl<T: MessengerStore + MemoryStore> Store for T {}
+trait Store: MessengerStore + MemoryStore + storage::ConfigStore {}
+impl<T: MessengerStore + MemoryStore + storage::ConfigStore> Store for T {}
 
 #[derive(Clone)]
 pub struct Messengers {
@@ -79,7 +79,7 @@ impl Drop for LiveState {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct SendArgs {
     #[serde(default)]
     text: String,
@@ -229,13 +229,13 @@ async fn read_outbound_files(
     .map_err(|err| -> Error { format!("failed to read attachments: {err}").into() })?
 }
 impl Messengers {
-    pub fn new<S: MessengerStore + MemoryStore + 'static>(
+    pub fn new<S: MessengerStore + MemoryStore + storage::ConfigStore + 'static>(
         messengers: Vec<Arc<dyn Messenger>>,
-        store: S,
+        store: Arc<S>,
     ) -> Self {
         Self {
             messengers,
-            store: Arc::new(store),
+            store,
             utility: None,
             workspace: None,
             live: Arc::default(),
@@ -471,6 +471,57 @@ impl Messengers {
 
     pub async fn send(&self, arguments: &str) -> Result<String, Error> {
         let args: SendArgs = serde_json::from_str(arguments)?;
+        if args.reply.is_none() && args.to.as_deref() == Some("home") {
+            return self.send_home(args).await;
+        }
+        self.send_one(args).await
+    }
+
+    /// `to: "home"`: sends to every home destination. Succeeds when at least
+    /// one received it; the reply names any that failed.
+    async fn send_home(&self, args: SendArgs) -> Result<String, Error> {
+        let homes = self.store.homes()?;
+        if homes.is_empty() {
+            return Err("no home is set".into());
+        }
+        let mut sent = Vec::new();
+        let mut failed = Vec::new();
+        for home in homes {
+            let result: Result<String, Error> = async {
+                let messenger = self.find(&home.messenger)?;
+                let place = match home.target.strip_prefix("dm:") {
+                    Some(user) => messenger.direct(user).await?,
+                    None => Place {
+                        channel: home.target.clone(),
+                        thread: None,
+                        dm: false,
+                    },
+                };
+                let id = self.store.destination(&home.messenger, &place)?;
+                self.send_one(SendArgs {
+                    to: Some(format!("d{id}")),
+                    ..args.clone()
+                })
+                .await
+            }
+            .await;
+            match result {
+                Ok(_) => sent.push(home.messenger),
+                Err(error) => failed.push(format!("{}: {error}", home.messenger)),
+            }
+        }
+        match (sent.is_empty(), failed.is_empty()) {
+            (true, _) => Err(format!("home send failed: {}", failed.join("; ")).into()),
+            (false, true) => Ok(format!("sent to {}", sent.join(", "))),
+            (false, false) => Ok(format!(
+                "sent to {}; failed: {}",
+                sent.join(", "),
+                failed.join("; ")
+            )),
+        }
+    }
+
+    async fn send_one(&self, args: SendArgs) -> Result<String, Error> {
         if args.text.is_empty() && args.files.is_empty() {
             return Err("text or files must be non-empty".into());
         }
