@@ -189,6 +189,8 @@ export const BotSummary = Schema.Struct({
   createdAt: Schema.Finite,
   /** Monotonic generation: never reused for a recreated slug, so it identifies one bot instance. */
   generation: Schema.Finite,
+  /** Custom avatar upload time, versions the `/api/bots/{id}/avatar?v=` URL; null means generated. */
+  avatarAt: Schema.NullOr(Schema.Finite),
   mainModel: Schema.NullOr(Schema.String),
   connection: DiscordConnection,
   /** 'local' or the name of the remote execution environment this bot runs on. */

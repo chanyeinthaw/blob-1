@@ -10,7 +10,7 @@ use axum::{
     },
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     response::{IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -38,6 +38,9 @@ struct WebContext {
     bots: crate::run::BotRegistry,
     nodes: Arc<crate::nodes::NodeRegistry>,
     settings_lock: tokio::sync::Mutex<()>,
+    /// Serializes avatar write+sync so concurrent upload/reset can't diverge
+    /// the database order from the Discord order.
+    avatar_lock: tokio::sync::Mutex<()>,
     mcp: mcp::Mcp,
     public_url: Option<url::Url>,
 }
@@ -115,6 +118,7 @@ pub async fn serve(
         bots,
         nodes,
         settings_lock: tokio::sync::Mutex::new(()),
+        avatar_lock: tokio::sync::Mutex::new(()),
         mcp,
         public_url,
     });
@@ -122,6 +126,12 @@ pub async fn serve(
         .route("/api/session", get(session))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
+        .route(
+            "/api/bots/{id}/avatar",
+            put(bot_avatar_put)
+                .get(bot_avatar_get)
+                .delete(bot_avatar_delete),
+        )
         .route("/api/mcp/login", get(mcp_login))
         .route("/api/mcp/callback", get(mcp_callback))
         .route("/ws", get(ws))
@@ -146,6 +156,15 @@ fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("system time before epoch")
         .as_secs() as i64
+}
+
+/// Avatar versions need millisecond granularity: two uploads inside one second
+/// must still produce distinct `?v=` URLs, since the bytes are immutable.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before epoch")
+        .as_millis() as i64
 }
 fn token(headers: &HeaderMap) -> Option<&str> {
     headers
@@ -185,6 +204,141 @@ fn authenticated(ctx: &WebContext, headers: &HeaderMap) -> Result<Option<HeaderV
         .map(|valid| valid.then(|| cookie(token, ctx.secure_cookie())))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
+/// Image types accepted as bot avatars: everything `<img>` renders statically,
+/// so no inline-svg scripting surface.
+const AVATAR_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif"];
+
+/// Pushes an avatar change to the bot's Discord account when a token is
+/// configured. Web is the master: upload and reset both apply to Discord,
+/// and the generated DiceBear face never leaves the web. No token means no
+/// Discord presence, so there is nothing to sync and nothing to report.
+async fn sync_discord_avatar(
+    ctx: &WebContext,
+    bot_id: &str,
+    data_uri: Option<&str>,
+) -> Result<(), String> {
+    let Ok(handle) = ctx.bots.get(bot_id).await else {
+        return Ok(());
+    };
+    let token = handle
+        .store
+        .messenger_token("discord")
+        .map_err(|error| error.to_string())?;
+    let Some(token) = token else {
+        return Ok(());
+    };
+    messenger_discord::set_avatar(&token, data_uri).await
+}
+
+/// `PUT /api/bots/{id}/avatar` replaces the bot's custom avatar with the raw
+/// request body. Axum's default body limit caps the upload at 2 MiB.
+async fn bot_avatar_put(
+    State(store): State<Context>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    match authenticated(&store, &headers) {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(error) => return error.into_response(),
+    }
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or("").trim().to_owned())
+        .unwrap_or_default();
+    if !AVATAR_TYPES.contains(&content_type.as_str()) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "avatar must be png, jpeg or gif",
+        )
+            .into_response();
+    }
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty avatar").into_response();
+    }
+    match store.store.bot(&id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    let _guard = store.avatar_lock.lock().await;
+    match store
+        .store
+        .set_bot_avatar(&id, &body, &content_type, now_ms())
+    {
+        Ok(()) => {}
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    let data_uri = format!("data:{content_type};base64,{}", BASE64.encode(&body));
+    match sync_discord_avatar(&store, &id, Some(&data_uri)).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            format!("Saved here, but the Discord sync failed: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/bots/{id}/avatar` serves the custom avatar. The only consumer is
+/// the cache-busted `?v={updated_at}` URL, so the bytes are immutable.
+async fn bot_avatar_get(
+    State(store): State<Context>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    match authenticated(&store, &headers) {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(error) => return error.into_response(),
+    }
+    match store.store.bot_avatar(&id) {
+        Ok(Some((data, content_type))) => (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (
+                    header::CACHE_CONTROL,
+                    "private, max-age=31536000, immutable".to_owned(),
+                ),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+            ],
+            data,
+        )
+            .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// `DELETE /api/bots/{id}/avatar` resets the bot to its generated avatar.
+async fn bot_avatar_delete(
+    State(store): State<Context>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    match authenticated(&store, &headers) {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(error) => return error.into_response(),
+    }
+    let _guard = store.avatar_lock.lock().await;
+    match store.store.clear_bot_avatar(&id) {
+        Ok(()) => {}
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    match sync_discord_avatar(&store, &id, None).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            format!("Reset here, but the Discord sync failed: {error}"),
+        )
+            .into_response(),
+    }
+}
+
 async fn session(State(store): State<Context>, headers: HeaderMap) -> Response {
     match authenticated(&store, &headers) {
         Ok(Some(cookie)) => {
@@ -464,6 +618,8 @@ fn models_reply(global_store: &SqliteStorage, bot_id: &str) -> crate::Result<Val
 
 async fn bots_reply(ctx: &WebContext) -> crate::Result<Value> {
     let bots = ctx.store.bots()?;
+    let avatars: std::collections::HashMap<String, i64> =
+        ctx.store.bot_avatar_versions()?.into_iter().collect();
     let mut out = Vec::with_capacity(bots.len());
     for bot in bots {
         let bm = ctx.store.bot_models(&bot.id)?;
@@ -479,6 +635,7 @@ async fn bots_reply(ctx: &WebContext) -> crate::Result<Value> {
             "isDefault": bot.id == DEFAULT_BOT_ID,
             "createdAt": bot.created_at,
             "generation": bot.generation,
+            "avatarAt": avatars.get(&bot.id).copied(),
             "mainModel": main_model,
             "environment": bot.environment,
             "environmentOnline": bot.environment == storage::LOCAL_ENVIRONMENT

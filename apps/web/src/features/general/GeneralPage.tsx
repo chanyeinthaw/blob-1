@@ -5,9 +5,10 @@ import { AtomMachine } from '@typeonce/effect-machine/reactivity'
 import { MachineState, useMachineResult } from '@typeonce/effect-machine-react'
 import { Option } from 'effect'
 import { AsyncResult } from 'effect/reactivity'
-import { Trash2, Undo2 } from 'lucide-react'
-import { type FormEvent, useEffect, useState } from 'react'
+import { Trash2, Undo2, Upload } from 'lucide-react'
+import { type FormEvent, useEffect, useRef, useState } from 'react'
 
+import { BotAvatar, botAvatarUrl } from '~/components/BotAvatar'
 import { ConfirmDialog } from '~/components/ConfirmDialog'
 import { EmptyLine, FieldRow, PageError, Section } from '~/components/layout/Page'
 import { SplitDetail } from '~/components/layout/SplitPage'
@@ -37,6 +38,7 @@ import { machineAtomsForBot } from '~/lib/runtime'
 import { createPersistentMachineContext } from '~/lib/shellMachines'
 import { matchCached } from '~/lib/useBackgroundRefresh'
 import { cn } from '~/lib/utils'
+import { toast } from 'sonner'
 
 import { GeneralEvents, type GeneralInput, GeneralMachine } from './generalMachine'
 import { generalPageAtomFor } from './generalState'
@@ -118,6 +120,97 @@ export function GeneralPage(props: GeneralPageProps) {
   })
 }
 
+const AVATAR_TYPES = ['image/png', 'image/jpeg', 'image/gif']
+const AVATAR_MAX_BYTES = 2 * 1024 * 1024
+
+interface AvatarFieldProps {
+  readonly bot: BotSummary
+}
+
+/** Uploads or clears the bot's custom avatar over HTTP; the roster Refresh re-reads `avatarAt`. */
+function AvatarField(props: AvatarFieldProps) {
+  const machine = BotsOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  const fileInput = useRef<HTMLInputElement>(null)
+  const [busy, setBusy] = useState(false)
+  const bot = props.bot
+
+  const run = (request: () => Promise<Response>) => {
+    setBusy(true)
+    request()
+      .then(response => {
+        send(BotsEvents.Refresh({}))
+        if (!response.ok) {
+          return response.text().then(message => {
+            toast.error(message || 'Avatar update failed. Try again.')
+          })
+        }
+      })
+      .catch(() => toast.error('Avatar update failed. Try again.'))
+      .finally(() => setBusy(false))
+  }
+
+  const upload = (file: File) => {
+    if (!AVATAR_TYPES.includes(file.type)) {
+      toast.error('Avatar must be a png, jpeg or gif image.')
+      return
+    }
+    if (file.size > AVATAR_MAX_BYTES) {
+      toast.error('Avatar must be under 2 MB.')
+      return
+    }
+    run(() =>
+      fetch(`/api/bots/${bot.id}/avatar`, {
+        method: 'PUT',
+        headers: { 'Content-Type': file.type },
+        body: file,
+      }),
+    )
+  }
+
+  return (
+    <FieldRow labelId={`bot-avatar-${bot.id}`} label="Avatar">
+      <div className="flex items-center justify-end gap-3">
+        <BotAvatar
+          seed={`${bot.id}@${bot.generation}`}
+          imageUrl={botAvatarUrl(bot)}
+          className="size-10 rounded-xl"
+        />
+        <input
+          ref={fileInput}
+          type="file"
+          accept={AVATAR_TYPES.join(',')}
+          className="hidden"
+          onChange={event => {
+            const file = event.target.files?.[0]
+            event.target.value = ''
+            if (file !== undefined) upload(file)
+          }}
+        />
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={busy}
+          onClick={() => fileInput.current?.click()}
+        >
+          <Upload data-icon="inline-start" />
+          Upload
+        </Button>
+        {bot.avatarAt === null ? null : (
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={busy}
+            onClick={() => run(() => fetch(`/api/bots/${bot.id}/avatar`, { method: 'DELETE' }))}
+          >
+            Reset
+          </Button>
+        )}
+      </div>
+    </FieldRow>
+  )
+}
+
 interface BotIdentitySectionProps {
   readonly botId: string
 }
@@ -195,6 +288,7 @@ function BotIdentitySection(props: BotIdentitySectionProps) {
             </div>
           </FieldRow>
         </form>
+        <AvatarField bot={bot} />
         <FieldRow labelId={`bot-environment-${bot.id}`} label="Environment">
           <div className="flex justify-end">
             <EnvironmentSelect bot={bot} busy={busy} labelId={`bot-environment-${bot.id}`} />

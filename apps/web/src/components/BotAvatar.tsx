@@ -16,13 +16,29 @@ function botAvatarSvg(seed: string): string {
   return svg
 }
 
+/** Cache-busted URL of a bot's custom avatar, or undefined while it uses the generated one. */
+export function botAvatarUrl(bot: { readonly id: string; readonly avatarAt: number | null }) {
+  return bot.avatarAt === null ? undefined : `/api/bots/${bot.id}/avatar?v=${bot.avatarAt}`
+}
+
 interface BotAvatarProps {
   readonly seed: string
+  readonly imageUrl?: string | undefined
   readonly className?: string
 }
 
-/** A bot's DiceBear `blobs` avatar, seeded by instance so a recreated bot gets a fresh face. */
+/** A bot's custom avatar image, or the DiceBear `clay` avatar seeded by instance as the default face. */
 export function BotAvatar(props: BotAvatarProps) {
+  if (props.imageUrl !== undefined) {
+    return (
+      <img
+        aria-hidden="true"
+        alt=""
+        src={props.imageUrl}
+        className={cn('shrink-0 object-cover', props.className)}
+      />
+    )
+  }
   return (
     <span
       aria-hidden="true"

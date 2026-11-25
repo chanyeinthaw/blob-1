@@ -18,7 +18,7 @@ import {
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
-import { BotAvatar } from '~/components/BotAvatar'
+import { BotAvatar, botAvatarUrl } from '~/components/BotAvatar'
 import { EmptyLine, PageError, panelClassName } from '~/components/layout/Page'
 import { Button } from '~/components/ui/button'
 import { useBotInstanceKey, useBotsRoot } from '~/features/bots/CreateBotDialog'
@@ -50,9 +50,10 @@ export function WebChatPage(props: WebChatPageProps) {
   const result = useAtomValue(atom)
   const retry = useAtomRefresh(atom)
   const bots = useBotsRoot()?.bots ?? []
-  const botName = bots.find(entry => entry.id === props.botId)?.name ?? props.botId
+  const bot = bots.find(entry => entry.id === props.botId)
+  const botName = bot?.name ?? props.botId
 
-  const frame = { botId: props.botId, botName, instanceKey }
+  const frame = { botId: props.botId, botName, instanceKey, imageUrl: bot && botAvatarUrl(bot) }
 
   return matchCached(result, {
     onInitial: () => (
@@ -85,7 +86,12 @@ function ChatFrame(props: ChatFrameProps) {
     // On mobile the shell grows with its content, so the chat bounds itself
     // to the viewport below the 53px bot bar and the list owns scrolling.
     <div className={cn(panelClassName, 'relative flex-col max-md:h-[calc(100dvh-53px)]')}>
-      <ChatHeader botId={props.botId} botName={props.botName} instanceKey={props.instanceKey} />
+      <ChatHeader
+        botId={props.botId}
+        botName={props.botName}
+        instanceKey={props.instanceKey}
+        imageUrl={props.imageUrl}
+      />
       {props.children}
     </div>
   )
@@ -95,6 +101,7 @@ interface ChatHeaderProps {
   readonly botId: string
   readonly botName: string
   readonly instanceKey: string
+  readonly imageUrl: string | undefined
 }
 
 /** The bot's name over a fade, so messages scroll under it; it opens the bot's settings. */
@@ -108,7 +115,11 @@ function ChatHeader(props: ChatHeaderProps) {
           aria-label={`${props.botName} settings`}
           className="pointer-events-auto -ml-2 inline-flex max-w-full items-center gap-2.5 rounded-xl py-1.5 pr-2 pl-2 text-foreground transition-colors hover:bg-secondary"
         >
-          <BotAvatar seed={props.instanceKey} className="size-8 rounded-lg" />
+          <BotAvatar
+            seed={props.instanceKey}
+            imageUrl={props.imageUrl}
+            className="size-8 rounded-lg"
+          />
           <span className="truncate text-base font-semibold tracking-tight">{props.botName}</span>
           <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
         </Link>

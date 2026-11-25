@@ -7,7 +7,7 @@ import { type ReactNode, useEffect, useState } from 'react'
 import { toast } from 'sonner'
 
 import { BlobTile } from '~/components/BlobMark'
-import { BotAvatar } from '~/components/BotAvatar'
+import { BotAvatar, botAvatarUrl } from '~/components/BotAvatar'
 import { ConfirmDialog } from '~/components/ConfirmDialog'
 import { Tooltip, TooltipContent, TooltipTrigger } from '~/components/ui/tooltip'
 import { botsListAtom } from '~/features/bots/botsState'
@@ -230,7 +230,11 @@ function Rail(props: RailProps) {
                   />
                 }
               >
-                <BotAvatar seed={`${bot.id}@${bot.generation}`} className="size-9 rounded-xl" />
+                <BotAvatar
+                  seed={`${bot.id}@${bot.generation}`}
+                  imageUrl={botAvatarUrl(bot)}
+                  className="size-9 rounded-xl"
+                />
                 <span
                   aria-hidden="true"
                   className={cn(
@@ -448,6 +452,7 @@ const DEFAULT_FALLBACK_BOTS: ReadonlyArray<BotSummary> = [
     isDefault: true,
     createdAt: 0,
     generation: 0,
+    avatarAt: null,
     mainModel: null,
     connection: { state: 'off' },
     environment: 'local',

@@ -2523,6 +2523,19 @@ pub trait BotStore: Send + Sync {
         enabled: Option<bool>,
     ) -> Result<Option<Bot>, StoreError>;
     fn remove_bot(&self, id: &str) -> Result<bool, StoreError>;
+    /// Replaces the bot's custom avatar image; `updated_at` versions it for cache busting.
+    fn set_bot_avatar(
+        &self,
+        bot_id: &str,
+        data: &[u8],
+        content_type: &str,
+        updated_at: i64,
+    ) -> Result<(), StoreError>;
+    /// The bot's custom avatar bytes and content type, if one is set.
+    fn bot_avatar(&self, bot_id: &str) -> Result<Option<(Vec<u8>, String)>, StoreError>;
+    fn clear_bot_avatar(&self, bot_id: &str) -> Result<(), StoreError>;
+    /// `(bot_id, updated_at)` for every custom avatar, for cache-busted URLs in bot listings.
+    fn bot_avatar_versions(&self) -> Result<Vec<(String, i64)>, StoreError>;
     fn bot_models(&self, bot_id: &str) -> Result<BotModels, StoreError>;
     fn set_bot_main_model(
         &self,
@@ -2589,6 +2602,24 @@ impl<T: BotStore + ?Sized> BotStore for Arc<T> {
     }
     fn remove_bot(&self, id: &str) -> Result<bool, StoreError> {
         (**self).remove_bot(id)
+    }
+    fn set_bot_avatar(
+        &self,
+        bot_id: &str,
+        data: &[u8],
+        content_type: &str,
+        updated_at: i64,
+    ) -> Result<(), StoreError> {
+        (**self).set_bot_avatar(bot_id, data, content_type, updated_at)
+    }
+    fn bot_avatar(&self, bot_id: &str) -> Result<Option<(Vec<u8>, String)>, StoreError> {
+        (**self).bot_avatar(bot_id)
+    }
+    fn clear_bot_avatar(&self, bot_id: &str) -> Result<(), StoreError> {
+        (**self).clear_bot_avatar(bot_id)
+    }
+    fn bot_avatar_versions(&self) -> Result<Vec<(String, i64)>, StoreError> {
+        (**self).bot_avatar_versions()
     }
     fn bot_models(&self, bot_id: &str) -> Result<BotModels, StoreError> {
         (**self).bot_models(bot_id)

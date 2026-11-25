@@ -1037,6 +1037,7 @@ const botsReply = (root: MockRoot): ReadonlyArray<BotSummary> =>
     isDefault: bot.id === DEFAULT_BOT_ID,
     createdAt: bot.createdAt,
     generation: bot.generation,
+    avatarAt: null,
     mainModel:
       bot.state.main.provider !== '' && bot.state.main.model !== ''
         ? `${bot.state.main.provider}/${bot.state.main.model}`

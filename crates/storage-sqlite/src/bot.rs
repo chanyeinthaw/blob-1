@@ -139,6 +139,53 @@ impl BotStore for SqliteStorage {
         Ok(deleted > 0)
     }
 
+    fn set_bot_avatar(
+        &self,
+        bot_id: &str,
+        data: &[u8],
+        content_type: &str,
+        updated_at: i64,
+    ) -> Result<(), StoreError> {
+        self.lock()
+            .execute(
+                "INSERT OR REPLACE INTO bot_avatars (bot_id, data, content_type, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                params![bot_id, data, content_type, updated_at],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn bot_avatar(&self, bot_id: &str) -> Result<Option<(Vec<u8>, String)>, StoreError> {
+        self.lock()
+            .query_row(
+                "SELECT data, content_type FROM bot_avatars WHERE bot_id = ?1",
+                [bot_id],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(backend)
+    }
+
+    fn clear_bot_avatar(&self, bot_id: &str) -> Result<(), StoreError> {
+        self.lock()
+            .execute("DELETE FROM bot_avatars WHERE bot_id = ?1", [bot_id])
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn bot_avatar_versions(&self) -> Result<Vec<(String, i64)>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT bot_id, updated_at FROM bot_avatars")
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?;
+        Ok(rows)
+    }
+
     fn bot_models(&self, bot_id: &str) -> Result<BotModels, StoreError> {
         if bot_id == DEFAULT_BOT_ID {
             let s = self.settings()?;
@@ -750,6 +797,52 @@ mod tests {
         assert!(store.remove_bot("sunday").unwrap());
         assert_eq!(store.provider_in_use_by_bot(&pid).unwrap(), None);
         store.remove_provider(&pid).unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bot_avatar_roundtrip_and_cascade() {
+        let dir = std::env::temp_dir().join(format!("blob-1-avatar-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SqliteStorage::open(dir.join("agent.db"), None).unwrap();
+
+        // None until set; versions list empty.
+        assert_eq!(store.bot_avatar("sunday").unwrap(), None);
+        assert!(store.bot_avatar_versions().unwrap().is_empty());
+
+        store.create_bot("sunday", "Sunday", 100).unwrap();
+        store
+            .set_bot_avatar("sunday", b"png-bytes", "image/png", 1000)
+            .unwrap();
+        assert_eq!(
+            store.bot_avatar("sunday").unwrap(),
+            Some((b"png-bytes".to_vec(), "image/png".to_owned()))
+        );
+        assert_eq!(
+            store.bot_avatar_versions().unwrap(),
+            vec![("sunday".to_owned(), 1000)]
+        );
+
+        // Replace bumps the version; clear removes the row.
+        store
+            .set_bot_avatar("sunday", b"webp-bytes", "image/webp", 2000)
+            .unwrap();
+        assert_eq!(
+            store.bot_avatar_versions().unwrap(),
+            vec![("sunday".to_owned(), 2000)]
+        );
+        store.clear_bot_avatar("sunday").unwrap();
+        assert_eq!(store.bot_avatar("sunday").unwrap(), None);
+
+        // Removing the bot cascades its avatar row away.
+        store
+            .set_bot_avatar("sunday", b"png-bytes", "image/png", 3000)
+            .unwrap();
+        assert!(store.remove_bot("sunday").unwrap());
+        assert_eq!(store.bot_avatar("sunday").unwrap(), None);
+        assert!(store.bot_avatar_versions().unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -169,6 +169,12 @@ CREATE TABLE IF NOT EXISTS bots (
     environment TEXT NOT NULL DEFAULT 'local'
 ) STRICT;
 INSERT OR IGNORE INTO bots (id, name, enabled, created_at) VALUES ('default', 'Blob-1', 1, 0);
+CREATE TABLE IF NOT EXISTS bot_avatars (
+    bot_id TEXT PRIMARY KEY REFERENCES bots (id) ON DELETE CASCADE,
+    data BLOB NOT NULL,
+    content_type TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+) STRICT;
 CREATE TABLE IF NOT EXISTS environments (
     name TEXT PRIMARY KEY,
     node_id TEXT NOT NULL UNIQUE,

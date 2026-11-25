@@ -740,6 +740,18 @@ impl Inner {
     }
 }
 
+/// Pushes a bot avatar to the Discord account this token belongs to: a
+/// `data:image/...;base64,...` URI, or `None` to reset to Discord's default.
+pub async fn set_avatar(token: &str, data_uri: Option<&str>) -> Result<(), String> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Client::new(token.to_owned())
+        .update_current_user()
+        .avatar(data_uri)
+        .await
+        .map_err(|error| format!("Discord rejected the avatar update: {error}"))?;
+    Ok(())
+}
+
 /// Checks a bot token against `GET /users/@me` before it is stored.
 pub async fn validate_token(token: &str) -> Result<(), String> {
     let _ = rustls::crypto::ring::default_provider().install_default();
