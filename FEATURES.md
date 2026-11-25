@@ -45,6 +45,7 @@ The bot is one chat that never ends. It coordinates and talks; tasks do the work
 - Runs: a run ends when the agent is done. Task reports and reminders steer a live run or wake an idle agent (`resume`).
 - Input: every outside input is one XML element with escaped text: `<message>` (carries `time="Day YYYY-MM-DD HH:MM <TZ>"` in `clock.timezone`, falling back to `UTC`, both on live arrival and `zoom(id, 1)`), `<report>`, `<reminder>`, `<scheduled>`, `<checkin>`, `<event>` (also carries `time="..."`)
 - Final reply `NO_UPDATES` ends a messenger turn silently.
+- Voice: the prompts require one-entity speech — the bot owns task work in the first person and never attributes statements to a task or a model unless the person asks.
 - Tools: `zoom`, `date`, `spawn`, `models`, `tasks`, `tell`, `stop`, `send` (when messengers are configured), `request_secret`, plus calendar (`schedule`, `unschedule`, `schedules`) and watch (`watch`, `unwatch`, `watches`) tools; connected MCP servers are listed in the chat prompt so chat can delegate them to background tasks
 - Prompt caching: `ChatHarness` and `SessionHarness` pass a stable per-workspace/session `prompt_cache_key` on OpenAI Responses (`llm-rig`), and keeping MCP behind static `mcp_search` + `mcp_execute` in tasks avoids mutating the `tools` list mid-turn.
 - CLI: `agent chat <message>` (one message, then waits for its tasks to report)
