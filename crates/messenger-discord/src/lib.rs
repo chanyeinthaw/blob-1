@@ -652,9 +652,6 @@ impl Inner {
                 }
             };
             for member in members {
-                if member.user.bot {
-                    continue;
-                }
                 let p = person(&member.user);
                 let entry = people_map
                     .entry(p.id.clone())
@@ -898,8 +895,7 @@ impl Lookup for Discord {
                 for message in inner.messages(place, None, 100).await? {
                     let user = message.author;
                     let p = person(&user);
-                    if !user.bot
-                        && query
+                    if query
                             .as_ref()
                             .is_none_or(|q| p.name.to_lowercase().contains(q) || p.id.contains(q))
                         && seen.insert(p.id.clone())
@@ -936,7 +932,7 @@ impl Lookup for Discord {
                             .map_err(backend)?;
                         for member in members {
                             let p = person(&member.user);
-                            if !member.user.bot && seen.insert(p.id.clone()) {
+                            if seen.insert(p.id.clone()) {
                                 result.push(p);
                                 if result.len() == 50 {
                                     return Ok(result);

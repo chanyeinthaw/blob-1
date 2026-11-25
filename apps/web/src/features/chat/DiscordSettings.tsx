@@ -357,7 +357,9 @@ function TokenForm(props: TokenFormProps) {
 const SNOWFLAKE = /^\d{17,20}$/
 
 function personName(directory: DiscordDirectory, user: string) {
-  return directory.people.find(person => person.id === user)?.name
+  const entry = directory.people.find(person => person.id === user)
+  if (entry === undefined) return undefined
+  return entry.bot ? `${entry.name} (bot)` : entry.name
 }
 
 function initials(name: string) {
@@ -755,7 +757,11 @@ function AccessPersonPicker(props: AccessPersonPickerProps) {
       : directory.people.filter(person => person.guilds.includes(scopeGuildId))
   const options = people
     .filter(person => !hasAccessRule(rules, person.id, scope, selectedScopeId))
-    .map(person => ({ value: person.id, label: person.name, hint: person.id }))
+    .map(person => ({
+      value: person.id,
+      label: person.bot ? `${person.name} (bot)` : person.name,
+      hint: person.id,
+    }))
   const placeholder = scopeValid
     ? 'Choose a person or paste user ID'
     : scope === 'server'
@@ -1214,7 +1220,7 @@ interface OverrideTargetKey {
 }
 
 function resolveUserOverrideTarget(override: OverrideTargetKey, directory: DiscordDirectory) {
-  const name = directory.people.find(person => person.id === override.targetId)?.name
+  const name = personName(directory, override.targetId)
   const guildLabel =
     override.guildId === null
       ? 'Unassigned server (inactive)'
@@ -1372,7 +1378,11 @@ const modeTargetOptions = (
         !overridden(person.id) &&
         (selectedGuild === null || selectedGuild === '' || person.guilds.includes(selectedGuild)),
     )
-    .map(person => ({ value: person.id, label: person.name, hint: person.id }))
+    .map(person => ({
+      value: person.id,
+      label: person.bot ? `${person.name} (bot)` : person.name,
+      hint: person.id,
+    }))
 }
 
 /** Dialog to add a channel, person, or whole-server interaction mode override. */
@@ -2033,11 +2043,9 @@ function HomeForm(props: HomeFormProps) {
               focusOnMount={props.pendingKind === 'dm'}
               disabled={props.isSaving}
               value={props.home.kind === 'dm' ? props.home.user : ''}
-              options={props.directory.people.map(person => ({
-                value: person.id,
-                label: person.name,
-                hint: person.id,
-              }))}
+              options={props.directory.people
+                .filter(person => !person.bot)
+                .map(person => ({ value: person.id, label: person.name, hint: person.id }))}
               onChange={user => send(DiscordEvents.SetHome({ home: { kind: 'dm', user } }))}
             />
           </div>

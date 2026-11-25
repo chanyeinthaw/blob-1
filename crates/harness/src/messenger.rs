@@ -829,7 +829,14 @@ impl Messengers {
                 }
                 Ok(people
                     .into_iter()
-                    .map(|p| format!("{} ({})", storage::escape(&p.name), storage::escape(&p.id)))
+                    .map(|p| {
+                        format!(
+                            "{} ({}){}",
+                            storage::escape(&p.name),
+                            storage::escape(&p.id),
+                            if p.bot { " [bot]" } else { "" }
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n"))
             }

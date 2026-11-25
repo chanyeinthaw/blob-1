@@ -1318,17 +1318,26 @@ const handlers: { readonly [K in LegacyRequestType]: Handler<K> } = {
         {
           id: '435482941515104257',
           name: 'Chan Nyein Thaw',
+          bot: false,
           guilds: ['928368271290421000', '842724454677348000'],
         },
         {
           id: '694730852973805679',
           name: 'Su Hlaing Hnin',
+          bot: false,
           guilds: ['928368271290421000'],
         },
         {
           id: '1090496556781809745',
           name: 'Pinn',
+          bot: false,
           guilds: ['842724454677348000'],
+        },
+        {
+          id: '118329344729104000',
+          name: 'Deploy Bot',
+          bot: true,
+          guilds: ['928368271290421000'],
         },
       ],
     }),

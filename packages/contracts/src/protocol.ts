@@ -308,6 +308,7 @@ export type DiscordChannel = typeof DiscordChannel.Type
 export const DiscordPerson = Schema.Struct({
   id: Schema.String,
   name: Schema.String,
+  bot: Schema.Boolean,
   guilds: Schema.Array(Schema.String),
 })
 export type DiscordPerson = typeof DiscordPerson.Type

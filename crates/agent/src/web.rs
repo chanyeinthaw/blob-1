@@ -1499,7 +1499,7 @@ async fn dispatch(
                     }
                 }
                 Ok(
-                    json!({"guilds":guilds.into_iter().map(|(id,name)| json!({"id":id,"name":name})).collect::<Vec<_>>(),"channels":channels.into_iter().map(|(id,name,server,guild_id,is_thread)| json!({"id":id,"name":name,"server":server,"guildId":guild_id,"kind":if is_thread { "thread" } else { "channel" }})).collect::<Vec<_>>(),"people":people.into_iter().map(|(p,g)| json!({"id":p.id,"name":p.name,"guilds":g})).collect::<Vec<_>>() }),
+                    json!({"guilds":guilds.into_iter().map(|(id,name)| json!({"id":id,"name":name})).collect::<Vec<_>>(),"channels":channels.into_iter().map(|(id,name,server,guild_id,is_thread)| json!({"id":id,"name":name,"server":server,"guildId":guild_id,"kind":if is_thread { "thread" } else { "channel" }})).collect::<Vec<_>>(),"people":people.into_iter().map(|(p,g)| json!({"id":p.id,"name":p.name,"bot":p.bot,"guilds":g})).collect::<Vec<_>>() }),
                 )
             }
             "mcp.list" => {
