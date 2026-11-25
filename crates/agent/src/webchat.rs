@@ -29,6 +29,7 @@ pub fn owner() -> Person {
     Person {
         id: "owner".into(),
         name: "Owner".into(),
+        bot: false,
     }
 }
 
@@ -150,11 +151,11 @@ impl Lookup for WebChat {
                 Person {
                     id: "bot".into(),
                     name: "Bot".into(),
+                    bot: true,
                 }
             } else {
                 owner()
             },
-            bot: message.bot,
             text: message.text,
             date: message.created_at.to_string(),
             attachments: Vec::new(),

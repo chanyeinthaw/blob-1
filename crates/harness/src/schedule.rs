@@ -576,6 +576,7 @@ mod tests {
             author: Person {
                 id: "u1".into(),
                 name: "Chan".into(),
+                bot: false,
             },
             to: 7,
             location: "#dev".into(),

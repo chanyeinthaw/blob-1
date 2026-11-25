@@ -1626,7 +1626,8 @@ async fn missed_history(
     }
     let default_access = store.default_access("discord").ok()?;
     let rules = store.access_rules("discord").ok()?;
-    // Page backwards: bot posts and blocked users are filtered after fetching,
+    let self_id = discord.self_id();
+    // Page backwards: blocked users are filtered after fetching,
     // so a single 20-message page can hide every eligible message behind a
     // run of ineligible ones. Capped at 5 pages — a 100-message scan bounds
     // the latency one cold admission can add.
@@ -1648,7 +1649,13 @@ async fn missed_history(
                     .ok()
                     .is_some_and(|id| id < current && last.is_none_or(|last| id > last))
             })
-            .filter(|m| !m.bot)
+            // Our own messages are already session outputs, never gap
+            // context. While the own id is unknown (pre-READY), fall back to
+            // dropping all bot authors rather than risk inlining our own.
+            .filter(|m| match self_id.as_deref() {
+                Some(id) => m.author.id != id,
+                None => !m.author.bot,
+            })
             .filter(|m| {
                 access_allowed(
                     default_access,
@@ -3423,6 +3430,7 @@ mod tests {
             author: Person {
                 id: author.into(),
                 name: author.into(),
+                bot: false,
             },
             text: "hi".into(),
             quote: None,
@@ -4457,8 +4465,8 @@ mod tests {
                     author: storage::Person {
                         id: "bot42".into(),
                         name: "SupportBot".into(),
+                        bot: true,
                     },
-                    bot: false,
                     text: "Try restarting the service.".into(),
                     date: "2026-11-22".into(),
                     attachments: Vec::new(),
@@ -4559,6 +4567,7 @@ mod tests {
             author: storage::Person {
                 id: "u1".into(),
                 name: "Chan".into(),
+                bot: false,
             },
             text: "that worked, what next?".into(),
             quote: None,

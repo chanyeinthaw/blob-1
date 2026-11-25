@@ -110,6 +110,8 @@ pub async fn decide_respond(
             .map(|m| {
                 if bot_id.is_some_and(|id| id == m.author.id) {
                     format!("[assistant] {}: {}", m.author.name, m.text)
+                } else if m.author.bot {
+                    format!("[bot] {}: {}", m.author.name, m.text)
                 } else {
                     format!("{}: {}", m.author.name, m.text)
                 }
@@ -121,7 +123,8 @@ pub async fn decide_respond(
     if burst.len() == 1 {
         let inbound = first;
         if let Some(quote) = &inbound.quote {
-            sections.push(format!("Quoted ({}): {}", quote.author.name, quote.text));
+            let label = if quote.author.bot { "[bot] " } else { "" };
+            sections.push(format!("Quoted ({label}{}): {}", quote.author.name, quote.text));
         }
         if !inbound.attachments.is_empty() {
             let names = inbound
@@ -132,17 +135,20 @@ pub async fn decide_respond(
                 .join(", ");
             sections.push(format!("Attachments: {names}"));
         }
+        let label = if inbound.author.bot { "[bot] " } else { "" };
         sections.push(format!(
-            "Latest message ({}): {}",
+            "Latest message ({label}{}): {}",
             inbound.author.name, inbound.text
         ));
     } else {
         let lines = burst
             .iter()
             .map(|inbound| {
-                let mut line = format!("{}: {}", inbound.author.name, inbound.text);
+                let label = if inbound.author.bot { "[bot] " } else { "" };
+                let mut line = format!("{label}{}: {}", inbound.author.name, inbound.text);
                 if let Some(quote) = &inbound.quote {
-                    line.push_str(&format!(" [quoting {}: {}]", quote.author.name, quote.text));
+                    let qlabel = if quote.author.bot { "[bot] " } else { "" };
+                    line.push_str(&format!(" [quoting {qlabel}{}: {}]", quote.author.name, quote.text));
                 }
                 if !inbound.attachments.is_empty() {
                     let names = inbound
@@ -332,6 +338,7 @@ mod tests {
             author: messenger::Person {
                 id: "u1".into(),
                 name: "Chan".into(),
+                bot: false,
             },
             location: "#dev".into(),
             text: "hey".into(),

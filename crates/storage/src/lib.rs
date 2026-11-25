@@ -433,6 +433,10 @@ pub struct Place {
 pub struct Person {
     pub id: String,
     pub name: String,
+    /// Bot-authored (other bots, webhooks); admission control is the access
+    /// rules, the flag only labels the author for the model.
+    #[serde(default)]
+    pub bot: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -622,11 +626,12 @@ pub fn render_missed(missed: &[Missed]) -> String {
         .iter()
         .map(|m| {
             format!(
-                "<message author=\"{}\" author_name=\"{}\" message=\"{}\" date=\"{}\">\n{}{}\n</message>\n",
+                "<message author=\"{}\" author_name=\"{}\" message=\"{}\" date=\"{}\"{}>\n{}{}\n</message>\n",
                 attribute(&m.author.id),
                 attribute(&m.author.name),
                 attribute(&m.message),
                 attribute(&m.date),
+                if m.author.bot { " bot=\"true\"" } else { "" },
                 render_attachments(&m.attachments),
                 escape(&m.text)
             )
@@ -710,7 +715,7 @@ impl Meta {
                 unaddressed,
                 ..
             } => format!(
-                "<message messenger=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}{}{}{}>\n{}{}{}{body}\n</message>",
+                "<message messenger=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}{}{}{}{}>\n{}{}{}{body}\n</message>",
                 attribute(messenger),
                 attribute(&author.id),
                 attribute(&author.name),
@@ -723,10 +728,11 @@ impl Meta {
                 } else {
                     ""
                 },
+                if author.bot { " bot=\"true\"" } else { "" },
                 render_missed(missed),
                 quote.as_ref().map_or_else(String::new, |quote| format!(
-                    "<quote author=\"{}\" author_name=\"{}\" message=\"{}\">\n{}{}\n</quote>\n",
-                    attribute(&quote.author.id), attribute(&quote.author.name), attribute(&quote.message), render_attachments(&quote.attachments), escape(&quote.text)
+                    "<quote author=\"{}\" author_name=\"{}\" message=\"{}\"{}>\n{}{}\n</quote>\n",
+                    attribute(&quote.author.id), attribute(&quote.author.name), attribute(&quote.message), if quote.author.bot { " bot=\"true\"" } else { "" }, render_attachments(&quote.attachments), escape(&quote.text)
                 )),
                 render_attachments(attachments)
             ),

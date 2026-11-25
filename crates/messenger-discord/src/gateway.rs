@@ -164,7 +164,10 @@ async fn run(
                 if matches!(message.kind, MessageType::Regular | MessageType::Reply) {
                     inner.record_gateway_message(&message, message.author.id == bot);
                 }
-                if message.author.bot || message.author.id == bot {
+                // Other bots' messages flow through the same access rules as
+                // human ones (labeled bot-authored downstream); only our own
+                // are always skipped — the bot already knows what it said.
+                if message.author.id == bot {
                     continue;
                 }
                 let dm = message.guild_id.is_none();

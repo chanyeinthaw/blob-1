@@ -1048,6 +1048,7 @@ mod tests {
                     author: storage::Person {
                         id: "u1".into(),
                         name: "u1".into(),
+                        bot: false,
                     },
                     to,
                     inline: false,

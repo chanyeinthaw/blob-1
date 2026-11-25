@@ -216,6 +216,7 @@ fn person(user: &User) -> Person {
             .global_name
             .clone()
             .unwrap_or_else(|| user.name.clone()),
+        bot: user.bot,
     }
 }
 
@@ -235,7 +236,6 @@ fn fetched(message: Message) -> Fetched {
     Fetched {
         message: message.id.to_string(),
         author: person(&message.author),
-        bot: message.author.bot,
         text: message.content,
         date: message.timestamp.iso_8601().to_string(),
         attachments: attachments(&message.attachments),
@@ -1076,8 +1076,8 @@ mod recent_history_tests {
             author: Person {
                 id: "u1".into(),
                 name: "Chan".into(),
+                bot: false,
             },
-            bot: false,
             text: text.into(),
             date: String::new(),
             attachments: Vec::new(),

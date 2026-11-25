@@ -633,6 +633,7 @@ mod tests {
             author: Person {
                 id: "u1".into(),
                 name: "Chan".into(),
+                bot: false,
             },
             to: 1,
             location: "#dev".into(),
@@ -642,6 +643,7 @@ mod tests {
                 author: Person {
                     id: "u2".into(),
                     name: "Bot".into(),
+                    bot: true,
                 },
                 text: format!("line1\n{token_43}\nsee https://blob.example/hooks/cb/{token_43} and cbk_worker"),
                 attachments: Vec::new(),
