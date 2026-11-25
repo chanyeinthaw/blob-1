@@ -98,6 +98,41 @@ impl MemoryStore for SqliteStorage {
                 .transpose()?;
             let text = storage::redact_callback_tokens(&row.text);
             tx.execute("INSERT INTO memory_messages (i, kind, text, size, date, more, meta) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![next, row.kind.as_str(), text.as_ref(), sql_integer(row.size)?, row.date, row.more, meta]).map_err(backend)?;
+            // Advance the conversation high-water mark in the same transaction:
+            // the mark never covers a message the session has not durably
+            // recorded, so a restart re-fills the gap instead of skipping it.
+            // Compared by length-then-lexicographically, not integer-cast, so
+            // snowflakes beyond i64::MAX stay ordered.
+            if let Some(storage::Meta::Message {
+                messenger,
+                place,
+                message,
+                gap_open,
+                ..
+            }) = &row.meta
+            {
+                // Discord-only: it is the platform with gap detection and a
+                // numeric snowflake ordering; web chat inputs carry no gap.
+                // A `gap_open` row commits without its gap filled, so the mark
+                // stays behind it and a later admission retries the range.
+                if messenger != "discord"
+                    || *gap_open
+                    || !message.bytes().all(|b| b.is_ascii_digit())
+                {
+                    continue;
+                }
+                let thread = place.thread.as_deref().unwrap_or("");
+                tx.execute(
+                    "INSERT OR IGNORE INTO destinations (messenger, channel, thread, dm) VALUES (?1, ?2, ?3, ?4)",
+                    params![messenger, place.channel, thread, place.dm],
+                )
+                .map_err(backend)?;
+                tx.execute(
+                    "UPDATE destinations SET last_message = ?4                      WHERE messenger = ?1 AND channel = ?2 AND thread = ?3                      AND (last_message IS NULL OR length(last_message) < length(?4)                           OR (length(last_message) = length(?4) AND last_message < ?4))",
+                    params![messenger, place.channel, thread, message],
+                )
+                .map_err(backend)?;
+            }
         }
         save_views(&tx, changes)?;
         tx.commit().map_err(backend)

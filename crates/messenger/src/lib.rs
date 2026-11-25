@@ -64,6 +64,9 @@ pub enum Scope {
 pub struct Fetched {
     pub message: String,
     pub author: Person,
+    /// Bot-authored — the gateway excludes these from live admission, so gap
+    /// filling does too.
+    pub bot: bool,
     pub text: String,
     pub date: String,
     pub attachments: Vec<Attachment>,

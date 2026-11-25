@@ -154,6 +154,7 @@ impl Lookup for WebChat {
             } else {
                 owner()
             },
+            bot: message.bot,
             text: message.text,
             date: message.created_at.to_string(),
             attachments: Vec::new(),

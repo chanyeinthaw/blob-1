@@ -649,6 +649,8 @@ mod tests {
             attachments: Vec::new(),
             inline: false,
             unaddressed: false,
+            missed: Vec::new(),
+            gap_open: false,
         };
         store
             .append_messages(

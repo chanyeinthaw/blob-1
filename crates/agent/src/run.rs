@@ -1400,6 +1400,7 @@ async fn admit_approved(
     utility: Option<&harness::Utility>,
     prefetched_history: Option<&[messenger::Fetched]>,
     auto_responded: bool,
+    watermarks: &Watermarks,
 ) -> Result<Option<(String, storage::Meta)>> {
     let inline = if inbound.place.thread.is_none() && !inbound.place.dm {
         let default = store.messenger_defaults("discord")?.reply_mode;
@@ -1485,6 +1486,9 @@ async fn admit_approved(
     } else {
         false
     };
+    // Fill the conversation gap before the final policy recheck, so access
+    // revoked during any of the async waits is still caught before admission.
+    let gap = missed_history(store, watermarks, discord, &inbound).await;
     // Recheck policy after async triage / reply-mode awaits before any side effects.
     match admission_policy(store, &inbound)? {
         AdmissionPolicy::Deny => return Ok(None),
@@ -1528,6 +1532,51 @@ async fn admit_approved(
         });
     }
     messengers.live("discord", to, dest);
+    // Finalize the gap without awaiting: re-read the in-memory mark and drop
+    // whatever an overlapping lane covered while the fetch was in flight.
+    // The overlap check is best effort — seeing a published mark guarantees
+    // only that its covering message was already queued ahead in the FIFO
+    // (see `publish_watermark`), not that it has committed. The durable mark
+    // follows when the memory append commits. On fetch failure (`None`)
+    // neither mark moves, so the gap survives for the next admission until
+    // the durable append covers this message.
+    let gap_open = gap.is_none();
+    let mut missed = Vec::new();
+    if let Some(gap) = gap {
+        missed = gap;
+        // Drop whatever an overlapping lane already covered while the fetch
+        // was in flight. The mark itself is only advanced after the item is
+        // enqueued (see `publish_watermark`), so any lane reading it is
+        // guaranteed the covering message is already ahead in the FIFO.
+        if let Some(entry) = watermarks.get(&watermark_key(&inbound.place)) {
+            if *entry > 0 {
+                missed.retain(|m| {
+                    m.message.parse::<u64>().ok().is_some_and(|id| id > *entry)
+                });
+            }
+        }
+        // Re-filter authors against current access rules: the fetch-time
+        // filter read them before up to five REST requests, and access
+        // revoked meanwhile must not enter the session through the gap.
+        if !missed.is_empty() {
+            let default_access = store.default_access("discord")?;
+            let rules = store.access_rules("discord")?;
+            missed.retain(|m| {
+                access_allowed(
+                    default_access,
+                    &rules,
+                    &m.author.id,
+                    inbound.guild.as_deref(),
+                    &inbound.place.channel,
+                    inbound.place.thread.as_deref(),
+                    inbound.place.dm,
+                )
+            });
+        }
+        if missed.len() > 10 {
+            missed = missed.split_off(missed.len() - 10);
+        }
+    }
     Ok(Some((
         inbound.text,
         storage::Meta::Message {
@@ -1544,8 +1593,138 @@ async fn admit_approved(
             earlier: inbound.earlier,
             quote: inbound.quote,
             attachments: inbound.attachments,
+            missed,
+            gap_open,
         },
     )))
+}
+
+/// The conversation messages missed since the last admission in this place,
+/// oldest first and capped at the newest 10. The high-water mark is the later
+/// of the durable `destinations.last_message` (written when the memory append
+/// commits) and the in-memory admission mark; entries are access-filtered so a
+/// blocked user's messages never enter the session through the gap, while
+/// interaction-mode filtering deliberately does not apply — recovering the
+/// messages it skipped is the point. `None` when the history fetch failed.
+async fn missed_history(
+    store: &Arc<SqliteStorage>,
+    watermarks: &Watermarks,
+    discord: &Arc<dyn messenger::Messenger>,
+    inbound: &messenger::Inbound,
+) -> Option<Vec<storage::Missed>> {
+    let current = inbound.message.parse::<u64>().ok()?;
+    let durable = store
+        .last_seen_message("discord", &inbound.place)
+        .ok()
+        .flatten()
+        .and_then(|id| id.parse::<u64>().ok());
+    let memory = watermarks.get(&watermark_key(&inbound.place)).map(|v| *v);
+    let last = durable.into_iter().chain(memory).max();
+    // The mark at or past this message means no gap (replays, out-of-order).
+    if last.is_some_and(|last| last >= current) {
+        return Some(Vec::new());
+    }
+    let default_access = store.default_access("discord").ok()?;
+    let rules = store.access_rules("discord").ok()?;
+    // Page backwards: bot posts and blocked users are filtered after fetching,
+    // so a single 20-message page can hide every eligible message behind a
+    // run of ineligible ones. Capped at 5 pages — a 100-message scan bounds
+    // the latency one cold admission can add.
+    let mut pages: Vec<Vec<storage::Missed>> = Vec::new();
+    let mut before = inbound.message.clone();
+    for _ in 0..5 {
+        let history = discord.history(&inbound.place, Some(&before), 20).await.ok()?;
+        if history.is_empty() {
+            break;
+        }
+        // Oldest-first, so the first element is the cursor for the next page.
+        before = history[0].message.clone();
+        let exhausted = history.len() < 20;
+        let page: Vec<storage::Missed> = history
+            .iter()
+            .filter(|m| {
+                m.message
+                    .parse::<u64>()
+                    .ok()
+                    .is_some_and(|id| id < current && last.is_none_or(|last| id > last))
+            })
+            .filter(|m| !m.bot)
+            .filter(|m| {
+                access_allowed(
+                    default_access,
+                    &rules,
+                    &m.author.id,
+                    inbound.guild.as_deref(),
+                    &inbound.place.channel,
+                    inbound.place.thread.as_deref(),
+                    inbound.place.dm,
+                )
+            })
+            .map(|m| storage::Missed {
+                message: m.message.clone(),
+                author: m.author.clone(),
+                date: m.date.clone(),
+                text: m.text.clone(),
+                attachments: m.attachments.clone(),
+            })
+            .collect();
+        pages.push(page);
+        // Once the page's oldest id sits at or before the mark, older pages
+        // have nothing left to contribute.
+        let oldest = history
+            .first()
+            .and_then(|m| m.message.parse::<u64>().ok());
+        let at_mark = match (last, oldest) {
+            (Some(last), Some(oldest)) => oldest <= last,
+            _ => false,
+        };
+        if exhausted || at_mark || pages.iter().map(Vec::len).sum::<usize>() >= 10 {
+            break;
+        }
+    }
+    // Pages were fetched newest-first; flatten them back into oldest-first.
+    // Not capped here: the cap applies after the final access re-filter, so a
+    // mid-fetch revocation can backfill from spares the last page collected.
+    Some(pages.into_iter().rev().flatten().collect())
+}
+
+fn watermark_key(place: &storage::Place) -> (String, String) {
+    (
+        place.channel.clone(),
+        place.thread.clone().unwrap_or_default(),
+    )
+}
+
+/// The watermark an admitted input will publish once enqueued — `None` for
+/// `gap_open` rows, whose unfilled gap must stay open for a later retry.
+fn watermark_of(meta: &storage::Meta) -> Option<((String, String), u64)> {
+    let storage::Meta::Message {
+        place,
+        message,
+        gap_open,
+        ..
+    } = meta
+    else {
+        return None;
+    };
+    if *gap_open {
+        return None;
+    }
+    let id = message.parse::<u64>().ok()?;
+    Some((watermark_key(place), id))
+}
+
+/// Advances the in-memory mark after the covering item is in the admission
+/// FIFO. Post-send publication is the ordering guarantee: any lane that reads
+/// the mark either misses it (and inlines the range itself — cosmetic
+/// duplication) or sees it only after the covering message is already queued
+/// ahead, so downstream commits reach the covering row first and a restart
+/// can never leave the durable mark past a gap nothing persisted.
+fn publish_watermark(watermarks: &Watermarks, publish: Option<((String, String), u64)>) {
+    if let Some((key, id)) = publish {
+        let mut entry = watermarks.entry(key).or_insert(0);
+        *entry = (*entry).max(id);
+    }
 }
 
 #[cfg(test)]
@@ -1557,7 +1736,16 @@ async fn admit(
     utility: Option<&harness::Utility>,
 ) -> Result<Option<(String, storage::Meta)>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-    admit_batch(store, discord, messengers, vec![inbound], utility, &tx).await?;
+    admit_batch(
+        store,
+        discord,
+        messengers,
+        vec![inbound],
+        utility,
+        &Watermarks::default(),
+        &tx,
+    )
+    .await?;
     drop(tx);
     match rx.recv().await {
         Some(Ok(item)) => Ok(Some(item)),
@@ -1570,12 +1758,19 @@ async fn admit(
 /// message, runs a single utility-model gate over unaddressed `AutoRespondCheck`
 /// messages as a burst, and emits each approved message immediately in strict
 /// arrival order.
+/// Per-place high-water marks for admitted messages, in-memory and
+/// process-local: they cover the window between admission and the durable
+/// mark that the memory append writes, so bursts and overlapping lanes do not
+/// re-inline messages already admitted. Keyed by (channel, thread-or-empty).
+type Watermarks = Arc<dashmap::DashMap<(String, String), u64>>;
+
 async fn admit_batch(
     store: &Arc<SqliteStorage>,
     discord: Arc<dyn messenger::Messenger>,
     messengers: &harness::Messengers,
     batch: Vec<messenger::Inbound>,
     utility: Option<&harness::Utility>,
+    watermarks: &Watermarks,
     tx: &tokio::sync::mpsc::Sender<Result<(String, storage::Meta)>>,
 ) -> Result<()> {
     let mut ordered: Vec<(messenger::Inbound, AdmissionPolicy)> = Vec::with_capacity(batch.len());
@@ -1695,10 +1890,14 @@ async fn admit_batch(
         match admission_policy(store, &inbound)? {
             AdmissionPolicy::AdmitDirect => {
                 if let Some(item) =
-                    admit_approved(store, &discord, messengers, inbound, utility, None, false)
+                    admit_approved(
+                        store, &discord, messengers, inbound, utility, None, false, watermarks,
+                    )
                         .await?
                 {
+                    let publish = watermark_of(&item.1);
                     let _ = tx.send(Ok(item)).await;
+                    publish_watermark(watermarks, publish);
                 }
             }
             AdmissionPolicy::AutoRespondCheck if approved_triage_ids.contains(&inbound.message) => {
@@ -1706,11 +1905,13 @@ async fn admit_batch(
                     .as_ref()
                     .and_then(|(id, h)| (*id == inbound.message).then_some(h.as_slice()));
                 if let Some(item) = admit_approved(
-                    store, &discord, messengers, inbound, utility, prefetched, true,
+                    store, &discord, messengers, inbound, utility, prefetched, true, watermarks,
                 )
                 .await?
                 {
+                    let publish = watermark_of(&item.1);
                     let _ = tx.send(Ok(item)).await;
+                    publish_watermark(watermarks, publish);
                 }
             }
             AdmissionPolicy::AutoRespondCheck | AdmissionPolicy::Deny => {}
@@ -2648,6 +2849,8 @@ pub async fn serve_bot(
                                 earlier: None,
                                 quote: None,
                                 attachments: Vec::new(),
+                                missed: Vec::new(),
+                                gap_open: false,
                             },
                         )
                     })
@@ -2739,6 +2942,7 @@ pub async fn serve_bot(
         // Separate per-place coalescing lane for unaddressed Auto-respond triage:
         // runs 1 utility decision per sealed burst and admits each approved message
         // individually with its own destination and reply/to tokens.
+        let watermarks: Watermarks = Watermarks::default();
         let triage_limit = Arc::new(tokio::sync::Semaphore::new(8));
         let mut triage_inflight: tokio::task::JoinSet<storage::Place> = tokio::task::JoinSet::new();
         let mut triage_active: std::collections::HashSet<storage::Place> =
@@ -2764,13 +2968,22 @@ pub async fn serve_bot(
                 .current()
                 .ok()
                 .and_then(|current| current.utility);
+            let watermarks = watermarks.clone();
             let tx = admitted_tx.clone();
             inflight.spawn(async move {
                 let Ok(_permit) = limit.acquire_owned().await else {
                     return place;
                 };
-                if let Err(error) =
-                    admit_batch(&store, discord, &messengers, batch, utility.as_ref(), &tx).await
+                if let Err(error) = admit_batch(
+                    &store,
+                    discord,
+                    &messengers,
+                    batch,
+                    utility.as_ref(),
+                    &watermarks,
+                    &tx,
+                )
+                .await
                 {
                     let _ = tx.send(Err(error)).await;
                 }
@@ -4245,6 +4458,7 @@ mod tests {
                         id: "bot42".into(),
                         name: "SupportBot".into(),
                     },
+                    bot: false,
                     text: "Try restarting the service.".into(),
                     date: "2026-11-22".into(),
                     attachments: Vec::new(),

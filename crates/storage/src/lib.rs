@@ -452,6 +452,19 @@ pub struct Quote {
     pub attachments: Vec<Attachment>,
 }
 
+/// A conversation message the bot never saw, inlined into the `<message>`
+/// that follows the gap: arrivals while the bot was offline, filtered out,
+/// or predating its first involvement in the place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Missed {
+    pub message: String,
+    pub author: Person,
+    pub date: String,
+    pub text: String,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]
@@ -512,6 +525,15 @@ pub enum Meta {
         quote: Option<Quote>,
         #[serde(default)]
         attachments: Vec<Attachment>,
+        /// Conversation messages missed since the last one the bot saw in
+        /// this place, oldest first; empty when there is no gap.
+        #[serde(default)]
+        missed: Vec<Missed>,
+        /// The gap before this message could not be filled (history fetch
+        /// failed): the durable high-water mark must not advance past it, so
+        /// a later admission retries the range. Transient — never persisted.
+        #[serde(skip)]
+        gap_open: bool,
     },
 }
 
@@ -590,6 +612,29 @@ pub fn render_attachments(attachments: &[Attachment]) -> String {
         .collect()
 }
 
+/// Renders missed conversation messages as a `<missed>` block of compact
+/// `<message>` elements, matching the shape the history lookup tool returns.
+pub fn render_missed(missed: &[Missed]) -> String {
+    if missed.is_empty() {
+        return String::new();
+    }
+    let items: String = missed
+        .iter()
+        .map(|m| {
+            format!(
+                "<message author=\"{}\" author_name=\"{}\" message=\"{}\" date=\"{}\">\n{}{}\n</message>\n",
+                attribute(&m.author.id),
+                attribute(&m.author.name),
+                attribute(&m.message),
+                attribute(&m.date),
+                render_attachments(&m.attachments),
+                escape(&m.text)
+            )
+        })
+        .collect();
+    format!("<missed>\n{items}</missed>\n")
+}
+
 pub fn render_input(meta: Option<&Meta>, i: u64, body: &str, time: Option<&str>) -> String {
     match meta {
         Some(meta) => meta.render_at(i, body, time),
@@ -660,11 +705,12 @@ impl Meta {
                 earlier,
                 quote,
                 attachments,
+                missed,
                 inline,
                 unaddressed,
                 ..
             } => format!(
-                "<message messenger=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}{}{}{}>\n{}{}{body}\n</message>",
+                "<message messenger=\"{}\" reply=\"m{i}\" to=\"d{to}\" author=\"{}\" author_name=\"{}\" where=\"{}\"{}{}{}{}>\n{}{}{}{body}\n</message>",
                 attribute(messenger),
                 attribute(&author.id),
                 attribute(&author.name),
@@ -677,6 +723,7 @@ impl Meta {
                 } else {
                     ""
                 },
+                render_missed(missed),
                 quote.as_ref().map_or_else(String::new, |quote| format!(
                     "<quote author=\"{}\" author_name=\"{}\" message=\"{}\">\n{}{}\n</quote>\n",
                     attribute(&quote.author.id), attribute(&quote.author.name), attribute(&quote.message), render_attachments(&quote.attachments), escape(&quote.text)
@@ -1128,6 +1175,13 @@ pub trait MessengerStore: Send + Sync {
         thread: &str,
     ) -> Result<(), StoreError>;
     fn is_pending_thread(&self, destination: u64) -> Result<bool, StoreError>;
+    /// The newest message id admitted into the bot's session in `place`
+    /// — the high-water mark for missed-gap detection.
+    fn last_seen_message(
+        &self,
+        messenger: &str,
+        place: &Place,
+    ) -> Result<Option<String>, StoreError>;
 }
 
 impl<T: MessengerStore + ?Sized> MessengerStore for std::sync::Arc<T> {
@@ -1254,6 +1308,13 @@ impl<T: MessengerStore + ?Sized> MessengerStore for std::sync::Arc<T> {
     }
     fn is_pending_thread(&self, destination: u64) -> Result<bool, StoreError> {
         (**self).is_pending_thread(destination)
+    }
+    fn last_seen_message(
+        &self,
+        messenger: &str,
+        place: &Place,
+    ) -> Result<Option<String>, StoreError> {
+        (**self).last_seen_message(messenger, place)
     }
 }
 

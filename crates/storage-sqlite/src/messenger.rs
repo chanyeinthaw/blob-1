@@ -495,6 +495,23 @@ impl MessengerStore for SqliteStorage {
             )
             .map_err(backend)
     }
+
+    fn last_seen_message(
+        &self,
+        messenger: &str,
+        place: &Place,
+    ) -> Result<Option<String>, StoreError> {
+        self.lock()
+            .query_row(
+                "SELECT last_message FROM destinations WHERE messenger = ?1 AND channel = ?2 AND thread = ?3",
+                params![messenger, place.channel, place.thread.as_deref().unwrap_or("")],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(backend)
+            .map(|row| row.flatten())
+    }
+
 }
 
 fn normalize_access_rule<'a>(
@@ -1039,6 +1056,8 @@ mod tests {
                     earlier: None,
                     quote: None,
                     attachments: Vec::new(),
+                    missed: Vec::new(),
+                    gap_open: false,
                 })
                 .unwrap()
             };

@@ -73,7 +73,7 @@ Messages sent while you work reach you between tool calls."#;
 
 const MESSENGER_PROMPT: &str = r#"# Messengers
 
-People on messengers only see what you send. Messenger messages have a <message ...>...</message> element with messenger, reply and to tokens, author id and name, where, and earlier messages in the thread. DMs arrive directly. In group channels and threads, you receive mentions and replies to you, and—where interaction mode is set to always—plain group messages marked unaddressed="true".
+People on messengers only see what you send. Messenger messages have a <message ...>...</message> element with messenger, reply and to tokens, author id and name, where, and a count of earlier thread messages. Messages that arrived in the conversation since the last one you saw — while you were offline or filtered out, or before you first joined — are inlined in a <missed> block, oldest first; treat them as context, and answer the message itself, not the missed ones. DMs arrive directly. In group channels and threads, you receive mentions and replies to you, and—where interaction mode is set to always—plain group messages marked unaddressed="true".
 
 Always answer DMs, mentions and replies to you with at least one send. For group-chat messages marked unaddressed="true", people may be talking to each other rather than to you: decide first whether to reply to that message. Chime in when it is aimed at you, continues an exchange with you, or asks for something you should help with; otherwise skip sending a reply to it.
 

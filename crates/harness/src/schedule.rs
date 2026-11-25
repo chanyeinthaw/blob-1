@@ -584,6 +584,8 @@ mod tests {
             attachments: Vec::new(),
             inline: false,
             unaddressed: false,
+            missed: Vec::new(),
+            gap_open: false,
         };
         let rendered_msg = storage::render_input(Some(&msg_meta), 42, "yo", Some(&formatted));
         assert!(rendered_msg.starts_with(

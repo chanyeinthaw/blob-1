@@ -433,6 +433,7 @@ impl SqliteStorage {
         ensure_environments_pending_key(&mut connection, &mut require_exclusive)?;
         ensure_environments_hostname(&mut connection, &mut require_exclusive)?;
         ensure_environments_enrollment(&mut connection, &mut require_exclusive)?;
+        ensure_destinations_last_message(&mut connection, &mut require_exclusive)?;
         ensure_model_enabled(&mut connection, &mut require_exclusive)?;
         migrate_identity_to_instructions(&mut connection, &mut require_exclusive)?;
         migrate_home_to_homes(&mut connection, &mut require_exclusive)?;
@@ -1249,6 +1250,37 @@ fn ensure_environments_enrollment(
              UPDATE environments SET enrollment = randomblob(16) WHERE credential != x'';",
         )
         .map_err(backend)?;
+    }
+    tx.commit().map_err(backend)
+}
+
+/// Accepted destinations gain a `last_message` high-water mark used to
+/// inline missed conversation history; nullable — rows predating the
+/// feature simply have no mark yet.
+fn ensure_destinations_last_message(
+    connection: &mut Connection,
+    require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let has_column = |conn: &Connection| -> Result<bool, StoreError> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('destinations') WHERE name = 'last_message')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(backend)
+    };
+    if has_column(connection)? {
+        return Ok(());
+    }
+    require_exclusive(
+        "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
+    )?;
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    if !has_column(&tx)? {
+        tx.execute_batch("ALTER TABLE destinations ADD COLUMN last_message TEXT;")
+            .map_err(backend)?;
     }
     tx.commit().map_err(backend)
 }
