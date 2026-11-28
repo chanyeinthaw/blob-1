@@ -450,6 +450,9 @@ where
     if let Some(secrets) = &inner.secrets {
         session = session.with_secret_tools(secrets.clone());
     }
+    if let Some(modes) = &inner.skill_modes {
+        session = session.with_skill_modes(Arc::clone(modes));
+    }
     if let Some(mcp) = &inner.mcp {
         let tools = match &inner.mcp_filter {
             Some(filter) => mcp::SessionTools::with_filter(mcp.clone(), Arc::clone(filter)),

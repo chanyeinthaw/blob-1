@@ -218,6 +218,15 @@ CREATE TABLE IF NOT EXISTS bot_mcp_disabled (
     PRIMARY KEY (bot_id, server_id)
 ) STRICT, WITHOUT ROWID;
 
+-- Keyed by skill name, not `skills`: detected skills exist only on disk.
+-- A missing row means the bot uses the skill in chat and tasks.
+CREATE TABLE IF NOT EXISTS bot_skill_modes (
+    bot_id TEXT NOT NULL REFERENCES bots (id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK (mode IN ('chat','task','off')),
+    PRIMARY KEY (bot_id, name)
+) STRICT, WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS mcp_servers (
     id TEXT PRIMARY KEY,
     transport TEXT NOT NULL CHECK (transport IN ('stdio','http')),

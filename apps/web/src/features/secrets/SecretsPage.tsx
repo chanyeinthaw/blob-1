@@ -49,7 +49,7 @@ export function SecretsPage(props: SecretsPageProps) {
     onInitial: () => (
       <SplitDetail
         title="Secrets"
-        wide
+        width="wide"
         isListView={false}
         backTo="/settings/bots/$botId"
         backParams={{ botId: props.botId }}
@@ -61,7 +61,7 @@ export function SecretsPage(props: SecretsPageProps) {
     onFailure: failure => (
       <SplitDetail
         title="Secrets"
-        wide
+        width="wide"
         isListView={false}
         backTo="/settings/bots/$botId"
         backParams={{ botId: props.botId }}
@@ -101,7 +101,7 @@ function SecretsContent(props: SecretsContentProps) {
   return (
     <SplitDetail
       title="Secrets"
-      wide
+      width="wide"
       isListView={false}
       backTo="/settings/bots/$botId"
       backParams={{ botId: props.botId }}

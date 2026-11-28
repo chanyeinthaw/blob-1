@@ -418,6 +418,65 @@ impl BotStore for SqliteStorage {
         Ok(ids)
     }
 
+    fn bot_skill_modes(
+        &self,
+        bot_id: &str,
+    ) -> Result<std::collections::BTreeMap<String, storage::SkillMode>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT name, mode FROM bot_skill_modes WHERE bot_id = ?1")
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([bot_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?;
+        rows.into_iter()
+            .map(|(name, mode)| {
+                storage::SkillMode::parse(&mode)
+                    .map(|mode| (name, mode))
+                    .ok_or_else(|| StoreError::Invalid(format!("invalid skill mode '{mode}'")))
+            })
+            .collect()
+    }
+
+    fn set_bot_skill_mode(
+        &self,
+        bot_id: &str,
+        name: &str,
+        mode: storage::SkillMode,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock();
+        match mode {
+            storage::SkillMode::Both => conn.execute(
+                "DELETE FROM bot_skill_modes WHERE bot_id = ?1 AND name = ?2",
+                params![bot_id, name],
+            ),
+            mode => conn.execute(
+                "INSERT INTO bot_skill_modes (bot_id, name, mode) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (bot_id, name) DO UPDATE SET mode = excluded.mode",
+                params![bot_id, name, mode.as_str()],
+            ),
+        }
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    fn clear_skill_modes(&self, name: &str, bot_id: Option<&str>) -> Result<(), StoreError> {
+        let conn = self.lock();
+        match bot_id {
+            Some(bot_id) => conn.execute(
+                "DELETE FROM bot_skill_modes WHERE bot_id = ?1 AND name = ?2",
+                params![bot_id, name],
+            ),
+            None => conn.execute("DELETE FROM bot_skill_modes WHERE name = ?1", [name]),
+        }
+        .map_err(backend)?;
+        Ok(())
+    }
+
     fn set_bot_environment(
         &self,
         bot_id: &str,

@@ -4,7 +4,13 @@ import { type ReactNode, useEffect, useRef } from 'react'
 
 import { cn } from '~/lib/utils'
 
-import { focusRingClassName, panelClassName, scrollClassName } from './Page'
+import {
+  type ColumnWidth,
+  columnClassName,
+  focusRingClassName,
+  panelClassName,
+  scrollClassName,
+} from './Page'
 
 interface SplitPageProps {
   readonly title: string
@@ -74,7 +80,7 @@ interface SplitDetailProps {
   readonly backParams?: LinkProps['params']
   readonly backLabel: string
   readonly actions?: ReactNode
-  readonly wide?: boolean
+  readonly width?: ColumnWidth
   readonly children: ReactNode
 }
 
@@ -88,17 +94,12 @@ export function SplitDetail(props: SplitDetailProps) {
     prevIsListView.current = props.isListView
   }, [props.isListView])
 
-  const columnWidth = props.wide === true ? 'max-w-[1120px]' : 'max-w-[720px]'
+  const columnWidth = columnClassName[props.width ?? 'form']
 
   return (
     <section className="flex min-w-0 flex-1 flex-col group-data-[list-view=true]/split:hidden md:group-data-[list-view=true]/split:flex">
       <div className="shrink-0 px-5 pt-5 pb-4 md:px-8 md:py-4">
-        <div
-          className={cn(
-            'flex w-full flex-wrap items-center gap-x-1.5 gap-y-2 md:min-h-8 md:gap-x-3',
-            columnWidth,
-          )}
-        >
+        <div className="flex w-full flex-wrap items-center gap-x-1.5 gap-y-2 md:min-h-8 md:gap-x-3">
           <Link
             to={props.backTo}
             {...(props.backParams !== undefined ? { params: props.backParams } : {})}
@@ -114,7 +115,7 @@ export function SplitDetail(props: SplitDetailProps) {
             <h2
               ref={headingRef}
               tabIndex={-1}
-              className="mr-auto text-2xl font-semibold tracking-tight outline-none"
+              className="mr-auto text-lg font-semibold tracking-tight outline-none"
             >
               {props.title}
             </h2>
@@ -122,7 +123,7 @@ export function SplitDetail(props: SplitDetailProps) {
             <h1
               ref={headingRef}
               tabIndex={-1}
-              className="mr-auto text-2xl font-semibold tracking-tight outline-none"
+              className="mr-auto text-lg font-semibold tracking-tight outline-none"
             >
               {props.title}
             </h1>

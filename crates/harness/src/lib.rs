@@ -23,7 +23,7 @@ pub use llm::{CompletionRequest, CompletionResponse, Llm, LlmError, ToolCallRequ
 pub use prompt::SUB_PROMPT;
 pub use session::{
     CompactionConfig, EnvironmentPaths, HarnessConfig, HarnessError, MemoryTools, SessionHarness,
-    Step,
+    SkillModes, Step,
 };
 
 /// Stable FNV-1a 64-bit hash used to build compact (<= 64 char) upstream

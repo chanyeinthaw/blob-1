@@ -51,6 +51,7 @@ Your tools:
 - tasks lists tasks with their status and what each is doing now
 - tell sends a task a message: it steers a running task, or follows up on a finished one
 - stop stops a running task
+- skill loads one of the chat_skills listed below
 
 When tool calls do not depend on each other, make them together in one response (for example, a send and a spawn); they run in order.
 
@@ -129,6 +130,17 @@ pub(crate) const EXTRA: &[ToolSpec] = &[
     },
 ];
 
+/// Offered only when the bot has skills chat may use.
+const SKILL: ToolSpec = ToolSpec {
+    name: Cow::Borrowed("skill"),
+    description: Cow::Borrowed(
+        "Load a skill's instructions by name from chat_skills. A long skill comes in parts; pass the offset it names to continue.",
+    ),
+    input_schema: Cow::Borrowed(
+        r#"{"type":"object","properties":{"name":{"type":"string"},"offset":{"type":"integer"}},"required":["name"]}"#,
+    ),
+};
+
 pub trait Models: Send + Sync + 'static {
     type Llm: Llm + Send + Sync + 'static;
     fn list(&self, search: Option<&str>) -> Result<String, HarnessError>;
@@ -192,6 +204,15 @@ impl<T: Environment> Environment for Shared<T> {
     async fn skill_catalog(&self) -> Result<Vec<environment::SkillEntry>, environment::ToolError> {
         self.0.skill_catalog().await
     }
+    async fn remove_detected_skill(&self, folder: &str) -> Result<(), environment::ToolError> {
+        self.0.remove_detected_skill(folder).await
+    }
+    async fn read_detected_skill(
+        &self,
+        folder: &str,
+    ) -> Result<Vec<environment::SkillFile>, environment::ToolError> {
+        self.0.read_detected_skill(folder).await
+    }
     async fn execute(
         &self,
         call: ToolCall,
@@ -232,6 +253,7 @@ pub(crate) struct Inner<E, S, M, F: Models> {
     pub secrets: Option<crate::SecretTools>,
     pub mcp: Option<mcp::Mcp>,
     pub mcp_filter: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+    pub skill_modes: Option<crate::session::SkillModes>,
     pub config: Arc<dyn ConfigStore>,
     pub pulses: Mutex<Vec<(u64, tokio::task::Id)>>,
     pub schedule_gate: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -296,6 +318,12 @@ struct Stop {
     reason: Option<String>,
 }
 #[derive(Deserialize)]
+struct SkillArgs {
+    name: String,
+    /// Line to continue from when a long skill was cut off.
+    offset: Option<usize>,
+}
+#[derive(Deserialize)]
 struct Tell {
     task: String,
     text: String,
@@ -337,6 +365,7 @@ where
                 secrets: None,
                 mcp: None,
                 mcp_filter: None,
+                skill_modes: None,
                 config: Arc::clone(&config),
                 pulses: Mutex::new(Vec::new()),
                 schedule_gate: None,
@@ -392,6 +421,13 @@ where
     ) -> Self {
         let inner = Arc::get_mut(&mut self.inner).expect("unshared chat");
         inner.mcp_filter = Some(filter);
+        self
+    }
+
+    /// Applies the bot's skill modes to chat's `skill` tool and to its tasks.
+    pub fn with_skill_modes(mut self, modes: crate::session::SkillModes) -> Self {
+        let inner = Arc::get_mut(&mut self.inner).expect("unshared chat");
+        inner.skill_modes = Some(modes);
         self
     }
 
@@ -574,7 +610,11 @@ where
     async fn turn_loop(&self, text: &str, view: String) -> Result<String, HarnessError> {
         // The turn keeps the model it starts on; the next turn resolves again.
         let (llm, _, _) = self.inner.models.connect(None, None)?;
-        let skills = self.inner.environment.skill_catalog().await?;
+        let catalog = self.inner.environment.skill_catalog().await?;
+        let modes = self.inner.skill_modes.as_ref();
+        let chat_skills =
+            crate::session::usable_skills(catalog.clone(), modes, storage::SkillMode::chat)?;
+        let task_skills = crate::session::usable_skills(catalog, modes, storage::SkillMode::task)?;
         let mcp_servers = match &self.inner.mcp {
             Some(mcp) => match &self.inner.mcp_filter {
                 Some(allowed) => mcp.describe_filtered(allowed.as_ref()).await,
@@ -593,7 +633,12 @@ where
             } else {
                 String::new()
             },
-            prompt::build_chat(&self.inner.paths.workspace, &skills, &mcp_servers)
+            prompt::build_chat(
+                &self.inner.paths.workspace,
+                &chat_skills,
+                &task_skills,
+                &mcp_servers
+            )
         );
         let mut messages = vec![Message::User(view), Message::User(text.to_owned())];
         let mut tools = EXTRA.to_vec();
@@ -604,6 +649,9 @@ where
         }
         if self.inner.secrets.is_some() {
             tools.push(crate::secret::REQUEST);
+        }
+        if !chat_skills.is_empty() {
+            tools.push(SKILL);
         }
         let cache_key = crate::prompt_cache_key("chat", &self.inner.paths.workspace, "");
         loop {
@@ -684,7 +732,7 @@ where
                     Ok(result) => result,
                     Err(error) => format!("error: {error}"),
                 };
-                let content = if call.name == "zoom" {
+                let content = if call.name == "zoom" || call.name == "skill" {
                     content
                 } else {
                     memory::clip_tool_output(&content)
@@ -734,6 +782,35 @@ where
                 tasks::spawn(&self.inner, args.tasks).await?.join(", ")
             }
             "tasks" => tasks::list(&self.inner)?,
+            "skill" => {
+                let args: SkillArgs = serde_json::from_str(&call.arguments)?;
+                let entry = crate::session::usable_skills(
+                    self.inner.environment.skill_catalog().await?,
+                    self.inner.skill_modes.as_ref(),
+                    storage::SkillMode::chat,
+                )?
+                .into_iter()
+                .find(|skill| skill.name == args.name)
+                .ok_or_else(|| format!("no skill named {}", args.name))?;
+                let read = self
+                    .inner
+                    .environment
+                    .execute(environment::ToolCall {
+                        id: call.id.clone(),
+                        input: environment::ToolInput::Read {
+                            path: entry.location.clone(),
+                            offset: args.offset,
+                            limit: None,
+                        },
+                    })
+                    .await?;
+                let dir = entry.location.parent().unwrap_or(&entry.location);
+                format!(
+                    "{}\n\nFiles this skill refers to are in {}; tasks can read them.",
+                    read.content,
+                    dir.display()
+                )
+            }
             "request_secret" => match &self.inner.secrets {
                 Some(secrets) => secrets.request(&call.arguments)?,
                 None => return Err("secrets are not available".into()),

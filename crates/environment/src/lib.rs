@@ -8,17 +8,29 @@ pub fn valid_skill_name(name: &str) -> bool {
 
 pub const SKILL_FILE: &str = "SKILL.md";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Frontmatter {
     pub name: String,
     pub description: String,
 }
 
+/// Reads the header of a `SKILL.md`; `None` when it is missing or lacks a
+/// non-empty `name` and `description`. The header is YAML, but hand-written
+/// ones often carry unquoted `: ` in a description, which YAML rejects; those
+/// are read one `key: value` line at a time instead.
 pub fn parse_frontmatter(content: &str) -> Option<Frontmatter> {
     let body = content
         .strip_prefix("---")?
         .trim_start_matches(['\r', '\n']);
     let header = &body[..body.find("\n---")?];
+    let Frontmatter { name, description } =
+        serde_yaml_ng::from_str(header).ok().or_else(|| parse_lines(header))?;
+    let name = name.trim().to_owned();
+    let description = description.trim().to_owned();
+    (!name.is_empty() && !description.is_empty()).then_some(Frontmatter { name, description })
+}
+
+fn parse_lines(header: &str) -> Option<Frontmatter> {
     let mut name = None;
     let mut description = None;
     for line in header.lines() {
@@ -33,8 +45,8 @@ pub fn parse_frontmatter(content: &str) -> Option<Frontmatter> {
         }
     }
     Some(Frontmatter {
-        name: name.filter(|name| !name.is_empty())?,
-        description: description.filter(|description| !description.is_empty())?,
+        name: name?,
+        description: description?,
     })
 }
 
@@ -58,6 +70,9 @@ pub struct SkillEntry {
     pub name: String,
     pub description: String,
     pub location: PathBuf,
+    /// Synced from the bot's database rather than found on the machine.
+    #[serde(default)]
+    pub managed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -214,6 +229,11 @@ pub trait Environment: Send + Sync {
         remove: Vec<String>,
     ) -> Result<Vec<String>, ToolError>;
     async fn skill_catalog(&self) -> Result<Vec<SkillEntry>, ToolError>;
+    /// Deletes a user-owned skill folder from the skills dir. Managed skills
+    /// are refused: they leave through `apply_skills`.
+    async fn remove_detected_skill(&self, folder: &str) -> Result<(), ToolError>;
+    /// Reads a user-owned skill folder's files, paths relative to the folder.
+    async fn read_detected_skill(&self, folder: &str) -> Result<Vec<SkillFile>, ToolError>;
     async fn execute(&self, call: ToolCall) -> Result<ToolResult, ToolError>;
     /// Writes a secret's value to a private file outside the workspace that
     /// the environment deletes after `ttl`; returns the file's absolute path.
@@ -239,6 +259,12 @@ impl Environment for std::sync::Arc<dyn Environment> {
     }
     async fn skill_catalog(&self) -> Result<Vec<SkillEntry>, ToolError> {
         (**self).skill_catalog().await
+    }
+    async fn remove_detected_skill(&self, folder: &str) -> Result<(), ToolError> {
+        (**self).remove_detected_skill(folder).await
+    }
+    async fn read_detected_skill(&self, folder: &str) -> Result<Vec<SkillFile>, ToolError> {
+        (**self).read_detected_skill(folder).await
     }
     async fn execute(&self, call: ToolCall) -> Result<ToolResult, ToolError> {
         (**self).execute(call).await

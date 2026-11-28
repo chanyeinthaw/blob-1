@@ -89,12 +89,12 @@ export function ModelsPage() {
   const retry = useAtomRefresh(modelsCatalogAtom)
   return matchCached(result, {
     onInitial: () => (
-      <Page title="Model catalog" wide>
+      <Page title="Model catalog" width="wide">
         <EmptyLine>Loading…</EmptyLine>
       </Page>
     ),
     onFailure: failure => (
-      <Page title="Model catalog" wide>
+      <Page title="Model catalog" width="wide">
         <PageError cause={failure.cause} onRetry={retry} />
       </Page>
     ),
@@ -433,7 +433,7 @@ function ModelsLoaded() {
   return (
     <Page
       title="Model catalog"
-      wide
+      width="wide"
       wideActions
       actions={<FilterBar filters={filters} onChange={apply} />}
     >

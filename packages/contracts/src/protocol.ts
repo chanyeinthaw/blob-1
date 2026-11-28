@@ -237,6 +237,50 @@ export const BotMcpState = Schema.Struct({
 })
 export type BotMcpState = typeof BotMcpState.Type
 
+export const BotSkillMode = Schema.Literals(['both', 'chat', 'task', 'off'])
+export type BotSkillMode = typeof BotSkillMode.Type
+
+export const BotSkill = Schema.Struct({
+  name: Schema.String,
+  description: Schema.String,
+  source: Schema.Literals(['managed', 'detected']),
+  mode: BotSkillMode,
+})
+export type BotSkill = typeof BotSkill.Type
+
+/** A skill's full description, `SKILL.md` body without frontmatter, and other file paths. */
+export const BotSkillDetail = Schema.Struct({
+  name: Schema.String,
+  description: Schema.String,
+  source: Schema.Literals(['managed', 'detected']),
+  content: Schema.String,
+  files: Schema.Array(Schema.String),
+})
+export type BotSkillDetail = typeof BotSkillDetail.Type
+
+export const BotSkillsState = Schema.Struct({
+  skills: Schema.Array(BotSkill),
+})
+export type BotSkillsState = typeof BotSkillsState.Type
+
+export const GithubSkillPreview = Schema.Struct({
+  folder: Schema.String,
+  name: Schema.String,
+  description: Schema.String,
+  files: Schema.Finite,
+  bytes: Schema.Finite,
+  conflict: Schema.NullOr(Schema.Literals(['managed', 'detected'])),
+})
+export type GithubSkillPreview = typeof GithubSkillPreview.Type
+
+export const GithubSkillsPreview = Schema.Struct({
+  repo: Schema.String,
+  commit: Schema.String,
+  path: Schema.String,
+  skills: Schema.Array(GithubSkillPreview),
+})
+export type GithubSkillsPreview = typeof GithubSkillsPreview.Type
+
 export const DiscordInteractionScope = Schema.Literals(['channel', 'user', 'server'])
 export type DiscordInteractionScope = typeof DiscordInteractionScope.Type
 
@@ -459,6 +503,36 @@ export const requests = {
     reply: Schema.Array(BotSummary),
   },
   'bot.mcp.get': { payload: BotScopedPayload, reply: BotMcpState },
+  'bot.skills.list': { payload: BotScopedPayload, reply: BotSkillsState },
+  'bot.skills.setMode': {
+    payload: Schema.Struct({ ...botIdField, name: Schema.String, mode: BotSkillMode }),
+    reply: BotSkillsState,
+  },
+  'bot.skills.remove': {
+    payload: Schema.Struct({ ...botIdField, name: Schema.String }),
+    reply: BotSkillsState,
+  },
+  'bot.skills.githubPreview': {
+    payload: Schema.Struct({ ...botIdField, url: Schema.String, path: Schema.String }),
+    reply: GithubSkillsPreview,
+  },
+  'bot.skills.githubImport': {
+    payload: Schema.Struct({
+      ...botIdField,
+      repo: Schema.String,
+      commit: Schema.String,
+      folders: Schema.Array(Schema.String),
+    }),
+    reply: BotSkillsState,
+  },
+  'bot.skills.read': {
+    payload: Schema.Struct({ ...botIdField, name: Schema.String }),
+    reply: BotSkillDetail,
+  },
+  'bot.skills.adopt': {
+    payload: Schema.Struct({ ...botIdField, name: Schema.String }),
+    reply: BotSkillsState,
+  },
   'bot.mcp.setEnabled': {
     payload: Schema.Struct({ ...botIdField, id: Schema.String, enabled: Schema.Boolean }),
     reply: BotMcpState,

@@ -34,15 +34,23 @@ impl Drop for ProcessGroup {
 
 pub struct LocalEnvironment {
     root: PathBuf,
-    skills_dir: PathBuf,
+    /// This bot's managed skills, synced from its database.
+    managed_dir: PathBuf,
+    /// The machine's own skills (`~/.agents/skills` by default), shown as detected.
+    shared_dir: PathBuf,
     /// Where `write_secret` puts its files; `None` disables secrets.
     secrets_dir: Option<PathBuf>,
 }
 
 impl LocalEnvironment {
-    pub fn new(root: impl Into<PathBuf>, skills_dir: Option<PathBuf>) -> Result<Self, ToolError> {
+    /// `shared_dir` defaults to `~/.agents/skills`.
+    pub fn new(
+        root: impl Into<PathBuf>,
+        managed_dir: PathBuf,
+        shared_dir: Option<PathBuf>,
+    ) -> Result<Self, ToolError> {
         let root = root.into().canonicalize().map_err(io_error)?;
-        let skills_dir = match skills_dir {
+        let shared_dir = match shared_dir {
             Some(dir) => dir,
             None => PathBuf::from(
                 std::env::var_os("HOME")
@@ -50,13 +58,37 @@ impl LocalEnvironment {
             )
             .join(".agents/skills"),
         };
-        std::fs::create_dir_all(&skills_dir).map_err(io_error)?;
-        let skills_dir = skills_dir.canonicalize().map_err(io_error)?;
+        let canonical = |dir: PathBuf| {
+            std::fs::create_dir_all(&dir).map_err(io_error)?;
+            dir.canonicalize().map_err(io_error)
+        };
         Ok(Self {
             root,
-            skills_dir,
+            managed_dir: canonical(managed_dir)?,
+            shared_dir: canonical(shared_dir)?,
             secrets_dir: None,
         })
+    }
+
+    /// Managed skills used to sync into the shared dir with a `.managed.json`
+    /// manifest; deletes those copies so they don't show up as detected.
+    pub async fn forget_legacy_managed(&self) -> Result<(), ToolError> {
+        let manifest = self.shared_dir.join(".managed.json");
+        let data = match tokio::fs::read(&manifest).await {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io_error(e)),
+        };
+        let names: BTreeMap<String, String> =
+            serde_json::from_slice(&data).map_err(|e| ToolError::Invalid(e.to_string()))?;
+        for name in names.keys().filter(|name| valid_skill_name(name)) {
+            match tokio::fs::remove_dir_all(self.shared_dir.join(name)).await {
+                Ok(()) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(io_error(e)),
+            }
+        }
+        tokio::fs::remove_file(manifest).await.map_err(io_error)
     }
 
     /// Enables `write_secret`, writing its files under `dir`.
@@ -66,7 +98,7 @@ impl LocalEnvironment {
     }
 
     async fn read_manifest(&self) -> Result<BTreeMap<String, String>, ToolError> {
-        match tokio::fs::read(self.skills_dir.join(".managed.json")).await {
+        match tokio::fs::read(self.managed_dir.join(".managed.json")).await {
             Ok(data) => {
                 serde_json::from_slice(&data).map_err(|e| ToolError::Invalid(e.to_string()))
             }
@@ -76,10 +108,10 @@ impl LocalEnvironment {
     }
 
     async fn write_manifest(&self, manifest: &BTreeMap<String, String>) -> Result<(), ToolError> {
-        let temp = temporary_path(&self.skills_dir);
+        let temp = temporary_path(&self.managed_dir);
         let data = serde_json::to_vec(manifest).map_err(|e| ToolError::Invalid(e.to_string()))?;
         tokio::fs::write(&temp, data).await.map_err(io_error)?;
-        tokio::fs::rename(temp, self.skills_dir.join(".managed.json"))
+        tokio::fs::rename(temp, self.managed_dir.join(".managed.json"))
             .await
             .map_err(io_error)
     }
@@ -669,7 +701,7 @@ impl Environment for LocalEnvironment {
             .await?
             .into_iter()
             .map(|(name, hash)| {
-                let installed = self.skills_dir.join(&name).join(SKILL_FILE).is_file();
+                let installed = self.managed_dir.join(&name).join(SKILL_FILE).is_file();
                 (name, (hash, installed))
             })
             .collect())
@@ -684,7 +716,7 @@ impl Environment for LocalEnvironment {
             validate_name(name)?;
         }
         let mut manifest = self.read_manifest().await?;
-        tokio::fs::create_dir_all(&self.skills_dir)
+        tokio::fs::create_dir_all(&self.managed_dir)
             .await
             .map_err(io_error)?;
         let mut skipped = Vec::new();
@@ -707,12 +739,12 @@ impl Environment for LocalEnvironment {
                     )));
                 }
             }
-            let dest = self.skills_dir.join(&bundle.name);
+            let dest = self.managed_dir.join(&bundle.name);
             if dest.symlink_metadata().is_ok() && !manifest.contains_key(&bundle.name) {
                 skipped.push(bundle.name);
                 continue;
             }
-            let temp = temporary_path(&self.skills_dir);
+            let temp = temporary_path(&self.managed_dir);
             tokio::fs::create_dir(&temp).await.map_err(io_error)?;
             for file in bundle.files {
                 let path = temp.join(file.path);
@@ -735,7 +767,7 @@ impl Environment for LocalEnvironment {
         }
         for name in remove {
             if manifest.remove(&name).is_some() {
-                match tokio::fs::remove_dir_all(self.skills_dir.join(name)).await {
+                match tokio::fs::remove_dir_all(self.managed_dir.join(name)).await {
                     Ok(()) => (),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
                     Err(e) => return Err(io_error(e)),
@@ -746,30 +778,48 @@ impl Environment for LocalEnvironment {
         Ok(skipped)
     }
 
+    async fn remove_detected_skill(&self, folder: &str) -> Result<(), ToolError> {
+        validate_name(folder)?;
+        let path = self.shared_dir.join(folder);
+        let metadata = tokio::fs::symlink_metadata(&path)
+            .await
+            .map_err(|_| ToolError::NotFound(folder.to_owned()))?;
+        // A linked skill loses only its link; the target belongs to someone else.
+        if metadata.is_dir() {
+            tokio::fs::remove_dir_all(&path).await
+        } else {
+            tokio::fs::remove_file(&path).await
+        }
+        .map_err(io_error)
+    }
+
+    async fn read_detected_skill(
+        &self,
+        folder: &str,
+    ) -> Result<Vec<environment::SkillFile>, ToolError> {
+        validate_name(folder)?;
+        // The folder itself may be a link; links inside it are refused.
+        let root = self
+            .shared_dir
+            .join(folder)
+            .canonicalize()
+            .map_err(|_| ToolError::NotFound(folder.to_owned()))?;
+        tokio::task::spawn_blocking(move || {
+            let mut files = Vec::new();
+            read_skill_dir(&root, &root, &mut files)?;
+            Ok(files)
+        })
+        .await
+        .map_err(|e| ToolError::Io(e.to_string()))?
+    }
+
     async fn skill_catalog(&self) -> Result<Vec<SkillEntry>, ToolError> {
-        let mut entries = match tokio::fs::read_dir(&self.skills_dir).await {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(io_error(e)),
-        };
-        let mut skills = Vec::new();
-        while let Some(entry) = entries.next_entry().await.map_err(io_error)? {
-            if entry.file_name().to_string_lossy().starts_with('.') {
-                continue;
+        let mut skills = scan_skills(&self.managed_dir, true).await?;
+        // A managed skill hides a detected one with the same name.
+        for skill in scan_skills(&self.shared_dir, false).await? {
+            if !skills.iter().any(|managed| managed.name == skill.name) {
+                skills.push(skill);
             }
-            let path = self.skills_dir.join(entry.file_name()).join(SKILL_FILE);
-            let Ok(content) = tokio::fs::read_to_string(&path).await else {
-                continue;
-            };
-            let Some(frontmatter) = parse_frontmatter(&content) else {
-                continue;
-            };
-            let location = path;
-            skills.push(SkillEntry {
-                name: frontmatter.name,
-                description: frontmatter.description,
-                location,
-            });
         }
         skills.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(skills)
@@ -829,6 +879,66 @@ impl Environment for LocalEnvironment {
             images: Vec::new(),
         })
     }
+}
+
+async fn scan_skills(dir: &Path, managed: bool) -> Result<Vec<SkillEntry>, ToolError> {
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(io_error(e)),
+    };
+    let mut skills = Vec::new();
+    while let Some(entry) = entries.next_entry().await.map_err(io_error)? {
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let location = dir.join(entry.file_name()).join(SKILL_FILE);
+        let Ok(content) = tokio::fs::read_to_string(&location).await else {
+            continue;
+        };
+        let Some(frontmatter) = parse_frontmatter(&content) else {
+            continue;
+        };
+        skills.push(SkillEntry {
+            name: frontmatter.name,
+            description: frontmatter.description,
+            location,
+            managed,
+        });
+    }
+    Ok(skills)
+}
+
+fn read_skill_dir(
+    root: &Path,
+    dir: &Path,
+    files: &mut Vec<environment::SkillFile>,
+) -> Result<(), ToolError> {
+    for entry in std::fs::read_dir(dir).map_err(io_error)? {
+        let path = entry.map_err(io_error)?.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(io_error)?;
+        if metadata.is_dir() {
+            read_skill_dir(root, &path, files)?;
+        } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .ok()
+                .and_then(Path::to_str)
+                .ok_or_else(|| ToolError::Invalid(format!("unsupported path: {}", path.display())))?
+                .to_owned();
+            files.push(environment::SkillFile {
+                path: relative,
+                mode: metadata.permissions().mode() & 0o777,
+                content: std::fs::read(&path).map_err(io_error)?,
+            });
+        } else {
+            return Err(ToolError::Invalid(format!(
+                "unsupported file type (including symlinks): {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_name(name: &str) -> Result<(), ToolError> {

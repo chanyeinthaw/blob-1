@@ -670,6 +670,21 @@ fn bot_mcp_reply(global_store: &SqliteStorage, bot_id: &str) -> crate::Result<Va
     Ok(json!({ "servers": items }))
 }
 
+fn bot_skills_reply(skills: Vec<crate::run::BotSkill>) -> Value {
+    let skills: Vec<Value> = skills
+        .into_iter()
+        .map(|skill| {
+            json!({
+                "name": skill.name,
+                "description": skill.description,
+                "source": if skill.managed { "managed" } else { "detected" },
+                "mode": skill.mode.as_str(),
+            })
+        })
+        .collect();
+    json!({ "skills": skills })
+}
+
 fn connection_json(conn: messenger_discord::Connection) -> Value {
     match conn {
         messenger_discord::Connection::Off => json!({"state":"off"}),
@@ -1000,6 +1015,88 @@ async fn dispatch(
                 ctx.nodes.rename(name, to).await?;
                 ctx.bots.restart_environment(to).await?;
                 environments_reply(ctx)
+            }
+            "bot.skills.list" => {
+                resolve_bot(ctx, payload, bot_id).await?;
+                Ok(bot_skills_reply(ctx.bots.skill_catalog(bot_id).await?))
+            }
+            "bot.skills.setMode" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let name = get("name")?;
+                let mode = storage::SkillMode::parse(get("mode")?).ok_or_else(invalid)?;
+                let _guard = ctx.settings_lock.lock().await;
+                recheck_bot_generation(global, payload, bot_id, Some(bot.generation))?;
+                Ok(bot_skills_reply(
+                    ctx.bots.set_skill_mode(bot_id, name, mode).await?,
+                ))
+            }
+            "bot.skills.read" => {
+                resolve_bot(ctx, payload, bot_id).await?;
+                let (skill, content, files) = ctx.bots.read_skill(bot_id, get("name")?).await?;
+                Ok(json!({
+                    "name": skill.name,
+                    "description": skill.description,
+                    "source": if skill.managed { "managed" } else { "detected" },
+                    "content": content,
+                    "files": files,
+                }))
+            }
+            "bot.skills.adopt" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let name = get("name")?;
+                let _guard = ctx.settings_lock.lock().await;
+                recheck_bot_generation(global, payload, bot_id, Some(bot.generation))?;
+                Ok(bot_skills_reply(ctx.bots.adopt_skill(bot_id, name).await?))
+            }
+            "bot.skills.githubPreview" => {
+                resolve_bot(ctx, payload, bot_id).await?;
+                let (source, skills) = ctx
+                    .bots
+                    .preview_github_skills(bot_id, get("url")?, get("path")?)
+                    .await?;
+                let skills: Vec<Value> = skills
+                    .into_iter()
+                    .map(|preview| {
+                        json!({
+                            "folder": preview.skill.folder,
+                            "name": preview.skill.name,
+                            "description": preview.skill.description,
+                            "files": preview.skill.files,
+                            "bytes": preview.skill.bytes,
+                            "conflict": preview.conflict.map(|managed| if managed { "managed" } else { "detected" }),
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "repo": source.repo,
+                    "commit": source.commit,
+                    "path": source.path,
+                    "skills": skills,
+                }))
+            }
+            "bot.skills.githubImport" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let folders: Vec<String> = payload
+                    .get("folders")
+                    .and_then(Value::as_array)
+                    .ok_or_else(invalid)?
+                    .iter()
+                    .map(|folder| folder.as_str().map(str::to_owned).ok_or_else(invalid))
+                    .collect::<std::result::Result<_, _>>()?;
+                let _guard = ctx.settings_lock.lock().await;
+                recheck_bot_generation(global, payload, bot_id, Some(bot.generation))?;
+                Ok(bot_skills_reply(
+                    ctx.bots
+                        .import_github_skills(bot_id, get("repo")?, get("commit")?, &folders)
+                        .await?,
+                ))
+            }
+            "bot.skills.remove" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let name = get("name")?;
+                let _guard = ctx.settings_lock.lock().await;
+                recheck_bot_generation(global, payload, bot_id, Some(bot.generation))?;
+                Ok(bot_skills_reply(ctx.bots.remove_skill(bot_id, name).await?))
             }
             "bot.mcp.get" => {
                 resolve_bot(ctx, payload, bot_id).await?;
@@ -2694,6 +2791,7 @@ mod public_file_tests {
             bots,
             nodes: ctx_nodes(store.clone()),
             settings_lock: tokio::sync::Mutex::new(()),
+            avatar_lock: tokio::sync::Mutex::new(()),
             mcp,
             public_url: Some(public_url("https://blob-1.example.com").unwrap()),
         };
@@ -2801,6 +2899,7 @@ mod public_file_tests {
             bots,
             nodes: ctx_nodes(store.clone()),
             settings_lock: tokio::sync::Mutex::new(()),
+            avatar_lock: tokio::sync::Mutex::new(()),
             mcp,
             public_url: Some(public_url("https://blob-1.example.com").unwrap()),
         });

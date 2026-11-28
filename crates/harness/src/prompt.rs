@@ -105,26 +105,39 @@ pub fn build(workspace: &Path, skills: &[SkillEntry], mcp: &[(String, String)]) 
     sections.join("\n\n")
 }
 
-pub fn build_chat(workspace: &Path, skills: &[SkillEntry], mcp: &[(String, String)]) -> String {
+/// `chat_skills` are the ones chat may load with `skill`; `task_skills` the
+/// ones its tasks see.
+pub fn build_chat(
+    workspace: &Path,
+    chat_skills: &[SkillEntry],
+    task_skills: &[SkillEntry],
+    mcp: &[(String, String)],
+) -> String {
     let mut sections = vec![format!("Working directory: {}", workspace.display())];
-    if !skills.is_empty() {
-        let entries = skills
-            .iter()
-            .map(|skill| {
-                format!(
-                    "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n  </skill>",
-                    escape(&skill.name),
-                    escape(&skill.description)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        sections.push(format!("Tasks can load these skills; name the skill in the task when it fits.\n\n<available_skills>\n{entries}\n</available_skills>"));
+    if !chat_skills.is_empty() {
+        sections.push(format!("Skills hold specialized instructions. When a request matches one of these skills, load it with skill before acting.\n\n<chat_skills>\n{}\n</chat_skills>", skill_list(chat_skills)));
+    }
+    if !task_skills.is_empty() {
+        sections.push(format!("Tasks can load these skills; name the skill in the task when it fits.\n\n<task_skills>\n{}\n</task_skills>", skill_list(task_skills)));
     }
     if let Some(section) = mcp_section_for_chat(mcp) {
         sections.push(section);
     }
     sections.join("\n\n")
+}
+
+fn skill_list(skills: &[SkillEntry]) -> String {
+    skills
+        .iter()
+        .map(|skill| {
+            format!(
+                "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n  </skill>",
+                escape(&skill.name),
+                escape(&skill.description)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn escape(text: &str) -> String {

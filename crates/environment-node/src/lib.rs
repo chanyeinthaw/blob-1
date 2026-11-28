@@ -395,6 +395,8 @@ fn is_skills(request: &NodeRequest) -> bool {
         NodeRequest::ManagedSkills { .. }
             | NodeRequest::ApplySkills { .. }
             | NodeRequest::SkillCatalog { .. }
+            | NodeRequest::RemoveDetectedSkill { .. }
+            | NodeRequest::ReadDetectedSkill { .. }
     )
 }
 
@@ -411,6 +413,8 @@ async fn dispatch(
         | NodeRequest::ManagedSkills { workspace }
         | NodeRequest::ApplySkills { workspace, .. }
         | NodeRequest::SkillCatalog { workspace }
+        | NodeRequest::RemoveDetectedSkill { workspace, .. }
+        | NodeRequest::ReadDetectedSkill { workspace, .. }
         | NodeRequest::WriteSecret { workspace, .. } => workspace.clone(),
     };
     let env = match local_env(root, envs, &workspace).await {
@@ -438,6 +442,14 @@ async fn dispatch(
             .skill_catalog()
             .await
             .map(|entries| NodeReply::SkillCatalog { entries }),
+        NodeRequest::RemoveDetectedSkill { folder, .. } => env
+            .remove_detected_skill(&folder)
+            .await
+            .map(|()| NodeReply::RemoveDetectedSkill),
+        NodeRequest::ReadDetectedSkill { folder, .. } => env
+            .read_detected_skill(&folder)
+            .await
+            .map(|files| NodeReply::ReadDetectedSkill { files }),
         NodeRequest::WriteSecret {
             name,
             value,
@@ -472,7 +484,12 @@ async fn local_env(
     let secrets = secrets_root()
         .map_err(|error| ToolError::Invalid(error.to_string()))?
         .join(workspace);
-    let env = Arc::new(LocalEnvironment::new(dir, None)?.with_secrets_dir(secrets));
+    // Each workspace (one bot generation) keeps its managed skills apart;
+    // `~/.agents/skills` stays the node's own, detected skills.
+    let env = LocalEnvironment::new(dir, root.join(".skills").join(workspace), None)?
+        .with_secrets_dir(secrets);
+    env.forget_legacy_managed().await?;
+    let env = Arc::new(env);
     envs.lock()
         .unwrap()
         .insert(workspace.to_owned(), env.clone());

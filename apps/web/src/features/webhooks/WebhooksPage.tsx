@@ -65,7 +65,7 @@ export function WebhooksPage(props: WebhooksPageProps) {
     onInitial: () => (
       <SplitDetail
         title="Webhooks"
-        wide
+        width="wide"
         isListView={false}
         backTo="/settings/bots/$botId"
         backParams={{ botId: props.botId }}
@@ -77,7 +77,7 @@ export function WebhooksPage(props: WebhooksPageProps) {
     onFailure: failure => (
       <SplitDetail
         title="Webhooks"
-        wide
+        width="wide"
         isListView={false}
         backTo="/settings/bots/$botId"
         backParams={{ botId: props.botId }}
@@ -117,7 +117,7 @@ function WebhooksContent(props: WebhooksContentProps) {
   return (
     <SplitDetail
       title="Webhooks"
-      wide
+      width="wide"
       isListView={false}
       backTo="/settings/bots/$botId"
       backParams={{ botId: props.botId }}

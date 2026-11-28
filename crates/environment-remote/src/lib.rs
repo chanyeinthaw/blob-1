@@ -187,6 +187,31 @@ impl<D: NodeDirectory> Environment for RemoteEnvironment<D> {
         }
     }
 
+    async fn remove_detected_skill(&self, folder: &str) -> Result<(), ToolError> {
+        let request = NodeRequest::RemoveDetectedSkill {
+            workspace: self.workspace.clone(),
+            folder: folder.to_owned(),
+        };
+        match self.call(request, self.skills_timeout).await? {
+            NodeReply::RemoveDetectedSkill => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn read_detected_skill(
+        &self,
+        folder: &str,
+    ) -> Result<Vec<environment::SkillFile>, ToolError> {
+        let request = NodeRequest::ReadDetectedSkill {
+            workspace: self.workspace.clone(),
+            folder: folder.to_owned(),
+        };
+        match self.call(request, self.skills_timeout).await? {
+            NodeReply::ReadDetectedSkill { files } => Ok(files),
+            other => Err(unexpected(other)),
+        }
+    }
+
     async fn execute(&self, call: ToolCall) -> Result<ToolResult, ToolError> {
         let request = NodeRequest::Execute {
             workspace: self.workspace.clone(),

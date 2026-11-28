@@ -6,6 +6,10 @@ import { ChangeFrame, ReplyFrame, type RequestFrame } from '@blob-1/contracts'
 /** Everything the server sends on `/ws`: request replies and `changed` pushes. */
 const decodeServerFrame = Schema.decodeUnknownSync(Schema.Union([ChangeFrame, ReplyFrame]))
 
+/** GitHub skill requests download a repo archive; the server caps them at 120s. */
+const timeoutFor = (type: string): number =>
+  type === 'bot.skills.githubPreview' || type === 'bot.skills.githubImport' ? 130_000 : 15_000
+
 type Pending = Readonly<{
   frame: RequestFrame
   resume: (result: Effect.Effect<ReplyFrame, ApiError>) => void
@@ -126,7 +130,7 @@ export const wsTransport: Layer.Layer<Transport> = Layer.effect(
           const timer = setTimeout(() => {
             pending.delete(frame.id)
             resume(Effect.fail(new ApiError({ message: 'Request timed out' })))
-          }, 15000)
+          }, timeoutFor(frame.type))
           pending.set(frame.id, {
             frame,
             resume: result => {

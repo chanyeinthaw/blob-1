@@ -839,9 +839,9 @@ fn resolve(
     }
 }
 
-/// Pushes DB-tracked skills onto the bot's execution environment — local or a
-/// remote node, whichever the `Environment` impl targets.
-async fn sync_shared_skills(
+/// Pushes the bot's managed skills from its database into its managed skills
+/// dir — local or on a remote node, whichever the `Environment` impl targets.
+async fn sync_skills(
     store: &Arc<SqliteStorage>,
     environment: &Arc<dyn environment::Environment>,
 ) -> Result<()> {
@@ -895,6 +895,10 @@ async fn chat_harness(
         Compactor(models.clone()),
         memory::MemoryConfig::default(),
     )?;
+    let modes_store = global_store.clone();
+    let modes_bot = bot_id.clone();
+    let skill_modes: harness::SkillModes =
+        Arc::new(move || modes_store.bot_skill_modes(&modes_bot));
     let filter_store = global_store.clone();
     let filter_bot = bot_id;
     let mcp_filter: Arc<dyn Fn(&str) -> bool + Send + Sync> =
@@ -929,7 +933,8 @@ async fn chat_harness(
         ))
         .with_callback(harness::CallbackTools::new(bot_store, global_store))
         .with_mcp(mcp)
-        .with_mcp_filter(mcp_filter))
+        .with_mcp_filter(mcp_filter)
+        .with_skill_modes(skill_modes))
 }
 
 /// Creates a fresh owner-only directory with a random name under the temp
@@ -947,6 +952,7 @@ fn private_temp_dir(prefix: &str) -> Result<PathBuf> {
 pub async fn chat(
     store: Arc<SqliteStorage>,
     workspace: &Path,
+    managed_dir: PathBuf,
     skills_dir: Option<&Path>,
     prompt: String,
 ) -> Result<()> {
@@ -964,10 +970,10 @@ pub async fn chat(
     // process, so the directory is removed on the way out.
     let secrets_dir = private_temp_dir("blob-1-secrets")?;
     let environment: Arc<dyn environment::Environment> = Arc::new(
-        LocalEnvironment::new(workspace, skills_dir.map(Path::to_path_buf))?
+        LocalEnvironment::new(workspace, managed_dir, skills_dir.map(Path::to_path_buf))?
             .with_secrets_dir(secrets_dir.clone()),
     );
-    sync_shared_skills(&store, &environment).await?;
+    sync_skills(&store, &environment).await?;
     let pinned_workspace = harness::PinnedWorkspace::open(workspace)?;
     let harness = chat_harness(
         store.clone(),
@@ -1946,11 +1952,72 @@ pub struct BotHandle {
     pub discord: Arc<messenger_discord::Discord>,
     pub webchat: Arc<crate::webchat::WebChat>,
     pub live_chat: LiveChat,
+    /// Held across every sync of the bot's managed skills dir, so the bot
+    /// loop and web edits never rewrite its manifest at the same time.
+    pub skills_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BotSkill {
+    pub name: String,
+    pub description: String,
+    pub managed: bool,
+    /// Folder name under the skills dir.
+    pub folder: String,
+    pub mode: storage::SkillMode,
+}
+
+/// A bot's skill store and an environment to reach its machine.
+struct BotEnvironment {
+    store: Arc<SqliteStorage>,
+    environment: Arc<dyn environment::Environment>,
+    skills_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// A skill found in a GitHub folder; `conflict` is `Some(managed)` when the
+/// bot already has a skill with that name.
+pub struct GithubSkillPreview {
+    pub skill: crate::github::FoundSkill,
+    pub conflict: Option<bool>,
+}
+
+type BuiltEnvironment = (
+    Arc<dyn environment::Environment>,
+    Option<tokio::sync::watch::Receiver<bool>>,
+);
+
+#[allow(clippy::too_many_arguments)]
+fn environment_for_binding(
+    nodes: Arc<crate::nodes::NodeRegistry>,
+    managed_dir: PathBuf,
+    skills_dir: Option<PathBuf>,
+    workspace_path: PathBuf,
+    secrets_dir: PathBuf,
+    remote_workspace: String,
+    env_name: &str,
+    pin: Option<Vec<u8>>,
+) -> Result<BuiltEnvironment> {
+    if env_name == storage::LOCAL_ENVIRONMENT {
+        return Ok((
+            Arc::new(
+                LocalEnvironment::new(workspace_path, managed_dir, skills_dir)?
+                    .with_secrets_dir(secrets_dir),
+            ),
+            None,
+        ));
+    }
+    // Pinned to the bound enrollment: a re-enrolled name flips its derived
+    // watch offline and fails its calls until the supervisor rebinds.
+    let remote = environment_remote::RemoteEnvironment::new(env_name, remote_workspace, nodes, pin);
+    let watch = remote.availability();
+    Ok((Arc::new(remote), Some(watch)))
 }
 
 struct BotEntry {
     handle: BotHandle,
     workspace_path: PathBuf,
+    /// Where the bot's managed skills sync to when it runs locally.
+    managed_dir: PathBuf,
     running: Option<(
         tokio::sync::watch::Sender<bool>,
         tokio::task::JoinHandle<()>,
@@ -1978,10 +2045,6 @@ pub struct BotRegistry {
     skills_dir: Option<PathBuf>,
     mcp: mcp::Mcp,
     nodes: Arc<crate::nodes::NodeRegistry>,
-    /// Per-env serialization of remote skill pushes: bots sharing a node
-    /// would otherwise race the same node-wide skills dir on reconnect.
-    /// env name is unique per node, so one lock per env = one per node.
-    skill_sync: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     bots: Arc<tokio::sync::RwLock<HashMap<String, BotEntry>>>,
     /// Writes to web-visible bot data, fanned out to `/ws` clients.
     changes: tokio::sync::broadcast::Sender<Change>,
@@ -2027,7 +2090,6 @@ impl BotRegistry {
             skills_dir,
             mcp,
             nodes,
-            skill_sync: Arc::new(dashmap::DashMap::new()),
             bots: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             changes: tokio::sync::broadcast::channel(256).0,
         }
@@ -2124,6 +2186,11 @@ impl BotRegistry {
                 discord: Arc::new(messenger_discord::Discord::new()),
                 webchat,
                 live_chat: LiveChat::default(),
+                skills_lock: Arc::default(),
+            },
+            managed_dir: match bot.id == DEFAULT_BOT_ID {
+                true => self.data_dir.join("skills"),
+                false => self.bot_dir(&bot.id).join("skills"),
             },
             workspace_path,
             running: None,
@@ -2153,8 +2220,9 @@ impl BotRegistry {
         let webchat = entry.handle.webchat.clone();
         let mcp = self.mcp.clone();
         let live_chat = entry.handle.live_chat.clone();
+        let skills_lock = entry.handle.skills_lock.clone();
         let nodes = self.nodes.clone();
-        let skill_sync = self.skill_sync.clone();
+        let managed_dir = entry.managed_dir.clone();
         let task = tokio::spawn(async move {
             // A bot bound to a remote environment runs only while its node
             // session is authenticated; env drops pause the whole bot and a
@@ -2208,58 +2276,31 @@ impl BotRegistry {
                             );
                         }
                     }
-                    let (environment, env_watch): (
-                        Arc<dyn environment::Environment>,
-                        Option<tokio::sync::watch::Receiver<bool>>,
-                    ) = match &env_online {
-                        Some(_) => {
-                            // Pinned to the bound enrollment: a re-enrolled
-                            // name flips its derived watch offline and fails
-                            // its calls until the supervisor rebinds.
-                            let remote = environment_remote::RemoteEnvironment::new(
-                                env_name.clone(),
-                                remote_workspace.clone(),
-                                nodes.clone(),
-                                pin.clone(),
-                            );
-                            let watch = remote.availability();
-                            (Arc::new(remote), Some(watch))
-                        }
-                        None => (
-                            Arc::new(
-                                LocalEnvironment::new(ws_path.clone(), skills_dir.clone())?
-                                    .with_secrets_dir(secrets_dir.clone()),
-                            ),
-                            None,
-                        ),
+                    let (environment, env_watch) = environment_for_binding(
+                        nodes.clone(),
+                        managed_dir.clone(),
+                        skills_dir.clone(),
+                        ws_path.clone(),
+                        secrets_dir.clone(),
+                        remote_workspace.clone(),
+                        &env_name,
+                        pin.clone(),
+                    )?;
+                    // Each bot's managed skills live in its own dir, pushed
+                    // on every (re)start; shutdown interrupts a slow remote sync.
+                    if *rx.borrow() {
+                        break 'supervised Ok(());
+                    }
+                    let mut shutdown = rx.clone();
+                    let result = tokio::select! {
+                        _ = shutdown.changed() => break 'supervised Ok(()),
+                        result = async {
+                            let _sync = skills_lock.lock().await;
+                            sync_skills(&bot_store, &environment).await
+                        } => result,
                     };
-                    // Remote skills dirs are node-wide; the global catalog is
-                    // the single authoritative set pushed on each (re)connect,
-                    // matching the local shared-dir model. The per-env lock
-                    // stops bots sharing one node from racing the same dir.
-                    if env_online.is_some() {
-                        let lock = skill_sync
-                            .entry(env_name.clone())
-                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                            .clone();
-                        if *rx.borrow() {
-                            break 'supervised Ok(());
-                        }
-                        let mut shutdown = rx.clone();
-                        let _sync = tokio::select! {
-                            _ = shutdown.changed() => break 'supervised Ok(()),
-                            guard = lock.lock() => guard,
-                        };
-                        // Shutdown interrupts the sync too — a held lock
-                        // shouldn't stall a stop (e.g. web rename) by two
-                        // RPC timeouts.
-                        let result = tokio::select! {
-                            _ = shutdown.changed() => break 'supervised Ok(()),
-                            result = sync_shared_skills(&global_store, &environment) => result,
-                        };
-                        if let Err(error) = result {
-                            eprintln!("bot {bot_id} remote skill sync failed: {error}");
-                        }
+                    if let Err(error) = result {
+                        eprintln!("bot {bot_id} skill sync failed: {error}");
                     }
                     // Remote bots run in the node's `<workspaces>/<bot_id>-<generation>`
                     // (reported in `hello`); `share`/attachments stay off
@@ -2308,11 +2349,13 @@ impl BotRegistry {
         // Secret files outlive no restart: their deletion timers died with the
         // previous process.
         environment_local::clear_secrets(&self.data_dir.join("secrets"))?;
-        let environment: Arc<dyn environment::Environment> = Arc::new(LocalEnvironment::new(
+        LocalEnvironment::new(
             &self.root_workspace,
+            self.data_dir.join("skills"),
             self.skills_dir.clone(),
-        )?);
-        sync_shared_skills(&self.global_store, &environment).await?;
+        )?
+        .forget_legacy_managed()
+        .await?;
         let bots = self.global_store.bots()?;
         let mut map = self.bots.write().await;
         for bot in bots {
@@ -2350,6 +2393,236 @@ impl BotRegistry {
             .values()
             .map(|e| e.handle.clone())
             .collect()
+    }
+
+    /// Builds the bot's current local or remote environment for a one-off
+    /// call, failing when a remote node is offline.
+    async fn bot_environment(&self, bot_id: &str) -> Result<BotEnvironment> {
+        let (store, skills_lock, workspace_path, managed_dir, generation) = {
+            let map = self.bots.read().await;
+            let entry = map
+                .get(bot_id)
+                .ok_or_else(|| format!("Unknown bot {bot_id}"))?;
+            (
+                entry.handle.store.clone(),
+                entry.handle.skills_lock.clone(),
+                entry.workspace_path.clone(),
+                entry.managed_dir.clone(),
+                entry.handle.generation,
+            )
+        };
+        let (env_name, pin) = self
+            .global_store
+            .bot_env_binding(bot_id)?
+            .unwrap_or_else(|| (storage::LOCAL_ENVIRONMENT.to_owned(), None));
+        if env_name != storage::LOCAL_ENVIRONMENT {
+            let routed = self.nodes.availability(&env_name);
+            if pin.is_none() || routed.borrow().as_deref() != pin.as_deref() {
+                return Err(format!("environment '{env_name}' is offline").into());
+            }
+        }
+        let remote_workspace = format!("{bot_id}-{generation}");
+        let secrets_dir = self.data_dir.join("secrets").join(&remote_workspace);
+        let (environment, _) = environment_for_binding(
+            self.nodes.clone(),
+            managed_dir,
+            self.skills_dir.clone(),
+            workspace_path,
+            secrets_dir,
+            remote_workspace,
+            &env_name,
+            pin,
+        )?;
+        Ok(BotEnvironment {
+            store,
+            environment,
+            skills_lock,
+        })
+    }
+
+    async fn skills_in(&self, bot_id: &str, bot: &BotEnvironment) -> Result<Vec<BotSkill>> {
+        let modes = self.global_store.bot_skill_modes(bot_id)?;
+        let mut skills: Vec<BotSkill> = bot
+            .environment
+            .skill_catalog()
+            .await?
+            .into_iter()
+            .filter_map(|entry| {
+                let folder = entry
+                    .location
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str())?
+                    .to_owned();
+                Some(BotSkill {
+                    mode: modes.get(&entry.name).copied().unwrap_or_default(),
+                    managed: entry.managed,
+                    name: entry.name,
+                    description: entry.description,
+                    folder,
+                })
+            })
+            .collect();
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(skills)
+    }
+
+    async fn find_skill(&self, bot_id: &str, bot: &BotEnvironment, name: &str) -> Result<BotSkill> {
+        self.skills_in(bot_id, bot)
+            .await?
+            .into_iter()
+            .find(|skill| skill.name == name)
+            .ok_or_else(|| format!("no skill named {name}").into())
+    }
+
+    /// Lists the skills the bot's current local or remote environment exposes:
+    /// its own managed ones, then the machine's detected ones.
+    pub async fn skill_catalog(&self, bot_id: &str) -> Result<Vec<BotSkill>> {
+        let bot = self.bot_environment(bot_id).await?;
+        self.skills_in(bot_id, &bot).await
+    }
+
+    /// Removes a skill from the bot. A managed skill leaves the bot's database
+    /// and managed dir; a detected skill's folder is deleted from the machine.
+    pub async fn remove_skill(&self, bot_id: &str, name: &str) -> Result<Vec<BotSkill>> {
+        let bot = self.bot_environment(bot_id).await?;
+        let _sync = bot.skills_lock.lock().await;
+        let skill = self.find_skill(bot_id, &bot, name).await?;
+        if skill.managed {
+            bot.store.remove_skill(&skill.folder)?;
+            sync_skills(&bot.store, &bot.environment).await?;
+        } else {
+            bot.environment.remove_detected_skill(&skill.folder).await?;
+        }
+        self.global_store.clear_skill_modes(name, Some(bot_id))?;
+        self.skills_in(bot_id, &bot).await
+    }
+
+    /// Copies a detected skill into the bot's managed skills. The machine's
+    /// folder stays; the managed copy hides it.
+    pub async fn adopt_skill(&self, bot_id: &str, name: &str) -> Result<Vec<BotSkill>> {
+        let bot = self.bot_environment(bot_id).await?;
+        let _sync = bot.skills_lock.lock().await;
+        let skill = self.find_skill(bot_id, &bot, name).await?;
+        if skill.managed {
+            return Err(format!("{name} is already managed").into());
+        }
+        let files = bot
+            .environment
+            .read_detected_skill(&skill.folder)
+            .await?
+            .into_iter()
+            .map(|file| storage::SkillFile {
+                path: file.path,
+                mode: file.mode,
+                content: file.content,
+            })
+            .collect();
+        crate::import::store_bundle(&bot.store, files)?;
+        sync_skills(&bot.store, &bot.environment).await?;
+        self.skills_in(bot_id, &bot).await
+    }
+
+    /// Finds skills in a GitHub folder, marking names the bot already has.
+    pub async fn preview_github_skills(
+        &self,
+        bot_id: &str,
+        url: &str,
+        path: &str,
+    ) -> Result<(crate::github::Source, Vec<GithubSkillPreview>)> {
+        let bot = self.bot_environment(bot_id).await?;
+        let existing = self.skills_in(bot_id, &bot).await?;
+        let (source, found) =
+            tokio::time::timeout(crate::github::OPERATION_TIMEOUT, crate::github::find(url, path))
+                .await
+                .map_err(|_| "GitHub took too long to answer")??;
+        let previews = found
+            .into_iter()
+            .map(|skill| GithubSkillPreview {
+                conflict: existing
+                    .iter()
+                    .find(|have| have.name == skill.name)
+                    .map(|have| have.managed),
+                skill,
+            })
+            .collect();
+        Ok((source, previews))
+    }
+
+    /// Imports the chosen folders of `repo` at `commit` as managed skills of
+    /// the bot, replacing managed skills with the same name.
+    pub async fn import_github_skills(
+        &self,
+        bot_id: &str,
+        repo: &str,
+        commit: &str,
+        folders: &[String],
+    ) -> Result<Vec<BotSkill>> {
+        let bot = self.bot_environment(bot_id).await?;
+        let bundles = tokio::time::timeout(
+            crate::github::OPERATION_TIMEOUT,
+            crate::github::fetch(repo, commit, folders),
+        )
+        .await
+        .map_err(|_| "GitHub took too long to answer")??;
+        let _sync = bot.skills_lock.lock().await;
+        for files in bundles {
+            crate::import::store_bundle(&bot.store, files)?;
+        }
+        sync_skills(&bot.store, &bot.environment).await?;
+        self.skills_in(bot_id, &bot).await
+    }
+
+    /// The skill's `SKILL.md` body (frontmatter removed) and its other file paths.
+    pub async fn read_skill(&self, bot_id: &str, name: &str) -> Result<(BotSkill, String, Vec<String>)> {
+        let bot = self.bot_environment(bot_id).await?;
+        let skill = self.find_skill(bot_id, &bot, name).await?;
+        let files: Vec<(String, Vec<u8>)> = match skill.managed {
+            true => bot
+                .store
+                .skill_files(&skill.folder)?
+                .into_iter()
+                .map(|file| (file.path, file.content))
+                .collect(),
+            false => bot
+                .environment
+                .read_detected_skill(&skill.folder)
+                .await?
+                .into_iter()
+                .map(|file| (file.path, file.content))
+                .collect(),
+        };
+        let content = files
+            .iter()
+            .find(|(path, _)| path == environment::SKILL_FILE)
+            .map(|(_, content)| String::from_utf8_lossy(content).into_owned())
+            .ok_or_else(|| format!("{name} has no {}", environment::SKILL_FILE))?;
+        let body = content
+            .strip_prefix("---")
+            .and_then(|rest| rest.find("\n---").map(|end| &rest[end + 4..]))
+            .map(|rest| rest.split_once('\n').map_or("", |(_, body)| body))
+            .unwrap_or(&content)
+            .trim()
+            .to_owned();
+        let mut others: Vec<String> = files
+            .into_iter()
+            .map(|(path, _)| path)
+            .filter(|path| path != environment::SKILL_FILE)
+            .collect();
+        others.sort();
+        Ok((skill, body, others))
+    }
+
+    pub async fn set_skill_mode(
+        &self,
+        bot_id: &str,
+        name: &str,
+        mode: storage::SkillMode,
+    ) -> Result<Vec<BotSkill>> {
+        let bot = self.bot_environment(bot_id).await?;
+        self.find_skill(bot_id, &bot, name).await?;
+        self.global_store.set_bot_skill_mode(bot_id, name, mode)?;
+        self.skills_in(bot_id, &bot).await
     }
 
     pub async fn create(&self, id: &str, name: &str) -> Result<Bot> {

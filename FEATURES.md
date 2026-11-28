@@ -154,10 +154,20 @@ Each bot's default page is a chat with it, built in as the `web` messenger.
 
 ## Skills
 
-- Code: `crates/environment-local/src/lib.rs` (sync), `crates/storage-sqlite/src/skill.rs`, `crates/agent/src/import.rs`
-- Stored in the database, synced to the skills directory with a `.managed.json` manifest; tasks load them
-- CLI: `agent skill add | list | remove`
-- Tables: `skills`, `skill_files`
+- Code: `crates/environment-local/src/lib.rs` (managed sync, catalog, detected read/remove), `crates/storage-sqlite/src/{skill,bot}.rs`, `crates/agent/src/import.rs` (bundle validation), `crates/agent/src/github.rs` (GitHub import), `crates/agent/src/{run,web}.rs` (per-bot catalog, modes, removal, adopt, import), `crates/harness/src/{chat,session,prompt}.rs` (filtering, chat tool), `apps/web/src/features/bots/BotSkillsPage.tsx`
+- Skills are per bot. Managed skills live in the bot's database and sync to its own managed dir (`<data>/skills` for `default`, `<data>/bots/<id>/skills`, on a node `<workspaces>/.skills/<bot-id>-<generation>`) on every bot (re)start and change; detected skills are the machine's own folders in the shared skills dir (`~/.agents/skills` or `--skills-dir`). A managed skill hides a detected one with the same name
+- `SKILL.md` frontmatter is parsed as YAML (`name`, `description`; block scalars allowed)
+- Legacy: managed copies that older versions synced into the shared dir (listed in its `.managed.json`) are deleted at startup
+- Per-bot mode: `both` (default), `chat`, `task` or `off`; chat's prompt lists `<chat_skills>` and `<task_skills>` separately, and tasks see only skills whose mode allows them
+- Chat tool: `skill` loads one of the chat skills' `SKILL.md` into chat, offered only when the bot has chat skills
+- Removal: a managed skill leaves the bot's database and managed dir; a detected skill's folder is deleted from the bot's machine (a symlinked skill loses only its link); the bot's stored mode is cleared
+- Make managed: copies a detected skill's files into the bot's managed skills; the machine's folder stays
+- GitHub import: a repo, `tree/<ref>/<path>` or `blob/…/SKILL.md` URL plus optional path (continuing the URL's path; `skills/` at the repo root when neither has one; pasting a full URL splits it into both fields); the ref resolves to a commit, the commit's tarball is downloaded and every folder with a valid `SKILL.md` is offered with all its files (executable bits kept, links refused); import re-downloads at the same commit and replaces managed skills with the same name. Public repos only, unauthenticated
+- Detail: clicking a skill opens a side drawer with its full description, `SKILL.md` body (Markdown, frontmatter removed) and other file paths (`bot.skills.read`)
+- Web protocol: `bot.skills.list`, `bot.skills.read`, `bot.skills.setMode`, `bot.skills.remove`, `bot.skills.adopt`, `bot.skills.githubPreview`, `bot.skills.githubImport` (`/settings/bots/$botId/skills`)
+- Node protocol: `removeDetectedSkill`, `readDetectedSkill`
+- CLI: `agent skill add | list | remove` (the `default` bot's managed skills)
+- Tables: `skills`, `skill_files` (per bot store), `bot_skill_modes`
 
 ## MCP
 

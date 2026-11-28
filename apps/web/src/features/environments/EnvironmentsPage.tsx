@@ -54,12 +54,12 @@ export function EnvironmentsPage() {
   const retry = useAtomRefresh(environmentsPageAtom)
   return matchCached(result, {
     onInitial: () => (
-      <Page title="Environments" wide>
+      <Page title="Environments" width="wide">
         <EmptyLine>Loading…</EmptyLine>
       </Page>
     ),
     onFailure: failure => (
-      <Page title="Environments" wide>
+      <Page title="Environments" width="wide">
         <PageError cause={failure.cause} onRetry={retry} />
       </Page>
     ),
@@ -85,7 +85,7 @@ function EnvironmentsContent() {
   return (
     <Page
       title="Environments"
-      wide
+      width="wide"
       actions={
         <>
           <span aria-live="polite" className="text-xs text-muted-foreground empty:sr-only">

@@ -11,6 +11,12 @@ use crate::Result;
 pub fn add(store: &SqliteStorage, dir: &Path) -> Result<String> {
     let mut files = Vec::new();
     collect(dir, dir, &mut files)?;
+    store_bundle(store, files)
+}
+
+/// Validates a skill's files (paths relative to its folder) and stores them as
+/// a managed skill, replacing one with the same name; returns the skill name.
+pub fn store_bundle(store: &SqliteStorage, mut files: Vec<SkillFile>) -> Result<String> {
     files.sort_by(|a, b| a.path.cmp(&b.path));
     let skill = files
         .iter()

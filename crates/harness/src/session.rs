@@ -60,6 +60,29 @@ pub enum HarnessError {
     DisabledModel(String),
 }
 
+/// Reads a bot's per-skill modes; skills missing from the map are `Both`.
+pub type SkillModes = Arc<
+    dyn Fn() -> Result<std::collections::BTreeMap<String, storage::SkillMode>, StoreError>
+        + Send
+        + Sync,
+>;
+
+/// The catalog entries whose mode passes `allowed`.
+pub(crate) fn usable_skills(
+    catalog: Vec<environment::SkillEntry>,
+    modes: Option<&SkillModes>,
+    allowed: fn(storage::SkillMode) -> bool,
+) -> Result<Vec<environment::SkillEntry>, HarnessError> {
+    let Some(modes) = modes else {
+        return Ok(catalog);
+    };
+    let modes = modes()?;
+    Ok(catalog
+        .into_iter()
+        .filter(|skill| allowed(modes.get(&skill.name).copied().unwrap_or_default()))
+        .collect())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvironmentPaths {
     pub workspace: PathBuf,
@@ -87,6 +110,7 @@ pub struct SessionHarness<L, E, S> {
     callback_tools: Option<crate::CallbackTools>,
     secret_tools: Option<crate::SecretTools>,
     mcp_tools: Option<Arc<SessionTools>>,
+    skill_modes: Option<SkillModes>,
     observer: Option<Arc<dyn Fn(Step) + Send + Sync>>,
     summarizer: Option<Arc<Summarizer<L>>>,
     environment: E,
@@ -111,6 +135,7 @@ where
             callback_tools: None,
             secret_tools: None,
             mcp_tools: None,
+            skill_modes: None,
             observer: None,
             summarizer: None,
             environment,
@@ -150,6 +175,12 @@ where
     /// exposed to this session when at least one MCP server is enabled.
     pub fn with_mcp_tools(mut self, tools: Arc<SessionTools>) -> Self {
         self.mcp_tools = Some(tools);
+        self
+    }
+
+    /// Hides skills whose mode keeps them out of tasks.
+    pub fn with_skill_modes(mut self, modes: SkillModes) -> Self {
+        self.skill_modes = Some(modes);
         self
     }
 
@@ -200,7 +231,11 @@ where
             None => Session::new(id.clone()),
         };
 
-        let skills = self.environment.skill_catalog().await?;
+        let skills = usable_skills(
+            self.environment.skill_catalog().await?,
+            self.skill_modes.as_ref(),
+            storage::SkillMode::task,
+        )?;
         let mcp_servers = match &self.mcp_tools {
             Some(tools) => tools.describe().await,
             None => Vec::new(),

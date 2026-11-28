@@ -14,24 +14,32 @@ export const panelClassName =
 export const scrollClassName =
   'min-w-0 flex-1 px-5 pb-[max(2.5rem,env(safe-area-inset-bottom))] md:min-h-0 md:overflow-y-auto md:pt-4 md:pb-10'
 
+/** Content column widths: forms by default, `wide` for lists, `full` for dense lists. */
+export type ColumnWidth = 'form' | 'wide' | 'full'
+
+export const columnClassName = {
+  form: 'max-w-[720px]',
+  wide: 'max-w-[1120px]',
+  full: 'max-w-none',
+} satisfies Record<ColumnWidth, string>
+
 interface PageProps {
   readonly title: string
   readonly actions?: ReactNode
   /** Puts the actions on their own full-width row on mobile. */
   readonly wideActions?: boolean
-  /** Lets lists use the wide column instead of the 720px form column. */
-  readonly wide?: boolean
+  readonly width?: ColumnWidth
   readonly children: ReactNode
 }
 
 /** The content panel: a fixed title row with actions above a scrolling body. */
 export function Page(props: PageProps) {
-  const columnWidth = props.wide === true ? 'max-w-[1120px]' : 'max-w-[720px]'
+  const columnWidth = columnClassName[props.width ?? 'form']
   return (
     <div className={cn(panelClassName, 'flex-col')}>
       <div className="shrink-0 px-5 pt-5 pb-4 md:px-10 md:py-4 lg:px-16">
-        <div className={cn('flex w-full flex-wrap items-center gap-x-4 gap-y-3', columnWidth)}>
-          <h1 className="mr-auto text-2xl font-semibold tracking-tight">{props.title}</h1>
+        <div className="flex w-full flex-wrap items-center gap-x-4 gap-y-3">
+          <h1 className="mr-auto text-lg font-semibold tracking-tight">{props.title}</h1>
           {props.actions === undefined || props.actions === null ? null : (
             <div
               className={cn(

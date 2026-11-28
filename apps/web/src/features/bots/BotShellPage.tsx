@@ -1,7 +1,7 @@
 import type { BotSummary } from '@blob-1/contracts'
 import { useAtomMount, useAtomSet } from '@effect/atom-react'
 import { Link, Outlet, useNavigate, useRouterState } from '@tanstack/react-router'
-import { CalendarClock, ChevronLeft, Cpu, Home, KeyRound, Plug, Zap } from 'lucide-react'
+import { CalendarClock, ChevronLeft, Cpu, Home, KeyRound, Plug, Sparkles, Zap } from 'lucide-react'
 import { useEffect } from 'react'
 
 import { DiscordIcon } from '~/components/DiscordIcon'
@@ -18,7 +18,7 @@ import { webhooksPageAtomFor } from '~/features/webhooks/webhooksState'
 import { cn } from '~/lib/utils'
 
 import { BotsEvents } from './botsMachine'
-import { botMcpAtomFor } from './botsState'
+import { botMcpAtomFor, botSkillsAtomFor } from './botsState'
 import { BotsOwner, useBotInstanceKey, useBotsRoot } from './CreateBotDialog'
 
 function dotClassFor(bot: BotSummary | undefined): string {
@@ -43,6 +43,7 @@ function BotPrefetch(props: { readonly instanceKey: string }) {
   useAtomMount(secretsPageAtomFor(props.instanceKey))
   useAtomMount(discordPageAtomFor(props.instanceKey))
   useAtomMount(botMcpAtomFor(props.instanceKey))
+  useAtomMount(botSkillsAtomFor(props.instanceKey))
   return null
 }
 
@@ -50,7 +51,7 @@ interface BotShellPageProps {
   readonly botId: string
 }
 
-/** Nested SplitPage sidebar for a single bot: General, Models, Schedules, Webhooks, MCP, and Platforms → Discord. */
+/** Nested SplitPage sidebar for a single bot: General, Models, Schedules, Webhooks, Secrets, MCP, Skills, and Platforms → Discord. */
 export function BotShellPage(props: BotShellPageProps) {
   const root = useBotsRoot()
   const bots = root?.bots ?? []
@@ -159,6 +160,13 @@ export function BotShellPage(props: BotShellPageProps) {
               label="MCP"
               icon={<Plug className="size-4 shrink-0 text-muted-foreground" />}
               isActive={isActive('mcp')}
+            />
+            <SplitItem
+              to="/settings/bots/$botId/skills"
+              params={{ botId: props.botId }}
+              label="Skills"
+              icon={<Sparkles className="size-4 shrink-0 text-muted-foreground" />}
+              isActive={isActive('skills')}
             />
             <SplitGroupLabel>Platforms</SplitGroupLabel>
             <SplitItem

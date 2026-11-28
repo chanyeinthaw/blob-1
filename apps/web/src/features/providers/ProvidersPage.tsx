@@ -59,12 +59,12 @@ export function ProvidersPage() {
   const retry = useAtomRefresh(providersPageAtom)
   return matchCached(result, {
     onInitial: () => (
-      <Page title="Providers" wide>
+      <Page title="Providers" width="wide">
         <EmptyLine>Loading…</EmptyLine>
       </Page>
     ),
     onFailure: failure => (
-      <Page title="Providers" wide>
+      <Page title="Providers" width="wide">
         <PageError cause={failure.cause} onRetry={retry} />
       </Page>
     ),
@@ -98,7 +98,7 @@ function ProvidersContent() {
   return (
     <Page
       title="Providers"
-      wide
+      width="wide"
       actions={
         <MachineState machine={machine} path="Add.Closed">
           {() => (

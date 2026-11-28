@@ -164,6 +164,45 @@ pub struct SkillFile {
     pub content: Vec<u8>,
 }
 
+/// Where a bot may use a skill. A skill without a stored mode is `Both`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SkillMode {
+    #[default]
+    Both,
+    Chat,
+    Task,
+    Off,
+}
+
+impl SkillMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Chat => "chat",
+            Self::Task => "task",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "both" => Some(Self::Both),
+            "chat" => Some(Self::Chat),
+            "task" => Some(Self::Task),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub fn chat(self) -> bool {
+        matches!(self, Self::Both | Self::Chat)
+    }
+
+    pub fn task(self) -> bool {
+        matches!(self, Self::Both | Self::Task)
+    }
+}
+
 pub trait SkillStore: Send + Sync {
     fn skills(&self) -> Result<Vec<SkillInfo>, StoreError>;
     fn skill_files(&self, name: &str) -> Result<Vec<SkillFile>, StoreError>;
@@ -2561,6 +2600,19 @@ pub trait BotStore: Send + Sync {
     ) -> Result<(), StoreError>;
     fn provider_in_use_by_bot(&self, provider: &ProviderId) -> Result<Option<String>, StoreError>;
     fn bot_disabled_mcp_servers(&self, bot_id: &str) -> Result<Vec<String>, StoreError>;
+    /// Skill modes the bot overrides; skills missing here are `SkillMode::Both`.
+    fn bot_skill_modes(
+        &self,
+        bot_id: &str,
+    ) -> Result<std::collections::BTreeMap<String, SkillMode>, StoreError>;
+    fn set_bot_skill_mode(
+        &self,
+        bot_id: &str,
+        name: &str,
+        mode: SkillMode,
+    ) -> Result<(), StoreError>;
+    /// Forgets the skill's mode for `bot_id`, or for every bot when `None`.
+    fn clear_skill_modes(&self, name: &str, bot_id: Option<&str>) -> Result<(), StoreError>;
     /// `None` binds the bot back to `local`.
     fn set_bot_environment(
         &self,
@@ -2659,6 +2711,23 @@ impl<T: BotStore + ?Sized> BotStore for Arc<T> {
     }
     fn bot_disabled_mcp_servers(&self, bot_id: &str) -> Result<Vec<String>, StoreError> {
         (**self).bot_disabled_mcp_servers(bot_id)
+    }
+    fn bot_skill_modes(
+        &self,
+        bot_id: &str,
+    ) -> Result<std::collections::BTreeMap<String, SkillMode>, StoreError> {
+        (**self).bot_skill_modes(bot_id)
+    }
+    fn set_bot_skill_mode(
+        &self,
+        bot_id: &str,
+        name: &str,
+        mode: SkillMode,
+    ) -> Result<(), StoreError> {
+        (**self).set_bot_skill_mode(bot_id, name, mode)
+    }
+    fn clear_skill_modes(&self, name: &str, bot_id: Option<&str>) -> Result<(), StoreError> {
+        (**self).clear_skill_modes(name, bot_id)
     }
     fn set_bot_environment(
         &self,

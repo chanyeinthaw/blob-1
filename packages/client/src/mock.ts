@@ -3,6 +3,8 @@ import { Array, Duration, Effect, Layer, Random, Ref, Schema, Stream, Struct } f
 import { Transport } from './api.ts'
 import {
   type BotMcpState,
+  type BotSkillMode,
+  type BotSkillsState,
   type BotSummary,
   type CheckinConfig,
   type DecisionSlot,
@@ -16,6 +18,8 @@ import {
   type EnvironmentInfo,
   type Environments,
   type GeneralSettings,
+  type GithubSkillPreview,
+  type GithubSkillsPreview,
   Home,
   type Instructions,
   McpServer,
@@ -937,6 +941,89 @@ const transition = (
 const DEFAULT_BOT_ID = 'default'
 const VALID_BOT_ID = /^[a-z0-9][a-z0-9-]{0,31}$/
 
+type SkillInfo = Readonly<{
+  name: string
+  description: string
+}>
+
+const seedManagedSkills: ReadonlyArray<SkillInfo> = [
+  {
+    name: 'github-review',
+    description: 'Review a pull request and report focused findings.',
+  },
+  {
+    name: 'release-summary',
+    description: 'Summarize merged changes into release notes.',
+  },
+]
+
+const seedDetectedSkills: ReadonlyArray<SkillInfo> = [
+  {
+    name: 'deploy-watch',
+    description: 'Check deployment status and surface failures.',
+  },
+  {
+    name: 'linear-triage',
+    description: 'Triage incoming Linear issues by urgency and owner.',
+  },
+]
+
+const MOCK_GITHUB_COMMIT = '8f3a9c2d1e4b7a6f0d5c8e2a9b1f4c7d3e7b1d9f'
+
+const githubSkillSamples: ReadonlyArray<GithubSkillPreview> = [
+  {
+    folder: 'skills/github-review',
+    name: 'github-review',
+    description: 'Review a pull request and report focused findings.',
+    files: 3,
+    bytes: 18_420,
+    conflict: 'managed',
+  },
+  {
+    folder: 'skills/deploy-watch',
+    name: 'deploy-watch',
+    description: 'Check deployment status and surface failures.',
+    files: 2,
+    bytes: 9_870,
+    conflict: 'detected',
+  },
+  {
+    folder: 'skills/repo-map',
+    name: 'repo-map',
+    description: 'Build a concise map of repository ownership and entry points.',
+    files: 4,
+    bytes: 22_310,
+    conflict: null,
+  },
+  {
+    folder: 'skills/web-research',
+    name: 'web-research',
+    description: 'Research a topic against primary sources and cite them.',
+    files: 2,
+    bytes: 11_540,
+    conflict: null,
+  },
+  {
+    folder: 'skills/incident-review',
+    name: 'incident-review',
+    description: 'Turn an incident timeline into follow-up actions.',
+    files: 3,
+    bytes: 14_080,
+    conflict: null,
+  },
+]
+
+const githubRepoFromUrl = (raw: string): string | null => {
+  try {
+    const url = new URL(raw)
+    if (url.hostname !== 'github.com') return null
+    const [owner, repo] = url.pathname.split('/').filter(part => part !== '')
+    return owner === undefined || repo === undefined ? 'owner/repo' : `${owner}/${repo}`
+  } catch {
+    return null
+  }
+}
+
 type BotRecord = Readonly<{
   id: string
   name: string
@@ -944,6 +1031,8 @@ type BotRecord = Readonly<{
   createdAt: number
   generation: number
   disabledMcp: ReadonlyArray<string>
+  detectedSkills: ReadonlyArray<SkillInfo>
+  skillModes: Readonly<Record<string, BotSkillMode>>
   /** 'local' or the name of a remote execution environment. */
   environment: string
   state: State
@@ -955,6 +1044,7 @@ type EnvironmentRecord = EnvironmentInfo & Readonly<{ hostname: string }>
 type MockRoot = Readonly<{
   providers: ReadonlyArray<ProviderRecord>
   mcpServers: ReadonlyArray<McpServer>
+  managedSkills: ReadonlyArray<SkillInfo>
   bots: ReadonlyArray<BotRecord>
   pendingNodes: ReadonlyArray<PendingNode>
   environments: ReadonlyArray<EnvironmentRecord>
@@ -992,6 +1082,7 @@ const seedRoot = (): MockRoot => {
   return {
     providers: initial.providers,
     mcpServers: initial.mcpServers,
+    managedSkills: seedManagedSkills,
     bots: [
       {
         id: DEFAULT_BOT_ID,
@@ -1000,6 +1091,8 @@ const seedRoot = (): MockRoot => {
         createdAt: 0,
         generation: 0,
         disabledMcp: [],
+        detectedSkills: seedDetectedSkills,
+        skillModes: {},
         environment: 'local',
         state: initial,
       },
@@ -1071,6 +1164,64 @@ const botMcpReply = (root: MockRoot, botId: string): Effect.Effect<BotMcpState, 
   })
 }
 
+const botSkillsReply = (root: MockRoot, botId: string): Effect.Effect<BotSkillsState, string> => {
+  const bot = root.bots.find(entry => entry.id === botId)
+  if (bot === undefined) return Effect.fail(`Unknown bot ${botId}`)
+  if (!environmentOnline(root, bot.environment)) {
+    return Effect.fail(`Environment '${bot.environment}' is offline`)
+  }
+  const skills: BotSkillsState['skills'] = [
+    ...root.managedSkills.map(skill => ({
+      name: skill.name,
+      description: skill.description,
+      source: 'managed' as const,
+      mode: bot.skillModes[skill.name] ?? 'both',
+    })),
+    ...bot.detectedSkills
+      .filter(skill => !root.managedSkills.some(managed => managed.name === skill.name))
+      .map(skill => ({
+        name: skill.name,
+        description: skill.description,
+        source: 'detected' as const,
+        mode: bot.skillModes[skill.name] ?? 'both',
+      })),
+  ].toSorted((a, b) => a.name.localeCompare(b.name))
+  return Effect.succeed({ skills })
+}
+
+const githubPreviewReply = (
+  payload: RequestPayload<'bot.skills.githubPreview'>,
+): Effect.Effect<GithubSkillsPreview, string> => {
+  const repo = githubRepoFromUrl(payload.url)
+  return repo === null
+    ? Effect.fail('Not a GitHub URL')
+    : Effect.succeed({
+        repo,
+        commit: MOCK_GITHUB_COMMIT,
+        path: payload.path,
+        skills: githubSkillSamples,
+      })
+}
+
+const mergeImportedSkills = (
+  managed: ReadonlyArray<SkillInfo>,
+  folders: ReadonlyArray<string>,
+): ReadonlyArray<SkillInfo> => {
+  const incoming = githubSkillSamples.filter(skill => folders.includes(skill.folder))
+  const kept = managed.map(skill => {
+    const replacement = incoming.find(entry => entry.name === skill.name)
+    return replacement === undefined
+      ? skill
+      : { name: replacement.name, description: replacement.description }
+  })
+  return [
+    ...kept,
+    ...incoming
+      .filter(skill => !managed.some(existing => existing.name === skill.name))
+      .map(skill => ({ name: skill.name, description: skill.description })),
+  ]
+}
+
 const providerInUseByBot = (root: MockRoot, providerId: string): string | null => {
   for (const bot of root.bots) {
     const s = bot.state
@@ -1095,6 +1246,13 @@ type LegacyRequestType = Exclude<
   | 'bots.setEnvironment'
   | 'bot.mcp.get'
   | 'bot.mcp.setEnabled'
+  | 'bot.skills.list'
+  | 'bot.skills.setMode'
+  | 'bot.skills.remove'
+  | 'bot.skills.githubPreview'
+  | 'bot.skills.githubImport'
+  | 'bot.skills.adopt'
+  | 'bot.skills.read'
   | 'environments.list'
   | 'environments.accept'
   | 'environments.remove'
@@ -1681,6 +1839,12 @@ const toggleDisabledServer = (
 ): ReadonlyArray<string> =>
   enabled ? list.filter(entry => entry !== id) : list.includes(id) ? list : [...list, id]
 
+const withoutSkillMode = (modes: Readonly<Record<string, BotSkillMode>>, name: string) => {
+  const next = { ...modes }
+  delete next[name]
+  return next
+}
+
 const botControlHandlers = {
   'bots.list': (_payload: RequestPayload<'bots.list'>, rootRef: Ref.Ref<MockRoot>) =>
     Ref.get(rootRef).pipe(Effect.map(botsReply)),
@@ -1718,6 +1882,8 @@ const botControlHandlers = {
             createdAt,
             generation: root.nextGeneration,
             disabledMcp: [],
+            detectedSkills: seedDetectedSkills,
+            skillModes: {},
             environment: 'local',
             state: emptyBotState(name, seedState()),
           },
@@ -1890,6 +2056,195 @@ const botControlHandlers = {
       return yield* botMcpReply(root, resolved)
     }),
 
+  'bot.skills.list': (
+    { botId, botGeneration }: RequestPayload<'bot.skills.list'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const resolved = botId ?? DEFAULT_BOT_ID
+      const bot = root.bots.find(entry => entry.id === resolved)
+      if (bot !== undefined) yield* checkGeneration(bot, botGeneration)
+      return yield* botSkillsReply(root, resolved)
+    }),
+
+  'bot.skills.setMode': (
+    { botId: rawBotId, botGeneration, name, mode }: RequestPayload<'bot.skills.setMode'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const botId = rawBotId ?? DEFAULT_BOT_ID
+      const target = root.bots.find(bot => bot.id === botId)
+      if (target === undefined) {
+        return yield* Effect.fail(`Unknown bot ${botId}`)
+      }
+      yield* checkGeneration(target, botGeneration)
+      if (!environmentOnline(root, target.environment)) {
+        return yield* Effect.fail(`Environment '${target.environment}' is offline`)
+      }
+      const exists =
+        root.managedSkills.some(skill => skill.name === name) ||
+        target.detectedSkills.some(skill => skill.name === name)
+      if (!exists) {
+        return yield* Effect.fail(`no skill named ${name}`)
+      }
+      const next: MockRoot = Struct.evolve(root, {
+        bots: bots =>
+          bots.map(bot =>
+            bot.id === botId
+              ? Struct.evolve(bot, { skillModes: modes => ({ ...modes, [name]: mode }) })
+              : bot,
+          ),
+      })
+      yield* Ref.set(rootRef, next)
+      return yield* botSkillsReply(next, botId)
+    }),
+
+  'bot.skills.remove': (
+    { botId: rawBotId, botGeneration, name }: RequestPayload<'bot.skills.remove'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const botId = rawBotId ?? DEFAULT_BOT_ID
+      const target = root.bots.find(bot => bot.id === botId)
+      if (target === undefined) {
+        return yield* Effect.fail(`Unknown bot ${botId}`)
+      }
+      yield* checkGeneration(target, botGeneration)
+      if (!environmentOnline(root, target.environment)) {
+        return yield* Effect.fail(`Environment '${target.environment}' is offline`)
+      }
+      const managed = root.managedSkills.some(skill => skill.name === name)
+      const detected = target.detectedSkills.some(skill => skill.name === name)
+      if (!managed && !detected) {
+        return yield* Effect.fail(`no skill named ${name}`)
+      }
+      const next: MockRoot = managed
+        ? Struct.evolve(root, {
+            managedSkills: skills => skills.filter(skill => skill.name !== name),
+            bots: bots =>
+              bots.map(bot =>
+                Struct.evolve(bot, { skillModes: modes => withoutSkillMode(modes, name) }),
+              ),
+          })
+        : Struct.evolve(root, {
+            bots: bots =>
+              bots.map(bot =>
+                bot.id === botId
+                  ? Struct.evolve(bot, {
+                      detectedSkills: skills => skills.filter(skill => skill.name !== name),
+                      skillModes: modes => withoutSkillMode(modes, name),
+                    })
+                  : bot,
+              ),
+          })
+      yield* Ref.set(rootRef, next)
+      return yield* botSkillsReply(next, botId)
+    }),
+
+  'bot.skills.githubPreview': (
+    { botId: rawBotId, botGeneration, url, path }: RequestPayload<'bot.skills.githubPreview'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const botId = rawBotId ?? DEFAULT_BOT_ID
+      const target = root.bots.find(bot => bot.id === botId)
+      if (target === undefined) {
+        return yield* Effect.fail(`Unknown bot ${botId}`)
+      }
+      yield* checkGeneration(target, botGeneration)
+      if (!environmentOnline(root, target.environment)) {
+        return yield* Effect.fail(`Environment '${target.environment}' is offline`)
+      }
+      return yield* githubPreviewReply({ url, path })
+    }),
+
+  'bot.skills.githubImport': (
+    { botId: rawBotId, botGeneration, folders }: RequestPayload<'bot.skills.githubImport'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const botId = rawBotId ?? DEFAULT_BOT_ID
+      const target = root.bots.find(bot => bot.id === botId)
+      if (target === undefined) {
+        return yield* Effect.fail(`Unknown bot ${botId}`)
+      }
+      yield* checkGeneration(target, botGeneration)
+      if (!environmentOnline(root, target.environment)) {
+        return yield* Effect.fail(`Environment '${target.environment}' is offline`)
+      }
+      const next: MockRoot = Struct.evolve(root, {
+        managedSkills: skills => mergeImportedSkills(skills, folders),
+      })
+      yield* Ref.set(rootRef, next)
+      return yield* botSkillsReply(next, botId)
+    }),
+
+  'bot.skills.read': (
+    { botId: rawBotId, botGeneration, name }: RequestPayload<'bot.skills.read'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const botId = rawBotId ?? DEFAULT_BOT_ID
+      const target = root.bots.find(bot => bot.id === botId)
+      if (target === undefined) {
+        return yield* Effect.fail(`Unknown bot ${botId}`)
+      }
+      yield* checkGeneration(target, botGeneration)
+      const { skills } = yield* botSkillsReply(root, botId)
+      const skill = skills.find(entry => entry.name === name)
+      if (skill === undefined) {
+        return yield* Effect.fail(`no skill named ${name}`)
+      }
+      return {
+        name: skill.name,
+        description: skill.description,
+        source: skill.source,
+        content: `# ${skill.name}\n\n${skill.description}\n\n## Steps\n\n1. Read the request.\n2. Follow this skill.`,
+        files: skill.source === 'managed' ? ['references/guide.md'] : [],
+      }
+    }),
+
+  'bot.skills.adopt': (
+    { botId: rawBotId, botGeneration, name }: RequestPayload<'bot.skills.adopt'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const botId = rawBotId ?? DEFAULT_BOT_ID
+      const target = root.bots.find(bot => bot.id === botId)
+      if (target === undefined) {
+        return yield* Effect.fail(`Unknown bot ${botId}`)
+      }
+      yield* checkGeneration(target, botGeneration)
+      if (!environmentOnline(root, target.environment)) {
+        return yield* Effect.fail(`Environment '${target.environment}' is offline`)
+      }
+      const detected = target.detectedSkills.find(skill => skill.name === name)
+      if (detected === undefined) {
+        return yield* Effect.fail(`no detected skill named ${name}`)
+      }
+      const next: MockRoot = Struct.evolve(root, {
+        managedSkills: skills =>
+          skills.some(skill => skill.name === name) ? skills : [...skills, detected],
+        bots: bots =>
+          bots.map(bot =>
+            bot.id === botId
+              ? Struct.evolve(bot, {
+                  detectedSkills: skills => skills.filter(skill => skill.name !== name),
+                })
+              : bot,
+          ),
+      })
+      yield* Ref.set(rootRef, next)
+      return yield* botSkillsReply(next, botId)
+    }),
+
   'bot.mcp.setEnabled': (
     { botId: rawBotId, botGeneration, id, enabled }: RequestPayload<'bot.mcp.setEnabled'>,
     rootRef: Ref.Ref<MockRoot>,
@@ -1926,6 +2281,13 @@ const botControlHandlers = {
       | 'bots.setEnvironment'
       | 'bot.mcp.get'
       | 'bot.mcp.setEnabled'
+      | 'bot.skills.list'
+      | 'bot.skills.setMode'
+      | 'bot.skills.remove'
+      | 'bot.skills.githubPreview'
+      | 'bot.skills.githubImport'
+      | 'bot.skills.adopt'
+      | 'bot.skills.read'
       | 'environments.list'
       | 'environments.accept'
       | 'environments.remove'

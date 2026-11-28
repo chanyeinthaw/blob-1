@@ -10,6 +10,7 @@ use storage::{
 };
 use storage_sqlite::{AppKey, SqliteStorage};
 
+mod github;
 mod import;
 mod nodes;
 mod run;
@@ -972,7 +973,7 @@ async fn main() -> Result<()> {
         Command::Chat { message } => {
             std::fs::create_dir_all(&workspace)?;
             let workspace = workspace.canonicalize()?;
-            run::chat(store, &workspace, skills_dir.as_deref(), message).await
+            run::chat(store, &workspace, data_dir.join("skills"), skills_dir.as_deref(), message).await
         }
         Command::Environment { command } => environment_command(&store, &command),
         Command::Secret { bot, command } => {

@@ -32,12 +32,12 @@ export function McpPage() {
   const retry = useAtomRefresh(mcpPageAtom)
   return matchCached(result, {
     onInitial: () => (
-      <Page title="MCP" wide>
+      <Page title="MCP" width="wide">
         <EmptyLine>Loading…</EmptyLine>
       </Page>
     ),
     onFailure: failure => (
-      <Page title="MCP" wide>
+      <Page title="MCP" width="wide">
         <PageError cause={failure.cause} onRetry={retry} />
       </Page>
     ),
@@ -100,7 +100,7 @@ function McpContent() {
   return (
     <Page
       title="MCP"
-      wide
+      width="wide"
       actions={
         <>
           <span aria-live="polite" className="text-xs text-muted-foreground empty:sr-only">

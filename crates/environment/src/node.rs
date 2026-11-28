@@ -58,6 +58,14 @@ pub enum NodeRequest {
     SkillCatalog {
         workspace: String,
     },
+    RemoveDetectedSkill {
+        workspace: String,
+        folder: String,
+    },
+    ReadDetectedSkill {
+        workspace: String,
+        folder: String,
+    },
     /// Writes a secret to a private file the node deletes after `ttl_secs`.
     WriteSecret {
         workspace: String,
@@ -81,6 +89,10 @@ pub enum NodeReply {
     },
     SkillCatalog {
         entries: Vec<SkillEntry>,
+    },
+    RemoveDetectedSkill,
+    ReadDetectedSkill {
+        files: Vec<crate::SkillFile>,
     },
     WriteSecret {
         path: String,
