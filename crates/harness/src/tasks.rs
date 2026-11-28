@@ -52,6 +52,14 @@ enum Status {
     Stopped(String),
 }
 
+pub(crate) fn close_browser_owner(browser: &Option<crate::BrowserTools>, owner: String) {
+    if let Some(browser) = browser.clone() {
+        tokio::spawn(async move {
+            browser.close_owner(&owner).await;
+        });
+    }
+}
+
 fn duration(time: Instant) -> String {
     let seconds = time.elapsed().as_secs();
     if seconds >= 60 {
@@ -186,6 +194,7 @@ where
     if let Some(supervisor) = supervisor {
         let _ = supervisor.await;
     }
+    close_browser_owner(&inner.browser, format!("task:{name}"));
     inner.notify.notify_one();
     Ok(format!("Stopped {name}."))
 }
@@ -450,6 +459,9 @@ where
     if let Some(secrets) = &inner.secrets {
         session = session.with_secret_tools(secrets.clone());
     }
+    if let Some(browser) = &inner.browser {
+        session = session.with_browser_tools(browser.clone());
+    }
     if let Some(modes) = &inner.skill_modes {
         session = session.with_skill_modes(Arc::clone(modes));
     }
@@ -585,6 +597,7 @@ where
                 });
                 break;
             }
+            close_browser_owner(&inner.browser, id.0.clone());
             inner.notify.notify_one();
         });
     let work_abort = work.abort_handle();
@@ -640,6 +653,7 @@ where
                     run_id,
                 });
                 drop(state);
+                close_browser_owner(&crash_inner.browser, format!("task:{crash_name}"));
                 crash_inner.notify.notify_one();
             }
         });

@@ -149,6 +149,16 @@ jobs:
           tar -C "${stage}" -czf "${archive}" blob-1
           rm -rf "${stage}"
 
+      # The CEF browser companion ships as its own archive (Linux only for
+      # now); `blob-1 update --browser` unpacks it into `browser/`.
+      - name: Build browser companion
+        if: matrix.platform == 'linux-x64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build
+          crates/browser/scripts/dist.sh --release "${RUNNER_TEMP}/browser-dist"
+          tar -C "${RUNNER_TEMP}/browser-dist" -czf "blob-1-browser-${BLOB_1_VERSION}-${{ matrix.platform }}.tar.gz" .
+
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.platform }}

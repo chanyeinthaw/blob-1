@@ -76,7 +76,12 @@ fn mcp_section_for_chat(mcp: &[(String, String)]) -> Option<String> {
     Some(format!("Tasks can use these connected MCP servers; name the relevant server in the task when it fits:\n\n{servers}"))
 }
 
-pub fn build(workspace: &Path, skills: &[SkillEntry], mcp: &[(String, String)]) -> String {
+pub fn build(
+    workspace: &Path,
+    skills: &[SkillEntry],
+    mcp: &[(String, String)],
+    browser: bool,
+) -> String {
     let mut sections = Vec::new();
     if !BASE_PROMPT.is_empty() {
         sections.push(BASE_PROMPT.to_owned());
@@ -101,6 +106,9 @@ pub fn build(workspace: &Path, skills: &[SkillEntry], mcp: &[(String, String)]) 
     }
     if let Some(section) = mcp_section(mcp) {
         sections.push(section);
+    }
+    if browser {
+        sections.push("Browser tools are available: open tabs in your bot's persistent profile, snapshot them, act on snapshot refs, evaluate JavaScript, and capture screenshots.".into());
     }
     sections.join("\n\n")
 }

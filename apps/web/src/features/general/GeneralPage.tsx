@@ -33,6 +33,11 @@ import {
 import { Switch } from '~/components/ui/switch'
 import { BotsEvents } from '~/features/bots/botsMachine'
 import { BotsOwner, useBotInstanceKey, useBotsRoot } from '~/features/bots/CreateBotDialog'
+import {
+  BotBrowserEvents,
+  type BotBrowserInput,
+  BotBrowserMachine,
+} from '~/features/browser/botBrowserMachine'
 import { environmentsPageAtom } from '~/features/environments/environmentsState'
 import { machineAtomsForBot } from '~/lib/runtime'
 import { createPersistentMachineContext } from '~/lib/shellMachines'
@@ -60,6 +65,12 @@ const InstructionsOwner = createPersistentMachineContext(
   'instructions',
   ({ input, scopeKey }: { readonly input: InstructionsInput; readonly scopeKey: string }) =>
     machineAtomsForBot(scopeKey).make(InstructionsMachine, input),
+)
+
+const BotBrowserOwner = createPersistentMachineContext(
+  'bot-browser',
+  ({ input, scopeKey }: { readonly input: BotBrowserInput; readonly scopeKey: string }) =>
+    machineAtomsForBot(scopeKey).make(BotBrowserMachine, input),
 )
 
 const resetAllowed = AtomMachine.can(InstructionsEvents.Reset())
@@ -100,20 +111,22 @@ export function GeneralPage(props: GeneralPageProps) {
     onSuccess: value => (
       <GeneralOwner.Provider input={value.general} scopeKey={instanceKey}>
         <InstructionsOwner.Provider input={value.instructions} scopeKey={instanceKey}>
-          {wrap(
-            <>
-              <div className="space-y-8">
-                <BotIdentitySection botId={props.botId} />
-                <Section title="Instructions" action={<InstructionsActions />}>
-                  <InstructionsEditor />
-                </Section>
-                <AutoRespondSection botId={props.botId} />
-                <HomeSection botId={props.botId} />
-                <UsageSection instanceKey={instanceKey} />
-              </div>
-              <UnsavedGuard />
-            </>,
-          )}
+          <BotBrowserOwner.Provider input={value.browser} scopeKey={instanceKey}>
+            {wrap(
+              <>
+                <div className="space-y-8">
+                  <BotIdentitySection botId={props.botId} />
+                  <Section title="Instructions" action={<InstructionsActions />}>
+                    <InstructionsEditor />
+                  </Section>
+                  <AutoRespondSection botId={props.botId} />
+                  <HomeSection botId={props.botId} />
+                  <UsageSection instanceKey={instanceKey} />
+                </div>
+                <UnsavedGuard />
+              </>,
+            )}
+          </BotBrowserOwner.Provider>
         </InstructionsOwner.Provider>
       </GeneralOwner.Provider>
     ),
@@ -294,6 +307,11 @@ function BotIdentitySection(props: BotIdentitySectionProps) {
             <EnvironmentSelect bot={bot} busy={busy} labelId={`bot-environment-${bot.id}`} />
           </div>
         </FieldRow>
+        <FieldRow labelId={`bot-browser-profile-${bot.id}`} label="Browser profile">
+          <div className="flex justify-end">
+            <BrowserProfileSelect labelId={`bot-browser-profile-${bot.id}`} />
+          </div>
+        </FieldRow>
         <div className="flex items-center justify-between gap-4 border-t border-border/60 pt-3">
           <div className="min-w-0">
             <p className="text-sm font-medium text-foreground">Enabled</p>
@@ -319,6 +337,61 @@ function BotIdentitySection(props: BotIdentitySectionProps) {
         </div>
       </div>
     </Section>
+  )
+}
+
+const NONE_BROWSER_PROFILE = '\0none'
+
+interface BrowserProfileSelectProps {
+  readonly labelId: string
+}
+
+/** Picks the browser profile whose cookies and logins this bot uses. */
+function BrowserProfileSelect(props: BrowserProfileSelectProps) {
+  const machine = BotBrowserOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  useEffect(() => {
+    send(BotBrowserEvents.Refresh())
+  }, [send])
+
+  return (
+    <MachineState machine={machine} path="">
+      {({ value, states }) => {
+        const items = [
+          { value: NONE_BROWSER_PROFILE, label: 'None' },
+          ...value.data.profiles.map(profile => ({ value: profile, label: profile })),
+        ]
+        const current = value.data.profile ?? NONE_BROWSER_PROFILE
+        return (
+          <Select
+            value={current}
+            items={items}
+            disabled={
+              value.data.state === 'unavailable' || states.Mutate.state.path === 'Mutate.Saving'
+            }
+            onValueChange={next => {
+              if (next === null || next === current) return
+              send(
+                BotBrowserEvents.SetProfile({
+                  profile: next === NONE_BROWSER_PROFILE ? null : next,
+                }),
+              )
+            }}
+          >
+            <SelectTrigger aria-labelledby={props.labelId} className="w-full max-w-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {items.map(item => (
+                <SelectItem key={item.value} value={item.value}>
+                  {item.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )
+      }}
+    </MachineState>
   )
 }
 

@@ -109,6 +109,7 @@ pub struct SessionHarness<L, E, S> {
     share_tools: Option<crate::ShareTools>,
     callback_tools: Option<crate::CallbackTools>,
     secret_tools: Option<crate::SecretTools>,
+    browser_tools: Option<crate::BrowserTools>,
     mcp_tools: Option<Arc<SessionTools>>,
     skill_modes: Option<SkillModes>,
     observer: Option<Arc<dyn Fn(Step) + Send + Sync>>,
@@ -134,6 +135,7 @@ where
             share_tools: None,
             callback_tools: None,
             secret_tools: None,
+            browser_tools: None,
             mcp_tools: None,
             skill_modes: None,
             observer: None,
@@ -168,6 +170,13 @@ where
 
     pub fn with_callback_tools(mut self, tools: crate::CallbackTools) -> Self {
         self.callback_tools = Some(tools);
+        self
+    }
+
+    /// Browser tools for task sessions; they appear only while the bot has a
+    /// profile and the companion is ready.
+    pub fn with_browser_tools(mut self, tools: crate::BrowserTools) -> Self {
+        self.browser_tools = Some(tools);
         self
     }
 
@@ -240,7 +249,11 @@ where
             Some(tools) => tools.describe().await,
             None => Vec::new(),
         };
-        let system = prompt::build(&self.paths.workspace, &skills, &mcp_servers);
+        let browser_enabled = self
+            .browser_tools
+            .as_ref()
+            .is_some_and(crate::BrowserTools::enabled);
+        let system = prompt::build(&self.paths.workspace, &skills, &mcp_servers, browser_enabled);
         let system = if self.memory_tools.is_some() {
             format!("{}\n\n{}", prompt::SUB_PROMPT, system)
         } else {
@@ -263,6 +276,9 @@ where
         if self.secret_tools.is_some() {
             tools.push(crate::secret::REQUEST);
             tools.push(crate::secret::READ);
+        }
+        if let Some(browser) = &self.browser_tools {
+            tools.extend(browser.specs());
         }
         if let Some(mcp) = &self.mcp_tools {
             tools.extend(mcp.specs());
@@ -435,6 +451,26 @@ where
                     } else {
                         secrets.request(&call.arguments).map_err(|e| e.to_string())
                     }
+                } else if let Some(browser) = self
+                    .browser_tools
+                    .as_ref()
+                    .filter(|_| call.name.starts_with("browser_"))
+                {
+                    browser
+                        .execute(&id.0, &call.name, &call.arguments)
+                        .await
+                        .map(|outcome| {
+                            images = outcome
+                                .images
+                                .into_iter()
+                                .map(|image| storage::Image {
+                                    mime: image.mime,
+                                    data: image.data,
+                                })
+                                .collect();
+                            outcome.content
+                        })
+                        .map_err(|e| e.to_string())
                 } else if let Some(result) = match &self.mcp_tools {
                     Some(mcp) => mcp.execute(&call.name, &call.arguments).await,
                     None => None,

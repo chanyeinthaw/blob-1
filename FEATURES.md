@@ -18,6 +18,8 @@ Where each feature lives: code, CLI, model tools and storage.
 | `messenger` | `Messenger` and `Lookup` traits and neutral message types |
 | `messenger-discord` | Discord messenger over twilight |
 | `mcp` | MCP client manager: stdio and Streamable HTTP transports, OAuth, static `mcp_search`/`mcp_execute` tools |
+| `browser-protocol` | newline-delimited JSON wire types shared by `serve` and the browser companion |
+| `browser` | `blob-1-browser` headless CEF companion: persistent profiles, owner-scoped tabs, snapshots, actions, evaluation, screenshots |
 | `storage` | storage traits, `Meta`, XML rendering of model input |
 | `storage-sqlite` | SQLite implementation of every store |
 
@@ -207,6 +209,17 @@ Per-bot secrets the user provides without sending them in chat, which tasks use 
 - CLI: `agent secret [--bot <id>] list | set <name> (value from stdin, read whole; only a final newline is dropped) | remove <name> | request <name> [--label <text>]`. The CLI writes through its own connection, so an open Secrets page shows CLI changes after a refresh
 - `agent chat` gives its tasks a temporary secrets directory, removed when the command exits
 - Tables: `secrets` (value sealed with the app key), `secret_requests` (token hash, name, label, expiry)
+
+## Browser
+
+Persistent-profile web browsing for tasks through a supervised `blob-1-browser` companion (CEF, windowless), one shared child per `serve`.
+
+- Code: `crates/agent/src/browser.rs` (supervision, request routing, owner enforcement), `crates/harness/src/browser.rs` (task tools), `crates/browser-protocol/src/lib.rs` (wire protocol), `crates/browser/src/{main,socket,cef_layer,ops,snapshot}.rs` (companion), `crates/agent/src/web.rs` (`browser.*`, `bot.browser.*`), `crates/storage-sqlite/src/bot.rs` (profiles, `bots.browser_profile`)
+- The companion is found via `BLOB_1_BROWSER` (path) or as `blob-1-browser` next to the `serve` executable; with neither, the feature is off (no tools, state `unavailable`). `serve` spawns it with `--socket <data>/runtime/browser.sock --profiles-dir <data>/browser/profiles` and stdin piped (closing stdin stops it), connects as the only client, handshakes `Hello`/`Ready`, pings every 15s, and restarts it on crash or connection loss with backoff (1s doubling to 15s). Shutdown closes stdin, then kills after a grace period. Requests time out (45s for open/navigate, 60s otherwise) and are abandoned with `Cancel`
+- Browser profiles are global named cookie/storage jars (`browser_profiles` table; names are lowercase ascii/digits/`-`, max 64); each bot optionally uses one (`bots.browser_profile`, `ON DELETE SET NULL`). Deleting a profile also sends `DeleteProfile` to a running companion
+- Tools (tasks only, never chat; visible only while the bot has a profile and the companion is ready): `browser_open`, `browser_navigate`, `browser_snapshot` (text tree with action refs), `browser_act` (`click`/`type`/`press`/`select`/`hover`; `type` takes exactly one of `text` or `secret`, a bot secret name resolved server-side — the value goes only to the companion and the result reports `typed secret <name>`), `browser_evaluate`, `browser_screenshot` (PNG returned as a tool-result image), `browser_tabs`, `browser_close`. Tabs are owned by the task session: serve maps tab → owner and rejects other owners, the companion only ever lists an owner's own tabs, and finishing, stopping or crashing a task sends `CloseOwner`. Protocol frames are never logged since `type` actions can carry secrets
+- Web protocol: `browser.status` → `{state: "unavailable"|"starting"|"ready"|"error", message, profiles: [{name, bots: [botId]}]}`; `browser.profiles.add`/`browser.profiles.remove` `{name}` → same payload (errors on invalid/duplicate/unknown names); `bot.browser.get` → `{profile, profiles: [name], state}`; `bot.browser.set` `{profile: string|null}` → same, serialized through `settings_lock` with `recheck_bot_generation`
+- Tables: `browser_profiles` (global), `bots.browser_profile`
 
 ## Releases and self-update
 

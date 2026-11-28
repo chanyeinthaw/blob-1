@@ -1,7 +1,7 @@
 use rusqlite::{params, types::Type, OptionalExtension};
 use storage::{
-    Bot, BotModels, BotStore, ConfigStore, Environment, EnvironmentStore, ModelRef, ProviderId,
-    ReasoningLevel, StoreError, DEFAULT_BOT_ID,
+    Bot, BotModels, BotStore, BrowserProfile, ConfigStore, Environment, EnvironmentStore, ModelRef,
+    ProviderId, ReasoningLevel, StoreError, DEFAULT_BOT_ID,
 };
 
 use crate::{backend, SqliteStorage};
@@ -27,6 +27,7 @@ fn bot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Bot> {
         created_at: row.get(3)?,
         generation: row.get(4)?,
         environment: row.get(5)?,
+        browser_profile: row.get(6)?,
     })
 }
 
@@ -35,7 +36,7 @@ impl BotStore for SqliteStorage {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT id, name, enabled, created_at, generation, environment
+                "SELECT id, name, enabled, created_at, generation, environment, browser_profile
                  FROM bots
                  ORDER BY CASE WHEN id = 'default' THEN 0 ELSE 1 END, created_at ASC, id ASC",
             )
@@ -51,7 +52,7 @@ impl BotStore for SqliteStorage {
     fn bot(&self, id: &str) -> Result<Option<Bot>, StoreError> {
         self.lock()
             .query_row(
-                "SELECT id, name, enabled, created_at, generation, environment FROM bots WHERE id = ?1",
+                "SELECT id, name, enabled, created_at, generation, environment, browser_profile FROM bots WHERE id = ?1",
                 [id],
                 bot_from_row,
             )
@@ -89,6 +90,7 @@ impl BotStore for SqliteStorage {
             created_at,
             generation,
             environment: storage::LOCAL_ENVIRONMENT.to_owned(),
+            browser_profile: None,
         })
     }
 
@@ -104,7 +106,7 @@ impl BotStore for SqliteStorage {
             .map_err(backend)?;
         let Some(mut existing) = tx
             .query_row(
-                "SELECT id, name, enabled, created_at, generation, environment FROM bots WHERE id = ?1",
+                "SELECT id, name, enabled, created_at, generation, environment, browser_profile FROM bots WHERE id = ?1",
                 [id],
                 bot_from_row,
             )
@@ -532,6 +534,58 @@ impl BotStore for SqliteStorage {
             )
             .optional()
             .map_err(backend)
+    }
+
+    fn browser_profiles(&self) -> Result<Vec<BrowserProfile>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT name, created_at FROM browser_profiles ORDER BY name")
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(BrowserProfile {
+                    name: row.get(0)?,
+                    created_at: row.get(1)?,
+                })
+            })
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend);
+        rows
+    }
+
+    fn add_browser_profile(&self, name: &str, created_at: i64) -> Result<bool, StoreError> {
+        let changed = self
+            .lock()
+            .execute(
+                "INSERT OR IGNORE INTO browser_profiles (name, created_at) VALUES (?1, ?2)",
+                params![name, created_at],
+            )
+            .map_err(backend)?;
+        Ok(changed > 0)
+    }
+
+    fn remove_browser_profile(&self, name: &str) -> Result<bool, StoreError> {
+        let changed = self
+            .lock()
+            .execute("DELETE FROM browser_profiles WHERE name = ?1", [name])
+            .map_err(backend)?;
+        Ok(changed > 0)
+    }
+
+    fn set_bot_browser_profile(
+        &self,
+        bot_id: &str,
+        profile: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let changed = self
+            .lock()
+            .execute(
+                "UPDATE bots SET browser_profile = ?2 WHERE id = ?1",
+                params![bot_id, profile],
+            )
+            .map_err(backend)?;
+        Ok(changed > 0)
     }
 
     fn set_bot_mcp_server_enabled(

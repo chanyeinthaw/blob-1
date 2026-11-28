@@ -880,6 +880,7 @@ async fn sync_skills(
 /// `pinned_workspace` is `None` for remote environments: `share` and file
 /// attachments read the primary's disk, so they are withheld rather than
 /// served from a workspace the bot's tools never see.
+#[allow(clippy::too_many_arguments)]
 async fn chat_harness(
     global_store: Arc<SqliteStorage>,
     bot_store: Arc<SqliteStorage>,
@@ -889,6 +890,7 @@ async fn chat_harness(
     environment: Arc<dyn environment::Environment>,
     models: ModelFactory,
     mcp: mcp::Mcp,
+    browser: Option<&crate::browser::Browser>,
 ) -> Result<Chat> {
     let memory = memory::Memory::open(
         bot_store.clone(),
@@ -900,7 +902,7 @@ async fn chat_harness(
     let skill_modes: harness::SkillModes =
         Arc::new(move || modes_store.bot_skill_modes(&modes_bot));
     let filter_store = global_store.clone();
-    let filter_bot = bot_id;
+    let filter_bot = bot_id.clone();
     let mcp_filter: Arc<dyn Fn(&str) -> bool + Send + Sync> =
         Arc::new(
             move |server_id: &str| match filter_store.bot_disabled_mcp_servers(&filter_bot) {
@@ -923,6 +925,15 @@ async fn chat_harness(
             bot_store.clone(),
             global_store.clone(),
             pinned,
+        )),
+        None => harness,
+    };
+    let harness = match browser {
+        Some(browser) => harness.with_browser(crate::browser::BotBrowser::tools(
+            browser,
+            bot_store.clone(),
+            global_store.clone(),
+            bot_id.clone(),
         )),
         None => harness,
     };
@@ -984,6 +995,7 @@ pub async fn chat(
         environment,
         models,
         mcp,
+        None,
     )
     .await?;
     let mut failure = None;
@@ -2045,6 +2057,7 @@ pub struct BotRegistry {
     skills_dir: Option<PathBuf>,
     mcp: mcp::Mcp,
     nodes: Arc<crate::nodes::NodeRegistry>,
+    browser: crate::browser::Browser,
     bots: Arc<tokio::sync::RwLock<HashMap<String, BotEntry>>>,
     /// Writes to web-visible bot data, fanned out to `/ws` clients.
     changes: tokio::sync::broadcast::Sender<Change>,
@@ -2080,6 +2093,7 @@ impl BotRegistry {
         skills_dir: Option<PathBuf>,
         mcp: mcp::Mcp,
         nodes: Arc<crate::nodes::NodeRegistry>,
+        browser: crate::browser::Browser,
     ) -> Self {
         Self {
             global_store,
@@ -2090,6 +2104,7 @@ impl BotRegistry {
             skills_dir,
             mcp,
             nodes,
+            browser,
             bots: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             changes: tokio::sync::broadcast::channel(256).0,
         }
@@ -2219,6 +2234,7 @@ impl BotRegistry {
         let discord = entry.handle.discord.clone();
         let webchat = entry.handle.webchat.clone();
         let mcp = self.mcp.clone();
+        let browser = self.browser.clone();
         let live_chat = entry.handle.live_chat.clone();
         let skills_lock = entry.handle.skills_lock.clone();
         let nodes = self.nodes.clone();
@@ -2323,6 +2339,7 @@ impl BotRegistry {
                         rx.clone(),
                         mcp.clone(),
                         live_chat.clone(),
+                        browser.clone(),
                     )
                     .await;
                     discord.disconnect();
@@ -2947,6 +2964,7 @@ pub async fn serve_bot(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     mcp: mcp::Mcp,
     live_chat: LiveChat,
+    browser: crate::browser::Browser,
 ) -> Result<()> {
     let models = ModelFactory::new_for_bot(global_store.clone(), store.clone(), bot_id.clone());
     let harness = chat_harness(
@@ -2958,6 +2976,7 @@ pub async fn serve_bot(
         environment,
         models.clone(),
         mcp.clone(),
+        Some(&browser),
     )
     .await?;
     let outgoing: Arc<dyn messenger::Messenger> = discord.clone();

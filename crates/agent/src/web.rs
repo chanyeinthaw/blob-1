@@ -43,6 +43,7 @@ struct WebContext {
     avatar_lock: tokio::sync::Mutex<()>,
     mcp: mcp::Mcp,
     public_url: Option<url::Url>,
+    browser: crate::browser::Browser,
 }
 impl WebContext {
     fn secure_cookie(&self) -> bool {
@@ -104,6 +105,7 @@ pub fn public_url(raw: &str) -> crate::Result<url::Url> {
     Ok(url)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     listener: tokio::net::TcpListener,
     store: Arc<SqliteStorage>,
@@ -112,6 +114,7 @@ pub async fn serve(
     mcp: mcp::Mcp,
     shutdown: tokio::sync::watch::Receiver<bool>,
     public_url: Option<url::Url>,
+    browser: crate::browser::Browser,
 ) -> crate::Result<()> {
     let store = Arc::new(WebContext {
         store,
@@ -121,6 +124,7 @@ pub async fn serve(
         avatar_lock: tokio::sync::Mutex::new(()),
         mcp,
         public_url,
+        browser,
     });
     let app = Router::new()
         .route("/api/session", get(session))
@@ -931,6 +935,53 @@ fn recheck_bot_generation(
     Ok(())
 }
 
+/// `browser.status` payload: companion state plus every profile with the
+/// bots using it.
+fn browser_status_reply(ctx: &WebContext) -> crate::Result<Value> {
+    let (state, message) = ctx.browser.state();
+    let bots = ctx.store.bots()?;
+    let profiles = ctx
+        .store
+        .browser_profiles()?
+        .into_iter()
+        .map(|profile| {
+            json!({
+                "name": profile.name,
+                "bots": bots.iter()
+                    .filter(|bot| bot.browser_profile.as_deref() == Some(profile.name.as_str()))
+                    .map(|bot| bot.id.clone())
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "state": state.as_str(),
+        "message": message,
+        "profiles": profiles,
+    }))
+}
+
+/// `bot.browser.get` payload: the bot's assigned profile, the available
+/// profiles, and the companion state.
+fn bot_browser_reply(ctx: &WebContext, bot_id: &str) -> crate::Result<Value> {
+    let (state, _) = ctx.browser.state();
+    let bot = ctx
+        .store
+        .bot(bot_id)?
+        .ok_or_else(|| format!("Unknown bot {bot_id}"))?;
+    let profiles = ctx
+        .store
+        .browser_profiles()?
+        .into_iter()
+        .map(|profile| profile.name)
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "profile": bot.browser_profile,
+        "profiles": profiles,
+        "state": state.as_str(),
+    }))
+}
+
 async fn dispatch(
     ctx: &Context,
     request_type: &str,
@@ -1147,6 +1198,66 @@ async fn dispatch(
                 recheck_bot_generation(global, payload, bot_id, Some(bot.generation))?;
                 global.set_bot_mcp_server_enabled(bot_id, id, enabled)?;
                 bot_mcp_reply(global, bot_id)
+            }
+            "browser.status" => browser_status_reply(ctx),
+            "browser.profiles.add" => {
+                let name = get("name")?.trim();
+                if !browser_protocol::valid_profile_name(name) {
+                    return Err(
+                        "Profile names use lowercase letters, digits and '-' (max 64)".into(),
+                    );
+                }
+                let _guard = ctx.settings_lock.lock().await;
+                if !ctx.store.add_browser_profile(name, now())? {
+                    return Err(format!("Browser profile '{name}' already exists").into());
+                }
+                browser_status_reply(ctx)
+            }
+            "browser.profiles.remove" => {
+                let name = get("name")?;
+                let _guard = ctx.settings_lock.lock().await;
+                if !ctx.store.remove_browser_profile(name)? {
+                    return Err(format!("Unknown browser profile '{name}'").into());
+                }
+                drop(_guard);
+                // Closes the profile's tabs and deletes its cookies and
+                // storage, even while the companion is down.
+                if let Err(error) = ctx.browser.delete_profile(name).await {
+                    eprintln!("browser DeleteProfile {name}: {error}");
+                }
+                browser_status_reply(ctx)
+            }
+            "bot.browser.get" => {
+                resolve_bot(ctx, payload, bot_id).await?;
+                bot_browser_reply(ctx, bot_id)
+            }
+            "bot.browser.set" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let profile = match payload.get("profile") {
+                    None => return Err(invalid().into()),
+                    Some(Value::Null) => None,
+                    Some(Value::String(name)) => Some(name.clone()),
+                    Some(_) => return Err(invalid().into()),
+                };
+                let _guard = ctx.settings_lock.lock().await;
+                recheck_bot_generation(global, payload, bot_id, Some(bot.generation))?;
+                if let Some(name) = &profile {
+                    if !ctx
+                        .store
+                        .browser_profiles()?
+                        .iter()
+                        .any(|known| &known.name == name)
+                    {
+                        return Err(format!("Unknown browser profile '{name}'").into());
+                    }
+                }
+                if !ctx
+                    .store
+                    .set_bot_browser_profile(bot_id, profile.as_deref())?
+                {
+                    return Err(format!("Unknown bot {bot_id}").into());
+                }
+                bot_browser_reply(ctx, bot_id)
             }
             "general.get" => {
                 let bot = resolve_bot(ctx, payload, bot_id).await?;
@@ -2852,6 +2963,7 @@ mod public_file_tests {
             None,
             mcp.clone(),
             crate::nodes::NodeRegistry::new(store.clone()),
+            crate::browser::Browser::start(&dir),
         );
         bots.register_default_for_test().await.unwrap();
         let ctx = WebContext {
@@ -2862,6 +2974,7 @@ mod public_file_tests {
             avatar_lock: tokio::sync::Mutex::new(()),
             mcp,
             public_url: Some(public_url("https://blob-1.example.com").unwrap()),
+            browser: crate::browser::Browser::start(&dir),
         };
 
         let md_resp = serve_public_file(&ctx, &md_id, false).await;
@@ -2960,6 +3073,7 @@ mod public_file_tests {
             None,
             mcp.clone(),
             ctx_nodes(store.clone()),
+            crate::browser::Browser::start(&dir),
         );
         bots.register_default_for_test().await.unwrap();
         let ctx = Arc::new(WebContext {
@@ -2970,6 +3084,7 @@ mod public_file_tests {
             avatar_lock: tokio::sync::Mutex::new(()),
             mcp,
             public_url: Some(public_url("https://blob-1.example.com").unwrap()),
+            browser: crate::browser::Browser::start(&dir),
         });
 
         // Unknown token -> 404.

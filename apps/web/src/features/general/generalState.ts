@@ -12,6 +12,7 @@ export const generalPageAtomFor = Atom.family((instanceKey: string) => {
       {
         instructions: request('instructions.get', scope),
         general: request('general.get', scope),
+        browser: request('bot.browser.get', scope),
       },
       { concurrency: 'unbounded' },
     ),

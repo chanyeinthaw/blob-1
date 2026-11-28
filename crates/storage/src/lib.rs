@@ -2349,6 +2349,16 @@ pub struct Bot {
     pub generation: i64,
     /// Execution environment name; "local" means the primary's machine.
     pub environment: String,
+    /// Global browser profile this bot's tasks use, when set.
+    pub browser_profile: Option<String>,
+}
+
+/// A named persistent browser profile: one cookie/storage jar in the
+/// companion browser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserProfile {
+    pub name: String,
+    pub created_at: i64,
 }
 
 /// A remote execution environment — a `blob-1 node` accepted by an admin.
@@ -2626,6 +2636,18 @@ pub trait BotStore: Send + Sync {
         &self,
         bot_id: &str,
     ) -> Result<Option<(String, Option<Vec<u8>>)>, StoreError>;
+    /// Every global browser profile, ordered by name.
+    fn browser_profiles(&self) -> Result<Vec<BrowserProfile>, StoreError>;
+    /// Creates a browser profile; `false` means the name already exists.
+    fn add_browser_profile(&self, name: &str, created_at: i64) -> Result<bool, StoreError>;
+    /// Deletes a browser profile; bot references clear through `ON DELETE SET NULL`.
+    fn remove_browser_profile(&self, name: &str) -> Result<bool, StoreError>;
+    /// `None` clears the bot's browser profile.
+    fn set_bot_browser_profile(
+        &self,
+        bot_id: &str,
+        profile: Option<&str>,
+    ) -> Result<bool, StoreError>;
     fn set_bot_mcp_server_enabled(
         &self,
         bot_id: &str,
@@ -2741,6 +2763,22 @@ impl<T: BotStore + ?Sized> BotStore for Arc<T> {
         bot_id: &str,
     ) -> Result<Option<(String, Option<Vec<u8>>)>, StoreError> {
         (**self).bot_env_binding(bot_id)
+    }
+    fn browser_profiles(&self) -> Result<Vec<BrowserProfile>, StoreError> {
+        (**self).browser_profiles()
+    }
+    fn add_browser_profile(&self, name: &str, created_at: i64) -> Result<bool, StoreError> {
+        (**self).add_browser_profile(name, created_at)
+    }
+    fn remove_browser_profile(&self, name: &str) -> Result<bool, StoreError> {
+        (**self).remove_browser_profile(name)
+    }
+    fn set_bot_browser_profile(
+        &self,
+        bot_id: &str,
+        profile: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        (**self).set_bot_browser_profile(bot_id, profile)
     }
     fn set_bot_mcp_server_enabled(
         &self,

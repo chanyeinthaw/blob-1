@@ -10,6 +10,7 @@ use storage::{
 };
 use storage_sqlite::{AppKey, SqliteStorage};
 
+mod browser;
 mod github;
 mod import;
 mod nodes;
@@ -155,6 +156,9 @@ enum Command {
         /// Repoint launcher symlinks without asking a running launcher to restart.
         #[arg(long)]
         no_restart: bool,
+        /// Also install the browser companion (kept on later updates once installed).
+        #[arg(long)]
+        browser: bool,
     },
     /// Supervise `serve`, applying updates with database rollback.
     Launcher {
@@ -727,6 +731,7 @@ async fn main() -> Result<()> {
             channel,
             allow_downgrade,
             no_restart,
+            browser,
         } => {
             return runtime::update(runtime::UpdateOpts {
                 current: VERSION,
@@ -734,6 +739,7 @@ async fn main() -> Result<()> {
                 version: version.clone(),
                 allow_downgrade: *allow_downgrade,
                 no_restart: *no_restart,
+                browser: *browser,
             })
             .await;
         }
@@ -921,6 +927,7 @@ async fn main() -> Result<()> {
             let mcp_for_web = mcp.clone();
             let mcp_shutdown = mcp.clone();
             let nodes = nodes::NodeRegistry::new(store.clone());
+            let browser = browser::Browser::start(&data_dir);
             let registry = run::BotRegistry::new(
                 store.clone(),
                 data_dir.clone(),
@@ -930,6 +937,7 @@ async fn main() -> Result<()> {
                 skills_dir.clone(),
                 mcp,
                 nodes.clone(),
+                browser.clone(),
             );
             registry.start_all().await?;
             runtime::mark_ready();
@@ -952,8 +960,10 @@ async fn main() -> Result<()> {
                 mcp_for_web,
                 shutdown_rx,
                 public_url,
+                browser.clone(),
             )
             .await;
+            browser.shutdown().await;
             registry.shutdown_all().await;
             mcp_shutdown.shutdown().await;
             web_result

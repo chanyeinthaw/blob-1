@@ -454,31 +454,95 @@ fn installed(root: &Path, version: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Download, verify and unpack `blob-1-<version>-<platform>.tar.gz` into an
-/// already-created staging directory, then smoke-test and mark it complete.
-async fn install_into(client: &reqwest::Client, staging: &Path, version: &str) -> Result<()> {
-    let base = release_base();
-    let archive = format!("blob-1-{version}-{}.tar.gz", platform()?);
-    let sums = fetch(client, &format!("{base}/v{version}/SHA256SUMS")).await?;
-    let sums = String::from_utf8(sums)?;
-    let bytes = fetch(client, &format!("{base}/v{version}/{archive}")).await?;
-    let expected = checksum_for(&sums, &archive)?;
+/// Where `update --browser` unpacks the companion inside a version dir.
+const BROWSER_DIR: &str = "browser";
+
+/// Installed, and with the browser companion when it is wanted.
+fn installed_with(root: &Path, version: &str, browser: bool) -> bool {
+    installed(root, version)
+        && (!browser
+            || version_dir(root, version)
+                .join(BROWSER_DIR)
+                .join("blob-1-browser")
+                .is_file())
+}
+
+/// Downloads `archive` from the release, checks it against `sums`, and
+/// unpacks it into `into`.
+async fn fetch_and_extract(
+    client: &reqwest::Client,
+    version: &str,
+    sums: &str,
+    archive: &str,
+    into: &Path,
+) -> Result<()> {
+    let bytes = fetch(client, &format!("{}/v{version}/{archive}", release_base())).await?;
+    let expected = checksum_for(sums, archive)?;
     let actual = hex::encode(sha2::Sha256::digest(&bytes));
     if actual != expected {
         return Err(format!("checksum mismatch for {archive}").into());
     }
-    let archive_path = staging.join(&archive);
+    std::fs::create_dir_all(into)?;
+    let archive_path = into.join(archive);
     std::fs::write(&archive_path, &bytes)?;
     let status = std::process::Command::new("tar")
         .arg("-xzf")
         .arg(&archive_path)
         .arg("-C")
-        .arg(staging)
+        .arg(into)
         .status()?;
-    if !status.success() {
-        return Err("tar could not extract the release archive".into());
-    }
     std::fs::remove_file(&archive_path)?;
+    if !status.success() {
+        return Err(format!("tar could not extract {archive}").into());
+    }
+    Ok(())
+}
+
+/// Adds the browser companion to an already installed `version` (the one
+/// running), staging beside it and renaming into place under the versions lock.
+async fn add_browser(client: &reqwest::Client, root: &Path, version: &str) -> Result<()> {
+    if !installed(root, version) {
+        return Err(format!("{version} is not an installed release; run `blob-1 update --browser` to a release").into());
+    }
+    let sums = fetch(client, &format!("{}/v{version}/SHA256SUMS", release_base())).await?;
+    let sums = String::from_utf8(sums)?;
+    let dir = version_dir(root, version);
+    let staging = dir.join(format!(".{BROWSER_DIR}-staging-{}", std::process::id()));
+    let archive = format!("blob-1-browser-{version}-{}.tar.gz", platform()?);
+    if let Err(error) = fetch_and_extract(client, version, &sums, &archive, &staging).await {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(format!("browser companion: {error}").into());
+    }
+    let _lock = lock_versions(root)?;
+    let target = dir.join(BROWSER_DIR);
+    if target.exists() {
+        std::fs::remove_dir_all(&target)?;
+    }
+    std::fs::rename(&staging, &target)?;
+    Ok(())
+}
+
+/// Download, verify and unpack `blob-1-<version>-<platform>.tar.gz` into an
+/// already-created staging directory — plus the browser companion archive
+/// into `browser/` when `browser` is set — then smoke-test and mark it
+/// complete.
+async fn install_into(
+    client: &reqwest::Client,
+    staging: &Path,
+    version: &str,
+    browser: bool,
+) -> Result<()> {
+    let platform = platform()?;
+    let sums = fetch(client, &format!("{}/v{version}/SHA256SUMS", release_base())).await?;
+    let sums = String::from_utf8(sums)?;
+    let archive = format!("blob-1-{version}-{platform}.tar.gz");
+    fetch_and_extract(client, version, &sums, &archive, staging).await?;
+    if browser {
+        let archive = format!("blob-1-browser-{version}-{platform}.tar.gz");
+        fetch_and_extract(client, version, &sums, &archive, &staging.join(BROWSER_DIR))
+            .await
+            .map_err(|error| format!("browser companion: {error}"))?;
+    }
     let bin = staging.join("blob-1");
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
     let probe = if version == "0.0.0" { "--help" } else { "--version" };
@@ -511,6 +575,7 @@ async fn ensure_installed_and_register<F, T>(
     client: &reqwest::Client,
     root: &Path,
     version: &str,
+    browser: bool,
     register: F,
 ) -> Result<(bool, T)>
 where
@@ -519,13 +584,13 @@ where
     Version::parse(version)?;
     let mut attempt = 0;
     loop {
-        let staging = if attempt == 0 && installed(root, version) {
+        let staging = if attempt == 0 && installed_with(root, version, browser) {
             None
         } else {
             let versions = versions_dir(root);
             std::fs::create_dir_all(&versions)?;
             let dir = staging_dir(&versions)?;
-            if let Err(error) = install_into(client, &dir, version).await {
+            if let Err(error) = install_into(client, &dir, version, browser).await {
                 let _ = std::fs::remove_dir_all(&dir);
                 return Err(error);
             }
@@ -533,7 +598,7 @@ where
         };
         let lock = lock_versions(root)?;
         let fresh = if let Some(staging) = staging {
-            if installed(root, version) {
+            if installed_with(root, version, browser) {
                 let _ = std::fs::remove_dir_all(&staging);
                 false
             } else {
@@ -550,7 +615,7 @@ where
                 }
                 true
             }
-        } else if installed(root, version) {
+        } else if installed_with(root, version, browser) {
             false
         } else {
             // A concurrent prune removed the cached version before we acquired
@@ -725,6 +790,9 @@ pub struct UpdateOpts {
     pub version: Option<String>,
     pub allow_downgrade: bool,
     pub no_restart: bool,
+    /// Also install the browser companion; implied when the running version
+    /// already has one.
+    pub browser: bool,
 }
 
 enum UpdateRegistration {
@@ -743,6 +811,11 @@ pub async fn update(opts: UpdateOpts) -> Result<()> {
         None => resolve_target(&client, opts.channel).await?,
     };
     let target_version = Version::parse(&target)?;
+    if opts.browser && target == opts.current && !installed_with(&root, &target, true) {
+        add_browser(&client, &root, &target).await?;
+        println!("installed the browser companion into {target}; restart serve to use it");
+        return Ok(());
+    }
     if !upgrade_allowed(&current, &target_version, opts.allow_downgrade) {
         return Err(format!(
             "{target} is not newer than {}; pass --allow-downgrade to switch anyway",
@@ -750,9 +823,14 @@ pub async fn update(opts: UpdateOpts) -> Result<()> {
         )
         .into());
     }
+    let browser = opts.browser
+        || std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join(BROWSER_DIR).join("blob-1-browser")))
+            .is_some_and(|path| path.is_file());
     // Publish and register the target reference under the same `versions/.lock`
     // so pruning can never remove `target` between publication and activation.
-    let (fresh, registration) = ensure_installed_and_register(&client, &root, &target, |lock| {
+    let (fresh, registration) = ensure_installed_and_register(&client, &root, &target, browser, |lock| {
         if let Some(state) = load_state(&root)? {
             let queued = if state.active_version != target {
                 let entry = QueuedUpdate {

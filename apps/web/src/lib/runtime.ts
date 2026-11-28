@@ -26,6 +26,7 @@ export const MachineAtoms = AtomMachine.bind(AppRuntime)
 const isGlobalRequest = (type: RequestType): boolean =>
   type.startsWith('providers.') ||
   type.startsWith('mcp.') ||
+  type.startsWith('browser.') ||
   type.startsWith('bots.') ||
   type.startsWith('environments.')
 

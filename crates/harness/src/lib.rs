@@ -1,3 +1,4 @@
+pub mod browser;
 pub mod callback;
 pub mod chat;
 pub mod messenger;
@@ -5,6 +6,7 @@ pub mod schedule;
 pub mod secret;
 pub mod share;
 pub mod watch;
+pub use browser::BrowserTools;
 pub use callback::CallbackTools;
 pub use messenger::Messengers;
 pub use secret::SecretTools;

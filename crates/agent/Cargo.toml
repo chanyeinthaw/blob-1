@@ -15,6 +15,7 @@ dashmap = "6"
 harness.workspace = true
 llm-rig.workspace = true
 mcp.workspace = true
+browser-protocol.workspace = true
 storage.workspace = true
 storage-sqlite.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }

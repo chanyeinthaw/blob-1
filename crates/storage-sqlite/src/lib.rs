@@ -160,13 +160,19 @@ CREATE TABLE IF NOT EXISTS models (
 CREATE TABLE IF NOT EXISTS utility_model (id INTEGER PRIMARY KEY CHECK (id = 1), provider TEXT NOT NULL, model TEXT NOT NULL, reasoning TEXT CHECK (reasoning IN ('off','low','medium','high','xhigh','max')), FOREIGN KEY (provider, model) REFERENCES models (provider, id) ON DELETE CASCADE) STRICT;
 CREATE TABLE IF NOT EXISTS decision_model (id INTEGER PRIMARY KEY CHECK (id = 1), provider TEXT NOT NULL, model TEXT NOT NULL, FOREIGN KEY (provider, model) REFERENCES models (provider, id) ON DELETE CASCADE) STRICT;
 
+CREATE TABLE IF NOT EXISTS browser_profiles (
+    name TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS bots (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     created_at INTEGER NOT NULL,
     generation INTEGER NOT NULL DEFAULT 0,
-    environment TEXT NOT NULL DEFAULT 'local'
+    environment TEXT NOT NULL DEFAULT 'local',
+    browser_profile TEXT REFERENCES browser_profiles (name) ON DELETE SET NULL
 ) STRICT;
 INSERT OR IGNORE INTO bots (id, name, enabled, created_at) VALUES ('default', 'Blob-1', 1, 0);
 CREATE TABLE IF NOT EXISTS bot_avatars (
@@ -445,6 +451,7 @@ impl SqliteStorage {
         ensure_settings_auto_respond(&mut connection, &mut require_exclusive)?;
         ensure_bots_generation(&mut connection, &mut require_exclusive)?;
         ensure_bots_environment(&mut connection, &mut require_exclusive)?;
+        ensure_bots_browser_profile(&mut connection, &mut require_exclusive)?;
         ensure_environments_pending_key(&mut connection, &mut require_exclusive)?;
         ensure_environments_hostname(&mut connection, &mut require_exclusive)?;
         ensure_environments_enrollment(&mut connection, &mut require_exclusive)?;
@@ -1197,6 +1204,41 @@ fn ensure_bots_environment(
     if !has_column(&tx)? {
         tx.execute_batch("ALTER TABLE bots ADD COLUMN environment TEXT NOT NULL DEFAULT 'local';")
             .map_err(backend)?;
+    }
+    tx.commit().map_err(backend)?;
+    Ok(())
+}
+
+
+/// Adds `bots.browser_profile` to databases created before browser profiles
+/// existed. The nullable foreign key clears bot references when a profile is
+/// deleted.
+fn ensure_bots_browser_profile(
+    connection: &mut Connection,
+    require_exclusive: &mut impl FnMut(&'static str) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let has_column = |conn: &Connection| -> Result<bool, StoreError> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name = 'browser_profile')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(backend)
+    };
+    if has_column(connection)? {
+        return Ok(());
+    }
+    require_exclusive(
+        "this database needs an upgrade: restart blob-1 serve or run an exclusive command once",
+    )?;
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(backend)?;
+    if !has_column(&tx)? {
+        tx.execute_batch(
+            "ALTER TABLE bots ADD COLUMN browser_profile TEXT REFERENCES browser_profiles (name) ON DELETE SET NULL;",
+        )
+        .map_err(backend)?;
     }
     tx.commit().map_err(backend)?;
     Ok(())

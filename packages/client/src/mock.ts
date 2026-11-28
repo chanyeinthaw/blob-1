@@ -2,10 +2,12 @@ import { Array, Duration, Effect, Layer, Random, Ref, Schema, Stream, Struct } f
 
 import { Transport } from './api.ts'
 import {
+  type BotBrowser,
   type BotMcpState,
   type BotSkillMode,
   type BotSkillsState,
   type BotSummary,
+  type BrowserStatus,
   type CheckinConfig,
   type DecisionSlot,
   Discord,
@@ -955,6 +957,7 @@ const transition = (
 
 const DEFAULT_BOT_ID = 'default'
 const VALID_BOT_ID = /^[a-z0-9][a-z0-9-]{0,31}$/
+const VALID_BROWSER_PROFILE = /^[a-z0-9][a-z0-9-]{0,63}$/
 
 type SkillInfo = Readonly<{
   name: string
@@ -1046,6 +1049,7 @@ type BotRecord = Readonly<{
   createdAt: number
   generation: number
   disabledMcp: ReadonlyArray<string>
+  browserProfile: string | null
   managedSkills: ReadonlyArray<SkillInfo>
   detectedSkills: ReadonlyArray<SkillInfo>
   skillModes: Readonly<Record<string, BotSkillMode>>
@@ -1060,6 +1064,7 @@ type EnvironmentRecord = EnvironmentInfo & Readonly<{ hostname: string }>
 type MockRoot = Readonly<{
   providers: ReadonlyArray<ProviderRecord>
   mcpServers: ReadonlyArray<McpServer>
+  browserProfiles: ReadonlyArray<string>
   bots: ReadonlyArray<BotRecord>
   pendingNodes: ReadonlyArray<PendingNode>
   environments: ReadonlyArray<EnvironmentRecord>
@@ -1097,6 +1102,7 @@ const seedRoot = (): MockRoot => {
   return {
     providers: initial.providers,
     mcpServers: initial.mcpServers,
+    browserProfiles: ['personal', 'research'],
     bots: [
       {
         id: DEFAULT_BOT_ID,
@@ -1105,6 +1111,7 @@ const seedRoot = (): MockRoot => {
         createdAt: 0,
         generation: 0,
         disabledMcp: [],
+        browserProfile: 'personal',
         managedSkills: seedManagedSkills,
         detectedSkills: seedDetectedSkills,
         skillModes: {},
@@ -1176,6 +1183,25 @@ const botMcpReply = (root: MockRoot, botId: string): Effect.Effect<BotMcpState, 
       enabledGlobal: server.enabled,
       enabledForBot: !bot.disabledMcp.includes(server.id),
     })),
+  })
+}
+
+const browserStatusReply = (root: MockRoot): BrowserStatus => ({
+  state: 'ready',
+  message: null,
+  profiles: root.browserProfiles.map(name => ({
+    name,
+    bots: root.bots.filter(bot => bot.browserProfile === name).map(bot => bot.id),
+  })),
+})
+
+const botBrowserReply = (root: MockRoot, botId: string): Effect.Effect<BotBrowser, string> => {
+  const bot = root.bots.find(entry => entry.id === botId)
+  if (bot === undefined) return Effect.fail(`Unknown bot ${botId}`)
+  return Effect.succeed({
+    profile: bot.browserProfile,
+    profiles: root.browserProfiles,
+    state: 'ready',
   })
 }
 
@@ -1263,6 +1289,11 @@ type LegacyRequestType = Exclude<
   | 'bots.setEnvironment'
   | 'bot.mcp.get'
   | 'bot.mcp.setEnabled'
+  | 'browser.status'
+  | 'browser.profiles.add'
+  | 'browser.profiles.remove'
+  | 'bot.browser.get'
+  | 'bot.browser.set'
   | 'bot.skills.list'
   | 'bot.skills.setMode'
   | 'bot.skills.remove'
@@ -1901,6 +1932,7 @@ const botControlHandlers = {
             createdAt,
             generation: root.nextGeneration,
             disabledMcp: [],
+            browserProfile: null,
             managedSkills: [],
             detectedSkills: seedDetectedSkills,
             skillModes: {},
@@ -2062,6 +2094,86 @@ const botControlHandlers = {
       })
       yield* Ref.set(rootRef, next)
       return environmentsReply(next)
+    }),
+
+  'browser.status': (_payload: RequestPayload<'browser.status'>, rootRef: Ref.Ref<MockRoot>) =>
+    Ref.get(rootRef).pipe(Effect.map(browserStatusReply)),
+
+  'browser.profiles.add': (
+    { name: rawName }: RequestPayload<'browser.profiles.add'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const name = rawName.trim()
+      if (!VALID_BROWSER_PROFILE.test(name)) {
+        return yield* Effect.fail("Profile names use lowercase letters, digits and '-' (max 64)")
+      }
+      if (root.browserProfiles.includes(name)) {
+        return yield* Effect.fail(`Browser profile '${name}' already exists`)
+      }
+      const next: MockRoot = Struct.evolve(root, {
+        browserProfiles: profiles => [...profiles, name].toSorted((a, b) => a.localeCompare(b)),
+      })
+      yield* Ref.set(rootRef, next)
+      return browserStatusReply(next)
+    }),
+
+  'browser.profiles.remove': (
+    { name }: RequestPayload<'browser.profiles.remove'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      if (!root.browserProfiles.includes(name)) {
+        return yield* Effect.fail(`Unknown browser profile '${name}'`)
+      }
+      const next: MockRoot = Struct.evolve(root, {
+        browserProfiles: profiles => profiles.filter(profile => profile !== name),
+        bots: bots =>
+          bots.map(bot =>
+            bot.browserProfile === name ? Struct.evolve(bot, { browserProfile: () => null }) : bot,
+          ),
+      })
+      yield* Ref.set(rootRef, next)
+      return browserStatusReply(next)
+    }),
+
+  'bot.browser.get': (
+    { botId, botGeneration }: RequestPayload<'bot.browser.get'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const resolved = botId ?? DEFAULT_BOT_ID
+      const bot = root.bots.find(entry => entry.id === resolved)
+      if (bot !== undefined) yield* checkGeneration(bot, botGeneration)
+      return yield* botBrowserReply(root, resolved)
+    }),
+
+  'bot.browser.set': (
+    { botId: rawBotId, botGeneration, profile }: RequestPayload<'bot.browser.set'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const botId = rawBotId ?? DEFAULT_BOT_ID
+      const target = root.bots.find(bot => bot.id === botId)
+      if (target === undefined) {
+        return yield* Effect.fail(`Unknown bot ${botId}`)
+      }
+      yield* checkGeneration(target, botGeneration)
+      if (profile !== null && !root.browserProfiles.includes(profile)) {
+        return yield* Effect.fail(`Unknown browser profile '${profile}'`)
+      }
+      const next: MockRoot = Struct.evolve(root, {
+        bots: bots =>
+          bots.map(bot =>
+            bot.id === botId ? Struct.evolve(bot, { browserProfile: () => profile }) : bot,
+          ),
+      })
+      yield* Ref.set(rootRef, next)
+      return yield* botBrowserReply(next, botId)
     }),
 
   'bot.mcp.get': (
@@ -2369,6 +2481,11 @@ const botControlHandlers = {
       | 'bots.setEnvironment'
       | 'bot.mcp.get'
       | 'bot.mcp.setEnabled'
+      | 'browser.status'
+      | 'browser.profiles.add'
+      | 'browser.profiles.remove'
+      | 'bot.browser.get'
+      | 'bot.browser.set'
       | 'bot.skills.list'
       | 'bot.skills.setMode'
       | 'bot.skills.remove'

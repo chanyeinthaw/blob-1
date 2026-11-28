@@ -13,6 +13,7 @@ import { Route as IndexRouteImport } from './routes/index'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as SettingsIndexRouteImport } from './routes/settings.index'
+import { Route as SettingsBrowserRouteImport } from './routes/settings.browser'
 import { Route as SettingsChatRouteImport } from './routes/settings.chat'
 import { Route as SettingsDiscordRouteImport } from './routes/settings.discord'
 import { Route as SettingsEnvironmentsRouteImport } from './routes/settings.environments'
@@ -55,6 +56,11 @@ const SettingsRoute = SettingsRouteImport.update({
 const SettingsIndexRoute = SettingsIndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => SettingsRoute,
+} as any)
+const SettingsBrowserRoute = SettingsBrowserRouteImport.update({
+  id: '/browser',
+  path: '/browser',
   getParentRoute: () => SettingsRoute,
 } as any)
 const SettingsChatRoute = SettingsChatRouteImport.update({
@@ -182,6 +188,7 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/settings': typeof SettingsRouteWithChildren
+  '/settings/browser': typeof SettingsBrowserRoute
   '/settings/chat': typeof SettingsChatRouteWithChildren
   '/settings/discord': typeof SettingsDiscordRoute
   '/settings/environments': typeof SettingsEnvironmentsRoute
@@ -210,6 +217,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
+  '/settings/browser': typeof SettingsBrowserRoute
   '/settings/discord': typeof SettingsDiscordRoute
   '/settings/environments': typeof SettingsEnvironmentsRoute
   '/settings/general': typeof SettingsGeneralRoute
@@ -238,6 +246,7 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/settings': typeof SettingsRouteWithChildren
+  '/settings/browser': typeof SettingsBrowserRoute
   '/settings/chat': typeof SettingsChatRouteWithChildren
   '/settings/discord': typeof SettingsDiscordRoute
   '/settings/environments': typeof SettingsEnvironmentsRoute
@@ -269,6 +278,7 @@ export interface FileRouteTypes {
     | '/'
     | '/login'
     | '/settings'
+    | '/settings/browser'
     | '/settings/chat'
     | '/settings/discord'
     | '/settings/environments'
@@ -297,6 +307,7 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/login'
+    | '/settings/browser'
     | '/settings/discord'
     | '/settings/environments'
     | '/settings/general'
@@ -324,6 +335,7 @@ export interface FileRouteTypes {
     | '/'
     | '/login'
     | '/settings'
+    | '/settings/browser'
     | '/settings/chat'
     | '/settings/discord'
     | '/settings/environments'
@@ -384,6 +396,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/settings/'
       preLoaderRoute: typeof SettingsIndexRouteImport
+      parentRoute: typeof SettingsRoute
+    }
+    '/settings/browser': {
+      id: '/settings/browser'
+      path: '/browser'
+      fullPath: '/settings/browser'
+      preLoaderRoute: typeof SettingsBrowserRouteImport
       parentRoute: typeof SettingsRoute
     }
     '/settings/chat': {
@@ -594,6 +613,7 @@ const SettingsBotsBotIdRouteWithChildren =
   SettingsBotsBotIdRoute._addFileChildren(SettingsBotsBotIdRouteChildren)
 
 interface SettingsRouteChildren {
+  SettingsBrowserRoute: typeof SettingsBrowserRoute
   SettingsChatRoute: typeof SettingsChatRouteWithChildren
   SettingsDiscordRoute: typeof SettingsDiscordRoute
   SettingsEnvironmentsRoute: typeof SettingsEnvironmentsRoute
@@ -609,6 +629,7 @@ interface SettingsRouteChildren {
 }
 
 const SettingsRouteChildren: SettingsRouteChildren = {
+  SettingsBrowserRoute: SettingsBrowserRoute,
   SettingsChatRoute: SettingsChatRouteWithChildren,
   SettingsDiscordRoute: SettingsDiscordRoute,
   SettingsEnvironmentsRoute: SettingsEnvironmentsRoute,

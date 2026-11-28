@@ -62,6 +62,7 @@ You coordinate and talk; tasks do the work. You have no file, command, web, shar
 - read-only zoom and date on your memory
 - read-only messenger lookup (message, history, search, participants; never send)
 - share for creating public links to files or long writeups (when a public URL is configured)
+- browser tools for persistent-profile web browsing (when the bot has a browser profile)
 - the skills and MCP servers listed below
 
 A task knows only what you tell it and what it finds in your memory. Brief it like a capable teammate: the goal, what is already known or decided, the paths, ids or tokens it needs, and what to put in its report. Name a skill when one fits. Ask for a short report with the findings that matter, since the report is what lands in your memory.
@@ -251,6 +252,7 @@ pub(crate) struct Inner<E, S, M, F: Models> {
     pub share: Option<crate::ShareTools>,
     pub callback: Option<crate::CallbackTools>,
     pub secrets: Option<crate::SecretTools>,
+    pub browser: Option<crate::BrowserTools>,
     pub mcp: Option<mcp::Mcp>,
     pub mcp_filter: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
     pub skill_modes: Option<crate::session::SkillModes>,
@@ -270,6 +272,11 @@ impl<E, S, M, F: Models> Drop for ChatHarness<E, S, M, F> {
         let state = self.inner.state.lock().expect("chat state mutex poisoned");
         for task in &state.tasks {
             task.abort();
+        }
+        if tokio::runtime::Handle::try_current().is_ok() {
+            for name in state.agents.keys() {
+                tasks::close_browser_owner(&self.inner.browser, format!("task:{name}"));
+            }
         }
     }
 }
@@ -363,6 +370,7 @@ where
                 share: None,
                 callback: None,
                 secrets: None,
+                browser: None,
                 mcp: None,
                 mcp_filter: None,
                 skill_modes: None,
@@ -398,6 +406,14 @@ where
         Arc::get_mut(&mut self.inner)
             .expect("unshared chat")
             .secrets = Some(secrets);
+        self
+    }
+
+    /// Gives this bot's task sessions access to the shared browser companion.
+    pub fn with_browser(mut self, browser: crate::BrowserTools) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("unshared chat")
+            .browser = Some(browser);
         self
     }
 

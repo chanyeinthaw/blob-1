@@ -237,6 +237,29 @@ export const BotMcpState = Schema.Struct({
 })
 export type BotMcpState = typeof BotMcpState.Type
 
+export const BrowserState = Schema.Literals(['unavailable', 'starting', 'ready', 'error'])
+export type BrowserState = typeof BrowserState.Type
+
+export const BrowserProfile = Schema.Struct({
+  name: Schema.String,
+  bots: Schema.Array(Schema.String),
+})
+export type BrowserProfile = typeof BrowserProfile.Type
+
+export const BrowserStatus = Schema.Struct({
+  state: BrowserState,
+  message: Schema.NullOr(Schema.String),
+  profiles: Schema.Array(BrowserProfile),
+})
+export type BrowserStatus = typeof BrowserStatus.Type
+
+export const BotBrowser = Schema.Struct({
+  profile: Schema.NullOr(Schema.String),
+  profiles: Schema.Array(Schema.String),
+  state: BrowserState,
+})
+export type BotBrowser = typeof BotBrowser.Type
+
 export const BotSkillMode = Schema.Literals(['both', 'chat', 'task', 'off'])
 export type BotSkillMode = typeof BotSkillMode.Type
 
@@ -545,6 +568,20 @@ export const requests = {
   'bot.mcp.setEnabled': {
     payload: Schema.Struct({ ...botIdField, id: Schema.String, enabled: Schema.Boolean }),
     reply: BotMcpState,
+  },
+  'browser.status': { payload: NoPayload, reply: BrowserStatus },
+  'browser.profiles.add': {
+    payload: Schema.Struct({ name: Schema.String }),
+    reply: BrowserStatus,
+  },
+  'browser.profiles.remove': {
+    payload: Schema.Struct({ name: Schema.String }),
+    reply: BrowserStatus,
+  },
+  'bot.browser.get': { payload: BotScopedPayload, reply: BotBrowser },
+  'bot.browser.set': {
+    payload: Schema.Struct({ ...botIdField, profile: Schema.NullOr(Schema.String) }),
+    reply: BotBrowser,
   },
   'environments.list': { payload: NoPayload, reply: Environments },
   'environments.accept': {
