@@ -156,6 +156,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake ninja-build
+          export CEF_PATH="${RUNNER_TEMP}/cef"
           crates/browser/scripts/dist.sh --release "${RUNNER_TEMP}/browser-dist"
           tar -C "${RUNNER_TEMP}/browser-dist" -czf "blob-1-browser-${BLOB_1_VERSION}-${{ matrix.platform }}.tar.gz" .
 

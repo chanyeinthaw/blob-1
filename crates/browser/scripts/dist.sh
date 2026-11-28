@@ -33,9 +33,12 @@ install -m 0755 "$build_dir/blob-1-browser" "$tmp/blob-1-browser"
 # The CEF runtime: CEF_PATH when set, else the newest distribution the
 # cef-dll-sys build extracted. Its copy into target/<profile> is not reliable
 # on every runner, so that is only the last resort.
-cef_dir="${CEF_PATH:-}"
-if [[ -n "$cef_dir" && -d "$cef_dir/cef_linux_x86_64" ]]; then
-  cef_dir="$cef_dir/cef_linux_x86_64"
+cef_dir=""
+if [[ -n "${CEF_PATH:-}" ]]; then
+  # CEF_PATH may be the distribution itself or a parent holding
+  # <cef-version>/cef_linux_x86_64.
+  found="$(find "$CEF_PATH" -maxdepth 3 -name libcef.so -print -quit 2>/dev/null || true)"
+  [[ -n "$found" ]] && cef_dir="$(dirname "$found")"
 fi
 if [[ -z "$cef_dir" || ! -f "$cef_dir/libcef.so" ]]; then
   cef_dir="$(ls -dt "$build_dir"/build/cef-dll-sys-*/out/cef_linux_x86_64 2>/dev/null | head -n 1 || true)"
@@ -45,6 +48,7 @@ if [[ -z "$cef_dir" || ! -f "$cef_dir/libcef.so" ]]; then
 fi
 if [[ ! -f "$cef_dir/libcef.so" || ! -d "$cef_dir/locales" ]]; then
   echo "no CEF runtime found (looked in CEF_PATH, $build_dir/build/cef-dll-sys-*/out, $build_dir)" >&2
+  find "$repo_root/target" -name libcef.so 2>/dev/null | head -n 10 >&2 || true
   exit 1
 fi
 
