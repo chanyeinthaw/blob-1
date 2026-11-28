@@ -173,6 +173,7 @@ const BOT_PAGES = {
   webhooks: '/settings/bots/$botId/webhooks',
   secrets: '/settings/bots/$botId/secrets',
   mcp: '/settings/bots/$botId/mcp',
+  skills: '/settings/bots/$botId/skills',
   discord: '/settings/bots/$botId/discord',
 } as const satisfies Record<string, NonNullable<LinkProps['to']>>
 type BotPage = keyof typeof BOT_PAGES
