@@ -30,6 +30,24 @@ build_dir="$repo_root/target/$profile"
 mkdir -p "$tmp"
 install -m 0755 "$build_dir/blob-1-browser" "$tmp/blob-1-browser"
 
+# The CEF runtime: CEF_PATH when set, else the newest distribution the
+# cef-dll-sys build extracted. Its copy into target/<profile> is not reliable
+# on every runner, so that is only the last resort.
+cef_dir="${CEF_PATH:-}"
+if [[ -n "$cef_dir" && -d "$cef_dir/cef_linux_x86_64" ]]; then
+  cef_dir="$cef_dir/cef_linux_x86_64"
+fi
+if [[ -z "$cef_dir" || ! -f "$cef_dir/libcef.so" ]]; then
+  cef_dir="$(ls -dt "$build_dir"/build/cef-dll-sys-*/out/cef_linux_x86_64 2>/dev/null | head -n 1 || true)"
+fi
+if [[ -z "$cef_dir" || ! -f "$cef_dir/libcef.so" ]]; then
+  cef_dir="$build_dir"
+fi
+if [[ ! -f "$cef_dir/libcef.so" || ! -d "$cef_dir/locales" ]]; then
+  echo "no CEF runtime found (looked in CEF_PATH, $build_dir/build/cef-dll-sys-*/out, $build_dir)" >&2
+  exit 1
+fi
+
 # cef-dll-sys copies the CEF runtime into Cargo's target directory during the
 # build. Copy the runtime subset CEF documents for Linux; files marked absent
 # in a given CEF revision are skipped.
@@ -48,11 +66,11 @@ for file in \
   chrome_200_percent.pak \
   chrome-sandbox
 do
-  if [[ -e "$build_dir/$file" ]]; then
-    cp -a "$build_dir/$file" "$tmp/$file"
+  if [[ -e "$cef_dir/$file" ]]; then
+    cp -a "$cef_dir/$file" "$tmp/$file"
   fi
 done
-cp -a "$build_dir/locales" "$tmp/locales"
+cp -a "$cef_dir/locales" "$tmp/locales"
 
 # Upstream libcef.so carries debug symbols (~1.4 GiB); release builds ship it
 # stripped (~285 MiB).
