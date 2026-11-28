@@ -7,7 +7,14 @@ import { Pencil, RefreshCw, Trash2 } from 'lucide-react'
 import { type FormEvent, useEffect, useState } from 'react'
 
 import { ConfirmDialog } from '~/components/ConfirmDialog'
-import { EmptyLine, FieldRow, Page, PageError } from '~/components/layout/Page'
+import {
+  Empty,
+  EmptyLine,
+  FieldRow,
+  Page,
+  PageError,
+  tableRowHoverClassName,
+} from '~/components/layout/Page'
 import { Button } from '~/components/ui/button'
 import {
   Dialog,
@@ -40,7 +47,8 @@ const EnvironmentsOwner = createPersistentMachineContext(
 const environmentGridClassName = 'sm:grid-cols-[minmax(0,1fr)_104px_112px_minmax(144px,176px)_72px]'
 
 const rowClassName =
-  'group grid grid-cols-1 items-center gap-x-3 gap-y-2.5 px-1 py-3 sm:min-h-12 sm:gap-y-1.5 sm:px-2 sm:py-2'
+  'group grid grid-cols-1 items-center gap-x-3 gap-y-2.5 px-1 py-3 sm:min-h-12 sm:gap-y-1.5 sm:px-2 sm:py-2 ' +
+  tableRowHoverClassName
 
 function formatTimestamp(timestampSecs: number): string {
   const deltaSecs = Math.max(0, Math.floor(Date.now() / 1000) - timestampSecs)
@@ -236,7 +244,7 @@ interface EnvironmentListProps {
 /** One table: nodes waiting for approval first, then accepted environments. */
 function EnvironmentList(props: EnvironmentListProps) {
   if (props.pending.length === 0 && props.environments.length === 0) {
-    return <EmptyLine>No environments yet.</EmptyLine>
+    return <Empty>No environments yet.</Empty>
   }
   return (
     <div>

@@ -8,7 +8,15 @@ import { KeyRound, Link2, Pencil, Plus, RefreshCw, Trash2 } from 'lucide-react'
 import { type FormEvent, useEffect, useRef, useState } from 'react'
 
 import { ConfirmDialog } from '~/components/ConfirmDialog'
-import { EmptyLine, FieldError, FieldRow, Page, PageError, Section } from '~/components/layout/Page'
+import {
+  EmptyLine,
+  FieldError,
+  FieldRow,
+  Page,
+  PageError,
+  Section,
+  tableRowHoverClassName,
+} from '~/components/layout/Page'
 import { Button } from '~/components/ui/button'
 import {
   Dialog,
@@ -190,6 +198,7 @@ function ProviderRow(props: ProviderRowProps) {
     <li
       className={cn(
         'group grid grid-cols-1 items-center gap-x-3 gap-y-2.5 px-1 py-3 sm:min-h-12 sm:gap-y-1.5 sm:px-2 sm:py-2',
+        tableRowHoverClassName,
         gridClassName,
       )}
     >

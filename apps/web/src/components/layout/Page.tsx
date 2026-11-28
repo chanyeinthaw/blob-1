@@ -12,7 +12,7 @@ export const panelClassName =
   'flex min-h-0 flex-1 bg-background md:relative md:z-10 md:overflow-hidden md:rounded-l-2xl md:shadow-[0_1px_4px_rgb(0_0_0/0.06),0_8px_28px_rgb(0_0_0/0.10)]'
 
 export const scrollClassName =
-  'min-w-0 flex-1 px-5 pb-[max(2.5rem,env(safe-area-inset-bottom))] md:min-h-0 md:overflow-y-auto md:pt-4 md:pb-10'
+  'min-w-0 flex-1 px-5 pb-[max(2.5rem,env(safe-area-inset-bottom))] md:flex md:min-h-0 md:flex-col md:overflow-y-auto md:pt-4 md:pb-10 md:px-8'
 
 /** Content column widths: forms by default, `wide` for lists, `full` for dense lists. */
 export type ColumnWidth = 'form' | 'wide' | 'full'
@@ -22,6 +22,9 @@ export const columnClassName = {
   wide: 'max-w-[1120px]',
   full: 'max-w-none',
 } satisfies Record<ColumnWidth, string>
+
+/** Shared hover affordance for catalog-table rows, matching `SplitItem`'s hover. */
+export const tableRowHoverClassName = 'transition-colors hover:bg-border/40'
 
 interface PageProps {
   readonly title: string
@@ -37,7 +40,7 @@ export function Page(props: PageProps) {
   const columnWidth = columnClassName[props.width ?? 'form']
   return (
     <div className={cn(panelClassName, 'flex-col')}>
-      <div className="shrink-0 px-5 pt-5 pb-4 md:px-10 md:py-4 lg:px-16">
+      <div className="shrink-0 px-5 pt-5 pb-4 md:px-8 md:py-4">
         <div className="flex w-full flex-wrap items-center gap-x-4 gap-y-3">
           <h1 className="mr-auto text-lg font-semibold tracking-tight">{props.title}</h1>
           {props.actions === undefined || props.actions === null ? null : (
@@ -52,8 +55,8 @@ export function Page(props: PageProps) {
           )}
         </div>
       </div>
-      <div className={cn(scrollClassName, 'md:px-10 lg:px-16')}>
-        <div className={cn('w-full', columnWidth)}>{props.children}</div>
+      <div className={cn(scrollClassName)}>
+        <div className={cn('flex w-full flex-col md:flex-1', columnWidth)}>{props.children}</div>
       </div>
     </div>
   )
@@ -134,6 +137,19 @@ interface EmptyLineProps {
 
 export function EmptyLine(props: EmptyLineProps) {
   return <p className="py-2 text-sm text-muted-foreground">{props.children}</p>
+}
+
+interface EmptyProps {
+  readonly children: ReactNode
+}
+
+/** A page-level empty state, centered in the remaining space of the panel. */
+export function Empty(props: EmptyProps) {
+  return (
+    <div className="flex flex-1 items-center justify-center py-12">
+      <p className="text-sm text-muted-foreground">{props.children}</p>
+    </div>
+  )
 }
 
 export function pageErrorMessage(cause: Cause.Cause<ApiError>): string {

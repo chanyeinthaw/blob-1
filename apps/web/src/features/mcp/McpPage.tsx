@@ -8,7 +8,16 @@ import { ExternalLink, Link2, Plus, RefreshCw, Terminal, Trash2 } from 'lucide-r
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 
 import { ConfirmDialog } from '~/components/ConfirmDialog'
-import { EmptyLine, FieldError, FieldRow, Page, PageError, Section } from '~/components/layout/Page'
+import {
+  Empty,
+  EmptyLine,
+  FieldError,
+  FieldRow,
+  Page,
+  PageError,
+  Section,
+  tableRowHoverClassName,
+} from '~/components/layout/Page'
 import { Button } from '~/components/ui/button'
 import { Input } from '~/components/ui/input'
 import { Switch } from '~/components/ui/switch'
@@ -151,7 +160,7 @@ function ServersList() {
     <MachineState machine={machine} path="">
       {({ value, states }) =>
         value.servers.length === 0 ? (
-          <EmptyLine>No MCP servers configured yet.</EmptyLine>
+          <Empty>No MCP servers configured yet.</Empty>
         ) : (
           <div>
             <ServersHeader />
@@ -265,6 +274,7 @@ function ServerRow(props: ServerRowProps) {
     <li
       className={cn(
         'group grid grid-cols-1 items-center gap-x-3 gap-y-2.5 px-1 py-3 sm:min-h-12 sm:gap-y-1.5 sm:px-2 sm:py-2',
+        tableRowHoverClassName,
         gridClassName,
       )}
     >

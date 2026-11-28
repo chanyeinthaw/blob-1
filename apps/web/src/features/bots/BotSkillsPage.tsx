@@ -5,7 +5,7 @@ import { ChevronDown, Download, FolderSearch, Package, PackagePlus, Trash2 } fro
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 
 import { ConfirmDialog } from '~/components/ConfirmDialog'
-import { EmptyLine, PageError } from '~/components/layout/Page'
+import { EmptyLine, PageError, tableRowHoverClassName } from '~/components/layout/Page'
 import { SplitDetail } from '~/components/layout/SplitPage'
 import { Button } from '~/components/ui/button'
 import {
@@ -60,7 +60,7 @@ function SkillRow(props: SkillRowProps) {
   const managed = skill.source === 'managed'
   const action = managed ? 'Remove' : 'Delete'
   return (
-    <li className={cn(gridClassName, 'min-h-12 px-2 py-2')}>
+    <li className={cn(gridClassName, 'min-h-12 px-2 py-2', tableRowHoverClassName)}>
       <div className="flex min-w-0 items-center gap-2.5">
         <Tooltip>
           <TooltipTrigger

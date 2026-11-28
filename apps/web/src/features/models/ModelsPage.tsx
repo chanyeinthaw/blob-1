@@ -18,6 +18,7 @@ import {
   Page,
   PageError,
   Section,
+  tableRowHoverClassName,
 } from '~/components/layout/Page'
 import { SplitDetail } from '~/components/layout/SplitPage'
 import { Picker } from '~/components/Picker'
@@ -621,6 +622,7 @@ function ModelRow(props: ModelRowProps) {
     <li
       className={cn(
         'group grid grid-cols-1 items-center gap-x-3 gap-y-2.5 px-1 py-3 sm:min-h-12 sm:gap-y-1.5 sm:px-2 sm:py-2',
+        tableRowHoverClassName,
         gridClassName(props.showProvider),
       )}
     >
