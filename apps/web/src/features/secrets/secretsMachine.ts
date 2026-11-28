@@ -78,6 +78,7 @@ export const SecretsEvents = Machine.events({
   Refresh: {},
   SetSecret: { name: Schema.String, value: Schema.String },
   RemoveSecret: { name: Schema.String },
+  ReplaceData: { state: SecretsPayload },
   ClearMutationError: {},
   RequestSecret: { name: Schema.String, label: Schema.NullOr(Schema.String) },
   ClearRequestError: {},
@@ -107,6 +108,15 @@ export const SecretsMachine = Machine.make({
     Refresh: {
       update: 'root',
       data: ({ root }) => ({ ...root, refreshQueued: true }),
+    },
+    ReplaceData: {
+      update: 'root',
+      data: ({ root, event }) => ({
+        ...root,
+        publicUrl: event.state.publicUrl,
+        secrets: event.state.secrets,
+        mutationSeq: root.mutationSeq + 1,
+      }),
     },
     ClearMutationError: {
       update: 'root',

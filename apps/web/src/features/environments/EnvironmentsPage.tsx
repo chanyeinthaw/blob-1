@@ -3,11 +3,11 @@ import { useAtomRefresh, useAtomSet, useAtomValue } from '@effect/atom-react'
 import { AtomMachine } from '@typeonce/effect-machine/reactivity'
 import { MachineState, useMachineResult } from '@typeonce/effect-machine-react'
 import { AsyncResult } from 'effect/reactivity'
-import { Monitor, Pencil, RefreshCw, Server, Trash2 } from 'lucide-react'
+import { Pencil, RefreshCw, Trash2 } from 'lucide-react'
 import { type FormEvent, useEffect, useState } from 'react'
 
 import { ConfirmDialog } from '~/components/ConfirmDialog'
-import { EmptyLine, FieldRow, Page, PageError, Section } from '~/components/layout/Page'
+import { EmptyLine, FieldRow, Page, PageError } from '~/components/layout/Page'
 import { Button } from '~/components/ui/button'
 import {
   Dialog,
@@ -21,6 +21,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '~/components/ui/tooltip
 import { MachineAtoms } from '~/lib/runtime'
 import { createPersistentMachineContext } from '~/lib/shellMachines'
 import { matchCached } from '~/lib/useBackgroundRefresh'
+import { cn } from '~/lib/utils'
 
 import {
   EnvironmentsEvents,
@@ -34,6 +35,12 @@ const EnvironmentsOwner = createPersistentMachineContext(
   ({ input }: { readonly input: EnvironmentsInput }) =>
     MachineAtoms.make(EnvironmentsMachine, input),
 )
+
+/** Name | Status | Version | Last seen | actions, shared by pending and accepted rows. */
+const environmentGridClassName = 'sm:grid-cols-[minmax(0,1fr)_104px_112px_minmax(144px,176px)_72px]'
+
+const rowClassName =
+  'group grid grid-cols-1 items-center gap-x-3 gap-y-2.5 px-1 py-3 sm:min-h-12 sm:gap-y-1.5 sm:px-2 sm:py-2'
 
 function formatTimestamp(timestampSecs: number): string {
   const deltaSecs = Math.max(0, Math.floor(Date.now() / 1000) - timestampSecs)
@@ -114,36 +121,15 @@ function EnvironmentsContent() {
         {({ value, states }) => {
           const busy = states.Action.state.path !== 'Action.Idle'
           return (
-            <div className="space-y-8">
-              <Section title="Pending">
-                <PendingList pending={value.pending} busy={busy} />
-              </Section>
-              <Section title="Environments">
-                <EnvironmentList environments={value.environments} busy={busy} />
-              </Section>
-            </div>
+            <EnvironmentList
+              pending={value.pending}
+              environments={value.environments}
+              busy={busy}
+            />
           )
         }}
       </MachineState>
     </Page>
-  )
-}
-
-interface PendingListProps {
-  readonly pending: ReadonlyArray<PendingNode>
-  readonly busy: boolean
-}
-
-function PendingList(props: PendingListProps) {
-  if (props.pending.length === 0) {
-    return <EmptyLine>No nodes waiting for approval.</EmptyLine>
-  }
-  return (
-    <ul className="divide-y divide-border overflow-hidden rounded-2xl border border-border bg-card shadow-xs">
-      {props.pending.map(node => (
-        <PendingRow key={node.nodeId} node={node} busy={props.busy} />
-      ))}
-    </ul>
   )
 }
 
@@ -156,25 +142,28 @@ function PendingRow(props: PendingRowProps) {
   const [open, setOpen] = useState(false)
   const { node } = props
   return (
-    <li className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:gap-4">
-      <span
-        aria-hidden="true"
-        className="hidden size-10 shrink-0 place-items-center rounded-full border border-border bg-shelf text-muted-foreground sm:grid"
-      >
-        <Monitor className="size-5" />
-      </span>
-      <div className="min-w-0 flex-1 space-y-1">
-        <p className="min-w-0 break-words text-sm font-medium text-foreground [overflow-wrap:anywhere]">
+    <li className={cn(rowClassName, environmentGridClassName)}>
+      <div className="flex min-w-0 items-center">
+        <span className="min-w-0 break-words text-sm font-medium text-foreground [overflow-wrap:anywhere] sm:truncate">
           {node.hostname}
-        </p>
-        <p className="text-xs text-muted-foreground tabular-nums">
-          v{node.version} · Connected {formatTimestamp(node.connectedAt)}
-        </p>
+        </span>
       </div>
-      <div className="flex shrink-0 items-center justify-end gap-3">
-        <Button size="sm" disabled={props.busy} onClick={() => setOpen(true)}>
-          Accept
-        </Button>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 sm:contents">
+        <div className="flex min-w-0 items-center">
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-muted px-2 py-px text-xs font-medium whitespace-nowrap text-foreground">
+            <span aria-hidden="true" className="size-1.5 rounded-full bg-amber-500" />
+            Pending
+          </span>
+        </div>
+        <span className="text-xs text-muted-foreground tabular-nums">v{node.version}</span>
+        <span className="min-w-0 text-xs text-muted-foreground tabular-nums sm:truncate">
+          Connected {formatTimestamp(node.connectedAt)}
+        </span>
+        <div className="flex shrink-0 items-center justify-end">
+          <Button size="sm" disabled={props.busy} onClick={() => setOpen(true)}>
+            Accept
+          </Button>
+        </div>
       </div>
       <AcceptDialog node={node} open={open} onOpenChange={setOpen} />
     </li>
@@ -239,20 +228,45 @@ function AcceptForm(props: AcceptFormProps) {
 }
 
 interface EnvironmentListProps {
+  readonly pending: ReadonlyArray<PendingNode>
   readonly environments: ReadonlyArray<EnvironmentInfo>
   readonly busy: boolean
 }
 
+/** One table: nodes waiting for approval first, then accepted environments. */
 function EnvironmentList(props: EnvironmentListProps) {
-  if (props.environments.length === 0) {
+  if (props.pending.length === 0 && props.environments.length === 0) {
     return <EmptyLine>No environments yet.</EmptyLine>
   }
   return (
-    <ul className="divide-y divide-border overflow-hidden rounded-2xl border border-border bg-card shadow-xs">
-      {props.environments.map(environment => (
-        <EnvironmentRow key={environment.name} environment={environment} busy={props.busy} />
-      ))}
-    </ul>
+    <div>
+      <EnvironmentsHeader />
+      <ul className="flex flex-col divide-y">
+        {props.pending.map(node => (
+          <PendingRow key={node.nodeId} node={node} busy={props.busy} />
+        ))}
+        {props.environments.map(environment => (
+          <EnvironmentRow key={environment.name} environment={environment} busy={props.busy} />
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+function EnvironmentsHeader() {
+  return (
+    <div
+      className={cn(
+        'hidden h-10 items-center gap-x-3 border-b border-border px-2 text-sm font-medium text-muted-foreground sm:grid',
+        environmentGridClassName,
+      )}
+    >
+      <span>Name</span>
+      <span>Status</span>
+      <span>Version</span>
+      <span>Last seen</span>
+      <span />
+    </div>
   )
 }
 
@@ -268,19 +282,15 @@ function EnvironmentRow(props: EnvironmentRowProps) {
   const { environment } = props
 
   return (
-    <li className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:gap-4">
-      <span
-        aria-hidden="true"
-        className="hidden size-10 shrink-0 place-items-center rounded-full border border-border bg-shelf text-muted-foreground sm:grid"
-      >
-        <Server className="size-5" />
-      </span>
-      <div className="min-w-0 flex-1 space-y-1">
-        <div className="flex flex-wrap items-center gap-2">
-          <p className="min-w-0 break-words text-sm font-medium text-foreground [overflow-wrap:anywhere]">
-            {environment.name}
-          </p>
-          <span className="inline-flex items-center gap-1.5 rounded-full bg-muted px-2 py-px text-xs font-medium text-foreground">
+    <li className={cn(rowClassName, environmentGridClassName)}>
+      <div className="flex min-w-0 items-center">
+        <span className="min-w-0 break-words text-sm font-medium text-foreground [overflow-wrap:anywhere] sm:truncate">
+          {environment.name}
+        </span>
+      </div>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 sm:contents">
+        <div className="flex min-w-0 items-center">
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-muted px-2 py-px text-xs font-medium whitespace-nowrap text-foreground">
             <span
               aria-hidden="true"
               className={
@@ -292,46 +302,49 @@ function EnvironmentRow(props: EnvironmentRowProps) {
             {environment.online ? 'Online' : 'Offline'}
           </span>
         </div>
-        <p className="text-xs text-muted-foreground tabular-nums">
-          {environment.version === null ? 'Version unknown' : `v${environment.version}`} · Last seen{' '}
-          {formatTimestamp(environment.lastSeen)}
-        </p>
-      </div>
-      <div className="flex shrink-0 items-center justify-end gap-3">
-        <Tooltip>
-          <TooltipTrigger
-            render={
+        <span className="text-xs whitespace-nowrap text-muted-foreground tabular-nums">
+          {environment.version === null ? 'Version unknown' : `v${environment.version}`}
+        </span>
+        <span className="min-w-0 text-xs text-muted-foreground tabular-nums sm:truncate">
+          Last seen {formatTimestamp(environment.lastSeen)}
+        </span>
+        <div className="flex shrink-0 items-center justify-end gap-1">
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={`Rename ${environment.name}`}
+                  className="text-muted-foreground"
+                  disabled={props.busy}
+                  onClick={() => setRenameOpen(true)}
+                >
+                  <Pencil />
+                </Button>
+              }
+            />
+            <TooltipContent>Rename</TooltipContent>
+          </Tooltip>
+          <ConfirmDialog
+            tooltip="Revoke environment"
+            trigger={
               <Button
                 variant="ghost"
-                size="icon"
-                aria-label={`Rename ${environment.name}`}
+                size="icon-xs"
+                aria-label={`Revoke ${environment.name}`}
+                className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
                 disabled={props.busy}
-                onClick={() => setRenameOpen(true)}
               >
-                <Pencil />
+                <Trash2 />
               </Button>
             }
+            title={`Revoke ${environment.name}?`}
+            detail="The node drops back to pending and bots bound to it pause."
+            confirmLabel="Revoke"
+            onConfirm={() => send(EnvironmentsEvents.Remove({ name: environment.name }))}
           />
-          <TooltipContent>Rename</TooltipContent>
-        </Tooltip>
-        <ConfirmDialog
-          tooltip="Revoke environment"
-          trigger={
-            <Button
-              variant="ghost"
-              size="icon"
-              aria-label={`Revoke ${environment.name}`}
-              className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-              disabled={props.busy}
-            >
-              <Trash2 />
-            </Button>
-          }
-          title={`Revoke ${environment.name}?`}
-          detail="The node drops back to pending and bots bound to it pause."
-          confirmLabel="Revoke"
-          onConfirm={() => send(EnvironmentsEvents.Remove({ name: environment.name }))}
-        />
+        </div>
       </div>
       <RenameDialog environment={environment} open={renameOpen} onOpenChange={setRenameOpen} />
     </li>

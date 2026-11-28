@@ -900,6 +900,19 @@ fn check_bot_generation(payload: &Value, actual: i64, bot_id: &str) -> crate::Re
     Ok(())
 }
 
+/// Rejects an import whose source bot was deleted and recreated after the
+/// checklist was loaded: the dialog's `fromBotGeneration` must still match.
+fn check_source_generation(payload: &Value, actual: i64, bot_id: &str) -> crate::Result<()> {
+    let expected = payload
+        .get("fromBotGeneration")
+        .and_then(Value::as_i64)
+        .ok_or("Invalid fromBotGeneration")?;
+    if expected != actual {
+        return Err(format!("Bot '{bot_id}' was replaced; reload to continue").into());
+    }
+    Ok(())
+}
+
 /// Re-checks `botGeneration` against the persisted roster while `settings_lock`
 /// is held, closing the window where remove+recreate ran during the lock wait.
 /// `resolved` is the generation of the handle resolved before the lock; when a
@@ -1089,6 +1102,24 @@ async fn dispatch(
                     ctx.bots
                         .import_github_skills(bot_id, get("repo")?, get("commit")?, &folders)
                         .await?,
+                ))
+            }
+            "bot.skills.importFromBot" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let names: Vec<String> = payload
+                    .get("names")
+                    .and_then(Value::as_array)
+                    .ok_or_else(invalid)?
+                    .iter()
+                    .map(|name| name.as_str().map(str::to_owned).ok_or_else(invalid))
+                    .collect::<std::result::Result<_, _>>()?;
+                let from = get("fromBotId")?;
+                let _guard = ctx.settings_lock.lock().await;
+                recheck_bot_generation(global, payload, bot_id, Some(bot.generation))?;
+                let source = global.bot(from)?.ok_or_else(|| format!("Unknown bot {from}"))?;
+                check_source_generation(payload, source.generation, from)?;
+                Ok(bot_skills_reply(
+                    ctx.bots.import_bot_skills(bot_id, from, &names).await?,
                 ))
             }
             "bot.skills.remove" => {
@@ -2108,6 +2139,43 @@ async fn dispatch(
                     return Err("Secret value is required".into());
                 }
                 bot.store.set_secret(name, value, now())?;
+                Ok(secrets_reply(ctx, &bot.store)?)
+            }
+            "secrets.importFromBot" => {
+                let bot = resolve_bot(ctx, payload, bot_id).await?;
+                let from = get("fromBotId")?;
+                if from == bot_id {
+                    return Err("Choose another bot to import from".into());
+                }
+                // Holding the lock keeps either bot from being replaced mid-copy.
+                let _guard = ctx.settings_lock.lock().await;
+                recheck_bot_generation(global, payload, bot_id, Some(bot.generation))?;
+                let source = ctx.bots.get(from).await?;
+                check_source_generation(payload, source.generation, from)?;
+                let names: Vec<&str> = payload
+                    .get("names")
+                    .and_then(Value::as_array)
+                    .ok_or_else(invalid)?
+                    .iter()
+                    .map(|name| name.as_str().ok_or_else(invalid))
+                    .collect::<std::result::Result<_, _>>()?;
+                if names.is_empty() {
+                    return Err("Choose at least one secret".into());
+                }
+                // Read every value first so a missing one copies nothing.
+                let values = names
+                    .iter()
+                    .map(|name| {
+                        source
+                            .store
+                            .secret_value(name)?
+                            .map(|value| (*name, value))
+                            .ok_or_else(|| format!("{from} has no secret named {name}").into())
+                    })
+                    .collect::<crate::Result<Vec<_>>>()?;
+                for (name, value) in values {
+                    bot.store.set_secret(name, &value, now())?;
+                }
                 Ok(secrets_reply(ctx, &bot.store)?)
             }
             "secrets.remove" => {

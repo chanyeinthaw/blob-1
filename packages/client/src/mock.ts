@@ -253,6 +253,21 @@ const secretsReply = (state: State): SecretsPayload => ({
   secrets: state.secrets.toSorted((a, b) => a.name.localeCompare(b.name)),
 })
 
+const mergeImportedSecrets = (
+  existing: ReadonlyArray<Secret>,
+  names: ReadonlyArray<string>,
+  now: number,
+): ReadonlyArray<Secret> => {
+  const incoming = names.map(name => {
+    const previous = existing.find(entry => entry.name === name)
+    return { name, createdAt: previous?.createdAt ?? now, updatedAt: now }
+  })
+  return [
+    ...existing.map(secret => incoming.find(entry => entry.name === secret.name) ?? secret),
+    ...incoming.filter(secret => !existing.some(entry => entry.name === secret.name)),
+  ]
+}
+
 const usageReply = (days: number): UsageSummary => {
   const safeDays = Math.max(1, Math.min(90, Math.round(days)))
   const scale = safeDays === 1 ? 1 : safeDays <= 7 ? 5.6 : safeDays * 0.72
@@ -1031,6 +1046,7 @@ type BotRecord = Readonly<{
   createdAt: number
   generation: number
   disabledMcp: ReadonlyArray<string>
+  managedSkills: ReadonlyArray<SkillInfo>
   detectedSkills: ReadonlyArray<SkillInfo>
   skillModes: Readonly<Record<string, BotSkillMode>>
   /** 'local' or the name of a remote execution environment. */
@@ -1044,7 +1060,6 @@ type EnvironmentRecord = EnvironmentInfo & Readonly<{ hostname: string }>
 type MockRoot = Readonly<{
   providers: ReadonlyArray<ProviderRecord>
   mcpServers: ReadonlyArray<McpServer>
-  managedSkills: ReadonlyArray<SkillInfo>
   bots: ReadonlyArray<BotRecord>
   pendingNodes: ReadonlyArray<PendingNode>
   environments: ReadonlyArray<EnvironmentRecord>
@@ -1082,7 +1097,6 @@ const seedRoot = (): MockRoot => {
   return {
     providers: initial.providers,
     mcpServers: initial.mcpServers,
-    managedSkills: seedManagedSkills,
     bots: [
       {
         id: DEFAULT_BOT_ID,
@@ -1091,6 +1105,7 @@ const seedRoot = (): MockRoot => {
         createdAt: 0,
         generation: 0,
         disabledMcp: [],
+        managedSkills: seedManagedSkills,
         detectedSkills: seedDetectedSkills,
         skillModes: {},
         environment: 'local',
@@ -1171,14 +1186,14 @@ const botSkillsReply = (root: MockRoot, botId: string): Effect.Effect<BotSkillsS
     return Effect.fail(`Environment '${bot.environment}' is offline`)
   }
   const skills: BotSkillsState['skills'] = [
-    ...root.managedSkills.map(skill => ({
+    ...bot.managedSkills.map(skill => ({
       name: skill.name,
       description: skill.description,
       source: 'managed' as const,
       mode: bot.skillModes[skill.name] ?? 'both',
     })),
     ...bot.detectedSkills
-      .filter(skill => !root.managedSkills.some(managed => managed.name === skill.name))
+      .filter(skill => !bot.managedSkills.some(managed => managed.name === skill.name))
       .map(skill => ({
         name: skill.name,
         description: skill.description,
@@ -1203,23 +1218,25 @@ const githubPreviewReply = (
       })
 }
 
+const mergeSkillInfos = (
+  managed: ReadonlyArray<SkillInfo>,
+  incoming: ReadonlyArray<SkillInfo>,
+): ReadonlyArray<SkillInfo> => {
+  const kept = managed.map(skill => incoming.find(entry => entry.name === skill.name) ?? skill)
+  return [
+    ...kept,
+    ...incoming.filter(skill => !managed.some(existing => existing.name === skill.name)),
+  ]
+}
+
 const mergeImportedSkills = (
   managed: ReadonlyArray<SkillInfo>,
   folders: ReadonlyArray<string>,
 ): ReadonlyArray<SkillInfo> => {
-  const incoming = githubSkillSamples.filter(skill => folders.includes(skill.folder))
-  const kept = managed.map(skill => {
-    const replacement = incoming.find(entry => entry.name === skill.name)
-    return replacement === undefined
-      ? skill
-      : { name: replacement.name, description: replacement.description }
-  })
-  return [
-    ...kept,
-    ...incoming
-      .filter(skill => !managed.some(existing => existing.name === skill.name))
-      .map(skill => ({ name: skill.name, description: skill.description })),
-  ]
+  const incoming = githubSkillSamples
+    .filter(skill => folders.includes(skill.folder))
+    .map(skill => ({ name: skill.name, description: skill.description }))
+  return mergeSkillInfos(managed, incoming)
 }
 
 const providerInUseByBot = (root: MockRoot, providerId: string): string | null => {
@@ -1251,8 +1268,10 @@ type LegacyRequestType = Exclude<
   | 'bot.skills.remove'
   | 'bot.skills.githubPreview'
   | 'bot.skills.githubImport'
+  | 'bot.skills.importFromBot'
   | 'bot.skills.adopt'
   | 'bot.skills.read'
+  | 'secrets.importFromBot'
   | 'environments.list'
   | 'environments.accept'
   | 'environments.remove'
@@ -1882,6 +1901,7 @@ const botControlHandlers = {
             createdAt,
             generation: root.nextGeneration,
             disabledMcp: [],
+            managedSkills: [],
             detectedSkills: seedDetectedSkills,
             skillModes: {},
             environment: 'local',
@@ -2084,7 +2104,7 @@ const botControlHandlers = {
         return yield* Effect.fail(`Environment '${target.environment}' is offline`)
       }
       const exists =
-        root.managedSkills.some(skill => skill.name === name) ||
+        target.managedSkills.some(skill => skill.name === name) ||
         target.detectedSkills.some(skill => skill.name === name)
       if (!exists) {
         return yield* Effect.fail(`no skill named ${name}`)
@@ -2116,17 +2136,21 @@ const botControlHandlers = {
       if (!environmentOnline(root, target.environment)) {
         return yield* Effect.fail(`Environment '${target.environment}' is offline`)
       }
-      const managed = root.managedSkills.some(skill => skill.name === name)
+      const managed = target.managedSkills.some(skill => skill.name === name)
       const detected = target.detectedSkills.some(skill => skill.name === name)
       if (!managed && !detected) {
         return yield* Effect.fail(`no skill named ${name}`)
       }
       const next: MockRoot = managed
         ? Struct.evolve(root, {
-            managedSkills: skills => skills.filter(skill => skill.name !== name),
             bots: bots =>
               bots.map(bot =>
-                Struct.evolve(bot, { skillModes: modes => withoutSkillMode(modes, name) }),
+                bot.id === botId
+                  ? Struct.evolve(bot, {
+                      managedSkills: skills => skills.filter(skill => skill.name !== name),
+                      skillModes: modes => withoutSkillMode(modes, name),
+                    })
+                  : bot,
               ),
           })
         : Struct.evolve(root, {
@@ -2178,7 +2202,71 @@ const botControlHandlers = {
         return yield* Effect.fail(`Environment '${target.environment}' is offline`)
       }
       const next: MockRoot = Struct.evolve(root, {
-        managedSkills: skills => mergeImportedSkills(skills, folders),
+        bots: bots =>
+          bots.map(bot =>
+            bot.id === botId
+              ? Struct.evolve(bot, {
+                  managedSkills: skills => mergeImportedSkills(skills, folders),
+                })
+              : bot,
+          ),
+      })
+      yield* Ref.set(rootRef, next)
+      return yield* botSkillsReply(next, botId)
+    }),
+
+  'bot.skills.importFromBot': (
+    {
+      botId: rawBotId,
+      botGeneration,
+      fromBotId,
+      fromBotGeneration,
+      names,
+    }: RequestPayload<'bot.skills.importFromBot'>,
+    rootRef: Ref.Ref<MockRoot>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* Ref.get(rootRef)
+      const botId = rawBotId ?? DEFAULT_BOT_ID
+      const target = root.bots.find(bot => bot.id === botId)
+      if (target === undefined) {
+        return yield* Effect.fail(`Unknown bot ${botId}`)
+      }
+      yield* checkGeneration(target, botGeneration)
+      if (!environmentOnline(root, target.environment)) {
+        return yield* Effect.fail(`Environment '${target.environment}' is offline`)
+      }
+      if (fromBotId === botId) {
+        return yield* Effect.fail('choose another bot to import from')
+      }
+      if (names.length === 0) {
+        return yield* Effect.fail('choose at least one skill')
+      }
+      const sourceBot = root.bots.find(bot => bot.id === fromBotId)
+      if (sourceBot === undefined) {
+        return yield* Effect.fail(`Unknown bot ${fromBotId}`)
+      }
+      yield* checkGeneration(sourceBot, fromBotGeneration)
+      const source = yield* botSkillsReply(root, fromBotId)
+      const incoming: SkillInfo[] = []
+      for (const name of names) {
+        const skill = source.skills.find(entry => entry.name === name)
+        if (skill === undefined) {
+          return yield* Effect.fail(`${fromBotId} has no skill named ${name}`)
+        }
+        if (!incoming.some(entry => entry.name === skill.name)) {
+          incoming.push({ name: skill.name, description: skill.description })
+        }
+      }
+      const next: MockRoot = Struct.evolve(root, {
+        bots: bots =>
+          bots.map(bot =>
+            bot.id === botId
+              ? Struct.evolve(bot, {
+                  managedSkills: skills => mergeSkillInfos(skills, incoming),
+                })
+              : bot,
+          ),
       })
       yield* Ref.set(rootRef, next)
       return yield* botSkillsReply(next, botId)
@@ -2230,12 +2318,12 @@ const botControlHandlers = {
         return yield* Effect.fail(`no detected skill named ${name}`)
       }
       const next: MockRoot = Struct.evolve(root, {
-        managedSkills: skills =>
-          skills.some(skill => skill.name === name) ? skills : [...skills, detected],
         bots: bots =>
           bots.map(bot =>
             bot.id === botId
               ? Struct.evolve(bot, {
+                  managedSkills: skills =>
+                    skills.some(skill => skill.name === name) ? skills : [...skills, detected],
                   detectedSkills: skills => skills.filter(skill => skill.name !== name),
                 })
               : bot,
@@ -2286,6 +2374,7 @@ const botControlHandlers = {
       | 'bot.skills.remove'
       | 'bot.skills.githubPreview'
       | 'bot.skills.githubImport'
+      | 'bot.skills.importFromBot'
       | 'bot.skills.adopt'
       | 'bot.skills.read'
       | 'environments.list'
@@ -2368,6 +2457,57 @@ const wrapLegacy =
   (payload, rootRef) =>
     runBotScoped(rootRef, type, payload)
 
+const importSecretsFromBot = (
+  {
+    botId: rawBotId,
+    botGeneration,
+    fromBotId,
+    fromBotGeneration,
+    names,
+  }: RequestPayload<'secrets.importFromBot'>,
+  rootRef: Ref.Ref<MockRoot>,
+) =>
+  Effect.gen(function* () {
+    const root = yield* Ref.get(rootRef)
+    const botId = rawBotId ?? DEFAULT_BOT_ID
+    const target = root.bots.find(bot => bot.id === botId)
+    if (target === undefined) {
+      return yield* Effect.fail(`Unknown bot ${botId}`)
+    }
+    yield* checkGeneration(target, botGeneration)
+    if (fromBotId === botId) {
+      return yield* Effect.fail('Choose another bot to import from')
+    }
+    if (names.length === 0) {
+      return yield* Effect.fail('Choose at least one secret')
+    }
+    const source = root.bots.find(bot => bot.id === fromBotId)
+    if (source === undefined) {
+      return yield* Effect.fail(`Unknown bot ${fromBotId}`)
+    }
+    yield* checkGeneration(source, fromBotGeneration)
+
+    const requestedNames = [...new Set(names)]
+    for (const name of requestedNames) {
+      if (!source.state.secrets.some(entry => entry.name === name)) {
+        return yield* Effect.fail(`${fromBotId} has no secret named ${name}`)
+      }
+    }
+
+    const now = Math.floor(Date.now() / 1000)
+    const nextTargetState = Struct.evolve(target.state, {
+      secrets: secrets => mergeImportedSecrets(secrets, requestedNames, now),
+    })
+    const next: MockRoot = Struct.evolve(root, {
+      bots: bots =>
+        bots.map(bot =>
+          bot.id === botId ? Struct.evolve(bot, { state: () => nextTargetState }) : bot,
+        ),
+    })
+    yield* Ref.set(rootRef, next)
+    return secretsReply(nextTargetState)
+  })
+
 // oxlint-disable-next-line anti-slop/no-known-value-widening -- mapped table keeps each handler bound to its request type
 const allHandlers: { readonly [K in RequestType]: RootHandler<K> } = {
   ...botControlHandlers,
@@ -2430,6 +2570,7 @@ const allHandlers: { readonly [K in RequestType]: RootHandler<K> } = {
   'secrets.list': wrapLegacy('secrets.list'),
   'secrets.set': wrapLegacy('secrets.set'),
   'secrets.remove': wrapLegacy('secrets.remove'),
+  'secrets.importFromBot': importSecretsFromBot,
   'secrets.request': wrapLegacy('secrets.request'),
 }
 

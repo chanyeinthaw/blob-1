@@ -1,4 +1,4 @@
-import type { Secret, SecretRequestLink } from '@blob-1/contracts'
+import type { Secret, SecretRequestLink, SecretsPayload } from '@blob-1/contracts'
 import { useAtomRefresh, useAtomSet, useAtomValue } from '@effect/atom-react'
 import { AtomMachine } from '@typeonce/effect-machine/reactivity'
 import { MachineState, useMachineResult } from '@typeonce/effect-machine-react'
@@ -18,8 +18,10 @@ import { machineAtomsForBot } from '~/lib/runtime'
 import { createPersistentMachineContext } from '~/lib/shellMachines'
 import { matchCached, useChangeRefresh } from '~/lib/useBackgroundRefresh'
 
+import { ImportSecretsControl } from './ImportSecretsDialog'
+import type { ImportSecretsSource } from './importSecretsMachine'
 import { SecretsEvents, type SecretsInput, SecretsMachine } from './secretsMachine'
-import { secretsPageAtomFor } from './secretsState'
+import { formatSecretUpdatedAt, secretsPageAtomFor } from './secretsState'
 
 /** Mirrors the server's rule: names become file names, so no leading dot. */
 const SECRET_NAME = /^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}$/
@@ -43,7 +45,8 @@ export function SecretsPage(props: SecretsPageProps) {
   const result = useAtomValue(atom)
   const retry = useAtomRefresh(atom)
   const bots = useBotsRoot()?.bots ?? []
-  const botName = bots.find(entry => entry.id === props.botId)?.name ?? props.botId
+  const bot = bots.find(entry => entry.id === props.botId)
+  const botName = bot?.name ?? props.botId
 
   return matchCached(result, {
     onInitial: () => (
@@ -72,7 +75,13 @@ export function SecretsPage(props: SecretsPageProps) {
     ),
     onSuccess: payload => (
       <SecretsOwner.Provider input={payload} scopeKey={instanceKey}>
-        <SecretsContent botId={props.botId} botName={botName} instanceKey={instanceKey} />
+        <SecretsContent
+          botId={props.botId}
+          botName={botName}
+          botGeneration={bot?.generation ?? null}
+          sourceBots={bots.filter(entry => entry.id !== props.botId)}
+          instanceKey={instanceKey}
+        />
       </SecretsOwner.Provider>
     ),
   })
@@ -81,7 +90,40 @@ export function SecretsPage(props: SecretsPageProps) {
 interface SecretsContentProps {
   readonly botId: string
   readonly botName: string
+  readonly botGeneration: number | null
+  readonly sourceBots: ReadonlyArray<ImportSecretsSource>
   readonly instanceKey: string
+}
+
+interface ImportSecretsActionProps {
+  readonly instanceKey: string
+  readonly botId: string
+  readonly botGeneration: number | null
+  readonly sourceBots: ReadonlyArray<ImportSecretsSource>
+}
+
+function ImportSecretsAction(props: ImportSecretsActionProps) {
+  const machine = SecretsOwner.useMachine()
+  const send = useAtomSet(machine.send)
+  const handleImported = useCallback(
+    (state: SecretsPayload) => send(SecretsEvents.ReplaceData({ state })),
+    [send],
+  )
+
+  return (
+    <MachineState machine={machine} path="">
+      {({ value }) => (
+        <ImportSecretsControl
+          scopeKey={props.instanceKey}
+          targetBotId={props.botId}
+          targetBotGeneration={props.botGeneration}
+          sourceBots={props.sourceBots}
+          currentSecrets={value.secrets}
+          onImported={handleImported}
+        />
+      )}
+    </MachineState>
+  )
 }
 
 function SecretsContent(props: SecretsContentProps) {
@@ -108,6 +150,12 @@ function SecretsContent(props: SecretsContentProps) {
       backLabel={props.botName}
       actions={
         <>
+          <ImportSecretsAction
+            instanceKey={props.instanceKey}
+            botId={props.botId}
+            botGeneration={props.botGeneration}
+            sourceBots={props.sourceBots}
+          />
           <span aria-live="polite" className="text-xs text-muted-foreground empty:sr-only">
             {isRefreshing ? 'Refreshing…' : null}
           </span>
@@ -348,7 +396,7 @@ function SecretRow(props: SecretRowProps) {
           className="block text-xs text-muted-foreground tabular-nums"
           dateTime={updated.toISOString()}
         >
-          Updated {updated.toLocaleString()}
+          Updated {formatSecretUpdatedAt(props.secret.updatedAt)}
         </time>
       </div>
       <Tooltip>

@@ -5,7 +5,7 @@ import { createMachineContext, useMachineResult } from '@typeonce/effect-machine
 import { Option } from 'effect'
 import { AsyncResult } from 'effect/reactivity'
 import { Check, Download } from 'lucide-react'
-import { type FormEvent, useEffect, useState } from 'react'
+import { type FormEvent, type ReactNode, useEffect, useState } from 'react'
 
 import { FieldError, FieldRow } from '~/components/layout/Page'
 import { Button } from '~/components/ui/button'
@@ -330,6 +330,7 @@ function GithubImportDialogBody(props: GithubImportDialogBodyProps) {
 interface GithubImportControlProps {
   readonly scopeKey: string
   readonly onImported: (state: BotSkillsState) => void
+  readonly renderTrigger?: (open: () => void) => ReactNode
 }
 
 function GithubImportButtonAndDialog(props: GithubImportControlProps) {
@@ -341,17 +342,21 @@ function GithubImportButtonAndDialog(props: GithubImportControlProps) {
   )
   const open = !closed
 
+  const trigger = props.renderTrigger?.(() => send(GithubImportEvents.Open())) ?? (
+    <Button
+      type="button"
+      variant="outline"
+      size="sm"
+      onClick={() => send(GithubImportEvents.Open())}
+    >
+      <Download data-icon="inline-start" />
+      Import
+    </Button>
+  )
+
   return (
     <>
-      <Button
-        type="button"
-        variant="outline"
-        size="sm"
-        onClick={() => send(GithubImportEvents.Open())}
-      >
-        <Download data-icon="inline-start" />
-        Import
-      </Button>
+      {trigger}
       <Dialog
         open={open}
         onOpenChange={next => send(next ? GithubImportEvents.Open() : GithubImportEvents.Close())}
@@ -367,7 +372,7 @@ function GithubImportButtonAndDialog(props: GithubImportControlProps) {
   )
 }
 
-/** Title-bar button and two-step dialog for importing skills from a GitHub repository. */
+/** Two-step dialog for importing skills from GitHub, with its default title-bar button. */
 export function GithubImportControl(props: GithubImportControlProps) {
   return (
     <GithubImportOwner.Provider key={props.scopeKey} input={{ instanceKey: props.scopeKey }}>

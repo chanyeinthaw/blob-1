@@ -164,7 +164,8 @@ Each bot's default page is a chat with it, built in as the `web` messenger.
 - Make managed: copies a detected skill's files into the bot's managed skills; the machine's folder stays
 - GitHub import: a repo, `tree/<ref>/<path>` or `blob/…/SKILL.md` URL plus optional path (continuing the URL's path; `skills/` at the repo root when neither has one; pasting a full URL splits it into both fields); the ref resolves to a commit, the commit's tarball is downloaded and every folder with a valid `SKILL.md` is offered with all its files (executable bits kept, links refused); import re-downloads at the same commit and replaces managed skills with the same name. Public repos only, unauthenticated
 - Detail: clicking a skill opens a side drawer with its full description, `SKILL.md` body (Markdown, frontmatter removed) and other file paths (`bot.skills.read`)
-- Web protocol: `bot.skills.list`, `bot.skills.read`, `bot.skills.setMode`, `bot.skills.remove`, `bot.skills.adopt`, `bot.skills.githubPreview`, `bot.skills.githubImport` (`/settings/bots/$botId/skills`)
+- Import from another bot: copies chosen skills of another bot (managed or detected) into this bot as managed skills, replacing managed skills with the same name (`bot.skills.importFromBot`)
+- Web protocol: `bot.skills.list`, `bot.skills.read`, `bot.skills.setMode`, `bot.skills.remove`, `bot.skills.adopt`, `bot.skills.githubPreview`, `bot.skills.githubImport`, `bot.skills.importFromBot` (`/settings/bots/$botId/skills`)
 - Node protocol: `removeDetectedSkill`, `readDetectedSkill`
 - CLI: `agent skill add | list | remove` (the `default` bot's managed skills)
 - Tables: `skills`, `skill_files` (per bot store), `bot_skill_modes`
@@ -202,7 +203,7 @@ Per-bot secrets the user provides without sending them in chat, which tasks use 
 - Request form: `GET /secret/{token}` serves a one-field password form (`no-store`, `no-referrer`, no scripts, posts only to itself); `POST` (capped at 64 KiB; a whitespace-only value is rejected, any other is stored as submitted) overwrites the secret, consumes the request and queues a value-free `<event source="secret" name="...">` in one transaction, then wakes the chat loop. A stopped bot answers 503 without consuming the link
 - Files: the primary writes `<data_dir>/secrets/<bot>-<generation>/`, a node `~/.blob-1/secrets/<workspace>/` (node request `WriteSecret`); directories `0700`, one `0600` file per read (`<name>.<nonce>`), and each process wipes its secrets directory at start
 - Names: 1-64 of `[A-Za-z0-9_.-]`, not starting with `.`
-- Web: each bot's **Secrets** page (`/settings/bots/$botId/secrets`; `secrets.list`, `secrets.set`, `secrets.remove`, `secrets.request`) lists names and update times, sets or replaces values, deletes, and creates request links; values never return to the browser
+- Web: each bot's **Secrets** page (`/settings/bots/$botId/secrets`; `secrets.list`, `secrets.set`, `secrets.remove`, `secrets.request`, `secrets.importFromBot`) lists names and update times, sets or replaces values, deletes, creates request links, and copies chosen secrets from another bot (server-side, replacing same-named ones); values never return to the browser
 - CLI: `agent secret [--bot <id>] list | set <name> (value from stdin, read whole; only a final newline is dropped) | remove <name> | request <name> [--label <text>]`. The CLI writes through its own connection, so an open Secrets page shows CLI changes after a refresh
 - `agent chat` gives its tasks a temporary secrets directory, removed when the command exits
 - Tables: `secrets` (value sealed with the app key), `secret_requests` (token hash, name, label, expiry)

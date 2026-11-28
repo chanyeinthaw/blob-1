@@ -525,6 +525,15 @@ export const requests = {
     }),
     reply: BotSkillsState,
   },
+  'bot.skills.importFromBot': {
+    payload: Schema.Struct({
+      ...botIdField,
+      fromBotId: Schema.String,
+      fromBotGeneration: Schema.Finite,
+      names: Schema.Array(Schema.String),
+    }),
+    reply: BotSkillsState,
+  },
   'bot.skills.read': {
     payload: Schema.Struct({ ...botIdField, name: Schema.String }),
     reply: BotSkillDetail,
@@ -838,6 +847,15 @@ export const requests = {
   },
   'secrets.remove': {
     payload: Schema.Struct({ ...botIdField, name: Schema.String }),
+    reply: SecretsPayload,
+  },
+  'secrets.importFromBot': {
+    payload: Schema.Struct({
+      ...botIdField,
+      fromBotId: Schema.String,
+      fromBotGeneration: Schema.Finite,
+      names: Schema.Array(Schema.String),
+    }),
     reply: SecretsPayload,
   },
   'secrets.request': {

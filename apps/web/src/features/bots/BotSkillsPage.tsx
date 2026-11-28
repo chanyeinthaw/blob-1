@@ -1,13 +1,19 @@
 import type { BotSkill, BotSkillMode, BotSkillsState } from '@blob-1/contracts'
 import { useAtomRefresh, useAtomSet, useAtomValue } from '@effect/atom-react'
 import { MachineState } from '@typeonce/effect-machine-react'
-import { FolderSearch, Package, PackagePlus, Trash2 } from 'lucide-react'
+import { ChevronDown, Download, FolderSearch, Package, PackagePlus, Trash2 } from 'lucide-react'
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 
 import { ConfirmDialog } from '~/components/ConfirmDialog'
 import { EmptyLine, PageError } from '~/components/layout/Page'
 import { SplitDetail } from '~/components/layout/SplitPage'
 import { Button } from '~/components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '~/components/ui/dropdown-menu'
 import { Input } from '~/components/ui/input'
 import { Switch } from '~/components/ui/switch'
 import { Tooltip, TooltipContent, TooltipTrigger } from '~/components/ui/tooltip'
@@ -19,6 +25,8 @@ import { matchCached } from '~/lib/useBackgroundRefresh'
 import { BotSkillsEvents, type BotSkillsInput, BotSkillsMachine } from './botSkillsMachine'
 import { botSkillsAtomFor } from './botsState'
 import { GithubImportControl } from './GithubImportDialog'
+import { ImportFromBotControl } from './ImportFromBotDialog'
+import type { ImportFromBotSource } from './importFromBotMachine'
 import { SkillDetailSheet } from './SkillDetailSheet'
 import { useBotInstanceKey, useBotsRoot } from './CreateBotDialog'
 
@@ -205,8 +213,58 @@ function BotSkillsContent(props: BotSkillsContentProps) {
   )
 }
 
+interface ImportMenuProps {
+  readonly instanceKey: string
+  readonly botId: string
+  readonly botGeneration: number | null
+  readonly sourceBots: ReadonlyArray<ImportFromBotSource>
+  readonly currentSkills: ReadonlyArray<BotSkill>
+  readonly onImported: (state: BotSkillsState) => void
+}
+
+function ImportMenu(props: ImportMenuProps) {
+  return (
+    <GithubImportControl
+      scopeKey={props.instanceKey}
+      onImported={props.onImported}
+      renderTrigger={openGithub => (
+        <ImportFromBotControl
+          scopeKey={props.instanceKey}
+          targetBotId={props.botId}
+          targetBotGeneration={props.botGeneration}
+          sourceBots={props.sourceBots}
+          currentSkills={props.currentSkills}
+          onImported={props.onImported}
+          renderTrigger={openBot => (
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                render={
+                  <Button type="button" variant="outline" size="sm">
+                    <Download data-icon="inline-start" />
+                    Import
+                    <ChevronDown data-icon="inline-end" className="text-muted-foreground" />
+                  </Button>
+                }
+              />
+              <DropdownMenuContent align="end" className="w-44">
+                <DropdownMenuItem onClick={openGithub}>From GitHub…</DropdownMenuItem>
+                {props.sourceBots.length === 0 ? null : (
+                  <DropdownMenuItem onClick={openBot}>From another bot…</DropdownMenuItem>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+        />
+      )}
+    />
+  )
+}
+
 interface ImportSkillsActionProps {
   readonly instanceKey: string
+  readonly botId: string
+  readonly botGeneration: number | null
+  readonly sourceBots: ReadonlyArray<ImportFromBotSource>
 }
 
 function ImportSkillsAction(props: ImportSkillsActionProps) {
@@ -216,7 +274,20 @@ function ImportSkillsAction(props: ImportSkillsActionProps) {
     (state: BotSkillsState) => send(BotSkillsEvents.ReplaceData({ state })),
     [send],
   )
-  return <GithubImportControl scopeKey={props.instanceKey} onImported={handleImported} />
+  return (
+    <MachineState machine={machine} path="">
+      {({ value }) => (
+        <ImportMenu
+          instanceKey={props.instanceKey}
+          botId={props.botId}
+          botGeneration={props.botGeneration}
+          sourceBots={props.sourceBots}
+          currentSkills={value.data.skills}
+          onImported={handleImported}
+        />
+      )}
+    </MachineState>
+  )
 }
 
 interface BotSkillsFrameProps {
@@ -259,10 +330,11 @@ interface BotSkillsPageProps {
   readonly botId: string
 }
 
-/** Per-bot skill list with optimistic access-mode, removal, adoption, and GitHub imports. */
+/** Per-bot skill list with optimistic access-mode, removal, adoption, and skill imports. */
 export function BotSkillsPage(props: BotSkillsPageProps) {
   const bots = useBotsRoot()?.bots ?? []
-  const botName = bots.find(entry => entry.id === props.botId)?.name ?? props.botId
+  const bot = bots.find(entry => entry.id === props.botId)
+  const botName = bot?.name ?? props.botId
   const [query, setQuery] = useState('')
   const instanceKey = useBotInstanceKey(props.botId)
   const atom = botSkillsAtomFor(instanceKey)
@@ -288,7 +360,12 @@ export function BotSkillsPage(props: BotSkillsPageProps) {
       <BotSkillsOwner.Provider input={value} scopeKey={instanceKey}>
         {frame(
           <BotSkillsContent instanceKey={instanceKey} query={query} />,
-          <ImportSkillsAction instanceKey={instanceKey} />,
+          <ImportSkillsAction
+            instanceKey={instanceKey}
+            botId={props.botId}
+            botGeneration={bot?.generation ?? null}
+            sourceBots={bots.filter(entry => entry.id !== props.botId)}
+          />,
         )}
       </BotSkillsOwner.Provider>
     ),

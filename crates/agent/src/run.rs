@@ -2475,6 +2475,25 @@ impl BotRegistry {
             .ok_or_else(|| format!("no skill named {name}").into())
     }
 
+    /// A skill's files, paths relative to its folder: managed ones from the
+    /// bot's database, detected ones from its machine.
+    async fn skill_files(bot: &BotEnvironment, skill: &BotSkill) -> Result<Vec<storage::SkillFile>> {
+        Ok(match skill.managed {
+            true => bot.store.skill_files(&skill.folder)?,
+            false => bot
+                .environment
+                .read_detected_skill(&skill.folder)
+                .await?
+                .into_iter()
+                .map(|file| storage::SkillFile {
+                    path: file.path,
+                    mode: file.mode,
+                    content: file.content,
+                })
+                .collect(),
+        })
+    }
+
     /// Lists the skills the bot's current local or remote environment exposes:
     /// its own managed ones, then the machine's detected ones.
     pub async fn skill_catalog(&self, bot_id: &str) -> Result<Vec<BotSkill>> {
@@ -2507,18 +2526,41 @@ impl BotRegistry {
         if skill.managed {
             return Err(format!("{name} is already managed").into());
         }
-        let files = bot
-            .environment
-            .read_detected_skill(&skill.folder)
-            .await?
-            .into_iter()
-            .map(|file| storage::SkillFile {
-                path: file.path,
-                mode: file.mode,
-                content: file.content,
-            })
-            .collect();
+        let files = Self::skill_files(&bot, &skill).await?;
         crate::import::store_bundle(&bot.store, files)?;
+        sync_skills(&bot.store, &bot.environment).await?;
+        self.skills_in(bot_id, &bot).await
+    }
+
+    /// Copies the named skills of `from_bot` (managed or detected) into the
+    /// bot's managed skills, replacing managed skills with the same name.
+    pub async fn import_bot_skills(
+        &self,
+        bot_id: &str,
+        from_bot: &str,
+        names: &[String],
+    ) -> Result<Vec<BotSkill>> {
+        if from_bot == bot_id {
+            return Err("choose another bot to import from".into());
+        }
+        if names.is_empty() {
+            return Err("choose at least one skill".into());
+        }
+        let source = self.bot_environment(from_bot).await?;
+        let available = self.skills_in(from_bot, &source).await?;
+        let mut bundles = Vec::new();
+        for name in names {
+            let skill = available
+                .iter()
+                .find(|skill| &skill.name == name)
+                .ok_or_else(|| format!("{from_bot} has no skill named {name}"))?;
+            bundles.push(Self::skill_files(&source, skill).await?);
+        }
+        let bot = self.bot_environment(bot_id).await?;
+        let _sync = bot.skills_lock.lock().await;
+        for files in bundles {
+            crate::import::store_bundle(&bot.store, files)?;
+        }
         sync_skills(&bot.store, &bot.environment).await?;
         self.skills_in(bot_id, &bot).await
     }
@@ -2577,21 +2619,11 @@ impl BotRegistry {
     pub async fn read_skill(&self, bot_id: &str, name: &str) -> Result<(BotSkill, String, Vec<String>)> {
         let bot = self.bot_environment(bot_id).await?;
         let skill = self.find_skill(bot_id, &bot, name).await?;
-        let files: Vec<(String, Vec<u8>)> = match skill.managed {
-            true => bot
-                .store
-                .skill_files(&skill.folder)?
-                .into_iter()
-                .map(|file| (file.path, file.content))
-                .collect(),
-            false => bot
-                .environment
-                .read_detected_skill(&skill.folder)
-                .await?
-                .into_iter()
-                .map(|file| (file.path, file.content))
-                .collect(),
-        };
+        let files: Vec<(String, Vec<u8>)> = Self::skill_files(&bot, &skill)
+            .await?
+            .into_iter()
+            .map(|file| (file.path, file.content))
+            .collect();
         let content = files
             .iter()
             .find(|(path, _)| path == environment::SKILL_FILE)

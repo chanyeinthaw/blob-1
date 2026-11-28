@@ -4,7 +4,7 @@ import { AtomMachine } from '@typeonce/effect-machine/reactivity'
 import { MachineState, useMachineResult } from '@typeonce/effect-machine-react'
 import { Option } from 'effect'
 import { AsyncResult } from 'effect/reactivity'
-import { ExternalLink, Link2, Plus, RefreshCw, Server, Terminal, Trash2 } from 'lucide-react'
+import { ExternalLink, Link2, Plus, RefreshCw, Terminal, Trash2 } from 'lucide-react'
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 
 import { ConfirmDialog } from '~/components/ConfirmDialog'
@@ -25,6 +25,9 @@ import { mcpPageAtom } from './mcpState'
 const McpOwner = createPersistentMachineContext('mcp', ({ input }: { input: McpInput }) =>
   MachineAtoms.make(McpMachine, input),
 )
+
+/** Server | Target | Status | On | actions, shared by the header and every row. */
+const gridClassName = 'sm:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)_152px_48px_120px]'
 
 /** The MCP settings page. */
 export function McpPage() {
@@ -150,26 +153,46 @@ function ServersList() {
         value.servers.length === 0 ? (
           <EmptyLine>No MCP servers configured yet.</EmptyLine>
         ) : (
-          <ul className="divide-y divide-border overflow-hidden rounded-2xl border border-border bg-card shadow-xs">
-            {value.servers.map(server => {
-              const removeState = states.Remove.state
-              const loginState = states.Login.state
-              return (
-                <ServerRow
-                  key={server.id}
-                  server={server}
-                  removing={removeState.path === 'Remove.Working'}
-                  loggingIn={loginState.path === 'Login.Working'}
-                  loggingInThis={
-                    loginState.path === 'Login.Working' && loginState.value.id === server.id
-                  }
-                />
-              )
-            })}
-          </ul>
+          <div>
+            <ServersHeader />
+            <ul className="flex flex-col divide-y">
+              {value.servers.map(server => {
+                const removeState = states.Remove.state
+                const loginState = states.Login.state
+                return (
+                  <ServerRow
+                    key={server.id}
+                    server={server}
+                    removing={removeState.path === 'Remove.Working'}
+                    loggingIn={loginState.path === 'Login.Working'}
+                    loggingInThis={
+                      loginState.path === 'Login.Working' && loginState.value.id === server.id
+                    }
+                  />
+                )
+              })}
+            </ul>
+          </div>
         )
       }
     </MachineState>
+  )
+}
+
+function ServersHeader() {
+  return (
+    <div
+      className={cn(
+        'hidden h-10 items-center gap-x-3 border-b border-border px-2 text-sm font-medium text-muted-foreground sm:grid',
+        gridClassName,
+      )}
+    >
+      <span>Server</span>
+      <span>Target</span>
+      <span>Status</span>
+      <span className="text-right">On</span>
+      <span />
+    </div>
   )
 }
 
@@ -237,78 +260,101 @@ function ServerRow(props: ServerRowProps) {
   const machine = McpOwner.useMachine()
   const send = useAtomSet(machine.send)
   const { server, removing, loggingIn, loggingInThis } = props
+  const switchId = `mcp-enabled-${encodeURIComponent(server.id)}`
   return (
-    <li className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:gap-4">
-      <span
-        aria-hidden="true"
-        className="hidden size-10 shrink-0 place-items-center rounded-full border border-border bg-shelf text-muted-foreground sm:grid"
-      >
-        <Server className="size-5" />
-      </span>
-      <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-center gap-2">
-          <p className="min-w-0 break-words text-sm font-medium text-foreground [overflow-wrap:anywhere]">
-            {server.id}
-          </p>
-          {statusBadge(server)}
-        </div>
-        <div className="mt-1.5 flex min-w-0 items-start gap-1.5 text-muted-foreground sm:mt-1">
-          <span className="mt-0.5 shrink-0">
-            {server.transport === 'stdio' ? (
-              <Terminal className="size-3.5" />
-            ) : (
-              <Link2 className="size-3.5" />
-            )}
-          </span>
-          <span className="min-w-0 break-words font-mono text-xs select-text [overflow-wrap:anywhere]">
-            {serverDetail(server)}
-          </span>
-        </div>
-        {server.error === undefined ? null : (
-          <p
-            role="alert"
-            className="mt-1.5 break-words text-xs text-destructive [overflow-wrap:anywhere]"
-          >
-            {server.error}
-          </p>
-        )}
+    <li
+      className={cn(
+        'group grid grid-cols-1 items-center gap-x-3 gap-y-2.5 px-1 py-3 sm:min-h-12 sm:gap-y-1.5 sm:px-2 sm:py-2',
+        gridClassName,
+      )}
+    >
+      <div className="flex min-w-0 items-center">
+        <span className="min-w-0 break-words text-sm font-medium text-foreground [overflow-wrap:anywhere] sm:truncate">
+          {server.id}
+        </span>
       </div>
-      <div className="flex shrink-0 items-center justify-end gap-3">
-        {needsOauth(server) ? (
-          <Button
-            variant="outline"
-            disabled={loggingIn}
-            onClick={() => send(McpEvents.Login({ id: server.id }))}
+      <div className="flex flex-wrap items-start gap-x-3 gap-y-2 sm:contents">
+        <ServerTarget server={server} />
+        <div className="flex min-w-0 items-center">{statusBadge(server)}</div>
+        <div className="flex h-10 shrink-0 items-center justify-end gap-1.5 sm:h-auto sm:gap-2">
+          <label
+            htmlFor={switchId}
+            className="cursor-pointer text-xs font-medium text-muted-foreground sm:hidden"
           >
-            {loggingInThis ? 'Signing in…' : 'Sign in'}
-            {loggingInThis ? null : <ExternalLink data-icon="inline-end" className="size-3.5" />}
-          </Button>
-        ) : null}
-        <Switch
-          aria-label={`Enable ${server.id}`}
-          checked={server.enabled}
-          onCheckedChange={enabled => send(McpEvents.SetEnabled({ id: server.id, enabled }))}
-        />
-        <ConfirmDialog
-          tooltip="Remove server"
-          trigger={
+            Enabled
+          </label>
+          <Switch
+            id={switchId}
+            aria-label={`Enable ${server.id}`}
+            checked={server.enabled}
+            onCheckedChange={enabled => send(McpEvents.SetEnabled({ id: server.id, enabled }))}
+          />
+        </div>
+        <div className="flex shrink-0 items-center justify-end gap-1">
+          {needsOauth(server) ? (
             <Button
-              variant="ghost"
-              size="icon"
-              aria-label={`Remove ${server.id}`}
-              className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-              disabled={removing}
+              variant="outline"
+              size="xs"
+              disabled={loggingIn}
+              onClick={() => send(McpEvents.Login({ id: server.id }))}
             >
-              <Trash2 />
+              {loggingInThis ? 'Signing in…' : 'Sign in'}
+              {loggingInThis ? null : <ExternalLink data-icon="inline-end" className="size-3.5" />}
             </Button>
-          }
-          title="Remove MCP server?"
-          detail={server.id}
-          confirmLabel="Remove"
-          onConfirm={() => send(McpEvents.RemoveServer({ id: server.id }))}
-        />
+          ) : null}
+          <ConfirmDialog
+            tooltip="Remove server"
+            trigger={
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label={`Remove ${server.id}`}
+                className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                disabled={removing}
+              >
+                <Trash2 />
+              </Button>
+            }
+            title="Remove MCP server?"
+            detail={server.id}
+            confirmLabel="Remove"
+            onConfirm={() => send(McpEvents.RemoveServer({ id: server.id }))}
+          />
+        </div>
       </div>
     </li>
+  )
+}
+
+interface ServerTargetProps {
+  readonly server: McpServer
+}
+
+function ServerTarget(props: ServerTargetProps) {
+  const { server } = props
+  return (
+    <div className="w-full min-w-0">
+      <div className="flex min-w-0 items-center gap-1.5 text-muted-foreground">
+        <span className="shrink-0">
+          {server.transport === 'stdio' ? (
+            <Terminal className="size-3.5" />
+          ) : (
+            <Link2 className="size-3.5" />
+          )}
+        </span>
+        <span className="min-w-0 break-words font-mono text-xs select-text [overflow-wrap:anywhere] sm:truncate">
+          {serverDetail(server)}
+        </span>
+      </div>
+      {server.error === undefined ? null : (
+        <p
+          role="alert"
+          className="mt-1 break-words text-xs text-destructive [overflow-wrap:anywhere]"
+        >
+          {server.error}
+        </p>
+      )}
+    </div>
   )
 }
 

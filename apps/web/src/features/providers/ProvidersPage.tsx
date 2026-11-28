@@ -4,8 +4,8 @@ import { AtomMachine } from '@typeonce/effect-machine/reactivity'
 import { MachineState, useMachineResult } from '@typeonce/effect-machine-react'
 import { Option } from 'effect'
 import { AsyncResult } from 'effect/reactivity'
-import { KeyRound, Link2, Pencil, Plus, RefreshCw, Server, Trash2 } from 'lucide-react'
-import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react'
+import { KeyRound, Link2, Pencil, Plus, RefreshCw, Trash2 } from 'lucide-react'
+import { type FormEvent, useEffect, useRef, useState } from 'react'
 
 import { ConfirmDialog } from '~/components/ConfirmDialog'
 import { EmptyLine, FieldError, FieldRow, Page, PageError, Section } from '~/components/layout/Page'
@@ -30,6 +30,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '~/components/ui/tooltip
 import { MachineAtoms } from '~/lib/runtime'
 import { createPersistentMachineContext } from '~/lib/shellMachines'
 import { matchCached } from '~/lib/useBackgroundRefresh'
+import { cn } from '~/lib/utils'
 
 import { ProvidersEvents, type ProvidersInput, ProvidersMachine } from './providersMachine'
 import { providersPageAtom } from './providersState'
@@ -52,6 +53,9 @@ const apiOptions = [
   { value: 'opencode-go', label: apiLabels['opencode-go'] },
   { value: 'decision', label: apiLabels.decision },
 ]
+
+/** Provider | API | Base URL | Key | Models | actions, shared by the header and every row. */
+const gridClassName = 'sm:grid-cols-[minmax(0,0.8fr)_152px_minmax(0,1fr)_96px_88px_88px]'
 
 /** The Providers settings page. */
 export function ProvidersPage() {
@@ -127,50 +131,48 @@ function ProvidersList() {
         value.providers.length === 0 ? (
           <EmptyLine>No providers yet.</EmptyLine>
         ) : (
-          <ul className="divide-y divide-border overflow-hidden rounded-2xl border border-border bg-card shadow-xs">
-            {value.providers.map(provider => (
-              <ProviderRow
-                key={provider.id}
-                provider={provider}
-                refreshingId={value.refreshingId}
-                busy={
-                  states.Action.state.path !== 'Action.Idle' ||
-                  states.KeyDialog.state.path === 'KeyDialog.Submitting' ||
-                  states.Add.state.path === 'Add.Submitting'
-                }
-              />
-            ))}
-          </ul>
+          <div>
+            <ProvidersHeader />
+            <ul className="flex flex-col divide-y">
+              {value.providers.map(provider => (
+                <ProviderRow
+                  key={provider.id}
+                  provider={provider}
+                  refreshingId={value.refreshingId}
+                  busy={
+                    states.Action.state.path !== 'Action.Idle' ||
+                    states.KeyDialog.state.path === 'KeyDialog.Submitting' ||
+                    states.Add.state.path === 'Add.Submitting'
+                  }
+                />
+              ))}
+            </ul>
+          </div>
         )
       }
     </MachineState>
   )
 }
 
-const modelCountLabel = (count: number): string => `${count} ${count === 1 ? 'model' : 'models'}`
-
-interface DetailProps {
-  readonly icon: ReactNode
-  readonly text: string
-  readonly mono?: boolean
-}
-
-function Detail(props: DetailProps) {
+function ProvidersHeader() {
   return (
-    <span className="flex min-w-0 items-start gap-1.5">
-      <span className="mt-0.5 shrink-0">{props.icon}</span>
-      <span
-        className={
-          props.mono === false
-            ? 'min-w-0 break-words text-xs [overflow-wrap:anywhere]'
-            : 'min-w-0 break-words font-mono text-xs select-text [overflow-wrap:anywhere]'
-        }
-      >
-        {props.text}
-      </span>
-    </span>
+    <div
+      className={cn(
+        'hidden h-10 items-center gap-x-3 border-b border-border px-2 text-sm font-medium text-muted-foreground sm:grid',
+        gridClassName,
+      )}
+    >
+      <span>Provider</span>
+      <span>API</span>
+      <span>Base URL</span>
+      <span>Key</span>
+      <span className="text-right">Models</span>
+      <span />
+    </div>
   )
 }
+
+const modelCountLabel = (count: number): string => `${count} ${count === 1 ? 'model' : 'models'}`
 
 interface ProviderRowProps {
   readonly provider: Provider
@@ -185,43 +187,49 @@ function ProviderRow(props: ProviderRowProps) {
   const statusText =
     refreshingId === provider.id ? 'Refreshing…' : modelCountLabel(provider.modelCount)
   return (
-    <li className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:gap-4">
-      <span
-        aria-hidden="true"
-        className="hidden size-10 shrink-0 place-items-center rounded-full border border-border bg-shelf text-muted-foreground sm:grid"
-      >
-        <Server className="size-5" />
-      </span>
-      <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-center gap-2">
-          <p className="min-w-0 break-words text-sm font-medium text-foreground [overflow-wrap:anywhere]">
-            {provider.id}
-          </p>
-          <span className="rounded-full bg-muted px-2 py-px text-xs font-medium text-foreground">
+    <li
+      className={cn(
+        'group grid grid-cols-1 items-center gap-x-3 gap-y-2.5 px-1 py-3 sm:min-h-12 sm:gap-y-1.5 sm:px-2 sm:py-2',
+        gridClassName,
+      )}
+    >
+      <div className="flex min-w-0 items-center">
+        <span className="min-w-0 break-words text-sm font-medium text-foreground [overflow-wrap:anywhere] sm:truncate">
+          {provider.id}
+        </span>
+      </div>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 sm:contents">
+        <div className="flex min-w-0 items-center">
+          <span className="rounded-full bg-muted px-2 py-px text-xs font-medium whitespace-nowrap text-foreground">
             {apiLabels[provider.api]}
           </span>
         </div>
-        <div className="mt-1.5 flex min-w-0 flex-col gap-1 text-muted-foreground sm:mt-1 sm:flex-row sm:items-center sm:gap-4">
-          <Detail icon={<Link2 className="size-3.5" />} text={provider.baseUrl} />
-          <Detail
-            icon={<KeyRound className="size-3.5" />}
-            text={provider.apiKey === 'set' ? 'API key set' : 'No API key'}
-            mono={false}
-          />
+        <div className="flex w-full min-w-0 items-center gap-1.5 text-muted-foreground">
+          <Link2 className="size-3.5 shrink-0" />
+          <span className="min-w-0 break-words font-mono text-xs select-text [overflow-wrap:anywhere] sm:truncate">
+            {provider.baseUrl}
+          </span>
         </div>
-      </div>
-      <div className="flex shrink-0 items-center justify-between gap-3 sm:justify-end sm:gap-4">
-        <span aria-live="polite" className="shrink-0 text-xs text-muted-foreground tabular-nums">
-          {statusText}
-        </span>
-        <div className="flex shrink-0 items-center gap-3 sm:gap-2">
+        <div className="flex min-w-0 items-center gap-1.5 text-muted-foreground">
+          <KeyRound className="size-3.5 shrink-0" />
+          <span className="min-w-0 text-xs whitespace-nowrap">
+            {provider.apiKey === 'set' ? 'API key set' : 'No API key'}
+          </span>
+        </div>
+        <div className="flex shrink-0 items-center justify-end">
+          <span aria-live="polite" className="text-xs text-muted-foreground tabular-nums">
+            {statusText}
+          </span>
+        </div>
+        <div className="flex shrink-0 items-center justify-end gap-1">
           <Tooltip>
             <TooltipTrigger
               render={
                 <Button
                   variant="ghost"
-                  size="icon"
+                  size="icon-xs"
                   aria-label={`Update API key for ${provider.id}`}
+                  className="text-muted-foreground"
                   disabled={busy}
                   onClick={() => send(ProvidersEvents.OpenKeyDialog({ id: provider.id }))}
                 >
@@ -235,9 +243,10 @@ function ProviderRow(props: ProviderRowProps) {
             <TooltipTrigger
               render={
                 <Button
-                  variant="outline"
-                  size="icon"
+                  variant="ghost"
+                  size="icon-xs"
                   aria-label={`Refresh ${provider.id} models`}
+                  className="text-muted-foreground"
                   disabled={busy}
                   onClick={() => send(ProvidersEvents.RefreshProvider({ id: provider.id }))}
                 >
@@ -252,9 +261,9 @@ function ProviderRow(props: ProviderRowProps) {
             trigger={
               <Button
                 variant="ghost"
-                size="icon"
+                size="icon-xs"
                 aria-label={`Remove ${provider.id}`}
-                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
                 disabled={busy}
               >
                 <Trash2 />

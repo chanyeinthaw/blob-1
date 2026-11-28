@@ -1,5 +1,5 @@
 import { Api } from '@blob-1/client/api'
-import { BotMcpState } from '@blob-1/contracts'
+import { BotMcpState, type BotMcpServer } from '@blob-1/contracts'
 import { useAtomRefresh, useAtomSet, useAtomValue } from '@effect/atom-react'
 import { Link } from '@tanstack/react-router'
 import { Machine } from '@typeonce/effect-machine'
@@ -16,6 +16,7 @@ import { Notify } from '~/lib/notify'
 import { machineAtomsForBot } from '~/lib/runtime'
 import { createPersistentMachineContext } from '~/lib/shellMachines'
 import { matchCached } from '~/lib/useBackgroundRefresh'
+import { cn } from '~/lib/utils'
 
 import { botMcpAtomFor } from './botsState'
 import { useBotInstanceKey } from './CreateBotDialog'
@@ -166,6 +167,74 @@ const BotMcpOwner = createPersistentMachineContext(
     machineAtomsForBot(scopeKey).make(BotMcpMachine, input),
 )
 
+/** Server | Global | On, shared by the header and every row. */
+const gridClassName = 'sm:grid-cols-[minmax(0,1fr)_112px_48px]'
+
+function BotMcpHeader() {
+  return (
+    <div
+      className={cn(
+        'hidden h-10 items-center gap-x-3 border-b border-border px-2 text-sm font-medium text-muted-foreground sm:grid',
+        gridClassName,
+      )}
+    >
+      <span>Server</span>
+      <span>Global</span>
+      <span className="text-right">On</span>
+    </div>
+  )
+}
+
+interface BotMcpServerRowProps {
+  readonly server: BotMcpServer
+  readonly disabled: boolean
+  readonly onSetEnabled: (enabled: boolean) => void
+}
+
+function BotMcpServerRow(props: BotMcpServerRowProps) {
+  const { server } = props
+  const switchId = `bot-mcp-enabled-${encodeURIComponent(server.id)}`
+  return (
+    <li
+      className={cn(
+        'group grid grid-cols-1 items-center gap-x-3 gap-y-2.5 px-1 py-3 sm:min-h-12 sm:gap-y-1.5 sm:px-2 sm:py-2',
+        gridClassName,
+      )}
+    >
+      <div className="flex min-w-0 items-center gap-2.5">
+        <Plug className="size-4 shrink-0 text-muted-foreground" />
+        <span className="min-w-0 break-words font-mono text-sm font-medium [overflow-wrap:anywhere] sm:truncate">
+          {server.id}
+        </span>
+      </div>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 sm:contents">
+        <div className="flex min-w-0 items-center">
+          {!server.enabledGlobal ? (
+            <Badge variant="outline" className="text-muted-foreground">
+              Off globally
+            </Badge>
+          ) : null}
+        </div>
+        <div className="flex h-10 shrink-0 items-center justify-end gap-1.5 sm:h-auto sm:gap-2">
+          <label
+            htmlFor={switchId}
+            className="cursor-pointer text-xs font-medium text-muted-foreground sm:hidden"
+          >
+            On for this bot
+          </label>
+          <Switch
+            id={switchId}
+            aria-label={`Allow ${server.id}`}
+            checked={server.enabledForBot}
+            disabled={!server.enabledGlobal || props.disabled}
+            onCheckedChange={props.onSetEnabled}
+          />
+        </div>
+      </div>
+    </li>
+  )
+}
+
 interface BotMcpContentProps {
   readonly botId: string
 }
@@ -202,28 +271,20 @@ function BotMcpContent(_props: BotMcpContentProps) {
               </Button>
             }
           >
-            <div className="divide-y divide-border/60 rounded-2xl border border-border/80 bg-card">
-              {servers.map(server => (
-                <div key={server.id} className="flex items-center justify-between gap-3 px-4 py-3">
-                  <div className="flex min-w-0 items-center gap-2.5">
-                    <Plug className="size-4 shrink-0 text-muted-foreground" />
-                    <span className="truncate font-mono text-sm font-medium">{server.id}</span>
-                    {!server.enabledGlobal ? (
-                      <Badge variant="outline" className="text-muted-foreground">
-                        Off globally
-                      </Badge>
-                    ) : null}
-                  </div>
-                  <Switch
-                    aria-label={`Allow ${server.id}`}
-                    checked={server.enabledForBot}
-                    disabled={!server.enabledGlobal || isSaving}
-                    onCheckedChange={checked =>
-                      send(BotMcpEvents.SetEnabled({ id: server.id, enabled: checked }))
+            <div>
+              <BotMcpHeader />
+              <ul className="flex flex-col divide-y">
+                {servers.map(server => (
+                  <BotMcpServerRow
+                    key={server.id}
+                    server={server}
+                    disabled={isSaving}
+                    onSetEnabled={enabled =>
+                      send(BotMcpEvents.SetEnabled({ id: server.id, enabled }))
                     }
                   />
-                </div>
-              ))}
+                ))}
+              </ul>
             </div>
           </Section>
         )
